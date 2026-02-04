@@ -1,0 +1,7 @@
+// python3.13
+// gcc
+// cargo
+
+> cd source-code
+>>> cd compiler && python3.13 -m venv venv && source venv/bin/activate && pip install sly && cargo build --release
+>>> cd virus && hla -cc main.hcs -c virus
