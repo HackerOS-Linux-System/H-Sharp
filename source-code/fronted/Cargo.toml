@@ -1,7 +1,0 @@
-[package]
-name = "hsf"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-pyo3 = { version = "0.20.0", features = ["auto-initialize"] }
