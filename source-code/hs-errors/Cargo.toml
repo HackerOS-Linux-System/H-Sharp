@@ -1,1 +1,11 @@
+[package]
+name = "hs-errors"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+miette = { version = "5.10.0", features = ["fancy"] }
+thiserror = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+colored = "2.0"
 
