@@ -1,7 +1,10 @@
 // python3.13
-// gcc
 // cargo
+// golang
+// virus
 
 > cd source-code
->>> cd compiler && python3.13 -m venv venv && source venv/bin/activate && pip install sly && cargo build --release
->>> cd virus && hla -cc main.hcs -c virus
+>>> cd core && python3.13 -m venv venv && source venv/bin/activate && pip install lark && cargo build --release
+>>> cd virus && virus build
+>>> cd virus-go && go get virus-go && go build
+>>> cd hs-errors && cargo build --release
