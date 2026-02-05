@@ -12,10 +12,10 @@ class HSharpLexer(Lexer):
         ID, STRING, NUMBER,
         EQEQ, NEQ, GEQ, LEQ, GT, LT,
         EQ, COMMA, COLON, LBRACKET, RBRACKET, PIPE, LPAREN, RPAREN,
-        PLUS, MINUS, SEMICOLON
+        PLUS, MINUS
     }
     ignore = ' \t'
-
+    
     @_(r'\n+')
     def ignore_newline(self, t):
         self.lineno += len(t.value)
@@ -37,7 +37,6 @@ class HSharpLexer(Lexer):
     MEMORY_MODE = r'---'
     LINKAGE_MODE = r'==='
     PIPE = r'\|'
-    SEMICOLON = r';'
 
     # Operators
     EQEQ = r'=='
@@ -75,7 +74,7 @@ class MultiCommentLexer(Lexer):
 # --- Parser ---
 class HSharpParser(Parser):
     tokens = HSharpLexer.tokens
-
+    
     # Precedence rules to resolve Shift/Reduce conflicts
     precedence = (
         ('right', ELSE),           # Bind ELSE to the nearest IF
@@ -89,13 +88,13 @@ class HSharpParser(Parser):
             "config": {"memory": "auto", "linkage": "auto"},
             "imports": [],
             "declarations": [],
-            "main_body": []
+            "main_body": [] 
         }
 
     @_('statements')
     def program(self, p):
         for stmt in p.statements:
-            if stmt:
+            if stmt: 
                 self.ast["main_body"].append(stmt)
         return self.ast
 
@@ -115,11 +114,11 @@ class HSharpParser(Parser):
 
     @_('import_stmt', 'memory_mode_stmt', 'linkage_mode_stmt')
     def statement(self, p):
-        return None
+        return None 
 
     @_('func_def', 'object_def')
     def statement(self, p):
-        return None
+        return None 
 
     @_('log_stmt', 'system_exec_stmt', 'if_stmt', 'let_stmt', 'return_stmt', 'call_stmt', 'assign_stmt')
     def statement(self, p):
@@ -127,7 +126,6 @@ class HSharpParser(Parser):
 
     # --- Configurations ---
 
-    # Fix: Use tokens LT/GT instead of literals "<", ">"
     @_('IMPORT LT ID COLON ID GT')
     def import_stmt(self, p):
         self.ast["imports"].append({"source": p.ID0, "lib": p.ID1})
@@ -151,10 +149,10 @@ class HSharpParser(Parser):
         for match in re.finditer(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', text):
             parts.append(text[last:match.start()])
             args.append(match.group(1))
-            parts.append("%s")
+            parts.append("%s") 
             last = match.end()
         parts.append(text[last:])
-
+        
         return {
             "node": "Log",
             "format": "".join(parts),
@@ -211,7 +209,7 @@ class HSharpParser(Parser):
         return {"name": p.ID, "type": self.map_type(p.type)}
 
     # --- Objects ---
-
+    
     @_('OBJECT ID EQ variants')
     def object_def(self, p):
         self.ast["declarations"].append({
@@ -238,7 +236,8 @@ class HSharpParser(Parser):
     def members(self, p):
         return []
 
-    @_('ID COLON type SEMICOLON')
+    # Removed SEMICOLON token requirement
+    @_('ID COLON type')
     def member(self, p):
         return {"name": p.ID, "type": self.map_type(p.type)}
 
@@ -315,7 +314,7 @@ class HSharpParser(Parser):
             "index": p.expr0,
             "value": p.expr1
         }
-
+        
     @_('RETURN expr')
     def return_stmt(self, p):
         return {
@@ -333,7 +332,7 @@ class HSharpParser(Parser):
 
     # --- Expressions ---
 
-    @_('expr EQEQ expr', 'expr NEQ expr', 'expr GT expr', 'expr LT expr', 'expr GEQ expr', 'expr LEQ expr',
+    @_('expr EQEQ expr', 'expr NEQ expr', 'expr GT expr', 'expr LT expr', 'expr GEQ expr', 'expr LEQ expr', 
        'expr PLUS expr', 'expr MINUS expr')
     def expr(self, p):
         return {"node": "BinaryOp", "op": p[1], "left": p.expr0, "right": p.expr1}
@@ -402,7 +401,7 @@ if __name__ == '__main__':
 
     lexer = HSharpLexer()
     parser = HSharpParser()
-
+    
     try:
         with open(args.input, 'r') as f:
             code = f.read()
@@ -414,8 +413,7 @@ if __name__ == '__main__':
         ast = parser.parse(lexer.tokenize(code))
         with open(args.output, 'w') as f:
             json.dump(ast, f, indent=2)
-        print(f"Compilation (Frontend) successful. IR written to {args.output}")
+        # Keep silent for JSON output to pipe correctly if needed, or just standard logging
     except Exception as e:
         sys.stderr.write(f"Parse Error: {e}\n")
         sys.exit(1)
-
