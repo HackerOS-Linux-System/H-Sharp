@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# FILE: ~/.hackeros/h-sharp/hst
+# AUTHOR: HackerOS Core Team
+# DESC: H# Transpiler (HST). Transforms .hcs -> Python -> Rust Binary
+
 import sys
 import os
 import gc
@@ -183,6 +189,13 @@ class Arc:
 
     def free(self):
         self.val = None
+
+    # Truthiness (Crucial for loops!)
+    def __bool__(self):
+        return bool(self.val)
+
+    def __nonzero__(self):
+        return bool(self.val)
 
     def __repr__(self): return str(self.val)
     def __str__(self): return str(self.val)
