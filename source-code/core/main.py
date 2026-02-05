@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# FILE: ~/.hackeros/h-sharp/hst
-# AUTHOR: HackerOS Core Team
-# DESC: H# Transpiler (HST). Transforms .hcs -> Python -> Rust Binary
-
 import sys
 import os
 import gc
