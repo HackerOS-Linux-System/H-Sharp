@@ -24,6 +24,15 @@ hsharp_grammar = r"""
     %ignore COMMENT
 
     // Keywords
+    KW_LOG: "log"
+    KW_FUNC: "func"
+    KW_RETURN: "return"
+    KW_IF: "if"
+    KW_ELSE: "else"
+    KW_WHILE: "while"
+    KW_LET: "let"
+    KW_OBJECT: "object"
+
     KW_STATIC: "static"
     KW_DYNAMIC: "dynamic"
     KW_AUTO: "auto"
@@ -46,30 +55,33 @@ hsharp_grammar = r"""
 
     // --- Imports ---
     import_stmt: "#" "<" SOURCE ":" NAME ">"
-    SOURCE: "c" | "ruby" | "rust" | "java" | "bytes" | "virus" | "python"
+    SOURCE: "c" | "ruby" | "rust" | "java" | "bytes" | "virus" | "python" | "core"
 
     // --- Functions ---
-    func_def: KW_FAST? "func" NAME "(" args? ")" "[" body "]"
+    func_def: KW_FAST? KW_FUNC NAME "(" args? ")" "[" body "]"
 
     args: NAME ("," NAME)*
 
     // --- Objects ---
-    object_def: "object" NAME "[" class_body "]"
+    object_def: KW_OBJECT NAME "[" class_body "]"
 
-    class_body: (var_decl ";")* func_def*
+    class_body: (var_decl ";"?)* func_def*
 
     body: stmt*
 
-    var_decl: "let" NAME "=" expr
+    var_decl: KW_LET NAME "=" expr
 
-    stmt: "log" (expr | STRING) ";"  -> log_stmt
+    // Helper to resolve NAME conflict between assign and expr
+    lvalue: NAME
+
+    stmt: KW_LOG expr ";"?            -> log_stmt
         | ">" /[^\n]+/               -> sys_cmd
-        | var_decl ";"               -> var_decl_stmt
-        | NAME "=" expr ";"          -> assign
-        | "if" expr "[" body "]" ("else" "[" body "]")? -> if_stmt
-        | "while" expr "[" body "]"  -> while_stmt
-        | "return" expr ";"          -> return_stmt
-        | expr ";"                   -> expr_stmt
+        | var_decl ";"?               -> var_decl_stmt
+        | lvalue "=" expr ";"?        -> assign
+        | KW_IF expr "[" body "]" (KW_ELSE "[" body "]")? -> if_stmt
+        | KW_WHILE expr "[" body "]"  -> while_stmt
+        | KW_RETURN expr ";"?          -> return_stmt
+        | expr ";"?                   -> expr_stmt
 
     ?expr: term
          | expr "+" term -> add
@@ -93,8 +105,10 @@ hsharp_grammar = r"""
 # ==========================================
 class HSTCompiler(Transformer):
     def __init__(self):
-        self.user_home = os.path.expanduser("~")
-        self.cache_dir = os.path.join(self.user_home, ".cache")
+        # Use current working directory for cache to match Virus Build System
+        # Virus creates .cache in the project root (CWD), not in user home
+        self.cache_dir = os.path.join(os.getcwd(), ".cache")
+
         # Modes: auto (ARC), gc (Python GC), fast (Arena), manual (No GC)
         self.memory_mode = "auto"
         self.imports = []
@@ -115,9 +129,14 @@ class HSTCompiler(Transformer):
             f"sys.path.append(r'{venv_site}')",
             "",
             "import gc, ctypes, subprocess",
-            "import numpy as np",
-            "import polars as pl",
-            "from numba import jit",
+            "try:",
+            "    import numpy as np",
+            "    import polars as pl",
+            "    from numba import jit",
+            "except ImportError as e:",
+            "    print(f'[H# Runtime Warning] Missing libs: {e}. Check .cache/venv integrity.')",
+            "    # Mocking for basic execution if libs fail (optional fallback)",
+            "    np = None; pl = None; jit = lambda *a, **k: (lambda f: f)",
             "",
             f"# Cache Root: {self.cache_dir}",
             ""
@@ -170,6 +189,9 @@ class Arena:
 # H# Custom ARC (Automatic Reference Counting)
 class Arc:
     def __init__(self, val):
+        # Flatten nested Arcs to prevent infinite wrapping
+        while hasattr(val, 'val'):
+            val = val.val
         self.val = val
         self.rc = 1
 
@@ -197,7 +219,9 @@ class Arc:
 
     # Helpers for mixing Arc with raw types
     def _get(self, other):
-        return other.val if hasattr(other, 'val') else other
+        # Recursively unwrap if needed (though init handles most)
+        if hasattr(other, 'val'): return other.val
+        return other
 
     # Arithmetic
     def __add__(self, o): return Arc(self.val + self._get(o))
@@ -205,10 +229,19 @@ class Arc:
     def __mul__(self, o): return Arc(self.val * self._get(o))
     def __truediv__(self, o): return Arc(self.val / self._get(o))
 
+    # Reverse Arithmetic (for Int + Arc)
+    def __radd__(self, o): return Arc(self._get(o) + self.val)
+    def __rsub__(self, o): return Arc(self._get(o) - self.val)
+    def __rmul__(self, o): return Arc(self._get(o) * self.val)
+    def __rtruediv__(self, o): return Arc(self._get(o) / self.val)
+
     # Comparison
     def __eq__(self, o): return self.val == self._get(o)
     def __gt__(self, o): return self.val > self._get(o)
     def __lt__(self, o): return self.val < self._get(o)
+    def __ge__(self, o): return self.val >= self._get(o)
+    def __le__(self, o): return self.val <= self._get(o)
+    def __ne__(self, o): return self.val != self._get(o)
 """
 
     # --- Directives ---
@@ -222,26 +255,44 @@ class Arc:
     # --- Imports ---
     def import_stmt(self, args):
         src, name = args[0], args[1]
+
         if src == "python":
             return f"import {name}"
+
         elif src == "virus":
             path = os.path.join(self.cache_dir, "virus", name, f"{name}.so")
             return f"try:\n    lib_{name} = ctypes.CDLL('{path}')\nexcept: pass"
+
         elif src == "bytes":
             path = os.path.join(self.cache_dir, "bytes", name)
             return f"def {name}(*a):\n    subprocess.run(['{path}', *a])"
+
+        elif src == "rust":
+            # Just a marker for Virus Build System to inject into Cargo.toml
+            return f"# H#_RUST_DEP: {name}"
+
+        elif src == "core":
+            # Core libraries are compiled H# files located in /usr/lib/h-sharp/core
+            # Virus compiles them to .so and places them in cache/core
+            path = os.path.join(self.cache_dir, "core", f"lib{name}.so")
+            return f"try:\n    core_{name} = ctypes.CDLL('{path}')\nexcept Exception as e: print(f'Core Load Error: {{e}}')"
+
         return f"# IMPORT {src}:{name}"
 
     # --- Statements ---
     def log_stmt(self, args):
-        return f"print({args[0]})"
+        # args[0] is KW_LOG (token), args[1] is the expr
+        return f"print({args[1]})"
 
     def sys_cmd(self, args):
+        # args[0] is the regex match for /[^\n]+/
         cmd = args[0].value.strip()
         return f"os.system('{cmd}')"
 
     def var_decl(self, args):
-        name, val = args[0], args[1]
+        # args[0] is KW_LET, args[1] is NAME, args[2] is expr
+        name = args[1]
+        val = args[2]
         # In Auto/ARC mode, wrap values
         if self.memory_mode in ["auto", "automatic"]:
             return f"{name} = Arc({val})"
@@ -250,56 +301,78 @@ class Arc:
         return f"{name} = {val}"
 
     def var_decl_stmt(self, args): return args[0]
+
+    def lvalue(self, args): return args[0]
     def assign(self, args): return f"{args[0]} = {args[1]}"
 
     def if_stmt(self, args):
-        out = f"if {args[0]}:\n    {args[1]}"
-        if len(args) > 2: out += f"\nelse:\n    {args[2]}"
+        # args[0] = KW_IF
+        # args[1] = expr (condition)
+        # args[2] = body (true block)
+        # Optional: args[3] = KW_ELSE, args[4] = body (false block)
+        body_true = str(args[2]).replace("\n", "\n    ")
+        out = f"if {args[1]}:\n    {body_true}"
+        if len(args) > 3:
+            body_false = str(args[4]).replace("\n", "\n    ")
+            out += f"\nelse:\n    {body_false}"
         return out
 
     def while_stmt(self, args):
-        return f"while {args[0]}:\n    {args[1]}"
+        # args[0] = KW_WHILE, args[1] = expr, args[2] = body
+        body = str(args[2]).replace("\n", "\n    ")
+        return f"while {args[1]}:\n    {body}"
 
-    def return_stmt(self, args): return f"return {args[0]}"
+    def return_stmt(self, args):
+        # args[0] = KW_RETURN, args[1] = expr
+        return f"return {args[1]}"
+
     def expr_stmt(self, args): return str(args[0])
 
     # --- Functions ---
     def func_def(self, args):
-        is_fast = False
-        if hasattr(args[0], 'type') and args[0].type == 'KW_FAST':
-            is_fast = True
-            args = args[1:]
+        has_fast = False
+        name_idx = -1
 
-        name = args[0]
-        params_str = str(args[1]) if len(args) == 3 else ""
-        body = str(args[2]) if len(args) == 3 else str(args[1])
+        # Scan for NAME token to locate function name.
+        # Everything before it is qualifiers (KW_FUNC, KW_FAST).
+        # Everything after it is children (args and body).
+        for i, arg in enumerate(args):
+            if hasattr(arg, 'type'):
+                if arg.type == 'KW_FAST':
+                    has_fast = True
+                elif arg.type == 'NAME':
+                    name_idx = i
+                    break
 
-        # HACK: If fast/JIT, we must STRIP Arc() usage from the body and unwrap arguments
-        # Numba nopython mode cannot handle Arc classes.
-        if is_fast:
-            # 1. Regex strip Arc() wrapping from var declarations in body
-            # Matches "Arc(...)" and replaces with "..."
-            # Note: This is a simple heuristic. Nested Arcs might be tricky.
+        if name_idx == -1: return "" # Should be caught by parser syntax error
+
+        name = args[name_idx].value
+        children = args[name_idx+1:]
+
+        params_str = ""
+        body = ""
+
+        if len(children) == 2:
+            params_str = str(children[0])
+            body = str(children[1])
+        elif len(children) == 1:
+            body = str(children[0])
+
+        if has_fast:
+             # 1. Regex strip Arc() wrapping from var declarations in body
             jit_body = re.sub(r'\bArc\s*\((.*?)\)', r'\1', body)
             jit_body_indent = jit_body.replace("\n", "\n    ") if jit_body else "pass"
-
             jit_name = f"_jit_{name}"
-
-            # 2. Generate JIT Function
             jit_func = f"@jit(nopython=True)\ndef {jit_name}({params_str}):\n    {jit_body_indent}\n"
 
-            # 3. Generate Wrapper Trampoline to unwrap Arc args
-            # We need to know arg names to unwrap them
             arg_names = [x.strip() for x in params_str.split(',') if x.strip()]
             unwrap_code = ""
             call_args = []
-
             for arg in arg_names:
                 unwrap_code += f"    _{arg} = {arg}.val if hasattr({arg}, 'val') else {arg}\n"
                 call_args.append(f"_{arg}")
 
             call_args_str = ", ".join(call_args)
-
             wrapper = f"""
 def {name}({params_str}):
 {unwrap_code}
@@ -312,13 +385,19 @@ def {name}({params_str}):
         body_indent = body.replace("\n", "\n    ") if body else "pass"
         return f"\ndef {name}({params_str}):\n    {body_indent}\n"
 
-    def args(self, args): return ", ".join([str(a) for a in args])
+    def args(self, args):
+        # Ensure we use .value for tokens to avoid getting "Token(NAME, 'val')"
+        return ", ".join([str(a.value) if hasattr(a, 'value') else str(a) for a in args])
+
     def body(self, args): return "\n".join([str(a) for a in args])
 
     # --- Objects ---
     def object_def(self, args):
-        name = args[0]
-        body = args[1].replace("\n", "\n    ")
+        # args[0] = KW_OBJECT
+        # args[1] = NAME
+        # args[2] = body
+        name = args[1]
+        body = args[2].replace("\n", "\n    ")
         return f"\nclass {name}:\n    {body}\n"
 
     def class_body(self, args): return "\n".join([str(a) for a in args])
@@ -334,8 +413,10 @@ def {name}({params_str}):
     def factor(self, a): return str(a[0])
 
     def func_call(self, a):
-        params = a[1] if a[1] else ""
-        return f"{a[0]}({params})"
+        name = a[0]
+        params = a[1] if len(a) > 1 else ""
+        return f"{name}({params})"
+
     def call_args(self, a): return ", ".join([str(arg) for arg in a])
 
 
