@@ -32,13 +32,13 @@ struct Args {
 #[derive(Error, Debug, Diagnostic)]
 #[error("{message}")]
 #[diagnostic(
-    code(h_sharp::transpilation_error),
-    help("Check the syntax in your .hcs file.")
+code(h_sharp::transpilation_error),
+             help("Check the syntax in your .hcs file.")
 )]
 struct HSharpError {
     message: String,
     #[source_code]
-    src: NamedSource<String>,
+    src: NamedSource,
     #[label("Here")]
     span: SourceSpan,
 }
@@ -85,14 +85,13 @@ fn get_offset(source: &str, line: usize, col: usize) -> usize {
             // col is 1-based, offset adds col-1
             return offset + (col.saturating_sub(1));
         }
-        
+
         offset += char.len_utf8();
         if char == '\n' {
             current_line += 1;
         }
     }
-    
+
     // Fallback if line out of bounds
     source.len().saturating_sub(1)
 }
-
