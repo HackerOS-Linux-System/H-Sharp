@@ -1,1 +1,4 @@
-
+! > sudo apt remove -y rustc cargo python
+> sudo rm -rf /usr/bin/virus
+> sudo rm -rf /usr/bin/virus-go
+> sudo rm -rf ~/.hackeros/h-sharp/
