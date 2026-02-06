@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -56,15 +57,15 @@ func main() {
 	command := os.Args[1]
 
 	switch command {
-	case "build":
-		handleBuildCommand()
+		case "build":
+			handleBuildCommand()
 
-	case "clean":
-		cleanBuild()
+		case "clean":
+			cleanBuild()
 
-	default:
-		logError(fmt.Sprintf("Unknown command: %s", command))
-		printHelp()
+		default:
+			logError(fmt.Sprintf("Unknown command: %s", command))
+			printHelp()
 	}
 }
 
@@ -78,7 +79,7 @@ func printHelp() {
 
 func cleanBuild() {
 	logStep("Cleaning build artifacts...")
-	
+
 	dirs := []string{CACHE_DIR, BUILD_DIR}
 	for _, d := range dirs {
 		if _, err := os.Stat(d); !os.IsNotExist(err) {
@@ -86,7 +87,7 @@ func cleanBuild() {
 			os.RemoveAll(d)
 		}
 	}
-	
+
 	logSuccess("Clean complete.")
 }
 
@@ -180,7 +181,7 @@ func parseHK(path string) (ProjectInfo, error) {
 			}
 		}
 	}
-	
+
 	// Check if source exists
 	if _, err := os.Stat(info.Entrypoint); os.IsNotExist(err) {
 		return info, fmt.Errorf("Entrypoint not found: %s", info.Entrypoint)
@@ -194,14 +195,14 @@ func parseHK(path string) (ProjectInfo, error) {
 // ==========================================
 func startBuildPipeline(srcFile string, projectName string) {
 	startTime := time.Now()
-	
+
 	// 1. ENVIRONMENT SETUP
 	logStep(fmt.Sprintf("Compiling %s (H# -> Binary)...", projectName))
-	
+
 	wd, _ := os.Getwd()
 	cachePath := filepath.Join(wd, CACHE_DIR)
 	buildPath := filepath.Join(wd, BUILD_DIR)
-	
+
 	dirs := []string{
 		filepath.Join(cachePath, "src"),
 		filepath.Join(cachePath, "libs"),
@@ -230,14 +231,16 @@ func startBuildPipeline(srcFile string, projectName string) {
 	// 3. TRANSPILATION (H# -> Python)
 	logInfo("Transpiling H# source...")
 	home, _ := os.UserHomeDir()
-	
+
 	// Try to use the compiled transpiler binary first (PyOxidizer/PyO3 build)
 	hstBin := filepath.Join(home, ".hackeros", "h-sharp", "hst")
 	var cmd *exec.Cmd
+	var usingNativeHst bool
 
 	if _, err := os.Stat(hstBin); err == nil {
 		// Native binary found
 		cmd = exec.Command(hstBin, srcFile)
+		usingNativeHst = true
 	} else {
 		// Fallback to local python script for development
 		hstScript := "hsf/main.py"
@@ -245,12 +248,56 @@ func startBuildPipeline(srcFile string, projectName string) {
 			hstScript = "main.py"
 		}
 		cmd = exec.Command("python3", hstScript, srcFile)
+		usingNativeHst = false
 	}
 
 	pythonCode, err := cmd.CombinedOutput()
 	if err != nil {
-		logError("Transpilation Failed:")
-		fmt.Println(string(pythonCode))
+		// !!! ERROR HANDLING via hs-errors !!!
+		logError("Transpilation Failed.")
+
+		// Attempt to parse Lark/Python error format
+		// Expected format example: "Error at line 1, column 5" or typical python exception
+		errorOutput := string(pythonCode)
+
+		// Regex to find line/column
+		// Matches: "line 5, column 10" or "line 5"
+		lineRegex := regexp.MustCompile(`line\s+(\d+)`)
+		colRegex := regexp.MustCompile(`column\s+(\d+)`)
+
+		lineMatch := lineRegex.FindStringSubmatch(errorOutput)
+		colMatch := colRegex.FindStringSubmatch(errorOutput)
+
+		lineNum := 1
+		colNum := 1
+
+		if len(lineMatch) > 1 {
+			if l, err := strconv.Atoi(lineMatch[1]); err == nil {
+				lineNum = l
+			}
+		}
+		if len(colMatch) > 1 {
+			if c, err := strconv.Atoi(colMatch[1]); err == nil {
+				colNum = c
+			}
+		}
+
+		// Cleanup message (remove full traceback if it's too long, just take last line)
+		lines := strings.Split(strings.TrimSpace(errorOutput), "\n")
+		shortMsg := lines[len(lines)-1]
+		if len(shortMsg) > 100 {
+			shortMsg = shortMsg[:100] + "..."
+		}
+		if shortMsg == "" {
+			shortMsg = "Unknown Syntax Error"
+		}
+
+		// INVOKE RUST ERROR REPORTER
+		if !usingNativeHst {
+			// If we are dev mode, maybe don't require the global binary, but try anyway
+		}
+
+		reportPrettyError(srcFile, lineNum, colNum, shortMsg, errorOutput)
 		os.Exit(1)
 	}
 
@@ -269,12 +316,14 @@ func startBuildPipeline(srcFile string, projectName string) {
 	// 6. COMPILATION
 	logInfo("Compiling native binary (cargo)...")
 	rustProjectDir := filepath.Join(cachePath, "rust_build")
-	
+
 	buildCmd := exec.Command("cargo", "build", "--release")
 	buildCmd.Dir = rustProjectDir
-	
+
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		logError("Rust Compilation Failed.")
+		// We can also use hs-errors here if we parse Cargo output,
+		// but Cargo output is already pretty. Just dump it.
 		fmt.Println(string(out))
 		os.Exit(1)
 	}
@@ -284,10 +333,10 @@ func startBuildPipeline(srcFile string, projectName string) {
 	if os.PathSeparator == '\\' {
 		binaryName += ".exe"
 	}
-	
+
 	targetBin := filepath.Join(rustProjectDir, "target", "release", binaryName)
 	finalBin := filepath.Join(buildPath, projectName)
-	
+
 	input, err := os.ReadFile(targetBin)
 	if err != nil {
 		logError("Could not find compiled binary.")
@@ -303,13 +352,40 @@ func startBuildPipeline(srcFile string, projectName string) {
 }
 
 // ==========================================
+// ERROR REPORTING (Rust Integration)
+// ==========================================
+func reportPrettyError(file string, line int, col int, msg string, fullLog string) {
+	home, _ := os.UserHomeDir()
+	hsErrorsBin := filepath.Join(home, ".hackeros", "h-sharp", "hs-errors")
+
+	if _, err := os.Stat(hsErrorsBin); os.IsNotExist(err) {
+		// Fallback if hs-errors is not installed
+		fmt.Println("\n" + ColorRed + "--- RAW ERROR OUTPUT ---" + ColorReset)
+		fmt.Println(fullLog)
+		fmt.Println(ColorYellow + "Tip: Install hs-errors in ~/.hackeros/h-sharp/ for pretty errors." + ColorReset)
+		return
+	}
+
+	cmd := exec.Command(hsErrorsBin,
+			    "--file", file,
+		     "--line", strconv.Itoa(line),
+			    "--col", strconv.Itoa(col),
+			    "--msg", msg,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Run() // Let it print directly to terminal
+}
+
+// ==========================================
 // PYTHON VENV & RUNTIME MANAGER
 // ==========================================
 func ensureVenv(cachePath string) error {
 	venvPath := filepath.Join(cachePath, "venv")
 	pipPath := filepath.Join(venvPath, "bin", "pip")
 	if _, err := os.Stat(pipPath); err == nil {
-		return nil 
+		return nil
 	}
 	logWarn("Creating new virtual environment...")
 	cmd := exec.Command("python3", "-m", "venv", venvPath)
@@ -320,7 +396,7 @@ func installPythonRuntimeDeps(cachePath string) error {
 	venvPath := filepath.Join(cachePath, "venv")
 	pipPath := filepath.Join(venvPath, "bin", "pip")
 	pkgs := []string{"numpy", "polars", "numba"}
-	
+
 	args := append([]string{"install", "--disable-pip-version-check"}, pkgs...)
 	cmd := exec.Command(pipPath, args...)
 	out, err := cmd.CombinedOutput()
@@ -344,16 +420,16 @@ func resolveDependencies(srcFile string, cachePath string) {
 	for _, match := range matches {
 		repoType := match[1]
 		pkgName := match[2]
-		
+
 		logInfo(fmt.Sprintf("Fetching %s:%s...", repoType, pkgName))
-		
+
 		var repoUrl string
 		var targetPath string
 		var isBinary bool
 
 		if repoType == "virus" {
 			repoUrl = VIRUS_REPO_URL
-			targetPath = filepath.Join(cachePath, "virus", pkgName, pkgName+".so") 
+			targetPath = filepath.Join(cachePath, "virus", pkgName, pkgName+".so")
 			isBinary = false
 		} else {
 			repoUrl = BYTES_REPO_URL
@@ -393,7 +469,7 @@ func fetchPackageUrlFromRepo(repoIndexUrl string, pkgName string) (string, error
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Skip comments and empty lines
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
@@ -411,10 +487,10 @@ func fetchPackageUrlFromRepo(repoIndexUrl string, pkgName string) (string, error
 
 		// 2. Normalize separator: replace "=>" with "="
 		line = strings.ReplaceAll(line, "=>", "=")
-		
+
 		// 3. Split
 		parts := strings.SplitN(line, "=", 2)
-		
+
 		if len(parts) >= 2 {
 			currentPkg := strings.TrimSpace(parts[0])
 			if currentPkg == pkgName {
@@ -450,39 +526,39 @@ func downloadFile(url string, dest string) error {
 // ==========================================
 func generateRustProject(cachePath string, projectName string, pythonCode []byte) {
 	rustDir := filepath.Join(cachePath, "rust_build")
-	
+
 	cargoToml := fmt.Sprintf(`[package]
-name = "hsharp_app"
-version = "0.1.0"
-edition = "2021"
+	name = "hsharp_app"
+	version = "0.1.0"
+	edition = "2021"
 
-[dependencies]
-pyo3 = { version = "0.19.0", features = ["auto-initialize"] }
+	[dependencies]
+	pyo3 = { version = "0.19.0", features = ["auto-initialize"] }
 
-[[bin]]
-name = "hsharp_app"
-path = "src/main.rs"
-`)
+	[[bin]]
+	name = "hsharp_app"
+	path = "src/main.rs"
+	`)
 	os.WriteFile(filepath.Join(rustDir, "Cargo.toml"), []byte(cargoToml), 0644)
-	
+
 	safePyCode := strings.ReplaceAll(string(pythonCode), "`", "` + \"`\" + `")
 
 	mainRs := fmt.Sprintf(`
-use pyo3::prelude::*;
-use pyo3::types::PyModule;
+	use pyo3::prelude::*;
+	use pyo3::types::PyModule;
 
-fn main() -> PyResult<()> {
-    let py_app = r#"%s"#;
+	fn main() -> PyResult<()> {
+	let py_app = r#"%s"#;
 
-    Python::with_gil(|py| {
-        let app = PyModule::from_code(py, py_app, "app.py", "app")?;
-        
-        if let Ok(main_fn) = app.getattr("main") {
-            main_fn.call0()?;
-        }
-        
-        Ok(())
-    })
+	Python::with_gil(|py| {
+	let app = PyModule::from_code(py, py_app, "app.py", "app")?;
+
+	if let Ok(main_fn) = app.getattr("main") {
+		main_fn.call0()?;
+}
+
+Ok(())
+})
 }
 `, safePyCode)
 
