@@ -1,3 +1,4 @@
 // curl
 
+> sudo apt install -y cargo rustc python
 > 
