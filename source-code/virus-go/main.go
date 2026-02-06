@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,6 +47,15 @@ const (
 type ProjectInfo struct {
 	Name       string
 	Entrypoint string
+}
+
+// Struct for JSON errors from HST (Python)
+type HstError struct {
+	Type     string   `json:"type"`
+	Msg      string   `json:"msg"`
+	Line     int      `json:"line"`
+	Col      int      `json:"col"`
+	Expected []string `json:"expected"`
 }
 
 func main() {
@@ -235,12 +245,10 @@ func startBuildPipeline(srcFile string, projectName string) {
 	// Try to use the compiled transpiler binary first (PyOxidizer/PyO3 build)
 	hstBin := filepath.Join(home, ".hackeros", "h-sharp", "hst")
 	var cmd *exec.Cmd
-	var usingNativeHst bool
 
 	if _, err := os.Stat(hstBin); err == nil {
 		// Native binary found
 		cmd = exec.Command(hstBin, srcFile)
-		usingNativeHst = true
 	} else {
 		// Fallback to local python script for development
 		hstScript := "hsf/main.py"
@@ -248,25 +256,39 @@ func startBuildPipeline(srcFile string, projectName string) {
 			hstScript = "main.py"
 		}
 		cmd = exec.Command("python3", hstScript, srcFile)
-		usingNativeHst = false
 	}
 
 	pythonCode, err := cmd.CombinedOutput()
+	outputStr := string(pythonCode)
+
 	if err != nil {
-		// !!! ERROR HANDLING via hs-errors !!!
-		logError("Transpilation Failed.")
+		// 1. Check for JSON error marker from updated HST
+		if strings.Contains(outputStr, "__HST_JSON_ERR__") {
+			parts := strings.Split(outputStr, "__HST_JSON_ERR__")
+			if len(parts) > 1 {
+				jsonStr := strings.TrimSpace(parts[1])
 
-		// Attempt to parse Lark/Python error format
-		// Expected format example: "Error at line 1, column 5" or typical python exception
-		errorOutput := string(pythonCode)
+				var hstErr HstError
+				if jErr := json.Unmarshal([]byte(jsonStr), &hstErr); jErr == nil {
+					// Add Expected info to message if available
+					finalMsg := hstErr.Msg
+					if len(hstErr.Expected) > 0 {
+						finalMsg += fmt.Sprintf(". Expected: %v", hstErr.Expected)
+					}
+					reportPrettyError(srcFile, hstErr.Line, hstErr.Col, finalMsg, outputStr)
+					os.Exit(1)
+				}
+			}
+		}
 
-		// Regex to find line/column
-		// Matches: "line 5, column 10" or "line 5"
+		// 2. Fallback legacy parsing (if JSON parsing failed)
+		logError("Transpilation Failed (Raw Output).")
+
 		lineRegex := regexp.MustCompile(`line\s+(\d+)`)
 		colRegex := regexp.MustCompile(`column\s+(\d+)`)
 
-		lineMatch := lineRegex.FindStringSubmatch(errorOutput)
-		colMatch := colRegex.FindStringSubmatch(errorOutput)
+		lineMatch := lineRegex.FindStringSubmatch(outputStr)
+		colMatch := colRegex.FindStringSubmatch(outputStr)
 
 		lineNum := 1
 		colNum := 1
@@ -282,22 +304,12 @@ func startBuildPipeline(srcFile string, projectName string) {
 			}
 		}
 
-		// Cleanup message (remove full traceback if it's too long, just take last line)
-		lines := strings.Split(strings.TrimSpace(errorOutput), "\n")
-		shortMsg := lines[len(lines)-1]
-		if len(shortMsg) > 100 {
-			shortMsg = shortMsg[:100] + "..."
+		// Just dump the raw output if we can't extract structured info
+		if lineNum == 1 && colNum == 1 {
+			fmt.Println(outputStr)
+		} else {
+			reportPrettyError(srcFile, lineNum, colNum, "Syntax Error", outputStr)
 		}
-		if shortMsg == "" {
-			shortMsg = "Unknown Syntax Error"
-		}
-
-		// INVOKE RUST ERROR REPORTER
-		if !usingNativeHst {
-			// If we are dev mode, maybe don't require the global binary, but try anyway
-		}
-
-		reportPrettyError(srcFile, lineNum, colNum, shortMsg, errorOutput)
 		os.Exit(1)
 	}
 
@@ -356,14 +368,25 @@ func startBuildPipeline(srcFile string, projectName string) {
 // ==========================================
 func reportPrettyError(file string, line int, col int, msg string, fullLog string) {
 	home, _ := os.UserHomeDir()
+
+	// Check standard install location
 	hsErrorsBin := filepath.Join(home, ".hackeros", "h-sharp", "hs-errors")
 
+	// Check local dev location (fallback)
 	if _, err := os.Stat(hsErrorsBin); os.IsNotExist(err) {
-		// Fallback if hs-errors is not installed
-		fmt.Println("\n" + ColorRed + "--- RAW ERROR OUTPUT ---" + ColorReset)
-		fmt.Println(fullLog)
-		fmt.Println(ColorYellow + "Tip: Install hs-errors in ~/.hackeros/h-sharp/ for pretty errors." + ColorReset)
-		return
+		wd, _ := os.Getwd()
+		localBin := filepath.Join(wd, "hs-errors", "target", "release", "hs-errors")
+		if _, err := os.Stat(localBin); err == nil {
+			hsErrorsBin = localBin
+		} else {
+			// Fail: Binary not found
+			fmt.Println("\n" + ColorRed + ">>> HS-ERRORS BINARY NOT FOUND <<<" + ColorReset)
+			fmt.Println("Please run:")
+			fmt.Println(ColorYellow + "  cd hs-errors && cargo build --release && mkdir -p ~/.hackeros/h-sharp/ && cp target/release/hs-errors ~/.hackeros/h-sharp/" + ColorReset)
+			fmt.Println("\n" + ColorRed + "--- RAW ERROR OUTPUT ---" + ColorReset)
+			fmt.Println(fullLog)
+			return
+		}
 	}
 
 	cmd := exec.Command(hsErrorsBin,
@@ -508,13 +531,19 @@ func fetchPackageUrlFromRepo(repoIndexUrl string, pkgName string) (string, error
 
 func downloadFile(url string, dest string) error {
 	resp, err := http.Get(url)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 { return fmt.Errorf("HTTP %d", resp.StatusCode) }
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 
 	out, err := os.Create(dest)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer out.Close()
 
 	_, err = io.Copy(out, resp.Body)
