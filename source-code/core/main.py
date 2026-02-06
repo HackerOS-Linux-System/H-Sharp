@@ -2,8 +2,9 @@ import sys
 import os
 import gc
 import re
+import json
 import argparse
-from lark import Lark, Transformer, v_args
+from lark import Lark, Transformer, v_args, exceptions
 
 # ==========================================
 # 1. GRAMMAR (H#)
@@ -359,7 +360,29 @@ def main():
         compiler = HSTCompiler()
         python_code = compiler.transform(tree)
         print(python_code)
+    except exceptions.UnexpectedToken as e:
+        # Structured Error Output for Virus Build System (Go)
+        err = {
+            "type": "SyntaxError",
+            "msg": f"Unexpected token: '{e.token}'",
+            "line": e.line,
+            "col": e.column,
+            "expected": sorted(list(e.expected)) if e.expected else []
+        }
+        # Print magic string for Go to capture
+        print(f"__HST_JSON_ERR__{json.dumps(err)}")
+        sys.exit(1)
+    except exceptions.UnexpectedCharacters as e:
+        err = {
+            "type": "LexerError",
+            "msg": f"Unexpected character: '{e.char}'",
+            "line": e.line,
+            "col": e.column
+        }
+        print(f"__HST_JSON_ERR__{json.dumps(err)}")
+        sys.exit(1)
     except Exception as e:
+        # Fallback for other errors
         print(f"HST ERROR: {e}")
         sys.exit(1)
 
