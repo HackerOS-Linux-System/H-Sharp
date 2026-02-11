@@ -1,4 +1,4 @@
-# ![H# - Programing language for cybersecurity.]()
+# ![H# - Programing language for cybersecurity.](https://github.com/HackerOS-Linux-System/H-Sharp/blob/main/images/h-sharp.png)
 # H-Sharp
 A programming language from a hacker for hackers.
 
