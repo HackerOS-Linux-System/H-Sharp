@@ -1,0 +1,236 @@
+use crate::ast::*;
+use crate::lexer::Token;
+use chumsky::prelude::*;
+use chumsky::recursive::Recursive;
+
+#[derive(Clone)]
+enum IdentSuffix {
+    Union(String, Box<HSharpExpr>),
+    Struct(Vec<HSharpExpr>),
+    Call(Vec<HSharpExpr>),
+    Var,
+}
+
+#[derive(Clone)]
+enum PostfixOp {
+    Field(String),
+    Index(Box<HSharpExpr>),
+}
+
+pub fn parser() -> impl Parser<Token, HSharpProgram, Error = Simple<Token>> {
+    recursive(|stmt| {
+        // Recursive expression parser
+        let expr = recursive(|expr: Recursive<'_, Token, HSharpExpr, Simple<Token>>| {
+            let literal = choice((
+                select! { Token::Num(n) => HSharpLiteral::Int(n) },
+                                  select! { Token::Float(f) => HSharpLiteral::Float(f) },
+                                  select! { Token::True => HSharpLiteral::Bool(true) },
+                                  select! { Token::False => HSharpLiteral::Bool(false) },
+                                  select! { Token::String(s) => HSharpLiteral::String(s) },
+            ))
+            .map(HSharpExpr::Literal);
+
+            let ident_parser = select! { Token::Ident(s) => s };
+
+            let block = just(Token::LBrace)
+            .ignore_then(stmt.clone().repeated())
+            .then_ignore(just(Token::RBrace))
+            .map(HSharpExpr::Block);
+
+            let ident_suffix = choice((
+                just(Token::Dot)
+                .ignore_then(ident_parser.clone())
+                .then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
+                .map(|(field, e)| IdentSuffix::Union(field, Box::new(e))),
+                                       just(Token::LBrace)
+                                       .ignore_then(expr.clone().separated_by(just(Token::Comma)))
+                                       .then_ignore(just(Token::RBrace))
+                                       .map(IdentSuffix::Struct),
+                                       just(Token::LParen)
+                                       .ignore_then(expr.clone().separated_by(just(Token::Comma)))
+                                       .then_ignore(just(Token::RParen))
+                                       .map(IdentSuffix::Call),
+                                       empty().to(IdentSuffix::Var),
+            ));
+
+            let atom = choice((
+                literal,
+                ident_parser.clone().then(ident_suffix)
+                .map(|(name, suffix)| match suffix {
+                    IdentSuffix::Union(f, e) => HSharpExpr::UnionLit(name, f, e),
+                     IdentSuffix::Struct(fields) => HSharpExpr::StructLit(name, fields),
+                     IdentSuffix::Call(args) => HSharpExpr::Call(name, args),
+                     IdentSuffix::Var => HSharpExpr::Var(name),
+                }),
+                just(Token::Alloc)
+                .ignore_then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
+                .map(|e| HSharpExpr::Alloc(Box::new(e))),
+                               just(Token::Dealloc)
+                               .ignore_then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
+                               .map(|e| HSharpExpr::Dealloc(Box::new(e))),
+                               just(Token::Write)
+                               .ignore_then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
+                               .map(|e| HSharpExpr::Write(Box::new(e))),
+                               just(Token::Direct)
+                               .ignore_then(block.clone())
+                               .map(|b| HSharpExpr::Direct(Box::new(b))),
+                               just(Token::If)
+                               .ignore_then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
+                               .then(block.clone())
+                               .then(just(Token::Else).ignore_then(block.clone()).or_not())
+                               .map(|((cond, then), else_): ((HSharpExpr, HSharpExpr), Option<HSharpExpr>)| HSharpExpr::If(Box::new(cond), Box::new(then), else_.map(Box::new))),
+                               just(Token::While)
+                               .ignore_then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
+                               .then(block.clone())
+                               .map(|(cond, body)| HSharpExpr::While(Box::new(cond), Box::new(body))),
+                               just(Token::For)
+                               .ignore_then(ident_parser.clone())
+                               .then_ignore(just(Token::Eq))
+                               .then(expr.clone())
+                               .then_ignore(just(Token::Lt))
+                               .then(expr.clone())
+                               .then(block.clone())
+                               .map(|(((var, start), end), body)| HSharpExpr::For(var, Box::new(start), Box::new(end), Box::new(body))),
+                               just(Token::Return)
+                               .ignore_then(expr.clone())
+                               .map(|e| HSharpExpr::Return(Box::new(e))),
+                               just(Token::LBracket)
+                               .ignore_then(expr.clone().separated_by(just(Token::Comma)))
+                               .then_ignore(just(Token::RBracket))
+                               .map(HSharpExpr::ArrayLit),
+                               just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)),
+                               block,
+            ));
+
+            let unary = recursive(|unary| {
+                choice((
+                    just(Token::Star).ignore_then(unary.clone()).map(|e| HSharpExpr::Deref(Box::new(e))),
+                        just(Token::Amp).ignore_then(unary.clone()).map(|e| HSharpExpr::AddrOf(Box::new(e))),
+                        atom,
+                ))
+            });
+
+            let postfix_op = choice((
+                just(Token::Dot).ignore_then(ident_parser.clone())
+                .map(PostfixOp::Field),
+                                     just(Token::LBracket).ignore_then(expr.clone()).then_ignore(just(Token::RBracket))
+                                     .map(|i| PostfixOp::Index(Box::new(i))),
+            ));
+
+            let postfix = unary.clone()
+            .then(postfix_op.repeated())
+            .foldl(|left, op| match op {
+                PostfixOp::Field(f) => HSharpExpr::Field(Box::new(left), f),
+                   PostfixOp::Index(i) => HSharpExpr::Index(Box::new(left), i),
+            });
+
+            let ty = recursive(|ty| {
+                choice((
+                    select! { Token::I8Type => HType::I8 },
+                    select! { Token::I32Type => HType::I32 },
+                    select! { Token::BoolType => HType::Bool },
+                    select! { Token::F32Type => HType::F32 },
+                    select! { Token::F64Type => HType::F64 },
+                    select! { Token::UnitType => HType::Unit },
+                    just(Token::Star).ignore_then(ty.clone()).map(|t| HType::Pointer(Box::new(t))),
+                        select! { Token::Ident(s) => HType::Struct(s) },
+                        select! { Token::Ident(s) => HType::Union(s) },
+                        just(Token::LBracket)
+                        .ignore_then(ty.clone())
+                        .then_ignore(just(Token::Semi))
+                        .then(select! { Token::Num(n) => n as usize })
+                        .then_ignore(just(Token::RBracket))
+                        .map(|(inner, size)| HType::Array(Box::new(inner), size)),
+                        just(Token::LParen).ignore_then(ty).then_ignore(just(Token::RParen)),
+                ))
+            });
+
+            let cast = postfix
+            .then(just(Token::As).ignore_then(ty).or_not())
+            .map(|(e, opt_ty)| {
+                if let Some(ty) = opt_ty {
+                    HSharpExpr::Cast(ty, Box::new(e))
+                } else {
+                    e
+                }
+            });
+
+            let bin_op = choice((
+                just(Token::Plus).to(HSharpOp::Add),
+                                 just(Token::EqEq).to(HSharpOp::Eq),
+                                 just(Token::Lt).to(HSharpOp::Lt),
+            ));
+
+            cast.clone()
+            .then(bin_op.then(cast.clone()).repeated())
+            .foldl(|lhs, (op, rhs)| HSharpExpr::BinOp(op, Box::new(lhs), Box::new(rhs)))
+        });
+
+        let ty = recursive(|ty| {
+            choice((
+                select! { Token::I8Type => HType::I8 },
+                select! { Token::I32Type => HType::I32 },
+                select! { Token::BoolType => HType::Bool },
+                select! { Token::F32Type => HType::F32 },
+                select! { Token::F64Type => HType::F64 },
+                select! { Token::UnitType => HType::Unit },
+                just(Token::Star).ignore_then(ty.clone()).map(|t| HType::Pointer(Box::new(t))),
+                    select! { Token::Ident(s) => HType::Struct(s) },
+                    select! { Token::Ident(s) => HType::Union(s) },
+                    just(Token::LBracket)
+                    .ignore_then(ty.clone())
+                    .then_ignore(just(Token::Semi))
+                    .then(select! { Token::Num(n) => n as usize })
+                    .then_ignore(just(Token::RBracket))
+                    .map(|(inner, size)| HType::Array(Box::new(inner), size)),
+                    just(Token::LParen).ignore_then(ty).then_ignore(just(Token::RParen)),
+            ))
+        });
+
+        let ident_parser = select! { Token::Ident(s) => s };
+
+        let param = ident_parser.clone().then(just(Token::Colon).ignore_then(ty.clone())).map(|(name, ty)| (name, ty));
+
+        let field_def = ident_parser.clone().then_ignore(just(Token::Colon)).then(ty.clone());
+
+        let let_stmt = just(Token::Let)
+        .ignore_then(ident_parser.clone())
+        .then(just(Token::Colon).ignore_then(ty.clone()).or_not())
+        .then_ignore(just(Token::Eq))
+        .then(expr.clone())
+        .then_ignore(just(Token::Semi))
+        .map(|((name, ty), e)| HSharpStmt::Let(name, ty, e));
+
+        let expr_stmt = expr.clone().then_ignore(just(Token::Semi)).map(HSharpStmt::Expr);
+
+        let fn_stmt = just(Token::Fn)
+        .ignore_then(ident_parser.clone())
+        .then(just(Token::LParen).ignore_then(param.separated_by(just(Token::Comma))).then_ignore(just(Token::RParen)))
+        .then(just(Token::Arrow).ignore_then(ty.clone()).or_not())
+        .then(expr.clone())
+        .map(|(((name, params), ret), body): (((String, Vec<(String, HType)>), Option<HType>), HSharpExpr)| HSharpStmt::FunctionDef(name, params, ret.unwrap_or(HType::Unit), Box::new(body)));
+
+        let struct_def = just(Token::Struct)
+        .ignore_then(ident_parser.clone())
+        .then(just(Token::LBrace).ignore_then(field_def.clone().separated_by(just(Token::Comma)).allow_trailing()).then_ignore(just(Token::RBrace)))
+        .map(|(name, fields)| HSharpStmt::StructDef(name, fields));
+
+        let union_def = just(Token::Union)
+        .ignore_then(ident_parser.clone())
+        .then(just(Token::LBrace).ignore_then(field_def.separated_by(just(Token::Comma)).allow_trailing()).then_ignore(just(Token::RBrace)))
+        .map(|(name, fields)| HSharpStmt::UnionDef(name, fields));
+
+        let require_item = ident_parser.clone().then(just(Token::Colon).ignore_then(ident_parser.clone()).or_not()).map(|(m, opt_s)| if let Some(s) = opt_s { RequireItem::Specific(m, s) } else { RequireItem::WholeModule(m) });
+
+        let import_stmt = just(Token::From)
+        .ignore_then(just(Token::LBracket).ignore_then(ident_parser.clone()).then_ignore(just(Token::RBracket)))
+        .then(just(Token::Require).ignore_then(just(Token::LBracket).ignore_then(require_item.separated_by(just(Token::Comma))).then_ignore(just(Token::RBracket))))
+        .then_ignore(just(Token::Semi))
+        .map(|(from, requires)| HSharpStmt::Import(from, requires));
+
+        choice((let_stmt, expr_stmt, fn_stmt, import_stmt, struct_def, union_def))
+    })
+    .repeated()
+    .map(|stmts| HSharpProgram { stmts })
+    .then_ignore(end())
+}
