@@ -1,0 +1,8 @@
+// cargo
+// odin
+
+> cd source-code
+> cd hsc && odin build . && cd ..
+> cd conpiler && cargo build --release && cd ..
+> cd parser && cargo build --release && cd ..
+> cd cli && cargo build --release && cd ..
