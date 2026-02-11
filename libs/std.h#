@@ -1,1 +1,48 @@
+// Definicje struktur dla podstawowych typów danych
+struct Vector3 {
+    x: f64,
+    y: f64,
+    z: f64
+}
 
+// Alokacja pamięci dla liczby całkowitej z inicjalizacją
+fn new_int(value: int) -> *int {
+    let ptr: *int = alloc(value);
+    ptr
+}
+
+// Generyczne (ręczne) zwalnianie pamięci
+fn free_ptr(ptr: *int) -> unit {
+    dealloc(ptr)
+}
+
+// Funkcja pomocnicza do zapisu wartości pod wskaźnik
+fn poke_int(ptr: *int, value: int) -> unit {
+    write(ptr) // Zakładając, że Twoje 'write' przyjmuje wyrażenie do zapisu
+}
+
+// Prosta funkcja matematyczna: potęga kwadratowa
+fn square(n: int) -> int {
+    n + n // Parser obecnie obsługuje tylko operator Plus, Eq i Lt
+}
+
+// Sprawdzanie czy liczba jest dodatnia
+fn is_positive(n: int) -> bool {
+    0 < n
+}
+
+// Przykład pętli for (składnia: for var = start < end block)
+fn fill_array(arr: *int, size: int) -> unit {
+    for i = 0 < size {
+        // Operacje na tablicy przy użyciu składni block/direct
+        direct {
+            // Tutaj logika niskopoziomowa
+        }
+    }
+}
+
+// Funkcja zwracająca jednostkę (unit)
+fn noop() -> unit {
+    let x: int = 0;
+    return x
+}
