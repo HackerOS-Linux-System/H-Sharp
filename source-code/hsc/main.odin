@@ -4,6 +4,40 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:c/libc"
+
+run_command :: proc(bin: string, args: []string) -> int {
+    sb := strings.builder_make(context.temp_allocator)
+    defer strings.builder_destroy(&sb)
+    strings.write_string(&sb, bin)
+    for arg in args {
+        strings.write_rune(&sb, ' ')
+        // Simple quoting if arg has space
+        if strings.contains(arg, " ") {
+            strings.write_rune(&sb, '"')
+            strings.write_string(&sb, arg)
+            strings.write_rune(&sb, '"')
+        } else {
+            strings.write_string(&sb, arg)
+        }
+    }
+    cmd_str := strings.to_string(sb)
+    c_cmd := strings.clone_to_cstring(cmd_str, context.temp_allocator)
+    defer delete(c_cmd)
+    res := libc.system(c_cmd)
+    if res == -1 {
+        return 1
+    }
+    return int((res >> 8) & 0xff)
+}
+
+temp_dir :: proc() -> string {
+    dir := os.get_env("TMPDIR")
+    if dir != "" {
+        return dir
+    }
+    return "/tmp"
+}
 
 main :: proc() {
     args := os.args[1:]
@@ -11,51 +45,35 @@ main :: proc() {
         fmt.eprintln("Usage: hsc <input.hs> -o <output.o>")
         os.exit(1)
     }
-
     input := args[0]
     output := args[2]
-
     // Get home dir
-    home, ok := os.get_env("HOME")
-    if !ok {
+    home := os.get_env("HOME")
+    if home == "" {
         home = "/home/default"
     }
-    bin_path := filepath.join({home, ".hackeros", "H-Sharp"})
-    parser_bin := filepath.join({bin_path, "h-sharp-parser"})
-    compiler_bin := filepath.join({bin_path, "h-sharp-compiler"})
-
+    bin_path, _ := filepath.join([]string{home, ".hackeros", "H-Sharp"})
+    parser_bin, _ := filepath.join([]string{bin_path, "h-sharp-parser"})
+    compiler_bin, _ := filepath.join([]string{bin_path, "h-sharp-compiler"})
     // Create temp json file
-    temp_dir := os.temp_dir()
-    temp_json := filepath.join({temp_dir, "hsharp_temp.json"})
+    temp_dir_path := temp_dir()
+    temp_json, _ := filepath.join([]string{temp_dir_path, "hsharp_temp.json"})
     defer os.remove(temp_json)
-
     // Run parser
     fmt.printf("Parsing %s...\n", input)
     parser_args := []string{input, temp_json}
-    parser_exit_code := os.run_command(parser_bin, parser_args[:])
+    parser_exit_code := run_command(parser_bin, parser_args)
     if parser_exit_code != 0 {
         fmt.eprintln("Parser failed")
         os.exit(1)
     }
-
     // Run compiler
     fmt.println("Compiling...")
     compiler_args := []string{temp_json, output}
-    compiler_exit_code := os.run_command(compiler_bin, compiler_args[:])
+    compiler_exit_code := run_command(compiler_bin, compiler_args)
     if compiler_exit_code != 0 {
         fmt.eprintln("Compiler failed")
         os.exit(1)
     }
-
     fmt.printf("Compilation successful: %s\n", output)
 }
-
-// Note: This is a direct port from Rust to Odin.
-// Assumptions:
-// - os.run_command is used to execute external commands (Odin's os.exec or similar; adjust if needed).
-// - filepath.join for paths.
-// - os.temp_dir() exists or implement.
-// - defer os.remove for cleanup.
-// In real Odin, use core:os/exec for command execution if available.
-// Odin stdlib has os.exec_cmd or similar in core:sys/unix or windows.
-// This is simplified; adjust for platform-specific exec.
