@@ -1,0 +1,11 @@
+[package]
+name = "h#"
+version = "0.1.0"
+edition = "2021"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+indicatif = "0.17.8"
+anyhow = "1.0.81"
+tempfile = "3.10.1"
