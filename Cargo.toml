@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "./source-code/parser",
+    "./source-code/compiler",
+    "./source-code/cli",
+]
+resolver = "2"
