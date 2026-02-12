@@ -1,70 +1,129 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::env;
+use std::fs;
+use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
-use tempfile::NamedTempFile;
+use tempfile::Builder;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "H# CLI Tool", long_about = None)]
+#[command(version, about = "H# Compiler Driver", long_about = None)]
 struct Args {
-    /// Input source file
+    /// Input source file (.h#)
     input: String,
 
-    /// Output object file
-    #[arg(short, long)]
+    /// Output executable file
+    #[arg(short, long, default_value = "a.out")]
     output: String,
+
+    /// Keep intermediate files (.o, .c)
+    #[arg(long)]
+    keep_temps: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+const RUNTIME_C: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-    // Get home dir
-    let home = env::var("HOME").context("Failed to get HOME env")?;
-    let bin_path = format!("{}/.hackeros/H-Sharp", home);
-    let parser_bin = format!("{}/h-sharp-parser", &bin_path);
-    let compiler_bin = format!("{}/h-sharp-compiler", &bin_path);
+// I/O Functions expected by codegen
+void write_int(int n) {
+printf("%d\n", n);
+}
 
-    // Create temp json file
-    let temp_json = NamedTempFile::new().context("Failed to create temp file")?;
-    let temp_json_path = temp_json.path().to_str().unwrap().to_string();
+void write_float(double f) {
+printf("%f\n", f);
+}
 
-    // Progress bar for parsing
-    let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
-    pb.set_message(format!("Parsing {}...", args.input));
+// String layout in H# is { char* ptr, long len }
+// We receive the pointer to the struct.
+void write_str(long* s) {
+if (!s) { printf("(null)\n"); return; }
+char* ptr = (char*)s[0];
+long len = s[1];
+fwrite(ptr, 1, len, stdout);
+printf("\n");
+}
 
-    let parser_status = Command::new(&parser_bin)
-        .arg(&args.input)
-        .arg(&temp_json_path)
-        .status()
-        .context("Failed to run parser")?;
+// Simple Arena Allocator Wrappers
+long arena_new(long capacity) {
+return 0;
+}
 
-    if !parser_status.success() {
-        pb.finish_with_message("Parsing failed");
-        return Err(anyhow::anyhow!("Parser failed"));
+long arena_alloc(long arena_handle, long size) {
+void* ptr = malloc(size);
+if (!ptr) {
+    fprintf(stderr, "Out of memory\n");
+    exit(1);
     }
-    pb.finish_with_message("Parsing complete");
+    memset(ptr, 0, size);
+    return (long)ptr;
+    }
 
-    // Progress bar for compiling
-    let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
-    pb.set_message("Compiling...");
+    void arena_free(long arena_handle) {
+    }
+    "#;
 
-    let compiler_status = Command::new(&compiler_bin)
-        .arg(&temp_json_path)
+    fn main() -> Result<()> {
+        let args = Args::parse();
+
+        // 1. Read Source
+        println!("Compiling {}...", args.input);
+        let src = fs::read_to_string(&args.input).context("Failed to read input file")?;
+
+        // 2. Parse
+        // parse_code prints errors to stderr via ariadne. We don't use a spinner here to avoid interference.
+        let program = match h_sharp_parser::parse_code(&src, &args.input) {
+            Ok(p) => p,
+            Err(e) => return Err(e),
+        };
+
+        // 3. Compile to Object Bytes
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
+        pb.set_message("Compiling to object code...");
+        pb.enable_steady_tick(Duration::from_millis(100));
+
+        let mut obj_file = Builder::new().suffix(".o").tempfile()?;
+        let obj_path = obj_file.path().to_str().unwrap().to_string();
+
+        match h_sharp_compiler::compile_program(&program, &obj_path) {
+            Ok(_) => {},
+            Err(e) => {
+                pb.finish_and_clear();
+                return Err(e.context("Codegen failed"));
+            }
+        }
+
+        // 4. Create Runtime C file
+        pb.set_message("Generating runtime...");
+        let mut c_file = Builder::new().suffix(".c").tempfile()?;
+        c_file.write_all(RUNTIME_C.as_bytes())?;
+        let c_path = c_file.path().to_str().unwrap().to_string();
+
+        // 5. Link
+        pb.set_message("Linking...");
+        let status = Command::new("cc")
+        .arg(&obj_path)
+        .arg(&c_path)
+        .arg("-o")
         .arg(&args.output)
+        .arg("-lm")
         .status()
-        .context("Failed to run compiler")?;
+        .context("Failed to run linker (cc). Is a C compiler installed?")?;
 
-    if !compiler_status.success() {
-        pb.finish_with_message("Compilation failed");
-        return Err(anyhow::anyhow!("Compiler failed"));
+        if !status.success() {
+            pb.finish_and_clear();
+            return Err(anyhow::anyhow!("Linker failed"));
+        }
+
+        // Optional: Copy temps if keep_temps is on
+        if args.keep_temps {
+            let _ = fs::copy(&obj_path, format!("{}.o", args.output));
+            let _ = fs::copy(&c_path, format!("{}_runtime.c", args.output));
+        }
+
+        pb.finish_with_message(format!("Build successful! Binary: ./{}", args.output));
+        Ok(())
     }
-    pb.finish_with_message(format!("Compilation successful: {}", args.output));
-
-    Ok(())
-}
