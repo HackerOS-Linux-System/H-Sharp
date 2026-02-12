@@ -1,6 +1,6 @@
 [package]
 name = "h-sharp-compiler"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 
 [dependencies]
@@ -13,3 +13,4 @@ target-lexicon = "0.12.14"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
+h-sharp-parser = { path = "../parser" }
