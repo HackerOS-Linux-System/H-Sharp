@@ -8,22 +8,24 @@ pub enum HSharpLiteral {
     Float(f64),
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 pub enum HSharpOp {
-    Add,
-    Eq,
-    Lt,
+    Add, Sub, Mul, Div, Mod,
+    Eq, Ne, Lt, Gt, Le, Ge,
+    And, Or,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub enum HType {
     I8,
     I32,
+    I64, // Added for pointer-sized integers / lengths
     Bool,
     F32,
     F64,
     Pointer(Box<HType>),
     Array(Box<HType>, usize),
+    Slice(Box<HType>), // Dynamic array: { ptr, len }
     Struct(String),
     Union(String),
     Unit,
@@ -44,14 +46,19 @@ pub enum HSharpExpr {
     AddrOf(Box<HSharpExpr>),
     If(Box<HSharpExpr>, Box<HSharpExpr>, Option<Box<HSharpExpr>>),
     While(Box<HSharpExpr>, Box<HSharpExpr>),
+    For(String, Box<HSharpExpr>, Box<HSharpExpr>, Box<HSharpExpr>),
+    Break,
+    Continue,
+    Match(Box<HSharpExpr>, Vec<(HSharpExpr, HSharpExpr)>, Option<Box<HSharpExpr>>), // target, cases (val, body), default
     Call(String, Vec<HSharpExpr>),
+    MethodCall(Box<HSharpExpr>, String, Vec<HSharpExpr>), // obj.method(args)
     Cast(HType, Box<HSharpExpr>),
+    SizeOf(HType),
     StructLit(String, Vec<HSharpExpr>),
     UnionLit(String, String, Box<HSharpExpr>),
     ArrayLit(Vec<HSharpExpr>),
     Field(Box<HSharpExpr>, String),
     Index(Box<HSharpExpr>, Box<HSharpExpr>),
-    For(String, Box<HSharpExpr>, Box<HSharpExpr>, Box<HSharpExpr>),
     Return(Box<HSharpExpr>),
 }
 
@@ -62,6 +69,7 @@ pub enum HSharpStmt {
     FunctionDef(String, Vec<(String, HType)>, HType, Box<HSharpExpr>),
     StructDef(String, Vec<(String, HType)>),
     UnionDef(String, Vec<(String, HType)>),
+    Impl(String, Vec<HSharpStmt>), // Methods for a struct
     Import(String, Vec<RequireItem>),
 }
 
