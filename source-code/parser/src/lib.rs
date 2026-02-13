@@ -11,6 +11,7 @@ use chumsky::prelude::*;
 use chumsky::Stream;
 use std::collections::HashSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn parse_code(src: &str, filename: &str) -> Result<HSharpProgram> {
     // Lexer
@@ -63,6 +64,46 @@ fn print_errors<T: std::fmt::Debug + std::fmt::Display + std::hash::Hash + std::
     }
 }
 
+// Funkcja pomocnicza do znajdowania ścieżki biblioteki
+fn find_library_path(lib_name: &str, mod_name: &str) -> Option<PathBuf> {
+    let base_libs = Path::new("/usr/lib/h-sharp/libs");
+
+    // 1. Sprawdź bezpośrednio w libs (stary sposób / domyślny)
+    let direct_path = base_libs.join(lib_name).join(format!("{}.h#", mod_name));
+    if direct_path.exists() {
+        return Some(direct_path);
+    }
+
+    // 2. Sprawdź w envs (izolowane środowiska)
+    let envs_path = base_libs.join("envs");
+    if let Ok(entries) = fs::read_dir(envs_path) {
+        // Sortujemy, aby zachować determinizm (np. env przed env2)
+        let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        paths.sort();
+
+        for env_path in paths {
+            if env_path.is_dir() {
+                // Sprawdź czy biblioteka jest bezpośrednio w env (np. env/lib.h#)
+                // lub w podkatalogu (env/lib/mod.h#) - w H# zazwyczaj biblioteka to plik .h#
+
+                // Przypadek A: Install wrzucił plik .h# bezpośrednio do env folderu
+                let direct_file = env_path.join(format!("{}.h#", lib_name));
+                if direct_file.exists() && mod_name == lib_name {
+                    return Some(direct_file);
+                }
+
+                // Przypadek B: Struktura katalogowa
+                let sub_dir_file = env_path.join(lib_name).join(format!("{}.h#", mod_name));
+                if sub_dir_file.exists() {
+                    return Some(sub_dir_file);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn resolve_imports(
     program: &mut HSharpProgram,
     visited: &mut HashSet<String>,
@@ -76,11 +117,18 @@ fn resolve_imports(
                     RequireItem::WholeModule(m) => (m, None),
                     RequireItem::Specific(m, s) => (m, Some(vec![s])),
                 };
-                let file_path = format!("/usr/lib/H-Sharp/libs/{}/{}.h#", from, mod_name);
+
+                // Używamy nowej logiki wyszukiwania
+                let file_path_buf = find_library_path(&from, &mod_name)
+                .ok_or_else(|| anyhow::anyhow!("Library not found: {}/{}. Please install it using 'h# install {}'", from, mod_name, from))?;
+
+                let file_path = file_path_buf.to_string_lossy().to_string();
+
                 if visited.contains(&file_path) {
                     return Err(anyhow::anyhow!("Cycle in imports: {}", file_path));
                 }
                 visited.insert(file_path.clone());
+
                 let sub_src = fs::read_to_string(&file_path).unwrap_or_else(|_| String::new());
                 if sub_src.is_empty() { continue; }
 
