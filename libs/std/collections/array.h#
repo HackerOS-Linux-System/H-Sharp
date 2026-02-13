@@ -1,0 +1,368 @@
+// std/collections/array.h#
+// Array utilities and operations
+
+// Note: H# has built-in arrays: [T; N] and slices: [T]
+// This module provides utility functions for working with them
+
+// ============================================================================
+// ARRAY INITIALIZATION
+// ============================================================================
+
+// Fill array with a value
+fn array_fill_i32(arr: *i32, len: i64, value: i32) {
+    let i: i64 = 0;
+    while i < len {
+        *(arr + i) = value;
+        i = i + 1;
+    }
+}
+
+fn array_fill_i64(arr: *i64, len: i64, value: i64) {
+    let i: i64 = 0;
+    while i < len {
+        *(arr + i) = value;
+        i = i + 1;
+    }
+}
+
+// Zero out array
+fn array_zero_i32(arr: *i32, len: i64) {
+    array_fill_i32(arr, len, 0);
+}
+
+fn array_zero_i64(arr: *i64, len: i64) {
+    array_zero_i64(arr, len, 0);
+}
+
+// ============================================================================
+// ARRAY COPYING
+// ============================================================================
+
+// Copy array
+fn array_copy_i32(dest: *i32, src: *i32, len: i64) {
+    let i: i64 = 0;
+    while i < len {
+        *(dest + i) = *(src + i);
+        i = i + 1;
+    }
+}
+
+fn array_copy_i64(dest: *i64, src: *i64, len: i64) {
+    let i: i64 = 0;
+    while i < len {
+        *(dest + i) = *(src + i);
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// ARRAY SEARCH
+// ============================================================================
+
+// Linear search - returns index or -1 if not found
+fn array_find_i32(arr: *i32, len: i64, value: i32) -> i64 {
+    let i: i64 = 0;
+    while i < len {
+        if *(arr + i) == value {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Check if array contains value
+fn array_contains_i32(arr: *i32, len: i64, value: i32) -> bool {
+    return array_find_i32(arr, len, value) != -1;
+}
+
+// Count occurrences of value
+fn array_count_i32(arr: *i32, len: i64, value: i32) -> i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    while i < len {
+        if *(arr + i) == value {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ============================================================================
+// ARRAY COMPARISON
+// ============================================================================
+
+// Compare two arrays for equality
+fn array_eq_i32(a: *i32, b: *i32, len: i64) -> bool {
+    let i: i64 = 0;
+    while i < len {
+        if *(a + i) != *(b + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================================
+// ARRAY STATISTICS
+// ============================================================================
+
+// Sum of array elements
+fn array_sum_i32(arr: *i32, len: i64) -> i32 {
+    let sum: i32 = 0;
+    let i: i64 = 0;
+    while i < len {
+        sum = sum + *(arr + i);
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn array_sum_i64(arr: *i64, len: i64) -> i64 {
+    let sum: i64 = 0;
+    let i: i64 = 0;
+    while i < len {
+        sum = sum + *(arr + i);
+        i = i + 1;
+    }
+    return sum;
+}
+
+// Product of array elements
+fn array_product_i32(arr: *i32, len: i64) -> i32 {
+    let product: i32 = 1;
+    let i: i64 = 0;
+    while i < len {
+        product = product * *(arr + i);
+        i = i + 1;
+    }
+    return product;
+}
+
+// Minimum value in array
+fn array_min_i32(arr: *i32, len: i64) -> i32 {
+    if len == 0 {
+        return 0;
+    }
+    
+    let min_val: i32 = *arr;
+    let i: i64 = 1;
+    while i < len {
+        if *(arr + i) < min_val {
+            min_val = *(arr + i);
+        }
+        i = i + 1;
+    }
+    return min_val;
+}
+
+// Maximum value in array
+fn array_max_i32(arr: *i32, len: i64) -> i32 {
+    if len == 0 {
+        return 0;
+    }
+    
+    let max_val: i32 = *arr;
+    let i: i64 = 1;
+    while i < len {
+        if *(arr + i) > max_val {
+            max_val = *(arr + i);
+        }
+        i = i + 1;
+    }
+    return max_val;
+}
+
+// Average (mean) of array elements
+fn array_average_i32(arr: *i32, len: i64) -> f64 {
+    if len == 0 {
+        return 0.0;
+    }
+    
+    let sum: i32 = array_sum_i32(arr, len);
+    return cast(f64, sum) / cast(f64, len);
+}
+
+// ============================================================================
+// ARRAY MANIPULATION
+// ============================================================================
+
+// Reverse array in place
+fn array_reverse_i32(arr: *i32, len: i64) {
+    let i: i64 = 0;
+    let j: i64 = len - 1;
+    
+    while i < j {
+        let temp: i32 = *(arr + i);
+        *(arr + i) = *(arr + j);
+        *(arr + j) = temp;
+        
+        i = i + 1;
+        j = j - 1;
+    }
+}
+
+// Rotate array left by n positions
+fn array_rotate_left_i32(arr: *i32, len: i64, n: i64) {
+    if len == 0 || n == 0 {
+        return;
+    }
+    
+    // Normalize n to be within [0, len)
+    n = n % len;
+    if n < 0 {
+        n = n + len;
+    }
+    
+    // Reverse first n elements
+    array_reverse_i32(arr, n);
+    
+    // Reverse remaining elements
+    array_reverse_i32(arr + n, len - n);
+    
+    // Reverse entire array
+    array_reverse_i32(arr, len);
+}
+
+// Rotate array right by n positions
+fn array_rotate_right_i32(arr: *i32, len: i64, n: i64) {
+    array_rotate_left_i32(arr, len, len - n);
+}
+
+// ============================================================================
+// ARRAY SORTING (Bubble Sort - simple but O(n²))
+// ============================================================================
+
+fn array_sort_i32(arr: *i32, len: i64) {
+    let i: i64 = 0;
+    while i < len {
+        let j: i64 = 0;
+        while j < len - 1 - i {
+            if *(arr + j) > *(arr + j + 1) {
+                let temp: i32 = *(arr + j);
+                *(arr + j) = *(arr + j + 1);
+                *(arr + j + 1) = temp;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Check if array is sorted
+fn array_is_sorted_i32(arr: *i32, len: i64) -> bool {
+    let i: i64 = 0;
+    while i < len - 1 {
+        if *(arr + i) > *(arr + i + 1) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Binary search (array must be sorted)
+// Returns index or -1 if not found
+fn array_binary_search_i32(arr: *i32, len: i64, value: i32) -> i64 {
+    let left: i64 = 0;
+    let right: i64 = len - 1;
+    
+    while left <= right {
+        let mid: i64 = left + (right - left) / 2;
+        let mid_val: i32 = *(arr + mid);
+        
+        if mid_val == value {
+            return mid;
+        }
+        
+        if mid_val < value {
+            left = mid + 1;
+        } else {
+            right = mid - 1;
+        }
+    }
+    
+    return -1;
+}
+
+// ============================================================================
+// ARRAY PARTITIONING
+// ============================================================================
+
+// Partition array around a predicate (all elements satisfying pred come first)
+// Returns index where partition occurs
+fn array_partition_i32(arr: *i32, len: i64, threshold: i32) -> i64 {
+    let write_index: i64 = 0;
+    let read_index: i64 = 0;
+    
+    while read_index < len {
+        if *(arr + read_index) < threshold {
+            // Swap
+            let temp: i32 = *(arr + write_index);
+            *(arr + write_index) = *(arr + read_index);
+            *(arr + read_index) = temp;
+            
+            write_index = write_index + 1;
+        }
+        read_index = read_index + 1;
+    }
+    
+    return write_index;
+}
+
+// ============================================================================
+// ARRAY FILTERING
+// ============================================================================
+
+// Remove duplicates from sorted array (in-place)
+// Returns new length
+fn array_dedup_i32(arr: *i32, len: i64) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    
+    let write_pos: i64 = 1;
+    let read_pos: i64 = 1;
+    
+    while read_pos < len {
+        if *(arr + read_pos) != *(arr + read_pos - 1) {
+            *(arr + write_pos) = *(arr + read_pos);
+            write_pos = write_pos + 1;
+        }
+        read_pos = read_pos + 1;
+    }
+    
+    return write_pos;
+}
+
+// ============================================================================
+// 2D ARRAY UTILITIES (represented as 1D with stride)
+// ============================================================================
+
+// Get element from 2D array stored as 1D
+fn array_2d_get_i32(arr: *i32, width: i64, row: i64, col: i64) -> i32 {
+    return *(arr + row * width + col);
+}
+
+// Set element in 2D array stored as 1D
+fn array_2d_set_i32(arr: *i32, width: i64, row: i64, col: i64, value: i32) {
+    *(arr + row * width + col) = value;
+}
+
+// Transpose 2D array (requires temp buffer of same size)
+fn array_2d_transpose_i32(arr: *i32, temp: *i32, rows: i64, cols: i64) {
+    let i: i64 = 0;
+    while i < rows {
+        let j: i64 = 0;
+        while j < cols {
+            *(temp + j * rows + i) = *(arr + i * cols + j);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    
+    // Copy back
+    array_copy_i32(arr, temp, rows * cols);
+}
