@@ -1,0 +1,131 @@
+// std/core/types.h#
+// Podstawowe typy i aliasy dla H#
+
+// ============================================================================
+// TYPE ALIASES
+// ============================================================================
+
+// Integer types (already built-in, but for documentation)
+// i8   - 8-bit signed integer (-128 to 127)
+// i32  - 32-bit signed integer (-2^31 to 2^31-1)
+// i64  - 64-bit signed integer (-2^63 to 2^63-1)
+// bool - Boolean (true/false)
+
+// Floating point
+// f32 - 32-bit float
+// f64 - 64-bit float
+
+// ============================================================================
+// COMMON CONSTANTS
+// ============================================================================
+
+// Integer limits
+fn i8_min() -> i8 { return cast(i8, -128); }
+fn i8_max() -> i8 { return cast(i8, 127); }
+
+fn i32_min() -> i32 { return -2147483648; }
+fn i32_max() -> i32 { return 2147483647; }
+
+fn i64_min() -> i64 { return -9223372036854775808; }
+fn i64_max() -> i64 { return 9223372036854775807; }
+
+// Float constants
+fn f32_pi() -> f32 { return 3.14159265; }
+fn f32_e() -> f32 { return 2.71828182; }
+
+fn f64_pi() -> f64 { return 3.141592653589793; }
+fn f64_e() -> f64 { return 2.718281828459045; }
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn abs_i32(x: i32) -> i32 {
+    if x < 0 {
+        return -x;
+    }
+    return x;
+}
+
+fn abs_i64(x: i64) -> i64 {
+    if x < 0 {
+        return -x;
+    }
+    return x;
+}
+
+fn abs_f32(x: f32) -> f32 {
+    if x < 0.0 {
+        return -x;
+    }
+    return x;
+}
+
+fn abs_f64(x: f64) -> f64 {
+    if x < 0.0 {
+        return -x;
+    }
+    return x;
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn max_i32(a: i32, b: i32) -> i32 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn min_i64(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn max_i64(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn clamp_i32(value: i32, min_val: i32, max_val: i32) -> i32 {
+    if value < min_val {
+        return min_val;
+    }
+    if value > max_val {
+        return max_val;
+    }
+    return value;
+}
+
+// ============================================================================
+// COMPARISON HELPERS
+// ============================================================================
+
+fn is_positive_i32(x: i32) -> bool {
+    return x > 0;
+}
+
+fn is_negative_i32(x: i32) -> bool {
+    return x < 0;
+}
+
+fn is_zero_i32(x: i32) -> bool {
+    return x == 0;
+}
+
+fn is_even_i32(x: i32) -> bool {
+    return x % 2 == 0;
+}
+
+fn is_odd_i32(x: i32) -> bool {
+    return x % 2 != 0;
+}
