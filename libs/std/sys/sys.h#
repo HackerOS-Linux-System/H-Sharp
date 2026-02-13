@@ -1,0 +1,312 @@
+// std/sys/sys.h#
+// Low-level system operations and utilities
+
+// ============================================================================
+// EXIT CODES
+// ============================================================================
+
+fn exit_success() -> i32 { return 0; }
+fn exit_failure() -> i32 { return 1; }
+
+// ============================================================================
+// POINTER UTILITIES
+// ============================================================================
+
+// Check if pointer is null
+fn ptr_is_null(ptr: *i8) -> bool {
+    return cast(i64, ptr) == 0;
+}
+
+// Null pointer constant
+fn null_ptr() -> *i8 {
+    return cast(*i8, 0);
+}
+
+// Offset pointer by bytes
+fn ptr_offset(ptr: *i8, offset: i64) -> *i8 {
+    return ptr + offset;
+}
+
+// Distance between two pointers (in bytes)
+fn ptr_distance(a: *i8, b: *i8) -> i64 {
+    return cast(i64, a) - cast(i64, b);
+}
+
+// ============================================================================
+// BIT OPERATIONS
+// ============================================================================
+
+// Count set bits (population count)
+fn popcount_i32(x: i32) -> i32 {
+    let count: i32 = 0;
+    while x != 0 {
+        count = count + (x & 1);
+        x = x >> 1;
+    }
+    return count;
+}
+
+// Count trailing zeros
+fn trailing_zeros_i32(x: i32) -> i32 {
+    if x == 0 {
+        return 32;
+    }
+    
+    let count: i32 = 0;
+    while (x & 1) == 0 {
+        count = count + 1;
+        x = x >> 1;
+    }
+    return count;
+}
+
+// Count leading zeros (approximate)
+fn leading_zeros_i32(x: i32) -> i32 {
+    if x == 0 {
+        return 32;
+    }
+    
+    let count: i32 = 0;
+    let mask: i32 = 1 << 31; // Most significant bit
+    
+    while (x & mask) == 0 {
+        count = count + 1;
+        mask = mask >> 1;
+    }
+    
+    return count;
+}
+
+// Check if power of 2
+fn is_power_of_2_i32(x: i32) -> bool {
+    return x > 0 && (x & (x - 1)) == 0;
+}
+
+// Next power of 2 (round up)
+fn next_power_of_2_i32(x: i32) -> i32 {
+    if x <= 1 {
+        return 1;
+    }
+    
+    x = x - 1;
+    x = x | (x >> 1);
+    x = x | (x >> 2);
+    x = x | (x >> 4);
+    x = x | (x >> 8);
+    x = x | (x >> 16);
+    return x + 1;
+}
+
+// Rotate left
+fn rotate_left_i32(x: i32, n: i32) -> i32 {
+    n = n & 31; // Modulo 32
+    return (x << n) | (x >> (32 - n));
+}
+
+// Rotate right
+fn rotate_right_i32(x: i32, n: i32) -> i32 {
+    n = n & 31; // Modulo 32
+    return (x >> n) | (x << (32 - n));
+}
+
+// Reverse bits
+fn reverse_bits_i32(x: i32) -> i32 {
+    let result: i32 = 0;
+    let i: i32 = 0;
+    while i < 32 {
+        result = (result << 1) | (x & 1);
+        x = x >> 1;
+        i = i + 1;
+    }
+    return result;
+}
+
+// ============================================================================
+// BYTE SWAPPING (Endianness)
+// ============================================================================
+
+// Swap bytes of i32 (endianness conversion)
+fn swap_bytes_i32(x: i32) -> i32 {
+    return ((x & 0xFF) << 24) |
+           ((x & 0xFF00) << 8) |
+           ((x >> 8) & 0xFF00) |
+           ((x >> 24) & 0xFF);
+}
+
+// ============================================================================
+// ASSERTIONS
+// ============================================================================
+
+// Simple assert (prints error and exits on failure)
+fn assert(condition: bool, message: String) {
+    if !condition {
+        write_str("Assertion failed: ");
+        write_str(message);
+        write_str("\n");
+        // Would call exit(1) if we had it
+    }
+}
+
+fn assert_eq_i32(a: i32, b: i32, message: String) {
+    if a != b {
+        write_str("Assertion failed: ");
+        write_str(message);
+        write_str("\nExpected: ");
+        write_int(a);
+        write_str("\nGot: ");
+        write_int(b);
+        write_str("\n");
+    }
+}
+
+// ============================================================================
+// PANIC/ABORT
+// ============================================================================
+
+fn panic(message: String) {
+    write_str("PANIC: ");
+    write_str(message);
+    write_str("\n");
+    // Would call abort() or exit(1) if we had it
+    // For now, infinite loop
+    while true {
+        // Hang
+    }
+}
+
+// ============================================================================
+// UNREACHABLE
+// ============================================================================
+
+fn unreachable(message: String) {
+    panic(message);
+}
+
+// ============================================================================
+// HASHING (Simple)
+// ============================================================================
+
+// FNV-1a hash for strings
+fn hash_string(s: String) -> i64 {
+    let hash: i64 = 14695981039346656037; // FNV offset basis
+    let prime: i64 = 1099511628211;        // FNV prime
+    
+    let i: i64 = 0;
+    while i < s.len {
+        let byte: i64 = cast(i64, *(s.ptr + i));
+        hash = hash ^ byte;
+        hash = hash * prime;
+        i = i + 1;
+    }
+    
+    return hash;
+}
+
+// Simple integer hash
+fn hash_i32(x: i32) -> i64 {
+    let h: i64 = cast(i64, x);
+    h = h ^ (h >> 16);
+    h = h * 0x85ebca6b;
+    h = h ^ (h >> 13);
+    h = h * 0xc2b2ae35;
+    h = h ^ (h >> 16);
+    return h;
+}
+
+// Hash combine (for hashing multiple values)
+fn hash_combine(seed: i64, value: i64) -> i64 {
+    // Based on boost::hash_combine
+    return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+}
+
+// ============================================================================
+// RANDOM NUMBER GENERATION (Linear Congruential Generator)
+// ============================================================================
+
+struct Random {
+    state: i64
+}
+
+// Create new RNG with seed
+fn random_new(seed: i64) -> Random {
+    return Random { seed };
+}
+
+// Generate next random number
+fn random_next(rng: *Random) -> i64 {
+    // LCG parameters (from Numerical Recipes)
+    let a: i64 = 1664525;
+    let c: i64 = 1013904223;
+    let m: i64 = 2147483648; // 2^31
+    
+    rng->state = (a * rng->state + c) % m;
+    return rng->state;
+}
+
+// Random integer in range [min, max)
+fn random_range_i32(rng: *Random, min: i32, max: i32) -> i32 {
+    let range: i32 = max - min;
+    if range <= 0 {
+        return min;
+    }
+    
+    let rand_val: i64 = random_next(rng);
+    return min + cast(i32, rand_val % cast(i64, range));
+}
+
+// Random float in range [0.0, 1.0)
+fn random_f64(rng: *Random) -> f64 {
+    let rand_val: i64 = random_next(rng);
+    return cast(f64, rand_val) / 2147483648.0;
+}
+
+// Shuffle array (Fisher-Yates)
+fn random_shuffle_i32(rng: *Random, arr: *i32, len: i64) {
+    let i: i64 = len - 1;
+    while i > 0 {
+        let j: i64 = cast(i64, random_range_i32(rng, 0, cast(i32, i + 1)));
+        
+        // Swap arr[i] and arr[j]
+        let temp: i32 = *(arr + i);
+        *(arr + i) = *(arr + j);
+        *(arr + j) = temp;
+        
+        i = i - 1;
+    }
+}
+
+// ============================================================================
+// TIMING (Placeholder - requires actual system calls)
+// ============================================================================
+
+// Get current timestamp (milliseconds since epoch)
+// Placeholder - returns 0 (would need actual syscall)
+fn get_timestamp_ms() -> i64 {
+    // TODO: Implement with actual syscall or C library
+    return 0;
+}
+
+// Sleep for milliseconds
+// Placeholder - does nothing (would need actual syscall)
+fn sleep_ms(ms: i64) {
+    // TODO: Implement with actual syscall
+    // For now, just return
+}
+
+// ============================================================================
+// ENVIRONMENT (Placeholder)
+// ============================================================================
+
+// Get environment variable
+// Placeholder - returns empty string
+fn env_get(name: String) -> String {
+    // TODO: Implement with actual getenv()
+    return String { cast(*i8, 0), 0 };
+}
+
+// Set environment variable
+// Placeholder - returns false
+fn env_set(name: String, value: String) -> bool {
+    // TODO: Implement with actual setenv()
+    return false;
+}
