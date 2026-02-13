@@ -1,12 +1,23 @@
 [package]
 name = "h-sharp"
-version = "0.0.1"
+version = "0.0.3"
 edition = "2021"
 
 [dependencies]
 h-sharp-parser = { path = "../parser" }
 h-sharp-compiler = { path = "../compiler" }
-clap = { version = "4.5.4", features = ["derive"] }
 indicatif = "0.17.8"
 anyhow = "1.0.81"
 tempfile = "3.10.1"
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Zmiana z wasmer na wasmi (rozwiązuje problemy z linkerem, pure Rust interpreter)
+wasmi = "0.31"
+
+# Nowe biblioteki UI/CLI
+lexopt = "0.3.0"
+owo-colors = "4.0.0"
+console = "0.15.8"
+ratatui = "0.26.1"
+crossterm = "0.27.0"
