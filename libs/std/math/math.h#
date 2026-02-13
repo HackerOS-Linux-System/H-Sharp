@@ -1,0 +1,446 @@
+// std/math/math.h#
+// Mathematical operations and functions
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+fn pi() -> f64 { return 3.141592653589793; }
+fn e() -> f64 { return 2.718281828459045; }
+fn tau() -> f64 { return 6.283185307179586; } // 2π
+
+// ============================================================================
+// POWER AND ROOTS
+// ============================================================================
+
+// Integer power (x^n)
+fn pow_i32(x: i32, n: i32) -> i32 {
+    if n == 0 {
+        return 1;
+    }
+    if n < 0 {
+        return 0; // Integer division would give 0 anyway
+    }
+    
+    let result: i32 = 1;
+    let i: i32 = 0;
+    while i < n {
+        result = result * x;
+        i = i + 1;
+    }
+    return result;
+}
+
+// Float power (simplified - only integer exponents)
+fn pow_f64(x: f64, n: i32) -> f64 {
+    if n == 0 {
+        return 1.0;
+    }
+    
+    let result: f64 = 1.0;
+    let abs_n: i32 = n;
+    if abs_n < 0 {
+        abs_n = -abs_n;
+    }
+    
+    let i: i32 = 0;
+    while i < abs_n {
+        result = result * x;
+        i = i + 1;
+    }
+    
+    if n < 0 {
+        return 1.0 / result;
+    }
+    return result;
+}
+
+// Square root (Newton's method)
+fn sqrt_f64(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0; // Error case - would need proper error handling
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    
+    let guess: f64 = x / 2.0;
+    let epsilon: f64 = 0.000001;
+    let max_iterations: i32 = 100;
+    
+    let i: i32 = 0;
+    while i < max_iterations {
+        let next_guess: f64 = (guess + x / guess) / 2.0;
+        let diff: f64 = guess - next_guess;
+        if diff < 0.0 {
+            diff = -diff;
+        }
+        
+        if diff < epsilon {
+            return next_guess;
+        }
+        
+        guess = next_guess;
+        i = i + 1;
+    }
+    
+    return guess;
+}
+
+// Cube root (Newton's method)
+fn cbrt_f64(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0;
+    }
+    
+    let negative: bool = x < 0.0;
+    let abs_x: f64 = x;
+    if negative {
+        abs_x = -x;
+    }
+    
+    let guess: f64 = abs_x / 3.0;
+    let epsilon: f64 = 0.000001;
+    let max_iterations: i32 = 100;
+    
+    let i: i32 = 0;
+    while i < max_iterations {
+        let guess_squared: f64 = guess * guess;
+        let next_guess: f64 = (2.0 * guess + abs_x / guess_squared) / 3.0;
+        
+        let diff: f64 = guess - next_guess;
+        if diff < 0.0 {
+            diff = -diff;
+        }
+        
+        if diff < epsilon {
+            if negative {
+                return -next_guess;
+            }
+            return next_guess;
+        }
+        
+        guess = next_guess;
+        i = i + 1;
+    }
+    
+    if negative {
+        return -guess;
+    }
+    return guess;
+}
+
+// ============================================================================
+// TRIGONOMETRY (simplified approximations)
+// ============================================================================
+
+// Normalize angle to [0, 2π)
+fn normalize_angle(x: f64) -> f64 {
+    let two_pi: f64 = tau();
+    while x < 0.0 {
+        x = x + two_pi;
+    }
+    while x >= two_pi {
+        x = x - two_pi;
+    }
+    return x;
+}
+
+// Sine (Taylor series approximation)
+fn sin_f64(x: f64) -> f64 {
+    x = normalize_angle(x);
+    
+    let result: f64 = 0.0;
+    let term: f64 = x;
+    let x_squared: f64 = x * x;
+    
+    // Taylor series: x - x³/3! + x⁵/5! - x⁷/7! + ...
+    let i: i32 = 0;
+    while i < 10 { // 10 terms is usually enough
+        result = result + term;
+        
+        // Next term: multiply by -x²/((2i+2)(2i+3))
+        let n: i32 = 2 * i + 2;
+        term = term * (-x_squared) / cast(f64, n * (n + 1));
+        
+        i = i + 1;
+    }
+    
+    return result;
+}
+
+// Cosine (using cos(x) = sin(x + π/2))
+fn cos_f64(x: f64) -> f64 {
+    return sin_f64(x + pi() / 2.0);
+}
+
+// Tangent (tan(x) = sin(x) / cos(x))
+fn tan_f64(x: f64) -> f64 {
+    let cos_x: f64 = cos_f64(x);
+    if cos_x == 0.0 {
+        return 0.0; // Error case
+    }
+    return sin_f64(x) / cos_x;
+}
+
+// ============================================================================
+// EXPONENTIAL AND LOGARITHM (simplified)
+// ============================================================================
+
+// Exponential function (e^x) - Taylor series
+fn exp_f64(x: f64) -> f64 {
+    let result: f64 = 1.0;
+    let term: f64 = 1.0;
+    
+    // Taylor series: 1 + x + x²/2! + x³/3! + ...
+    let i: i32 = 1;
+    while i <= 20 {
+        term = term * x / cast(f64, i);
+        result = result + term;
+        i = i + 1;
+    }
+    
+    return result;
+}
+
+// Natural logarithm (ln(x)) - simplified for x near 1
+fn ln_f64(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0; // Error case
+    }
+    if x == 1.0 {
+        return 0.0;
+    }
+    
+    // Use Newton's method: f(y) = e^y - x = 0
+    let guess: f64 = 0.0;
+    let epsilon: f64 = 0.000001;
+    
+    let i: i32 = 0;
+    while i < 100 {
+        let exp_guess: f64 = exp_f64(guess);
+        let next_guess: f64 = guess - (exp_guess - x) / exp_guess;
+        
+        let diff: f64 = guess - next_guess;
+        if diff < 0.0 {
+            diff = -diff;
+        }
+        
+        if diff < epsilon {
+            return next_guess;
+        }
+        
+        guess = next_guess;
+        i = i + 1;
+    }
+    
+    return guess;
+}
+
+// Logarithm base 10
+fn log10_f64(x: f64) -> f64 {
+    return ln_f64(x) / ln_f64(10.0);
+}
+
+// Logarithm base 2
+fn log2_f64(x: f64) -> f64 {
+    return ln_f64(x) / ln_f64(2.0);
+}
+
+// ============================================================================
+// ROUNDING
+// ============================================================================
+
+// Floor function
+fn floor_f64(x: f64) -> f64 {
+    let int_part: i64 = cast(i64, x);
+    let float_int: f64 = cast(f64, int_part);
+    
+    if x >= 0.0 {
+        return float_int;
+    } else {
+        if x == float_int {
+            return x;
+        }
+        return float_int - 1.0;
+    }
+}
+
+// Ceiling function
+fn ceil_f64(x: f64) -> f64 {
+    let int_part: i64 = cast(i64, x);
+    let float_int: f64 = cast(f64, int_part);
+    
+    if x <= 0.0 {
+        return float_int;
+    } else {
+        if x == float_int {
+            return x;
+        }
+        return float_int + 1.0;
+    }
+}
+
+// Round to nearest integer
+fn round_f64(x: f64) -> f64 {
+    if x >= 0.0 {
+        return floor_f64(x + 0.5);
+    } else {
+        return ceil_f64(x - 0.5);
+    }
+}
+
+// Truncate (round toward zero)
+fn trunc_f64(x: f64) -> f64 {
+    return cast(f64, cast(i64, x));
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Absolute value (already in types.h# but repeated for completeness)
+fn abs_f64(x: f64) -> f64 {
+    if x < 0.0 {
+        return -x;
+    }
+    return x;
+}
+
+// Sign function
+fn sign_f64(x: f64) -> f64 {
+    if x > 0.0 {
+        return 1.0;
+    }
+    if x < 0.0 {
+        return -1.0;
+    }
+    return 0.0;
+}
+
+// Min and max
+fn min_f64(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn max_f64(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+// Clamp value between min and max
+fn clamp_f64(value: f64, min_val: f64, max_val: f64) -> f64 {
+    if value < min_val {
+        return min_val;
+    }
+    if value > max_val {
+        return max_val;
+    }
+    return value;
+}
+
+// Linear interpolation
+fn lerp_f64(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t;
+}
+
+// ============================================================================
+// INTEGER MATH UTILITIES
+// ============================================================================
+
+// Greatest Common Divisor (Euclidean algorithm)
+fn gcd_i32(a: i32, b: i32) -> i32 {
+    // Make both positive
+    if a < 0 {
+        a = -a;
+    }
+    if b < 0 {
+        b = -b;
+    }
+    
+    while b != 0 {
+        let temp: i32 = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
+
+// Least Common Multiple
+fn lcm_i32(a: i32, b: i32) -> i32 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    
+    let gcd_val: i32 = gcd_i32(a, b);
+    return (a / gcd_val) * b;
+}
+
+// Check if number is prime (simple trial division)
+fn is_prime_i32(n: i32) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n == 2 {
+        return true;
+    }
+    if n % 2 == 0 {
+        return false;
+    }
+    
+    let i: i32 = 3;
+    while i * i <= n {
+        if n % i == 0 {
+            return false;
+        }
+        i = i + 2;
+    }
+    
+    return true;
+}
+
+// Factorial
+fn factorial_i32(n: i32) -> i32 {
+    if n < 0 {
+        return 0;
+    }
+    if n == 0 || n == 1 {
+        return 1;
+    }
+    
+    let result: i32 = 1;
+    let i: i32 = 2;
+    while i <= n {
+        result = result * i;
+        i = i + 1;
+    }
+    return result;
+}
+
+// Fibonacci number
+fn fibonacci_i32(n: i32) -> i32 {
+    if n <= 0 {
+        return 0;
+    }
+    if n == 1 {
+        return 1;
+    }
+    
+    let a: i32 = 0;
+    let b: i32 = 1;
+    let i: i32 = 2;
+    
+    while i <= n {
+        let temp: i32 = a + b;
+        a = b;
+        b = temp;
+        i = i + 1;
+    }
+    
+    return b;
+}
