@@ -1,0 +1,120 @@
+// std/core/mem.h#
+// Memory management utilities
+
+// ============================================================================
+// MEMORY OPERATIONS
+// ============================================================================
+
+// Copy memory from src to dst (n bytes)
+fn memcpy(dst: *i8, src: *i8, n: i64) {
+    let i: i64 = 0;
+    while i < n {
+        *(dst + i) = *(src + i);
+        i = i + 1;
+    }
+}
+
+// Set memory to a specific value
+fn memset(ptr: *i8, value: i8, n: i64) {
+    let i: i64 = 0;
+    while i < n {
+        *(ptr + i) = value;
+        i = i + 1;
+    }
+}
+
+// Zero out memory
+fn memzero(ptr: *i8, n: i64) {
+    memset(ptr, cast(i8, 0), n);
+}
+
+// Compare two memory regions
+fn memcmp(a: *i8, b: *i8, n: i64) -> i32 {
+    let i: i64 = 0;
+    while i < n {
+        let diff: i32 = cast(i32, *(a + i)) - cast(i32, *(b + i));
+        if diff != 0 {
+            return diff;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// ALLOCATION HELPERS
+// ============================================================================
+
+// Allocate and zero memory
+fn alloc_zeroed(size: i64) -> *i8 {
+    let ptr: *i8 = cast(*i8, alloc(size));
+    if cast(i64, ptr) != 0 {
+        memzero(ptr, size);
+    }
+    return ptr;
+}
+
+// Reallocate memory (simplified - allocates new and copies)
+fn realloc(old_ptr: *i8, old_size: i64, new_size: i64) -> *i8 {
+    let new_ptr: *i8 = alloc_zeroed(new_size);
+    
+    if cast(i64, new_ptr) == 0 {
+        return cast(*i8, 0);
+    }
+    
+    if cast(i64, old_ptr) != 0 {
+        let copy_size: i64 = old_size;
+        if new_size < old_size {
+            copy_size = new_size;
+        }
+        memcpy(new_ptr, old_ptr, copy_size);
+        dealloc(old_ptr);
+    }
+    
+    return new_ptr;
+}
+
+// ============================================================================
+// ALIGNMENT HELPERS
+// ============================================================================
+
+// Align size up to alignment
+fn align_up(size: i64, alignment: i64) -> i64 {
+    let mask: i64 = alignment - 1;
+    return (size + mask) & ~mask;
+}
+
+// Check if pointer is aligned
+fn is_aligned(ptr: *i8, alignment: i64) -> bool {
+    let addr: i64 = cast(i64, ptr);
+    return (addr % alignment) == 0;
+}
+
+// ============================================================================
+// SIZE HELPERS
+// ============================================================================
+
+// Size of various types (in bytes)
+fn size_of_i8() -> i64 { return 1; }
+fn size_of_i32() -> i64 { return 4; }
+fn size_of_i64() -> i64 { return 8; }
+fn size_of_f32() -> i64 { return 4; }
+fn size_of_f64() -> i64 { return 8; }
+fn size_of_bool() -> i64 { return 1; }
+fn size_of_ptr() -> i64 { return 8; }
+
+// ============================================================================
+// SWAP
+// ============================================================================
+
+fn swap_i32(a: *i32, b: *i32) {
+    let temp: i32 = *a;
+    *a = *b;
+    *b = temp;
+}
+
+fn swap_i64(a: *i64, b: *i64) {
+    let temp: i64 = *a;
+    *a = *b;
+    *b = temp;
+}
