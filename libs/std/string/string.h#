@@ -1,0 +1,396 @@
+// std/string/string.h#
+// String operations and utilities
+
+// Note: String type is built-in: struct String { ptr: *i8, len: i64 }
+
+// ============================================================================
+// STRING CREATION
+// ============================================================================
+
+// Create a new empty string
+fn string_new() -> String {
+    return String { cast(*i8, 0), 0 };
+}
+
+// Create string from C-style null-terminated string
+fn string_from_cstr(cstr: *i8) -> String {
+    let len: i64 = cstr_len(cstr);
+    let data: *i8 = alloc(len);
+    
+    let i: i64 = 0;
+    while i < len {
+        *(data + i) = *(cstr + i);
+        i = i + 1;
+    }
+    
+    return String { data, len };
+}
+
+// Clone a string (deep copy)
+fn string_clone(s: String) -> String {
+    if s.len == 0 {
+        return string_new();
+    }
+    
+    let data: *i8 = alloc(s.len);
+    let i: i64 = 0;
+    while i < s.len {
+        *(data + i) = *(s.ptr + i);
+        i = i + 1;
+    }
+    
+    return String { data, s.len };
+}
+
+// ============================================================================
+// STRING LENGTH
+// ============================================================================
+
+// Get length of C-style string (until null terminator)
+fn cstr_len(cstr: *i8) -> i64 {
+    let len: i64 = 0;
+    while *(cstr + len) != cast(i8, 0) {
+        len = len + 1;
+    }
+    return len;
+}
+
+// Get length of H# String
+fn string_len(s: String) -> i64 {
+    return s.len;
+}
+
+// Check if string is empty
+fn string_is_empty(s: String) -> bool {
+    return s.len == 0;
+}
+
+// ============================================================================
+// STRING COMPARISON
+// ============================================================================
+
+// Compare two strings for equality
+fn string_eq(a: String, b: String) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    
+    let i: i64 = 0;
+    while i < a.len {
+        if *(a.ptr + i) != *(b.ptr + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    
+    return true;
+}
+
+// Compare strings lexicographically
+// Returns: -1 if a < b, 0 if a == b, 1 if a > b
+fn string_cmp(a: String, b: String) -> i32 {
+    let min_len: i64 = a.len;
+    if b.len < min_len {
+        min_len = b.len;
+    }
+    
+    let i: i64 = 0;
+    while i < min_len {
+        let ca: i8 = *(a.ptr + i);
+        let cb: i8 = *(b.ptr + i);
+        
+        if ca < cb {
+            return -1;
+        }
+        if ca > cb {
+            return 1;
+        }
+        
+        i = i + 1;
+    }
+    
+    if a.len < b.len {
+        return -1;
+    }
+    if a.len > b.len {
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// STRING SEARCH
+// ============================================================================
+
+// Check if string contains a character
+fn string_contains_char(s: String, c: i8) -> bool {
+    let i: i64 = 0;
+    while i < s.len {
+        if *(s.ptr + i) == c {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Find first occurrence of character
+// Returns index or -1 if not found
+fn string_find_char(s: String, c: i8) -> i64 {
+    let i: i64 = 0;
+    while i < s.len {
+        if *(s.ptr + i) == c {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find last occurrence of character
+fn string_rfind_char(s: String, c: i8) -> i64 {
+    let i: i64 = s.len - 1;
+    while i >= 0 {
+        if *(s.ptr + i) == c {
+            return i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Check if string starts with prefix
+fn string_starts_with(s: String, prefix: String) -> bool {
+    if prefix.len > s.len {
+        return false;
+    }
+    
+    let i: i64 = 0;
+    while i < prefix.len {
+        if *(s.ptr + i) != *(prefix.ptr + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Check if string ends with suffix
+fn string_ends_with(s: String, suffix: String) -> bool {
+    if suffix.len > s.len {
+        return false;
+    }
+    
+    let offset: i64 = s.len - suffix.len;
+    let i: i64 = 0;
+    while i < suffix.len {
+        if *(s.ptr + offset + i) != *(suffix.ptr + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================================
+// STRING MANIPULATION
+// ============================================================================
+
+// Concatenate two strings (creates new string)
+fn string_concat(a: String, b: String) -> String {
+    let new_len: i64 = a.len + b.len;
+    let data: *i8 = alloc(new_len);
+    
+    // Copy a
+    let i: i64 = 0;
+    while i < a.len {
+        *(data + i) = *(a.ptr + i);
+        i = i + 1;
+    }
+    
+    // Copy b
+    i = 0;
+    while i < b.len {
+        *(data + a.len + i) = *(b.ptr + i);
+        i = i + 1;
+    }
+    
+    return String { data, new_len };
+}
+
+// Get substring [start, end)
+fn string_substring(s: String, start: i64, end: i64) -> String {
+    if start < 0 {
+        start = 0;
+    }
+    if end > s.len {
+        end = s.len;
+    }
+    if start >= end {
+        return string_new();
+    }
+    
+    let len: i64 = end - start;
+    let data: *i8 = alloc(len);
+    
+    let i: i64 = 0;
+    while i < len {
+        *(data + i) = *(s.ptr + start + i);
+        i = i + 1;
+    }
+    
+    return String { data, len };
+}
+
+// Trim whitespace from start
+fn string_trim_start(s: String) -> String {
+    let start: i64 = 0;
+    while start < s.len {
+        let c: i8 = *(s.ptr + start);
+        // Check for space, tab, newline, carriage return
+        if c != cast(i8, 32) && c != cast(i8, 9) && 
+           c != cast(i8, 10) && c != cast(i8, 13) {
+            break;
+        }
+        start = start + 1;
+    }
+    
+    return string_substring(s, start, s.len);
+}
+
+// Trim whitespace from end
+fn string_trim_end(s: String) -> String {
+    let end: i64 = s.len;
+    while end > 0 {
+        let c: i8 = *(s.ptr + end - 1);
+        if c != cast(i8, 32) && c != cast(i8, 9) && 
+           c != cast(i8, 10) && c != cast(i8, 13) {
+            break;
+        }
+        end = end - 1;
+    }
+    
+    return string_substring(s, 0, end);
+}
+
+// Trim whitespace from both ends
+fn string_trim(s: String) -> String {
+    return string_trim_end(string_trim_start(s));
+}
+
+// ============================================================================
+// CHARACTER CLASSIFICATION
+// ============================================================================
+
+fn char_is_digit(c: i8) -> bool {
+    return c >= cast(i8, 48) && c <= cast(i8, 57); // '0'-'9'
+}
+
+fn char_is_alpha(c: i8) -> bool {
+    return (c >= cast(i8, 65) && c <= cast(i8, 90)) ||   // 'A'-'Z'
+           (c >= cast(i8, 97) && c <= cast(i8, 122));     // 'a'-'z'
+}
+
+fn char_is_alphanumeric(c: i8) -> bool {
+    return char_is_alpha(c) || char_is_digit(c);
+}
+
+fn char_is_whitespace(c: i8) -> bool {
+    return c == cast(i8, 32) ||  // space
+           c == cast(i8, 9) ||   // tab
+           c == cast(i8, 10) ||  // newline
+           c == cast(i8, 13);    // carriage return
+}
+
+fn char_to_lowercase(c: i8) -> i8 {
+    if c >= cast(i8, 65) && c <= cast(i8, 90) { // 'A'-'Z'
+        return c + cast(i8, 32); // to 'a'-'z'
+    }
+    return c;
+}
+
+fn char_to_uppercase(c: i8) -> i8 {
+    if c >= cast(i8, 97) && c <= cast(i8, 122) { // 'a'-'z'
+        return c - cast(i8, 32); // to 'A'-'Z'
+    }
+    return c;
+}
+
+// ============================================================================
+// STRING CONVERSION
+// ============================================================================
+
+// Convert string to lowercase
+fn string_to_lowercase(s: String) -> String {
+    let data: *i8 = alloc(s.len);
+    
+    let i: i64 = 0;
+    while i < s.len {
+        *(data + i) = char_to_lowercase(*(s.ptr + i));
+        i = i + 1;
+    }
+    
+    return String { data, s.len };
+}
+
+// Convert string to uppercase
+fn string_to_uppercase(s: String) -> String {
+    let data: *i8 = alloc(s.len);
+    
+    let i: i64 = 0;
+    while i < s.len {
+        *(data + i) = char_to_uppercase(*(s.ptr + i));
+        i = i + 1;
+    }
+    
+    return String { data, s.len };
+}
+
+// ============================================================================
+// NUMBER PARSING (BASIC)
+// ============================================================================
+
+// Parse string to i32 (simple implementation)
+// Returns 0 on error (TODO: add proper error handling)
+fn string_to_i32(s: String) -> i32 {
+    if s.len == 0 {
+        return 0;
+    }
+    
+    let result: i32 = 0;
+    let sign: i32 = 1;
+    let start: i64 = 0;
+    
+    // Check for negative sign
+    if *(s.ptr) == cast(i8, 45) { // '-'
+        sign = -1;
+        start = 1;
+    }
+    
+    let i: i64 = start;
+    while i < s.len {
+        let c: i8 = *(s.ptr + i);
+        
+        if !char_is_digit(c) {
+            return 0; // Invalid character
+        }
+        
+        let digit: i32 = cast(i32, c) - 48; // '0' = 48
+        result = result * 10 + digit;
+        
+        i = i + 1;
+    }
+    
+    return result * sign;
+}
+
+// ============================================================================
+// FREEING MEMORY
+// ============================================================================
+
+// Free string memory
+fn string_free(s: String) {
+    if cast(i64, s.ptr) != 0 {
+        dealloc(s.ptr);
+    }
+}
