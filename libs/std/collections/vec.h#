@@ -1,0 +1,343 @@
+// std/collections/vec.h#
+// Dynamic array implementation (Vec)
+// NOTE: This is a basic version without generics
+// When generics are added, this will become Vec<T>
+
+// ============================================================================
+// VEC_I32 - Dynamic array of i32
+// ============================================================================
+
+struct VecI32 {
+    data: *i32,
+    len: i64,
+    capacity: i64
+}
+
+// Create new empty vector
+fn vec_i32_new() -> VecI32 {
+    return VecI32 { cast(*i32, 0), 0, 0 };
+}
+
+// Create vector with initial capacity
+fn vec_i32_with_capacity(cap: i64) -> VecI32 {
+    let data: *i32 = cast(*i32, alloc(sizeof(i32) * cap));
+    return VecI32 { data, 0, cap };
+}
+
+// Free vector memory
+fn vec_i32_free(v: *VecI32) {
+    if cast(i64, v->data) != 0 {
+        dealloc(cast(*i8, v->data));
+        v->data = cast(*i32, 0);
+    }
+    v->len = 0;
+    v->capacity = 0;
+}
+
+// Get current length
+fn vec_i32_len(v: *VecI32) -> i64 {
+    return v->len;
+}
+
+// Check if empty
+fn vec_i32_is_empty(v: *VecI32) -> bool {
+    return v->len == 0;
+}
+
+// Get capacity
+fn vec_i32_capacity(v: *VecI32) -> i64 {
+    return v->capacity;
+}
+
+// Reserve capacity (ensure at least new_cap capacity)
+fn vec_i32_reserve(v: *VecI32, new_cap: i64) {
+    if new_cap <= v->capacity {
+        return;
+    }
+    
+    let new_data: *i32 = cast(*i32, alloc(sizeof(i32) * new_cap));
+    
+    // Copy existing data
+    if cast(i64, v->data) != 0 {
+        let i: i64 = 0;
+        while i < v->len {
+            *(new_data + i) = *(v->data + i);
+            i = i + 1;
+        }
+        dealloc(cast(*i8, v->data));
+    }
+    
+    v->data = new_data;
+    v->capacity = new_cap;
+}
+
+// Grow vector (double capacity or start with 4)
+fn vec_i32_grow(v: *VecI32) {
+    let new_cap: i64 = v->capacity * 2;
+    if new_cap == 0 {
+        new_cap = 4;
+    }
+    vec_i32_reserve(v, new_cap);
+}
+
+// Push element to end
+fn vec_i32_push(v: *VecI32, value: i32) {
+    if v->len >= v->capacity {
+        vec_i32_grow(v);
+    }
+    
+    *(v->data + v->len) = value;
+    v->len = v->len + 1;
+}
+
+// Pop element from end
+// Returns the value (or 0 if empty - needs proper Option<T> handling)
+fn vec_i32_pop(v: *VecI32) -> i32 {
+    if v->len == 0 {
+        return 0;
+    }
+    
+    v->len = v->len - 1;
+    return *(v->data + v->len);
+}
+
+// Get element at index (no bounds checking!)
+fn vec_i32_get(v: *VecI32, index: i64) -> i32 {
+    return *(v->data + index);
+}
+
+// Set element at index (no bounds checking!)
+fn vec_i32_set(v: *VecI32, index: i64, value: i32) {
+    *(v->data + index) = value;
+}
+
+// Get pointer to element (for modification)
+fn vec_i32_get_ptr(v: *VecI32, index: i64) -> *i32 {
+    return v->data + index;
+}
+
+// Insert element at index (shifts elements right)
+fn vec_i32_insert(v: *VecI32, index: i64, value: i32) {
+    if v->len >= v->capacity {
+        vec_i32_grow(v);
+    }
+    
+    // Shift elements right
+    let i: i64 = v->len;
+    while i > index {
+        *(v->data + i) = *(v->data + i - 1);
+        i = i - 1;
+    }
+    
+    *(v->data + index) = value;
+    v->len = v->len + 1;
+}
+
+// Remove element at index (shifts elements left)
+// Returns removed value
+fn vec_i32_remove(v: *VecI32, index: i64) -> i32 {
+    let value: i32 = *(v->data + index);
+    
+    // Shift elements left
+    let i: i64 = index;
+    while i < v->len - 1 {
+        *(v->data + i) = *(v->data + i + 1);
+        i = i + 1;
+    }
+    
+    v->len = v->len - 1;
+    return value;
+}
+
+// Clear vector (keep capacity)
+fn vec_i32_clear(v: *VecI32) {
+    v->len = 0;
+}
+
+// Shrink capacity to fit current length
+fn vec_i32_shrink_to_fit(v: *VecI32) {
+    if v->len == v->capacity {
+        return;
+    }
+    
+    if v->len == 0 {
+        if cast(i64, v->data) != 0 {
+            dealloc(cast(*i8, v->data));
+            v->data = cast(*i32, 0);
+        }
+        v->capacity = 0;
+        return;
+    }
+    
+    let new_data: *i32 = cast(*i32, alloc(sizeof(i32) * v->len));
+    let i: i64 = 0;
+    while i < v->len {
+        *(new_data + i) = *(v->data + i);
+        i = i + 1;
+    }
+    
+    dealloc(cast(*i8, v->data));
+    v->data = new_data;
+    v->capacity = v->len;
+}
+
+// Extend vector with another vector
+fn vec_i32_extend(v: *VecI32, other: *VecI32) {
+    vec_i32_reserve(v, v->len + other->len);
+    
+    let i: i64 = 0;
+    while i < other->len {
+        vec_i32_push(v, *(other->data + i));
+        i = i + 1;
+    }
+}
+
+// Clone vector
+fn vec_i32_clone(v: *VecI32) -> VecI32 {
+    let new_vec: VecI32 = vec_i32_with_capacity(v->capacity);
+    
+    let i: i64 = 0;
+    while i < v->len {
+        vec_i32_push(&new_vec, *(v->data + i));
+        i = i + 1;
+    }
+    
+    return new_vec;
+}
+
+// ============================================================================
+// VEC_I64 - Dynamic array of i64
+// ============================================================================
+
+struct VecI64 {
+    data: *i64,
+    len: i64,
+    capacity: i64
+}
+
+fn vec_i64_new() -> VecI64 {
+    return VecI64 { cast(*i64, 0), 0, 0 };
+}
+
+fn vec_i64_with_capacity(cap: i64) -> VecI64 {
+    let data: *i64 = cast(*i64, alloc(sizeof(i64) * cap));
+    return VecI64 { data, 0, cap };
+}
+
+fn vec_i64_free(v: *VecI64) {
+    if cast(i64, v->data) != 0 {
+        dealloc(cast(*i8, v->data));
+        v->data = cast(*i64, 0);
+    }
+    v->len = 0;
+    v->capacity = 0;
+}
+
+fn vec_i64_push(v: *VecI64, value: i64) {
+    if v->len >= v->capacity {
+        let new_cap: i64 = v->capacity * 2;
+        if new_cap == 0 {
+            new_cap = 4;
+        }
+        
+        let new_data: *i64 = cast(*i64, alloc(sizeof(i64) * new_cap));
+        
+        if cast(i64, v->data) != 0 {
+            let i: i64 = 0;
+            while i < v->len {
+                *(new_data + i) = *(v->data + i);
+                i = i + 1;
+            }
+            dealloc(cast(*i8, v->data));
+        }
+        
+        v->data = new_data;
+        v->capacity = new_cap;
+    }
+    
+    *(v->data + v->len) = value;
+    v->len = v->len + 1;
+}
+
+fn vec_i64_pop(v: *VecI64) -> i64 {
+    if v->len == 0 {
+        return 0;
+    }
+    v->len = v->len - 1;
+    return *(v->data + v->len);
+}
+
+fn vec_i64_get(v: *VecI64, index: i64) -> i64 {
+    return *(v->data + index);
+}
+
+// ============================================================================
+// VEC_PTR - Dynamic array of pointers
+// ============================================================================
+
+struct VecPtr {
+    data: **i8,
+    len: i64,
+    capacity: i64
+}
+
+fn vec_ptr_new() -> VecPtr {
+    return VecPtr { cast(**i8, 0), 0, 0 };
+}
+
+fn vec_ptr_free(v: *VecPtr) {
+    if cast(i64, v->data) != 0 {
+        dealloc(cast(*i8, v->data));
+        v->data = cast(**i8, 0);
+    }
+    v->len = 0;
+    v->capacity = 0;
+}
+
+fn vec_ptr_push(v: *VecPtr, ptr: *i8) {
+    if v->len >= v->capacity {
+        let new_cap: i64 = v->capacity * 2;
+        if new_cap == 0 {
+            new_cap = 4;
+        }
+        
+        let new_data: **i8 = cast(**i8, alloc(sizeof(*i8) * new_cap));
+        
+        if cast(i64, v->data) != 0 {
+            let i: i64 = 0;
+            while i < v->len {
+                *(new_data + i) = *(v->data + i);
+                i = i + 1;
+            }
+            dealloc(cast(*i8, v->data));
+        }
+        
+        v->data = new_data;
+        v->capacity = new_cap;
+    }
+    
+    *(v->data + v->len) = ptr;
+    v->len = v->len + 1;
+}
+
+fn vec_ptr_get(v: *VecPtr, index: i64) -> *i8 {
+    return *(v->data + index);
+}
+
+// ============================================================================
+// FUTURE: When generics are added, this becomes:
+// ============================================================================
+
+// struct Vec<T> {
+//     data: *T,
+//     len: i64,
+//     capacity: i64
+// }
+//
+// impl Vec<T> {
+//     fn new() -> Vec<T> { ... }
+//     fn push(&mut self, item: T) { ... }
+//     fn pop(&mut self) -> Option<T> { ... }
+//     fn get(&self, index: i64) -> Option<&T> { ... }
+//     // ... etc
+// }
