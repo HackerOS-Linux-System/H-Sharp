@@ -1,48 +1,191 @@
-// Definicje struktur dla podstawowych typów danych
-struct Vector3 {
-    x: f64,
-    y: f64,
-    z: f64
-}
+// std.h#
+// H# Standard Library - Main entry point
+// 
+// Usage:
+//   from [std] require [core, string, io, math, collections, sys];
+//
+// Or import specific modules:
+//   from [std] require [string:string_concat, math:sqrt_f64];
 
-// Alokacja pamięci dla liczby całkowitej z inicjalizacją
-fn new_int(value: int) -> *int {
-    let ptr: *int = alloc(value);
-    ptr
-}
+// ============================================================================
+// STANDARD LIBRARY STRUCTURE
+// ============================================================================
+//
+// std/
+// ├── core/
+// │   ├── types.h#     - Type aliases, constants, basic utilities
+// │   └── mem.h#       - Memory operations (memcpy, memset, etc.)
+// │
+// ├── string/
+// │   └── string.h#    - String operations and utilities
+// │
+// ├── io/
+// │   └── io.h#        - Input/output operations
+// │
+// ├── math/
+// │   └── math.h#      - Mathematical functions
+// │
+// ├── collections/
+// │   ├── array.h#     - Array utilities
+// │   └── vec.h#       - Dynamic arrays (Vec)
+// │
+// └── sys/
+//     └── sys.h#       - System-level operations
+//
+// ============================================================================
 
-// Generyczne (ręczne) zwalnianie pamięci
-fn free_ptr(ptr: *int) -> unit {
-    dealloc(ptr)
-}
+// This file serves as documentation and reference
+// The actual imports are done through the module system:
+//
+// from [std] require [core];        // Imports std/core/*
+// from [std] require [string];      // Imports std/string/*
+// from [std] require [io];          // Imports std/io/*
+// from [std] require [math];        // Imports std/math/*
+// from [std] require [collections]; // Imports std/collections/*
+// from [std] require [sys];         // Imports std/sys/*
 
-// Funkcja pomocnicza do zapisu wartości pod wskaźnik
-fn poke_int(ptr: *int, value: int) -> unit {
-    write(ptr) // Zakładając, że Twoje 'write' przyjmuje wyrażenie do zapisu
-}
+// ============================================================================
+// QUICK REFERENCE
+// ============================================================================
 
-// Prosta funkcja matematyczna: potęga kwadratowa
-fn square(n: int) -> int {
-    n + n // Parser obecnie obsługuje tylko operator Plus, Eq i Lt
-}
+// CORE TYPES (std/core/types.h#)
+// - Type limits: i8_min(), i32_max(), etc.
+// - Constants: f64_pi(), f64_e()
+// - Utilities: abs_i32(), min_i32(), max_i32(), clamp_i32()
 
-// Sprawdzanie czy liczba jest dodatnia
-fn is_positive(n: int) -> bool {
-    0 < n
-}
+// MEMORY (std/core/mem.h#)
+// - Operations: memcpy(), memset(), memzero(), memcmp()
+// - Allocation: alloc_zeroed(), realloc()
+// - Alignment: align_up(), is_aligned()
+// - Swap: swap_i32(), swap_i64()
 
-// Przykład pętli for (składnia: for var = start < end block)
-fn fill_array(arr: *int, size: int) -> unit {
-    for i = 0 < size {
-        // Operacje na tablicy przy użyciu składni block/direct
-        direct {
-            // Tutaj logika niskopoziomowa
-        }
+// STRING (std/string/string.h#)
+// - Creation: string_new(), string_from_cstr(), string_clone()
+// - Info: string_len(), string_is_empty()
+// - Comparison: string_eq(), string_cmp()
+// - Search: string_contains_char(), string_find_char(), string_starts_with()
+// - Manipulation: string_concat(), string_substring(), string_trim()
+// - Conversion: string_to_lowercase(), string_to_uppercase(), string_to_i32()
+// - Char classification: char_is_digit(), char_is_alpha(), char_is_whitespace()
+
+// IO (std/io/io.h#)
+// - Output: print_i32(), print_f64(), print_str(), println()
+// - Formatted: print_labeled_i32()
+// - Debug: debug_bool(), debug_ptr()
+// - Error: eprint()
+// - Buffer: buffer_new(), buffer_append_str(), buffer_to_string()
+
+// MATH (std/math/math.h#)
+// - Constants: pi(), e(), tau()
+// - Power: pow_i32(), pow_f64(), sqrt_f64(), cbrt_f64()
+// - Trig: sin_f64(), cos_f64(), tan_f64()
+// - Exponential: exp_f64(), ln_f64(), log10_f64(), log2_f64()
+// - Rounding: floor_f64(), ceil_f64(), round_f64(), trunc_f64()
+// - Utilities: abs_f64(), sign_f64(), min_f64(), max_f64(), clamp_f64(), lerp_f64()
+// - Integer: gcd_i32(), lcm_i32(), is_prime_i32(), factorial_i32(), fibonacci_i32()
+
+// ARRAY (std/collections/array.h#)
+// - Init: array_fill_i32(), array_zero_i32()
+// - Copy: array_copy_i32()
+// - Search: array_find_i32(), array_contains_i32(), array_count_i32()
+// - Stats: array_sum_i32(), array_min_i32(), array_max_i32(), array_average_i32()
+// - Manipulation: array_reverse_i32(), array_rotate_left_i32()
+// - Sorting: array_sort_i32(), array_is_sorted_i32(), array_binary_search_i32()
+
+// VEC (std/collections/vec.h#)
+// - Creation: vec_i32_new(), vec_i32_with_capacity()
+// - Basic: vec_i32_push(), vec_i32_pop(), vec_i32_get(), vec_i32_set()
+// - Advanced: vec_i32_insert(), vec_i32_remove(), vec_i32_extend()
+// - Memory: vec_i32_reserve(), vec_i32_shrink_to_fit(), vec_i32_free()
+
+// SYS (std/sys/sys.h#)
+// - Pointers: ptr_is_null(), null_ptr(), ptr_offset()
+// - Bits: popcount_i32(), leading_zeros_i32(), is_power_of_2_i32()
+// - Endian: swap_bytes_i32()
+// - Assert: assert(), assert_eq_i32(), panic(), unreachable()
+// - Hash: hash_string(), hash_i32(), hash_combine()
+// - Random: random_new(), random_next(), random_range_i32(), random_shuffle_i32()
+
+// ============================================================================
+// EXAMPLE USAGE
+// ============================================================================
+
+/*
+// Example program using std library:
+
+from [std] require [string, math, io, collections];
+
+fn main() {
+    // String operations
+    let s1: String = string_from_cstr("Hello");
+    let s2: String = string_from_cstr(" World");
+    let greeting: String = string_concat(s1, s2);
+    print_str(greeting);
+    println();
+    
+    // Math operations
+    let x: f64 = sqrt_f64(16.0);
+    let y: f64 = sin_f64(pi() / 2.0);
+    print_f64(x); // 4.0
+    print_f64(y); // 1.0
+    
+    // Dynamic array
+    let v: VecI32 = vec_i32_new();
+    vec_i32_push(&v, 10);
+    vec_i32_push(&v, 20);
+    vec_i32_push(&v, 30);
+    
+    let i: i64 = 0;
+    while i < vec_i32_len(&v) {
+        print_i32(vec_i32_get(&v, i));
+        i = i + 1;
     }
+    
+    vec_i32_free(&v);
+}
+*/
+
+// ============================================================================
+// VERSION AND METADATA
+// ============================================================================
+
+fn std_version_major() -> i32 { return 0; }
+fn std_version_minor() -> i32 { return 1; }
+fn std_version_patch() -> i32 { return 0; }
+
+fn std_version_string() -> String {
+    return string_from_cstr("0.1.0");
 }
 
-// Funkcja zwracająca jednostkę (unit)
-fn noop() -> unit {
-    let x: int = 0;
-    return x
-}
+// ============================================================================
+// NOTES FOR FUTURE EXPANSION
+// ============================================================================
+
+// When generics are added:
+// - Vec<T> instead of VecI32, VecI64, etc.
+// - Option<T> and Result<T, E> types
+// - HashMap<K, V>
+// - Generic algorithms (sort, map, filter, etc.)
+
+// When traits are added:
+// - Debug trait
+// - Clone trait
+// - PartialEq/Eq traits
+// - Iterator trait
+
+// When file I/O is added (requires syscalls or FFI):
+// - File operations in std/io/
+// - Path manipulation
+// - Directory operations
+
+// When networking is added:
+// - std/net/ module
+// - TCP/UDP sockets
+// - HTTP client
+
+// When concurrency is added:
+// - std/thread/ module
+// - Mutex, Arc, etc.
+// - Channels
+
+// ============================================================================
