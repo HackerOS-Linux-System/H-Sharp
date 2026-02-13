@@ -1,7 +1,13 @@
 [workspace]
 members = [
-    "./source-code/parser",
-    "./source-code/compiler",
-    "./source-code/cli",
+    "source-code/parser",
+    "source-code/compiler",
+    "source-code/cli",
 ]
 resolver = "2"
+
+[profile.release]
+lto = false
+opt-level = "z"
+codegen-units = 1
+strip = true
