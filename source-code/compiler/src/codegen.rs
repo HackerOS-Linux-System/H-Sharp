@@ -1,7 +1,9 @@
 use crate::ast::*;
 use crate::typechecker::TypeChecker;
+use crate::types::{StructOrUnion, HTypeExt};
 use anyhow::Result;
 use cranelift::prelude::*;
+use cranelift::prelude::types as cl_types; // Alias for cranelift types
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::ObjectModule;
@@ -42,10 +44,8 @@ fn emit_dead_block_value(builder: &mut FunctionBuilder) -> Value {
     let dead_block = builder.create_block();
     builder.switch_to_block(dead_block);
     builder.seal_block(dead_block);
-    let val = builder.ins().iconst(types::I32, 0);
+    let val = builder.ins().iconst(cl_types::I32, 0);
     // Use an infinite loop as a terminator for dead code.
-    // This avoids compatibility issues with TrapCode naming in different Cranelift versions
-    // (e.g. UnreachableCodeReached vs UNREACHABLE_CODE_REACHED).
     builder.ins().jump(dead_block, &[]);
     val
 }
@@ -77,8 +77,8 @@ fn compile_lvalue(
             let base_addr = compile_lvalue(builder, module, state, inner, loop_ctx)?;
             let inner_ty = get_expr_type(inner, state)?;
             let struct_name = match inner_ty {
-                HType::Struct(s) => s,
-                HType::Pointer(b) => match *b { HType::Struct(s) => s, _ => return Err(anyhow::anyhow!("Field access on non-struct")) },
+                HType::Struct(s, _) => s,
+                HType::Pointer(b) => match *b { HType::Struct(s, _) => s, _ => return Err(anyhow::anyhow!("Field access on non-struct")) },
                 _ => return Err(anyhow::anyhow!("Field access on non-struct"))
             };
 
@@ -91,20 +91,42 @@ fn compile_lvalue(
             let idx_val = compile_expr(builder, module, state, idx_expr, loop_ctx)?;
             let arr_ty = get_expr_type(arr_expr, state)?;
 
+            // Bounds Checking Logic
+            if !state.in_direct {
+                match &arr_ty {
+                    HType::Slice(_) => {
+                        // Slice layout: { ptr (offset 0), len (offset 8) }
+                        // base_addr is address of the slice struct on stack
+                        let len = builder.ins().load(cl_types::I64, MemFlags::trusted(), base_addr, 8);
+                        let idx_i64 = builder.ins().sextend(cl_types::I64, idx_val); // Ensure comparison in I64
+                        let out_of_bounds = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx_i64, len);
+                        builder.ins().trapnz(out_of_bounds, TrapCode::unwrap_user(1));
+                    },
+                    HType::Array(_, size) => {
+                        // Static array: len is constant known at compile time
+                        let len = builder.ins().iconst(cl_types::I64, *size as i64);
+                        let idx_i64 = builder.ins().sextend(cl_types::I64, idx_val);
+                        let out_of_bounds = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx_i64, len);
+                        builder.ins().trapnz(out_of_bounds, TrapCode::unwrap_user(1));
+                    },
+                    _ => {} // Pointer - unchecked
+                }
+            }
+
             // Handle different array types
             let (elem_ty, start_addr) = match arr_ty {
                 HType::Array(inner, _) => (inner, base_addr),
                 HType::Slice(inner) => {
                     // Slice is { ptr, len }. Load ptr.
-                    let ptr = builder.ins().load(types::I64, MemFlags::trusted(), base_addr, 0);
+                    let ptr = builder.ins().load(cl_types::I64, MemFlags::trusted(), base_addr, 0);
                     (inner, ptr)
                 },
-                HType::Pointer(inner) => (inner, builder.ins().load(types::I64, MemFlags::trusted(), base_addr, 0)),
+                HType::Pointer(inner) => (inner, builder.ins().load(cl_types::I64, MemFlags::trusted(), base_addr, 0)),
                 _ => return Err(anyhow::anyhow!("Index on non-array"))
             };
 
             let elem_size = elem_ty.size(state.type_map);
-            let idx_i64 = builder.ins().uextend(types::I64, idx_val); // Assume idx is i32, extend
+            let idx_i64 = builder.ins().uextend(cl_types::I64, idx_val); // Assume idx is i32, extend
             let offset = builder.ins().imul_imm(idx_i64, elem_size as i64);
             Ok(builder.ins().iadd(start_addr, offset))
         },
@@ -130,7 +152,7 @@ pub fn compile_stmt(
             let size = if ty.is_value_type() { ty.size(state.type_map) } else { 8 };
             let align = if ty.is_value_type() { ty.alignment(state.type_map) } else { 8 };
             let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-            let addr = builder.ins().stack_addr(types::I64, slot, 0);
+            let addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
 
             // Only emit stores if the block isn't already terminated (e.g. by a return in the let-expr)
             if !is_block_terminated(builder) {
@@ -138,7 +160,7 @@ pub fn compile_stmt(
                     builder.ins().store(MemFlags::trusted(), val, addr, 0);
                 } else {
                     // Aggregate copy (like struct/slice) - val is pointer to source
-                    let sz = builder.ins().iconst(types::I64, size as i64);
+                    let sz = builder.ins().iconst(cl_types::I64, size as i64);
                     let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                     builder.ins().call(memcpy, &[addr, val, sz]);
                 }
@@ -147,7 +169,7 @@ pub fn compile_stmt(
             state.type_env.last_mut().unwrap().insert(name.clone(), ty);
 
             if !is_block_terminated(builder) {
-                Ok(builder.ins().iconst(types::I32, 0))
+                Ok(builder.ins().iconst(cl_types::I32, 0))
             } else {
                 Ok(emit_dead_block_value(builder))
             }
@@ -155,7 +177,7 @@ pub fn compile_stmt(
         HSharpStmt::Expr(expr) => compile_expr(builder, module, state, expr, loop_ctx),
         _ => {
             if !is_block_terminated(builder) {
-                Ok(builder.ins().iconst(types::I32, 0))
+                Ok(builder.ins().iconst(cl_types::I32, 0))
             } else {
                 Ok(emit_dead_block_value(builder))
             }
@@ -170,7 +192,13 @@ pub fn compile_expr(
     expr: &HSharpExpr,
     loop_ctx: Option<(Block, Block)>,
 ) -> Result<Value> {
-    let ty = get_expr_type(expr, state)?;
+    // Optimization: Don't check type for Block/Direct immediately as it might involve scoping issues handled inside
+    let ty = if !matches!(expr, HSharpExpr::Block(_) | HSharpExpr::Direct(_)) {
+        get_expr_type(expr, state)?
+    } else {
+        HType::Unit
+    };
+
     match expr {
         HSharpExpr::Assign(lhs, rhs) => {
             let r_val = compile_expr(builder, module, state, rhs, loop_ctx)?;
@@ -178,11 +206,11 @@ pub fn compile_expr(
             let r_ty = get_expr_type(rhs, state)?;
 
             if !is_block_terminated(builder) {
-                if r_ty.is_value_type() && !matches!(r_ty, HType::Slice(_)) && !matches!(r_ty, HType::Struct(_)) {
+                if r_ty.is_value_type() && !matches!(r_ty, HType::Slice(_)) && !matches!(r_ty, HType::Struct(_, _)) {
                     builder.ins().store(MemFlags::trusted(), r_val, l_addr, 0);
                 } else {
                     let size = r_ty.size(state.type_map);
-                    let sz = builder.ins().iconst(types::I64, size as i64);
+                    let sz = builder.ins().iconst(cl_types::I64, size as i64);
                     let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                     builder.ins().call(memcpy, &[l_addr, r_val, sz]);
                 }
@@ -202,15 +230,17 @@ pub fn compile_expr(
             } else { Err(anyhow::anyhow!("Continue outside loop")) }
         }
         HSharpExpr::Literal(lit) => Ok(match lit {
-            HSharpLiteral::Int(n) => builder.ins().iconst(types::I32, *n as i64),
-                                       HSharpLiteral::Bool(b) => builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
+            HSharpLiteral::Int(n) => builder.ins().iconst(cl_types::I32, *n as i64),
+                                       HSharpLiteral::Bool(b) => builder.ins().iconst(cl_types::I8, if *b { 1 } else { 0 }),
                                        HSharpLiteral::Float(f) => builder.ins().f64const(*f),
                                        HSharpLiteral::String(s) => {
                                            let data_id = if let Some(&id) = state.string_constants.get(s) { id } else {
                                                let name = format!("str_{}", state.string_constants.len());
                                                let mut desc = DataDescription::new();
+                                               // C-String Support: Append NULL byte
                                                let mut bytes = s.as_bytes().to_vec();
                                                bytes.push(0);
+
                                                desc.define(bytes.into_boxed_slice());
                                                let id = module.declare_data(&name, Linkage::Local, false, false)?;
                                                module.define_data(id, &desc)?;
@@ -218,10 +248,10 @@ pub fn compile_expr(
                                                id
                                            };
                                            let gv = module.declare_data_in_func(data_id, builder.func);
-                                           let ptr = builder.ins().global_value(types::I64, gv);
-                                           let len = builder.ins().iconst(types::I64, s.len() as i64);
+                                           let ptr = builder.ins().global_value(cl_types::I64, gv);
+                                           let len = builder.ins().iconst(cl_types::I64, s.len() as i64);
                                            let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
-                                           let addr = builder.ins().stack_addr(types::I64, slot, 0);
+                                           let addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
                                            builder.ins().store(MemFlags::trusted(), ptr, addr, 0);
                                            builder.ins().store(MemFlags::trusted(), len, addr, 8);
                                            addr
@@ -238,7 +268,7 @@ pub fn compile_expr(
                 let size = ty.size(state.type_map);
                 let align = ty.alignment(state.type_map);
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-                Some(builder.ins().stack_addr(types::I64, slot, 0))
+                Some(builder.ins().stack_addr(cl_types::I64, slot, 0))
             } else {
                 None
             };
@@ -253,11 +283,11 @@ pub fn compile_expr(
             let then_val = compile_expr(builder, module, state, then_expr, loop_ctx)?;
             if !is_block_terminated(builder) {
                 if let Some(addr) = result_loc {
-                    if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                    if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                         builder.ins().store(MemFlags::trusted(), then_val, addr, 0);
                     } else {
                         let size = ty.size(state.type_map);
-                        let sz = builder.ins().iconst(types::I64, size as i64);
+                        let sz = builder.ins().iconst(cl_types::I64, size as i64);
                         let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                         builder.ins().call(memcpy, &[addr, then_val, sz]);
                     }
@@ -271,17 +301,17 @@ pub fn compile_expr(
             let else_val = if let Some(e) = else_expr {
                 compile_expr(builder, module, state, e, loop_ctx)?
             } else {
-                builder.ins().iconst(types::I32, 0)
+                builder.ins().iconst(cl_types::I32, 0)
             };
 
             if !is_block_terminated(builder) {
                 if else_expr.is_some() {
                     if let Some(addr) = result_loc {
-                        if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                        if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                             builder.ins().store(MemFlags::trusted(), else_val, addr, 0);
                         } else {
                             let size = ty.size(state.type_map);
-                            let sz = builder.ins().iconst(types::I64, size as i64);
+                            let sz = builder.ins().iconst(cl_types::I64, size as i64);
                             let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                             builder.ins().call(memcpy, &[addr, else_val, sz]);
                         }
@@ -294,32 +324,32 @@ pub fn compile_expr(
             builder.switch_to_block(merge_bb);
             builder.seal_block(merge_bb);
             if let Some(addr) = result_loc {
-                if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                     Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), addr, 0))
                 } else {
                     Ok(addr)
                 }
             } else {
-                Ok(builder.ins().iconst(types::I32, 0))
+                Ok(builder.ins().iconst(cl_types::I32, 0))
             }
         },
         HSharpExpr::Alloc(size_expr) => {
             let size_val = compile_expr(builder, module, state, size_expr, loop_ctx)?;
             // Extend i32 size to i64
             let size_ty = get_expr_type(size_expr, state)?;
-            let size_i64 = if size_ty == HType::I32 { builder.ins().uextend(types::I64, size_val) } else { size_val };
+            let size_i64 = if size_ty == HType::I32 { builder.ins().uextend(cl_types::I64, size_val) } else { size_val };
 
             let alloc_func = module.declare_func_in_func(state.arena_alloc_id, builder.func);
             let call = builder.ins().call(alloc_func, &[state.arena, size_i64]);
             Ok(builder.inst_results(call)[0])
         },
         HSharpExpr::Dealloc(_) => {
-            Ok(builder.ins().iconst(types::I32, 0))
+            Ok(builder.ins().iconst(cl_types::I32, 0))
         },
         HSharpExpr::AddrOf(expr) => compile_lvalue(builder, module, state, expr, loop_ctx),
         HSharpExpr::Deref(expr) => {
             let ptr = compile_expr(builder, module, state, expr, loop_ctx)?;
-            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                 Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), ptr, 0))
             } else {
                 Ok(ptr)
@@ -327,7 +357,7 @@ pub fn compile_expr(
         },
         HSharpExpr::SizeOf(t) => {
             let s = t.size(state.type_map);
-            Ok(builder.ins().iconst(types::I32, s as i64))
+            Ok(builder.ins().iconst(cl_types::I32, s as i64))
         },
         HSharpExpr::Return(expr) => {
             let val = compile_expr(builder, module, state, expr, loop_ctx)?;
@@ -341,15 +371,15 @@ pub fn compile_expr(
 
             // Coercion logic similar to end of function
             let val_ty = builder.func.dfg.value_type(val);
-            let final_val = if val_ty == types::I32 && ret_ty == types::I64 {
-                builder.ins().sextend(types::I64, val)
-            } else if val_ty == types::I64 && ret_ty == types::I32 {
-                builder.ins().ireduce(types::I32, val)
+            let final_val = if val_ty == cl_types::I32 && ret_ty == cl_types::I64 {
+                builder.ins().sextend(cl_types::I64, val)
+            } else if val_ty == cl_types::I64 && ret_ty == cl_types::I32 {
+                builder.ins().ireduce(cl_types::I32, val)
             } else {
                 val
             };
 
-            if ret_ty != types::INVALID {
+            if ret_ty != cl_types::INVALID {
                 builder.ins().return_(&[final_val]);
             } else {
                 builder.ins().return_(&[]);
@@ -365,17 +395,17 @@ pub fn compile_expr(
             let call = module.declare_func_in_func(func_id, builder.func);
             let call_inst = builder.ins().call(call, &arg_vals);
             let results = builder.inst_results(call_inst);
-            if !results.is_empty() { Ok(results[0]) } else { Ok(builder.ins().iconst(types::I32, 0)) }
+            if !results.is_empty() { Ok(results[0]) } else { Ok(builder.ins().iconst(cl_types::I32, 0)) }
         },
         HSharpExpr::Cast(target_ty, inner) => {
             let val = compile_expr(builder, module, state, inner, loop_ctx)?;
             let src_ty = get_expr_type(inner, state)?;
             match (src_ty, target_ty) {
-                (HType::I32, HType::F64) => Ok(builder.ins().fcvt_from_sint(types::F64, val)),
-                (HType::F64, HType::I32) => Ok(builder.ins().fcvt_to_sint_sat(types::I32, val)),
-                (HType::I32, HType::I8) => Ok(builder.ins().ireduce(types::I8, val)),
-                (HType::I32, HType::I64) => Ok(builder.ins().uextend(types::I64, val)),
-                (HType::I64, HType::I32) => Ok(builder.ins().ireduce(types::I32, val)),
+                (HType::I32, HType::F64) => Ok(builder.ins().fcvt_from_sint(cl_types::F64, val)),
+                (HType::F64, HType::I32) => Ok(builder.ins().fcvt_to_sint_sat(cl_types::I32, val)),
+                (HType::I32, HType::I8) => Ok(builder.ins().ireduce(cl_types::I8, val)),
+                (HType::I32, HType::I64) => Ok(builder.ins().uextend(cl_types::I64, val)),
+                (HType::I64, HType::I32) => Ok(builder.ins().ireduce(cl_types::I32, val)),
                 (HType::Pointer(_), HType::I64) => Ok(val),
                 (HType::I64, HType::Pointer(_)) => Ok(val),
                 _ => Ok(val)
@@ -390,7 +420,7 @@ pub fn compile_expr(
                 let size = ty.size(state.type_map);
                 let align = ty.alignment(state.type_map);
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-                Some(builder.ins().stack_addr(types::I64, slot, 0))
+                Some(builder.ins().stack_addr(cl_types::I64, slot, 0))
             } else {
                 None
             };
@@ -412,11 +442,11 @@ pub fn compile_expr(
                     let val = compile_expr(builder, module, state, body, loop_ctx)?;
                     if !is_block_terminated(builder) {
                         if let Some(addr) = result_loc {
-                            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                                 builder.ins().store(MemFlags::trusted(), val, addr, 0);
                             } else {
                                 let size = ty.size(state.type_map);
-                                let sz = builder.ins().iconst(types::I64, size as i64);
+                                let sz = builder.ins().iconst(cl_types::I64, size as i64);
                                 let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                                 builder.ins().call(memcpy, &[addr, val, sz]);
                             }
@@ -441,11 +471,11 @@ pub fn compile_expr(
                     let val = compile_expr(builder, module, state, body, loop_ctx)?;
                     if !is_block_terminated(builder) {
                         if let Some(addr) = result_loc {
-                            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                                 builder.ins().store(MemFlags::trusted(), val, addr, 0);
                             } else {
                                 let size = ty.size(state.type_map);
-                                let sz = builder.ins().iconst(types::I64, size as i64);
+                                let sz = builder.ins().iconst(cl_types::I64, size as i64);
                                 let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                                 builder.ins().call(memcpy, &[addr, val, sz]);
                             }
@@ -462,11 +492,11 @@ pub fn compile_expr(
                     let val = compile_expr(builder, module, state, d, loop_ctx)?;
                     if !is_block_terminated(builder) {
                         if let Some(addr) = result_loc {
-                            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                                 builder.ins().store(MemFlags::trusted(), val, addr, 0);
                             } else {
                                 let size = ty.size(state.type_map);
-                                let sz = builder.ins().iconst(types::I64, size as i64);
+                                let sz = builder.ins().iconst(cl_types::I64, size as i64);
                                 let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                                 builder.ins().call(memcpy, &[addr, val, sz]);
                             }
@@ -481,13 +511,13 @@ pub fn compile_expr(
             builder.switch_to_block(merge_block);
             builder.seal_block(merge_block);
             if let Some(addr) = result_loc {
-                if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+                if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                     Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), addr, 0))
                 } else {
                     Ok(addr)
                 }
             } else {
-                Ok(builder.ins().iconst(types::I32, 0))
+                Ok(builder.ins().iconst(cl_types::I32, 0))
             }
         },
         HSharpExpr::While(cond, body) => {
@@ -515,7 +545,7 @@ pub fn compile_expr(
             builder.switch_to_block(exit);
             builder.seal_block(head); // Now head is fully connected
             builder.seal_block(exit);
-            Ok(builder.ins().iconst(types::I32, 0))
+            Ok(builder.ins().iconst(cl_types::I32, 0))
         },
         HSharpExpr::For(var, start, end, body) => {
             let start_val = compile_expr(builder, module, state, start, loop_ctx)?;
@@ -523,7 +553,7 @@ pub fn compile_expr(
 
             // Stack slot for 'i'
             let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 0));
-            let i_addr = builder.ins().stack_addr(types::I64, slot, 0);
+            let i_addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
             builder.ins().store(MemFlags::trusted(), start_val, i_addr, 0);
 
             state.vars.last_mut().unwrap().insert(var.clone(), i_addr);
@@ -538,7 +568,7 @@ pub fn compile_expr(
             }
             builder.switch_to_block(head_bb);
 
-            let curr_i = builder.ins().load(types::I32, MemFlags::trusted(), i_addr, 0);
+            let curr_i = builder.ins().load(cl_types::I32, MemFlags::trusted(), i_addr, 0);
             let cmp = builder.ins().icmp(IntCC::SignedLessThan, curr_i, end_val);
             builder.ins().brif(cmp, body_bb, &[], exit_bb, &[]);
 
@@ -549,8 +579,8 @@ pub fn compile_expr(
 
             if !is_block_terminated(builder) {
                 // Increment i
-                let i_val = builder.ins().load(types::I32, MemFlags::trusted(), i_addr, 0);
-                let one = builder.ins().iconst(types::I32, 1);
+                let i_val = builder.ins().load(cl_types::I32, MemFlags::trusted(), i_addr, 0);
+                let one = builder.ins().iconst(cl_types::I32, 1);
                 let next_i = builder.ins().iadd(i_val, one);
                 builder.ins().store(MemFlags::trusted(), next_i, i_addr, 0);
 
@@ -561,12 +591,12 @@ pub fn compile_expr(
             builder.seal_block(head_bb);
             builder.seal_block(exit_bb);
 
-            Ok(builder.ins().iconst(types::I32, 0))
+            Ok(builder.ins().iconst(cl_types::I32, 0))
         },
         HSharpExpr::Var(name) => {
             let addr = *state.vars.iter().rev().find_map(|m| m.get(name))
             .ok_or_else(|| anyhow::anyhow!("Undefined variable: {}", name))?;
-            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                 Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), addr, 0))
             } else {
                 Ok(addr)
@@ -574,7 +604,7 @@ pub fn compile_expr(
         },
         HSharpExpr::MethodCall(obj, method, args) => {
             let obj_ty = get_expr_type(obj, state)?;
-            let struct_name = match obj_ty { HType::Struct(s) => s, HType::Pointer(b) => match *b { HType::Struct(s) => s, _ => "".into() }, _ => "".into() };
+            let struct_name = match obj_ty { HType::Struct(s, _) => s, HType::Pointer(b) => match *b { HType::Struct(s, _) => s, _ => "".into() }, _ => "".into() };
             let mangled = format!("{}_{}", struct_name, method);
             let fid = *state.func_ids.get(&mangled).ok_or_else(|| anyhow::anyhow!("Method not found: {}", mangled))?;
             let mut vals = Vec::new();
@@ -582,7 +612,7 @@ pub fn compile_expr(
             let call = module.declare_func_in_func(fid, builder.func);
             let call_inst = builder.ins().call(call, &vals);
             let results = builder.inst_results(call_inst);
-            if !results.is_empty() { Ok(results[0]) } else { Ok(builder.ins().iconst(types::I32, 0)) }
+            if !results.is_empty() { Ok(results[0]) } else { Ok(builder.ins().iconst(cl_types::I32, 0)) }
         },
         HSharpExpr::BinOp(op, left, right) => {
             let l = compile_expr(builder, module, state, left, loop_ctx)?;
@@ -604,7 +634,7 @@ pub fn compile_expr(
         HSharpExpr::Block(stmts) => {
             state.vars.push(HashMap::new()); state.type_env.push(HashMap::new());
             let mut last = if !is_block_terminated(builder) {
-                builder.ins().iconst(types::I32, 0)
+                builder.ins().iconst(cl_types::I32, 0)
             } else {
                 emit_dead_block_value(builder)
             };
@@ -614,8 +644,16 @@ pub fn compile_expr(
                     last = compile_stmt(builder, module, state, s, loop_ctx)?;
                 }
             }
+            // RAII Note: Here we would insert calls to drop/free for variables in the current scope
             state.vars.pop(); state.type_env.pop();
             Ok(last)
+        },
+        HSharpExpr::Direct(inner) => {
+            let old_direct = state.in_direct;
+            state.in_direct = true;
+            let res = compile_expr(builder, module, state, inner, loop_ctx);
+            state.in_direct = old_direct;
+            res
         },
         HSharpExpr::Write(expr) => {
             let val = compile_expr(builder, module, state, expr, loop_ctx)?;
@@ -629,28 +667,37 @@ pub fn compile_expr(
                     let f = module.declare_func_in_func(state.write_float_id, builder.func);
                     builder.ins().call(f, &[val]);
                 },
-                HType::Struct(name) if name == "String" => {
+                HType::Struct(name, _) if name == "String" => {
                     let f = module.declare_func_in_func(state.write_str_id, builder.func);
                     builder.ins().call(f, &[val]);
                 },
                 _ => {}
             }
-            Ok(builder.ins().iconst(types::I32, 0))
+            Ok(builder.ins().iconst(cl_types::I32, 0))
         },
         HSharpExpr::Field(..) | HSharpExpr::Index(..) => {
             let addr = compile_lvalue(builder, module, state, expr, loop_ctx)?;
-            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_)) {
+            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
                 Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), addr, 0))
             } else {
                 Ok(addr)
             }
         },
-        HSharpExpr::StructLit(name, fields) => {
+        HSharpExpr::StructLit(_name, fields) => {
             let size = ty.size(state.type_map);
             let align = ty.alignment(state.type_map);
             let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-            let base_addr = builder.ins().stack_addr(types::I64, slot, 0);
-            let struct_def = state.type_map.get(name).ok_or_else(|| anyhow::anyhow!("Unknown struct"))?;
+            let base_addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
+
+            // Note: _name is ignored here because we trust the typechecker/monomorphization
+            // to have resolved the type correctly. The struct layout is retrieved via
+            // `ty.size()` which internally looks up the name.
+            let struct_name = match ty {
+                HType::Struct(n, _) => n,
+                _ => return Err(anyhow::anyhow!("StructLit type mismatch")),
+            };
+
+            let struct_def = state.type_map.get(&struct_name).ok_or_else(|| anyhow::anyhow!("Unknown struct: {}", struct_name))?;
 
             if let StructOrUnion::Struct(def_fields) = struct_def {
                 for (i, expr) in fields.iter().enumerate() {
@@ -660,11 +707,11 @@ pub fn compile_expr(
                     let val = compile_expr(builder, module, state, expr, loop_ctx)?;
                     let addr = builder.ins().iadd_imm(base_addr, offset as i64);
 
-                    if fty.is_value_type() && !matches!(fty, HType::Slice(_)) && !matches!(fty, HType::Struct(_)) {
+                    if fty.is_value_type() && !matches!(fty, HType::Slice(_)) && !matches!(fty, HType::Struct(_, _)) {
                         builder.ins().store(MemFlags::trusted(), val, addr, 0);
                     } else {
                         let size = fty.size(state.type_map);
-                        let sz = builder.ins().iconst(types::I64, size as i64);
+                        let sz = builder.ins().iconst(cl_types::I64, size as i64);
                         let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                         builder.ins().call(memcpy, &[addr, val, sz]);
                     }
@@ -674,22 +721,22 @@ pub fn compile_expr(
         },
         HSharpExpr::ArrayLit(elems) => {
             let len = elems.len();
-            if len == 0 { return Ok(builder.ins().iconst(types::I64, 0)); }
+            if len == 0 { return Ok(builder.ins().iconst(cl_types::I64, 0)); }
             let inner_ty = get_expr_type(&elems[0], state)?;
             let size = inner_ty.size(state.type_map) * len as u32;
             let align = inner_ty.alignment(state.type_map);
             let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-            let base_addr = builder.ins().stack_addr(types::I64, slot, 0);
+            let base_addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
 
             let elem_size = inner_ty.size(state.type_map);
             for (i, e) in elems.iter().enumerate() {
                 let val = compile_expr(builder, module, state, e, loop_ctx)?;
                 let offset = (i as u32 * elem_size) as i64;
                 let addr = builder.ins().iadd_imm(base_addr, offset);
-                if inner_ty.is_value_type() && !matches!(inner_ty, HType::Slice(_)) && !matches!(inner_ty, HType::Struct(_)) {
+                if inner_ty.is_value_type() && !matches!(inner_ty, HType::Slice(_)) && !matches!(inner_ty, HType::Struct(_, _)) {
                     builder.ins().store(MemFlags::trusted(), val, addr, 0);
                 } else {
-                    let sz = builder.ins().iconst(types::I64, elem_size as i64);
+                    let sz = builder.ins().iconst(cl_types::I64, elem_size as i64);
                     let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                     builder.ins().call(memcpy, &[addr, val, sz]);
                 }
