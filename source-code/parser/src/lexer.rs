@@ -65,6 +65,7 @@ pub enum Token {
     For,
     Return,
     Dot,
+    Ellipsis,
     DoubleArrow,
 }
 
@@ -102,6 +103,7 @@ impl std::fmt::Display for Token {
             Token::Float(n) => write!(f, "{}", n),
             Token::Ident(s) => write!(f, "{}", s),
             Token::String(s) => write!(f, "{:?}", s),
+            Token::Ellipsis => write!(f, "..."),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -164,6 +166,7 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 
     let op1 = choice((
         just("=>").to(Token::DoubleArrow),
+                      just("...").to(Token::Ellipsis),
                       just("==").to(Token::EqEq),
                       just("!=").to(Token::Ne),
                       just("<=").to(Token::Le),
