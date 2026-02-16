@@ -19,14 +19,17 @@ pub enum HSharpOp {
 pub enum HType {
     I8,
     I32,
-    I64, // Added for pointer-sized integers / lengths
+    I64,
     Bool,
     F32,
     F64,
     Pointer(Box<HType>),
     Array(Box<HType>, usize),
-    Slice(Box<HType>), // Dynamic array: { ptr, len }
-    Struct(String),
+    Slice(Box<HType>),
+    // Struct supports generic arguments: e.g. List<Int>
+    Struct(String, Vec<HType>),
+    // Generic placeholder: T, U, V inside a struct definition
+    Generic(String),
     Union(String),
     Unit,
 }
@@ -49,9 +52,9 @@ pub enum HSharpExpr {
     For(String, Box<HSharpExpr>, Box<HSharpExpr>, Box<HSharpExpr>),
     Break,
     Continue,
-    Match(Box<HSharpExpr>, Vec<(HSharpExpr, HSharpExpr)>, Option<Box<HSharpExpr>>), // target, cases (val, body), default
+    Match(Box<HSharpExpr>, Vec<(HSharpExpr, HSharpExpr)>, Option<Box<HSharpExpr>>),
     Call(String, Vec<HSharpExpr>),
-    MethodCall(Box<HSharpExpr>, String, Vec<HSharpExpr>), // obj.method(args)
+    MethodCall(Box<HSharpExpr>, String, Vec<HSharpExpr>),
     Cast(HType, Box<HSharpExpr>),
     SizeOf(HType),
     StructLit(String, Vec<HSharpExpr>),
@@ -66,10 +69,11 @@ pub enum HSharpExpr {
 pub enum HSharpStmt {
     Let(String, Option<HType>, HSharpExpr),
     Expr(HSharpExpr),
-    FunctionDef(String, Vec<(String, HType)>, HType, Box<HSharpExpr>),
-    StructDef(String, Vec<(String, HType)>),
+    FunctionDef(String, Vec<(String, HType)>, HType, Option<Box<HSharpExpr>>),
+    // StructDef supports generic parameters: struct List<T> { ... }
+    StructDef(String, Vec<String>, Vec<(String, HType)>),
     UnionDef(String, Vec<(String, HType)>),
-    Impl(String, Vec<HSharpStmt>), // Methods for a struct
+    Impl(String, Vec<HSharpStmt>),
     Import(String, Vec<RequireItem>),
 }
 
