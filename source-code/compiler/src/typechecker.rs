@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::types::StructOrUnion; // Use imported types
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -17,7 +18,7 @@ impl<'a> TypeChecker<'a> {
             HSharpExpr::Literal(lit) => Ok(match lit {
                 HSharpLiteral::Int(_) => HType::I32,
                                            HSharpLiteral::Bool(_) => HType::Bool,
-                                           HSharpLiteral::String(_) => HType::Struct("String".to_string()),
+                                           HSharpLiteral::String(_) => HType::Struct("String".to_string(), vec![]),
                                            HSharpLiteral::Float(_) => HType::F64,
             }),
             HSharpExpr::Var(name) => env.iter().rev()
@@ -27,6 +28,7 @@ impl<'a> TypeChecker<'a> {
             HSharpExpr::Assign(l, r) => {
                 let lt = self.check_expr(l, env)?;
                 let rt = self.check_expr(r, env)?;
+                // Simple equality check; in full generic support we might need unification
                 if lt != rt { return Err(anyhow::anyhow!("Assign type mismatch: {:?} != {:?}", lt, rt)); }
                 Ok(lt)
             },
@@ -72,15 +74,17 @@ impl<'a> TypeChecker<'a> {
                 Ok(last_type)
             },
             HSharpExpr::Cast(target_ty, _) => Ok(target_ty.clone()),
-            HSharpExpr::MethodCall(obj, method, _) => {
+            HSharpExpr::MethodCall(obj, method, args) => {
                 let obj_ty = self.check_expr(obj, env)?;
                 let struct_name = match obj_ty {
-                    HType::Struct(n) => n,
-                    HType::Pointer(b) => match *b { HType::Struct(n) => n, _ => return Err(anyhow::anyhow!("Method on non-struct"))},
+                    HType::Struct(n, _) => n,
+                    HType::Pointer(b) => match *b { HType::Struct(n, _) => n, _ => return Err(anyhow::anyhow!("Method on non-struct"))},
                     _ => return Err(anyhow::anyhow!("Method on non-struct"))
                 };
                 let mangled = format!("{}_{}", struct_name, method);
-                if let Some((_, ret)) = self.func_types.get(&mangled) {
+
+                if let Some((params, ret)) = self.func_types.get(&mangled) {
+                    self.check_args(args, params, env, true)?;
                     Ok(ret.clone())
                 } else {
                     Err(anyhow::anyhow!("Method not found: {}", method))
@@ -105,7 +109,6 @@ impl<'a> TypeChecker<'a> {
                 let mut first = true;
 
                 for (cond, body) in cases {
-                    // Handle wildcard "_" pattern
                     let is_wildcard = if let HSharpExpr::Var(n) = cond { n == "_" } else { false };
 
                     if !is_wildcard {
@@ -134,6 +137,8 @@ impl<'a> TypeChecker<'a> {
                 Ok(ret_ty)
             },
             HSharpExpr::Alloc(_) => Ok(HType::Pointer(Box::new(HType::I8))),
+            HSharpExpr::Dealloc(_) => Ok(HType::Unit),
+            HSharpExpr::Direct(_) => Ok(HType::Unit),
             HSharpExpr::Deref(e) => {
                 match self.check_expr(e, env)? {
                     HType::Pointer(inner) => Ok(*inner),
@@ -144,11 +149,16 @@ impl<'a> TypeChecker<'a> {
                 let t = self.check_expr(e, env)?;
                 Ok(HType::Pointer(Box::new(t)))
             },
-            HSharpExpr::Call(name, _) => {
-                self.func_types.get(name).map(|(_, r)| r.clone()).ok_or_else(|| anyhow::anyhow!("Fn not found: {}", name))
+            HSharpExpr::Call(name, args) => {
+                if let Some((params, ret)) = self.func_types.get(name) {
+                    self.check_args(args, params, env, false)?;
+                    Ok(ret.clone())
+                } else {
+                    Err(anyhow::anyhow!("Fn not found: {}", name))
+                }
             },
             HSharpExpr::SizeOf(_) => Ok(HType::I32),
-            HSharpExpr::StructLit(name, _) => Ok(HType::Struct(name.clone())),
+            HSharpExpr::StructLit(name, _) => Ok(HType::Struct(name.clone(), vec![])), // Assume concrete for now
             HSharpExpr::UnionLit(name, _, _) => Ok(HType::Union(name.clone())),
             HSharpExpr::ArrayLit(elems) => {
                 if let Some(first) = elems.first() {
@@ -167,8 +177,8 @@ impl<'a> TypeChecker<'a> {
             HSharpExpr::Field(obj, field) => {
                 let t = self.check_expr(obj, env)?;
                 let struct_name = match t {
-                    HType::Struct(n) => n,
-                    HType::Pointer(b) => match *b { HType::Struct(n) => n, _ => return Err(anyhow::anyhow!("Field on non-struct"))},
+                    HType::Struct(n, _) => n,
+                    HType::Pointer(b) => match *b { HType::Struct(n, _) => n, _ => return Err(anyhow::anyhow!("Field on non-struct"))},
                     _ => return Err(anyhow::anyhow!("Field on non-struct"))
                 };
                 self.type_map.get(&struct_name).and_then(|s| s.field_type(field)).ok_or_else(|| anyhow::anyhow!("Field not found"))
@@ -192,9 +202,30 @@ impl<'a> TypeChecker<'a> {
             HSharpExpr::Write(_) => Ok(HType::Unit),
             HSharpExpr::Break => Ok(HType::Unit),
             HSharpExpr::Continue => Ok(HType::Unit),
-            HSharpExpr::Direct(_) => Ok(HType::Unit),
-            HSharpExpr::Dealloc(_) => Ok(HType::Unit),
             HSharpExpr::Return(_) => Ok(HType::Unit),
         }
+    }
+
+    fn check_args(&self, args: &[HSharpExpr], params: &[HType], env: &[HashMap<String, HType>], is_method: bool) -> Result<()> {
+        let effective_params = if is_method && !params.is_empty() {
+            &params[1..]
+        } else {
+            params
+        };
+
+        if effective_params.len() > args.len() {
+            return Err(anyhow::anyhow!("Argument count mismatch: expected {}, got {}", effective_params.len(), args.len()));
+        }
+
+        for (i, param_ty) in effective_params.iter().enumerate() {
+            if *param_ty == HType::Unit { break; } // Ellipsis handling placeholder
+            let arg_ty = self.check_expr(&args[i], env)?;
+            // In a real monomorphization system, we would need to check compatibility here
+            // For now, we assume simple equality.
+            if arg_ty != *param_ty {
+                return Err(anyhow::anyhow!("Argument {} type mismatch: expected {:?}, got {:?}", i, param_ty, arg_ty));
+            }
+        }
+        Ok(())
     }
 }
