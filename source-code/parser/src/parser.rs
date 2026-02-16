@@ -24,14 +24,25 @@ pub fn parser() -> impl Parser<Token, HSharpProgram, Error = Simple<Token>> {
             choice((
                 select! { Token::I8Type => HType::I8 },
                 select! { Token::I32Type => HType::I32 },
-                select! { Token::I64Type => HType::I64 }, // Added
+                select! { Token::I64Type => HType::I64 },
                 select! { Token::BoolType => HType::Bool },
                 select! { Token::F32Type => HType::F32 },
                 select! { Token::F64Type => HType::F64 },
                 select! { Token::UnitType => HType::Unit },
                 just(Token::Star).ignore_then(ty.clone()).map(|t| HType::Pointer(Box::new(t))),
-                    select! { Token::Ident(s) => HType::Struct(s) },
-                    select! { Token::Ident(s) => HType::Union(s) },
+
+                    // Generics: List<Int>
+                    select! { Token::Ident(s) => s }
+                    .then(
+                        just(Token::Lt)
+                        .ignore_then(ty.clone().separated_by(just(Token::Comma)))
+                        .then_ignore(just(Token::Gt))
+                        .or_not()
+                    )
+                    .map(|(name, generics)| {
+                        HType::Struct(name, generics.unwrap_or_default())
+                    }),
+
                     // Array: [T; 10]
                     just(Token::LBracket)
                     .ignore_then(ty.clone())
@@ -70,14 +81,17 @@ pub fn parser() -> impl Parser<Token, HSharpProgram, Error = Simple<Token>> {
                 .ignore_then(ident_parser.clone())
                 .then(just(Token::LParen).ignore_then(expr.clone()).then_ignore(just(Token::RParen)))
                 .map(|(field, e)| IdentSuffix::Union(field, Box::new(e))),
+
                                        just(Token::LBrace)
                                        .ignore_then(expr.clone().separated_by(just(Token::Comma)))
                                        .then_ignore(just(Token::RBrace))
                                        .map(IdentSuffix::Struct),
+
                                        just(Token::LParen)
                                        .ignore_then(expr.clone().separated_by(just(Token::Comma)))
                                        .then_ignore(just(Token::RParen))
                                        .map(IdentSuffix::Call),
+
                                        empty().to(IdentSuffix::Var),
             ));
 
@@ -224,8 +238,6 @@ pub fn parser() -> impl Parser<Token, HSharpProgram, Error = Simple<Token>> {
             .then(logic_op.then(compare.clone()).repeated())
             .foldl(|lhs, (op, rhs)| HSharpExpr::BinOp(op, Box::new(lhs), Box::new(rhs)));
 
-            // Assignment: logic (= expr)?
-            // This handles right-associativity via recursion of `expr`
             logic.clone()
             .then(just(Token::Eq).ignore_then(expr.clone()).or_not())
             .map(|(lhs, rhs)| {
@@ -238,7 +250,12 @@ pub fn parser() -> impl Parser<Token, HSharpProgram, Error = Simple<Token>> {
         });
 
         let ident_parser = select! { Token::Ident(s) => s };
-        let param = ident_parser.clone().then(just(Token::Colon).ignore_then(ty.clone())).map(|(name, ty)| (name, ty));
+
+        let param = choice((
+            ident_parser.clone().then(just(Token::Colon).ignore_then(ty.clone())).map(|(name, ty)| (name, ty)),
+                            just(Token::Ellipsis).to(("...".to_string(), HType::Unit))
+        ));
+
         let field_def = ident_parser.clone().then_ignore(just(Token::Colon)).then(ty.clone());
 
         let let_stmt = just(Token::Let)
@@ -249,29 +266,34 @@ pub fn parser() -> impl Parser<Token, HSharpProgram, Error = Simple<Token>> {
         .then_ignore(just(Token::Semi))
         .map(|((name, ty), e)| HSharpStmt::Let(name, ty, e));
 
-        // Allow optional semicolon for expression statements to support implicit returns in blocks
         let expr_stmt = expr.clone()
         .then(just(Token::Semi).or_not())
         .map(|(e, _)| HSharpStmt::Expr(e));
 
+        // Fix: Use .or_not() then direct wrapping, do not wrap Option in Option
         let fn_stmt = just(Token::Fn)
         .ignore_then(ident_parser.clone())
         .then(just(Token::LParen).ignore_then(param.separated_by(just(Token::Comma))).then_ignore(just(Token::RParen)))
         .then(just(Token::Arrow).ignore_then(ty.clone()).or_not())
-        .then(expr.clone())
-        .map(|(((name, params), ret), body)| HSharpStmt::FunctionDef(name, params, ret.unwrap_or(HType::Unit), Box::new(body)));
+        .then(expr.clone().map(Box::new).or_not())
+        .map(|(((name, params), ret), body)| HSharpStmt::FunctionDef(name, params, ret.unwrap_or(HType::Unit), body));
 
         let struct_def = just(Token::Struct)
         .ignore_then(ident_parser.clone())
+        .then(
+            just(Token::Lt)
+            .ignore_then(ident_parser.clone().separated_by(just(Token::Comma)))
+            .then_ignore(just(Token::Gt))
+            .or_not()
+        )
         .then(just(Token::LBrace).ignore_then(field_def.clone().separated_by(just(Token::Comma)).allow_trailing()).then_ignore(just(Token::RBrace)))
-        .map(|(name, fields)| HSharpStmt::StructDef(name, fields));
+        .map(|((name, generics), fields)| HSharpStmt::StructDef(name, generics.unwrap_or_default(), fields));
 
         let union_def = just(Token::Union)
         .ignore_then(ident_parser.clone())
         .then(just(Token::LBrace).ignore_then(field_def.separated_by(just(Token::Comma)).allow_trailing()).then_ignore(just(Token::RBrace)))
         .map(|(name, fields)| HSharpStmt::UnionDef(name, fields));
 
-        // Impl block: impl Type { fn ... }
         let impl_block = just(Token::Impl)
         .ignore_then(ident_parser.clone())
         .then(just(Token::LBrace).ignore_then(fn_stmt.clone().repeated()).then_ignore(just(Token::RBrace)))
