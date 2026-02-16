@@ -1,37 +1,246 @@
 pub mod ast;
 pub mod codegen;
 pub mod typechecker;
+pub mod types;
 
 use crate::ast::*;
-use crate::codegen::{compile_expr, CompilerState, is_block_terminated}; // compile_stmt removed from import
+use crate::codegen::{compile_expr, CompilerState, is_block_terminated};
+use crate::types::{StructOrUnion, HTypeExt};
 use anyhow::{Context, Result};
 use cranelift::prelude::*;
 use cranelift::prelude::isa::CallConv;
+// Rename the cranelift types module to avoid conflict with our local 'types' module
+use cranelift::prelude::types as cl_types;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::HashMap;
 use std::fs;
 
+// --- Monomorphization Utilities ---
+
+fn mangle_name(name: &str, args: &[HType]) -> String {
+    if args.is_empty() {
+        return name.to_string();
+    }
+    let mut mangled = format!("{}_", name);
+    for arg in args {
+        match arg {
+            HType::I32 => mangled.push_str("_I32"),
+            HType::I64 => mangled.push_str("_I64"),
+            HType::F64 => mangled.push_str("_F64"),
+            HType::Bool => mangled.push_str("_Bool"),
+            HType::Struct(n, sub) => mangled.push_str(&format!("_{}{}", n, if !sub.is_empty() { "_M" } else { "" })),
+            HType::Pointer(_) => mangled.push_str("_Ptr"),
+            _ => mangled.push_str("_T"),
+        }
+    }
+    mangled
+}
+
+// Recursively substitute 'Generic("T")' with concrete types provided in 'mapping'
+fn substitute_type(ty: &HType, mapping: &HashMap<String, HType>) -> HType {
+    match ty {
+        HType::Generic(name) => mapping.get(name)
+        .cloned()
+        .unwrap_or_else(|| panic!("Compiler Error: Unbound generic type parameter '{}' during monomorphization. The type was not inferred or provided.", name)),
+        HType::Pointer(inner) => HType::Pointer(Box::new(substitute_type(inner, mapping))),
+        HType::Array(inner, s) => HType::Array(Box::new(substitute_type(inner, mapping)), *s),
+        HType::Slice(inner) => HType::Slice(Box::new(substitute_type(inner, mapping))),
+        HType::Struct(name, args) => {
+            let new_args = args.iter().map(|a| substitute_type(a, mapping)).collect();
+            HType::Struct(name.clone(), new_args)
+        }
+        _ => ty.clone()
+    }
+}
+
+// Convert "fake structs" from Parser (Struct("T")) into Generic("T") based on defined params
+fn normalize_struct_fields(
+    fields: &[(String, HType)],
+                           generic_params: &[String]
+) -> Vec<(String, HType)> {
+    fields.iter().map(|(n, ty)| (n.clone(), normalize_type(ty, generic_params))).collect()
+}
+
+fn normalize_type(ty: &HType, params: &[String]) -> HType {
+    match ty {
+        HType::Struct(name, args) if args.is_empty() => {
+            if params.contains(name) {
+                HType::Generic(name.clone())
+            } else {
+                ty.clone()
+            }
+        },
+        HType::Pointer(inner) => HType::Pointer(Box::new(normalize_type(inner, params))),
+        HType::Array(inner, s) => HType::Array(Box::new(normalize_type(inner, params)), *s),
+        HType::Slice(inner) => HType::Slice(Box::new(normalize_type(inner, params))),
+        HType::Struct(name, args) => {
+            let new_args = args.iter().map(|a| normalize_type(a, params)).collect();
+            HType::Struct(name.clone(), new_args)
+        }
+        _ => ty.clone()
+    }
+}
+
+// Scan AST to find HType::Struct(name, args) where args > 0 and instantiate them
+fn instantiate_struct(
+    ty: &HType,
+    templates: &HashMap<String, (Vec<String>, Vec<(String, HType)>)>,
+                      type_map: &mut HashMap<String, StructOrUnion>
+) -> HType {
+    match ty {
+        HType::Struct(name, args) if !args.is_empty() => {
+            // It's a generic usage!
+            if let Some((params, fields)) = templates.get(name) {
+                // Recursively resolve args first
+                let concrete_args: Vec<HType> = args.iter().map(|a| instantiate_struct(a, templates, type_map)).collect();
+
+                let mangled = mangle_name(name, &concrete_args);
+
+                if !type_map.contains_key(&mangled) {
+                    // Instantiate!
+                    if params.len() != concrete_args.len() {
+                        panic!("Generic argument count mismatch for struct '{}': expected {}, got {}", name, params.len(), concrete_args.len());
+                    }
+
+                    let mapping: HashMap<String, HType> = params.iter().zip(concrete_args.iter()).map(|(k, v)| (k.clone(), v.clone())).collect();
+
+                    let concrete_fields: Vec<(String, HType)> = fields.iter().map(|(fname, fty)| {
+                        (fname.clone(), substitute_type(fty, &mapping))
+                    }).collect();
+
+                    // Recursively ensure fields are instantiated too (e.g. struct A<T> { b: B<T> })
+                    let final_fields: Vec<(String, HType)> = concrete_fields.iter().map(|(fnm, fty)| {
+                        (fnm.clone(), instantiate_struct(fty, templates, type_map))
+                    }).collect();
+
+                    type_map.insert(mangled.clone(), StructOrUnion::Struct(final_fields));
+                }
+
+                // Return concrete type pointing to mangled name.
+                // NOTE: We strip args here because the mangled name is unique and points to a concrete struct layout.
+                return HType::Struct(mangled, vec![]);
+            }
+            ty.clone()
+        },
+        HType::Pointer(inner) => HType::Pointer(Box::new(instantiate_struct(inner, templates, type_map))),
+        HType::Array(inner, s) => HType::Array(Box::new(instantiate_struct(inner, templates, type_map)), *s),
+        HType::Slice(inner) => HType::Slice(Box::new(instantiate_struct(inner, templates, type_map))),
+        _ => ty.clone()
+    }
+}
+
+// Traverse AST helper
+fn scan_and_instantiate_stmts(
+    stmts: &mut [HSharpStmt],
+    templates: &HashMap<String, (Vec<String>, Vec<(String, HType)>)>,
+                              type_map: &mut HashMap<String, StructOrUnion>
+) {
+    for stmt in stmts {
+        match stmt {
+            HSharpStmt::Let(_, ty_opt, expr) => {
+                if let Some(ty) = ty_opt {
+                    *ty = instantiate_struct(ty, templates, type_map);
+                }
+                scan_and_instantiate_expr(expr, templates, type_map);
+            },
+            HSharpStmt::Expr(e) => scan_and_instantiate_expr(e, templates, type_map),
+            HSharpStmt::FunctionDef(_, params, ret, body_opt) => {
+                for (_, pty) in params {
+                    *pty = instantiate_struct(pty, templates, type_map);
+                }
+                *ret = instantiate_struct(ret, templates, type_map);
+                if let Some(body) = body_opt {
+                    scan_and_instantiate_expr(body, templates, type_map);
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+fn scan_and_instantiate_expr(
+    expr: &mut HSharpExpr,
+    templates: &HashMap<String, (Vec<String>, Vec<(String, HType)>)>,
+                             type_map: &mut HashMap<String, StructOrUnion>
+) {
+    match expr {
+        HSharpExpr::Block(stmts) => scan_and_instantiate_stmts(stmts, templates, type_map),
+        HSharpExpr::Alloc(e) | HSharpExpr::Dealloc(e) | HSharpExpr::Deref(e) | HSharpExpr::AddrOf(e) |
+        HSharpExpr::Write(e) | HSharpExpr::Return(e) | HSharpExpr::Direct(e) => scan_and_instantiate_expr(e, templates, type_map),
+        HSharpExpr::Assign(l, r) | HSharpExpr::BinOp(_, l, r) | HSharpExpr::While(l, r) => {
+            scan_and_instantiate_expr(l, templates, type_map);
+            scan_and_instantiate_expr(r, templates, type_map);
+        },
+        HSharpExpr::If(c, t, e_opt) => {
+            scan_and_instantiate_expr(c, templates, type_map);
+            scan_and_instantiate_expr(t, templates, type_map);
+            if let Some(e) = e_opt { scan_and_instantiate_expr(e, templates, type_map); }
+        },
+        HSharpExpr::For(_, s, e, b) => {
+            scan_and_instantiate_expr(s, templates, type_map);
+            scan_and_instantiate_expr(e, templates, type_map);
+            scan_and_instantiate_expr(b, templates, type_map);
+        },
+        HSharpExpr::Cast(ty, e) => {
+            *ty = instantiate_struct(ty, templates, type_map);
+            scan_and_instantiate_expr(e, templates, type_map);
+        },
+        HSharpExpr::Call(_, args) | HSharpExpr::MethodCall(_, _, args) | HSharpExpr::ArrayLit(args) => {
+            for a in args { scan_and_instantiate_expr(a, templates, type_map); }
+        },
+        HSharpExpr::StructLit(_name, args) => {
+            // Check if 'name' is a generic template.
+            // NOTE: StructLit with generics (e.g., Vec<i32>{...}) is hard to parse as Ident<Types> currently.
+            // If the user provides a raw name "Vec", it might be ambiguous without inference.
+            // For MVP: We recursively check arguments. If the struct expects generics but none are provided here,
+            // we rely on the type checker or Let binding to carry the type, but instantiation happens on Type names.
+            // A more advanced compiler would infer T from the types of 'args'.
+            for a in args { scan_and_instantiate_expr(a, templates, type_map); }
+        },
+        _ => {}
+    }
+}
+
+
 pub fn compile_program(
     program: &HSharpProgram,
     output_path: &str,
 ) -> Result<()> {
+    // Phase 1: Registration & Templating
     let mut type_map: HashMap<String, StructOrUnion> = HashMap::new();
-    // Inject core String struct: { ptr: *i8, len: i64 }
+    let mut generic_templates: HashMap<String, (Vec<String>, Vec<(String, HType)>)> = HashMap::new();
+
+    // Inject core String struct
     type_map.insert("String".to_string(), StructOrUnion::Struct(vec![
         ("ptr".to_string(), HType::Pointer(Box::new(HType::I8))),
-                                                                ("len".to_string(), HType::I64), // Slice length often pointer-sized, using i64
+                                                                ("len".to_string(), HType::I64),
     ]));
 
+    // Separate Concrete Structs from Generic Templates
     for stmt in &program.stmts {
         match stmt {
-            HSharpStmt::StructDef(name, fields) => { type_map.insert(name.clone(), StructOrUnion::Struct(fields.clone())); }
+            HSharpStmt::StructDef(name, generics, fields) => {
+                if generics.is_empty() {
+                    type_map.insert(name.clone(), StructOrUnion::Struct(fields.clone()));
+                } else {
+                    // Normalize fields: Convert Struct("T") -> Generic("T")
+                    let normalized_fields = normalize_struct_fields(fields, generics);
+                    generic_templates.insert(name.clone(), (generics.clone(), normalized_fields));
+                }
+            }
             HSharpStmt::UnionDef(name, fields) => { type_map.insert(name.clone(), StructOrUnion::Union(fields.clone())); }
             _ => {}
         }
     }
 
+    // Phase 2: Monomorphization / Instantiation
+    // Clone stmts to modify types in place
+    let mut modified_stmts = program.stmts.clone();
+    scan_and_instantiate_stmts(&mut modified_stmts, &generic_templates, &mut type_map);
+
+    // Phase 3: Compiler Setup
     let mut flag_builder = settings::builder();
     flag_builder.set("opt_level", "speed").unwrap();
     let flags = settings::Flags::new(flag_builder);
@@ -47,25 +256,25 @@ pub fn compile_program(
     let mut module = ObjectModule::new(builder);
 
     // Runtime imports
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64)); sig.returns.push(AbiParam::new(types::I64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
     let malloc_id = module.declare_function("malloc", Linkage::Import, &sig)?;
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64));
     let free_id = module.declare_function("free", Linkage::Import, &sig)?;
 
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I32));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I32));
     let write_int_id = module.declare_function("write_int", Linkage::Import, &sig)?;
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64)); // Writes string ptr/len? Simplified: pointer
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64));
     let write_str_id = module.declare_function("write_str", Linkage::Import, &sig)?;
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::F64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::F64));
     let write_float_id = module.declare_function("write_float", Linkage::Import, &sig)?;
 
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64)); sig.returns.push(AbiParam::new(types::I64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
     let arena_new_id = module.declare_function("arena_new", Linkage::Import, &sig)?;
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64)); sig.params.push(AbiParam::new(types::I64)); sig.returns.push(AbiParam::new(types::I64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
     let arena_alloc_id = module.declare_function("arena_alloc", Linkage::Import, &sig)?;
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64));
     let arena_free_id = module.declare_function("arena_free", Linkage::Import, &sig)?;
-    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(types::I64)); sig.params.push(AbiParam::new(types::I64)); sig.params.push(AbiParam::new(types::I64));
+    let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.params.push(AbiParam::new(cl_types::I64)); sig.params.push(AbiParam::new(cl_types::I64));
     let memcpy_id = module.declare_function("memcpy", Linkage::Import, &sig)?;
 
     let mut string_constants: HashMap<String, DataId> = HashMap::new();
@@ -73,25 +282,24 @@ pub fn compile_program(
     let mut func_types: HashMap<String, (Vec<HType>, HType)> = HashMap::new();
     let mut func_sigs: HashMap<String, Signature> = HashMap::new();
 
-    // Register built-in functions so typechecker and codegen know about them
     func_types.insert("write_int".to_string(), (vec![HType::I32], HType::Unit));
     func_ids.insert("write_int".to_string(), write_int_id);
 
     func_types.insert("write_float".to_string(), (vec![HType::F64], HType::Unit));
     func_ids.insert("write_float".to_string(), write_float_id);
 
-    func_types.insert("write_str".to_string(), (vec![HType::Struct("String".to_string())], HType::Unit));
+    func_types.insert("write_str".to_string(), (vec![HType::Struct("String".to_string(), vec![])], HType::Unit));
     func_ids.insert("write_str".to_string(), write_str_id);
 
-    // Collect functions (including Impl methods mangled as Type_method)
+    // Prepare functions
     let mut flattened_stmts = Vec::new();
-    for stmt in &program.stmts {
+    for stmt in &modified_stmts {
         match stmt {
             HSharpStmt::Impl(struct_name, methods) => {
                 for m in methods {
-                    if let HSharpStmt::FunctionDef(fn_name, params, ret, body) = m {
+                    if let HSharpStmt::FunctionDef(fn_name, params, ret, body_opt) = m {
                         let mangled = format!("{}_{}", struct_name, fn_name);
-                        flattened_stmts.push(HSharpStmt::FunctionDef(mangled, params.clone(), ret.clone(), body.clone()));
+                        flattened_stmts.push(HSharpStmt::FunctionDef(mangled, params.clone(), ret.clone(), body_opt.clone()));
                     }
                 }
             },
@@ -101,17 +309,26 @@ pub fn compile_program(
 
     // Declaration Pass
     for stmt in &flattened_stmts {
-        if let HSharpStmt::FunctionDef(name, params, ret, _) = stmt {
+        if let HSharpStmt::FunctionDef(name, params, ret, body_opt) = stmt {
             let param_tys = params.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
             func_types.insert(name.clone(), (param_tys.clone(), ret.clone()));
             let mut sig = module.make_signature();
             for pty in &param_tys {
-                sig.params.push(AbiParam::new(pty.param_type()));
+                let cl_ty = pty.param_type();
+                if cl_ty != cl_types::INVALID {
+                    sig.params.push(AbiParam::new(cl_ty));
+                }
             }
-            if ret.param_type() != types::INVALID {
+            if ret.param_type() != cl_types::INVALID {
                 sig.returns.push(AbiParam::new(ret.param_type()));
             }
-            let linkage = if name == "main" { Linkage::Export } else { Linkage::Local };
+            let linkage = if name == "main" {
+                Linkage::Export
+            } else if body_opt.is_none() {
+                Linkage::Import
+            } else {
+                Linkage::Local
+            };
             let func_id = module.declare_function(name, linkage, &sig)?;
             func_ids.insert(name.clone(), func_id);
             func_sigs.insert(name.clone(), sig);
@@ -120,85 +337,83 @@ pub fn compile_program(
 
     // Compilation Pass
     for stmt in &flattened_stmts {
-        if let HSharpStmt::FunctionDef(name, params, ret, body) = stmt {
-            let mut codegen_ctx = cranelift::codegen::Context::new();
-            codegen_ctx.func.signature = func_sigs.get(name).unwrap().clone();
-            let mut builder_ctx = FunctionBuilderContext::new();
-            let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, &mut builder_ctx);
-            let entry_block = builder.create_block();
-            builder.append_block_params_for_function_params(entry_block);
-            builder.switch_to_block(entry_block);
-            builder.seal_block(entry_block);
+        if let HSharpStmt::FunctionDef(name, params, ret, body_opt) = stmt {
+            if let Some(body) = body_opt {
+                let mut codegen_ctx = cranelift::codegen::Context::new();
+                codegen_ctx.func.signature = func_sigs.get(name).unwrap().clone();
+                let mut builder_ctx = FunctionBuilderContext::new();
+                let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, &mut builder_ctx);
+                let entry_block = builder.create_block();
+                builder.append_block_params_for_function_params(entry_block);
+                builder.switch_to_block(entry_block);
+                builder.seal_block(entry_block);
 
-            let mut vars: Vec<HashMap<String, Value>> = vec![HashMap::new()];
-            let mut type_env: Vec<HashMap<String, HType>> = vec![HashMap::new()];
+                let mut vars: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+                let mut type_env: Vec<HashMap<String, HType>> = vec![HashMap::new()];
 
-            for (i, (pname, pty)) in params.iter().enumerate() {
-                let param_repr = builder.block_params(entry_block)[i];
-                let is_aggregate = !pty.is_value_type() || matches!(pty, HType::Slice(_));
-                let size = pty.size(&type_map);
-                let align = pty.alignment(&type_map);
+                for (i, (pname, pty)) in params.iter().enumerate() {
+                    if pty.param_type() == cl_types::INVALID { continue; }
 
-                // Always allocate a stack slot for parameters.
-                // If it's a value type, store the value.
-                // If it's an aggregate (passed by reference/pointer), copy the data from the pointer to the stack (Pass-by-Value semantics).
-                let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-                let addr = builder.ins().stack_addr(types::I64, slot, 0);
+                    let param_repr = builder.block_params(entry_block)[i];
+                    let is_aggregate = !pty.is_value_type() || matches!(pty, HType::Slice(_));
+                    // Note: pty here is already instantiated (e.g. List_I32), so size() works
+                    let size = pty.size(&type_map);
+                    let align = pty.alignment(&type_map);
 
-                if !is_aggregate {
-                    builder.ins().store(MemFlags::trusted(), param_repr, addr, 0);
-                } else {
-                    // param_repr is the pointer to the source data. Memcpy to local stack.
-                    let sz = builder.ins().iconst(types::I64, size as i64);
-                    let memcpy = module.declare_func_in_func(memcpy_id, builder.func);
-                    builder.ins().call(memcpy, &[addr, param_repr, sz]);
-                }
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
+                    let addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
 
-                vars.last_mut().unwrap().insert(pname.clone(), addr);
-                type_env.last_mut().unwrap().insert(pname.clone(), pty.clone());
-            }
-
-            let capacity = builder.ins().iconst(types::I64, 1_048_576);
-            let new_call = module.declare_func_in_func(arena_new_id, builder.func);
-            let call_inst = builder.ins().call(new_call, &[capacity]);
-            let arena = builder.inst_results(call_inst)[0];
-
-            let mut state = CompilerState {
-                malloc_id, free_id, write_int_id, write_str_id, write_float_id,
-                arena_new_id, arena_alloc_id, arena_free_id, memcpy_id,
-                vars: &mut vars, type_env: &mut type_env,
-                string_constants: &mut string_constants,
-                func_ids: &func_ids, func_types: &func_types, type_map: &type_map,
-                arena, in_direct: false,
-            };
-
-            let val = compile_expr(&mut builder, &mut module, &mut state, body, None)?;
-
-            // Implicit return at end of function block.
-            // Only generate if the block isn't already terminated (e.g. by explicit return or infinite loop).
-            if !is_block_terminated(&builder) {
-                let free_call = module.declare_func_in_func(arena_free_id, builder.func);
-                builder.ins().call(free_call, &[arena]);
-
-                let ret_ty = ret.param_type();
-                if ret_ty != types::INVALID {
-                    let val_ty = builder.func.dfg.value_type(val);
-                    // Coerce i32 to i64 if needed (e.g. Unit or Int literal returning as I64)
-                    let final_val = if val_ty == types::I32 && ret_ty == types::I64 {
-                        builder.ins().sextend(types::I64, val)
-                    } else if val_ty == types::I64 && ret_ty == types::I32 {
-                        builder.ins().ireduce(types::I32, val)
+                    if !is_aggregate {
+                        builder.ins().store(MemFlags::trusted(), param_repr, addr, 0);
                     } else {
-                        val
-                    };
-                    builder.ins().return_(&[final_val]);
-                } else {
-                    builder.ins().return_(&[]);
-                }
-            }
+                        let sz = builder.ins().iconst(cl_types::I64, size as i64);
+                        let memcpy = module.declare_func_in_func(memcpy_id, builder.func);
+                        builder.ins().call(memcpy, &[addr, param_repr, sz]);
+                    }
 
-            builder.finalize();
-            module.define_function(func_ids[name], &mut codegen_ctx)?;
+                    vars.last_mut().unwrap().insert(pname.clone(), addr);
+                    type_env.last_mut().unwrap().insert(pname.clone(), pty.clone());
+                }
+
+                let capacity = builder.ins().iconst(cl_types::I64, 1_048_576);
+                let new_call = module.declare_func_in_func(arena_new_id, builder.func);
+                let call_inst = builder.ins().call(new_call, &[capacity]);
+                let arena = builder.inst_results(call_inst)[0];
+
+                let mut state = CompilerState {
+                    malloc_id, free_id, write_int_id, write_str_id, write_float_id,
+                    arena_new_id, arena_alloc_id, arena_free_id, memcpy_id,
+                    vars: &mut vars, type_env: &mut type_env,
+                    string_constants: &mut string_constants,
+                    func_ids: &func_ids, func_types: &func_types, type_map: &type_map,
+                    arena, in_direct: false,
+                };
+
+                let val = compile_expr(&mut builder, &mut module, &mut state, body, None)?;
+
+                if !is_block_terminated(&builder) {
+                    let free_call = module.declare_func_in_func(arena_free_id, builder.func);
+                    builder.ins().call(free_call, &[arena]);
+
+                    let ret_ty = ret.param_type();
+                    if ret_ty != cl_types::INVALID {
+                        let val_ty = builder.func.dfg.value_type(val);
+                        let final_val = if val_ty == cl_types::I32 && ret_ty == cl_types::I64 {
+                            builder.ins().sextend(cl_types::I64, val)
+                        } else if val_ty == cl_types::I64 && ret_ty == cl_types::I32 {
+                            builder.ins().ireduce(cl_types::I32, val)
+                        } else {
+                            val
+                        };
+                        builder.ins().return_(&[final_val]);
+                    } else {
+                        builder.ins().return_(&[]);
+                    }
+                }
+
+                builder.finalize();
+                module.define_function(func_ids[name], &mut codegen_ctx)?;
+            }
         }
     }
 
