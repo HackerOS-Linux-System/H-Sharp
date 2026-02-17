@@ -2,7 +2,6 @@ pub mod ast;
 pub mod codegen;
 pub mod typechecker;
 pub mod types;
-
 use crate::ast::*;
 use crate::codegen::{compile_expr, CompilerState, is_block_terminated};
 use crate::types::{StructOrUnion, HTypeExt};
@@ -18,7 +17,6 @@ use std::collections::HashMap;
 use std::fs;
 
 // --- Monomorphization Utilities ---
-
 fn mangle_name(name: &str, args: &[HType]) -> String {
     if args.is_empty() {
         return name.to_string();
@@ -95,29 +93,22 @@ fn instantiate_struct(
             if let Some((params, fields)) = templates.get(name) {
                 // Recursively resolve args first
                 let concrete_args: Vec<HType> = args.iter().map(|a| instantiate_struct(a, templates, type_map)).collect();
-
                 let mangled = mangle_name(name, &concrete_args);
-
                 if !type_map.contains_key(&mangled) {
                     // Instantiate!
                     if params.len() != concrete_args.len() {
                         panic!("Generic argument count mismatch for struct '{}': expected {}, got {}", name, params.len(), concrete_args.len());
                     }
-
                     let mapping: HashMap<String, HType> = params.iter().zip(concrete_args.iter()).map(|(k, v)| (k.clone(), v.clone())).collect();
-
                     let concrete_fields: Vec<(String, HType)> = fields.iter().map(|(fname, fty)| {
                         (fname.clone(), substitute_type(fty, &mapping))
                     }).collect();
-
                     // Recursively ensure fields are instantiated too (e.g. struct A<T> { b: B<T> })
                     let final_fields: Vec<(String, HType)> = concrete_fields.iter().map(|(fnm, fty)| {
                         (fnm.clone(), instantiate_struct(fty, templates, type_map))
                     }).collect();
-
                     type_map.insert(mangled.clone(), StructOrUnion::Struct(final_fields));
                 }
-
                 // Return concrete type pointing to mangled name.
                 // NOTE: We strip args here because the mangled name is unique and points to a concrete struct layout.
                 return HType::Struct(mangled, vec![]);
@@ -203,6 +194,141 @@ fn scan_and_instantiate_expr(
     }
 }
 
+// --- Optimizer ---
+
+fn lit_int(val: i64) -> HSharpExpr {
+    HSharpExpr::Literal(HSharpLiteral::Int(val))
+}
+
+fn lit_bool(val: bool) -> HSharpExpr {
+    HSharpExpr::Literal(HSharpLiteral::Bool(val))
+}
+
+pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
+    match expr {
+        HSharpExpr::BinOp(op, l, r) => {
+            let l = optimize_expr(*l);
+            let r = optimize_expr(*r);
+            match (&l, &r) {
+                (HSharpExpr::Literal(HSharpLiteral::Int(a)), HSharpExpr::Literal(HSharpLiteral::Int(b))) => {
+                    match op {
+                        HSharpOp::Add => lit_int(a + b),
+                        HSharpOp::Sub => lit_int(a - b),
+                        HSharpOp::Mul => lit_int(a * b),
+                        HSharpOp::Div => if *b != 0 { lit_int(a / b) } else { HSharpExpr::BinOp(op, Box::new(l), Box::new(r)) },
+                        HSharpOp::Mod => if *b != 0 { lit_int(a % b) } else { HSharpExpr::BinOp(op, Box::new(l), Box::new(r)) },
+                        HSharpOp::Eq => lit_bool(a == b),
+                        HSharpOp::Ne => lit_bool(a != b),
+                        HSharpOp::Lt => lit_bool(a < b),
+                        HSharpOp::Gt => lit_bool(a > b),
+                        HSharpOp::Le => lit_bool(a <= b),
+                        HSharpOp::Ge => lit_bool(a >= b),
+                        _ => HSharpExpr::BinOp(op, Box::new(l), Box::new(r))
+                    }
+                },
+                (HSharpExpr::Literal(HSharpLiteral::Bool(false)), _) if op == HSharpOp::And => lit_bool(false),
+                (HSharpExpr::Literal(HSharpLiteral::Bool(true)), _) if op == HSharpOp::And => r,
+                (_, HSharpExpr::Literal(HSharpLiteral::Bool(false))) if op == HSharpOp::And => lit_bool(false),
+                (_, HSharpExpr::Literal(HSharpLiteral::Bool(true))) if op == HSharpOp::And => l,
+                (HSharpExpr::Literal(HSharpLiteral::Bool(true)), _) if op == HSharpOp::Or => lit_bool(true),
+                (HSharpExpr::Literal(HSharpLiteral::Bool(false)), _) if op == HSharpOp::Or => r,
+                (_, HSharpExpr::Literal(HSharpLiteral::Bool(true))) if op == HSharpOp::Or => lit_bool(true),
+                (_, HSharpExpr::Literal(HSharpLiteral::Bool(false))) if op == HSharpOp::Or => l,
+                (_, HSharpExpr::Literal(HSharpLiteral::Int(0))) if op == HSharpOp::Mul => lit_int(0),
+                (HSharpExpr::Literal(HSharpLiteral::Int(0)), _) if op == HSharpOp::Mul => lit_int(0),
+                (_, HSharpExpr::Literal(HSharpLiteral::Int(1))) if op == HSharpOp::Mul => l,
+                (HSharpExpr::Literal(HSharpLiteral::Int(1)), _) if op == HSharpOp::Mul => r,
+                (_, HSharpExpr::Literal(HSharpLiteral::Int(0))) if op == HSharpOp::Add => l,
+                (HSharpExpr::Literal(HSharpLiteral::Int(0)), _) if op == HSharpOp::Add => r,
+                (_, HSharpExpr::Literal(HSharpLiteral::Int(0))) if op == HSharpOp::Sub => l,
+                _ => HSharpExpr::BinOp(op, Box::new(l), Box::new(r))
+            }
+        },
+        HSharpExpr::Block(stmts) => {
+            let stmts = optimize_stmts(stmts);
+            if stmts.len() == 1 {
+                if let HSharpStmt::Expr(e) = stmts.into_iter().next().unwrap() {
+                    e
+                } else {
+                    HSharpExpr::Block(stmts)
+                }
+            } else {
+                HSharpExpr::Block(stmts)
+            }
+        },
+        HSharpExpr::If(cond, then, els) => {
+            let cond = optimize_expr(*cond);
+            let then = optimize_expr(*then);
+            let els = els.map(|e| Box::new(optimize_expr(*e)));
+            match cond {
+                HSharpExpr::Literal(HSharpLiteral::Bool(true)) => then,
+                HSharpExpr::Literal(HSharpLiteral::Bool(false)) => els.map(|e| *e).unwrap_or(HSharpExpr::Unit),
+                _ => HSharpExpr::If(Box::new(cond), Box::new(then), els)
+            }
+        },
+        HSharpExpr::While(cond, body) => {
+            let cond = optimize_expr(*cond);
+            let body = optimize_expr(*body);
+            match cond {
+                HSharpExpr::Literal(HSharpLiteral::Bool(false)) => HSharpExpr::Unit,
+                _ => HSharpExpr::While(Box::new(cond), Box::new(body))
+            }
+        },
+        HSharpExpr::For(name, start, end, body) => {
+            let start = optimize_expr(*start);
+            let end = optimize_expr(*end);
+            let body = optimize_expr(*body);
+            HSharpExpr::For(name, Box::new(start), Box::new(end), Box::new(body))
+        },
+        HSharpExpr::Assign(l, r) => {
+            let l = optimize_expr(*l);
+            let r = optimize_expr(*r);
+            HSharpExpr::Assign(Box::new(l), Box::new(r))
+        },
+        HSharpExpr::Call(name, args) => {
+            let args = args.into_iter().map(optimize_expr).collect();
+            HSharpExpr::Call(name, args)
+        },
+        HSharpExpr::MethodCall(recv, method, args) => {
+            let recv = optimize_expr(*recv);
+            let args = args.into_iter().map(optimize_expr).collect();
+            HSharpExpr::MethodCall(Box::new(recv), method, args)
+        },
+        HSharpExpr::ArrayLit(args) => {
+            let args = args.into_iter().map(optimize_expr).collect();
+            HSharpExpr::ArrayLit(args)
+        },
+        HSharpExpr::StructLit(name, args) => {
+            let args = args.into_iter().map(optimize_expr).collect();
+            HSharpExpr::StructLit(name, args)
+        },
+        HSharpExpr::Cast(ty, e) => {
+            let e = optimize_expr(*e);
+            HSharpExpr::Cast(ty, Box::new(e))
+        },
+        HSharpExpr::Alloc(e) => HSharpExpr::Alloc(Box::new(optimize_expr(*e))),
+        HSharpExpr::Dealloc(e) => HSharpExpr::Dealloc(Box::new(optimize_expr(*e))),
+        HSharpExpr::Deref(e) => HSharpExpr::Deref(Box::new(optimize_expr(*e))),
+        HSharpExpr::AddrOf(e) => HSharpExpr::AddrOf(Box::new(optimize_expr(*e))),
+        HSharpExpr::Write(e) => HSharpExpr::Write(Box::new(optimize_expr(*e))),
+        HSharpExpr::Return(e) => HSharpExpr::Return(Box::new(optimize_expr(*e))),
+        HSharpExpr::Direct(e) => HSharpExpr::Direct(Box::new(optimize_expr(*e))),
+        other => other,
+    }
+}
+
+fn optimize_stmt(stmt: HSharpStmt) -> HSharpStmt {
+    match stmt {
+        HSharpStmt::Let(name, ty_opt, expr) => HSharpStmt::Let(name, ty_opt, optimize_expr(expr)),
+        HSharpStmt::Expr(e) => HSharpStmt::Expr(optimize_expr(e)),
+        HSharpStmt::FunctionDef(name, params, ret, body_opt) => HSharpStmt::FunctionDef(name, params, ret, body_opt.map(optimize_expr)),
+        other => other,
+    }
+}
+
+fn optimize_stmts(stmts: Vec<HSharpStmt>) -> Vec<HSharpStmt> {
+    stmts.into_iter().map(optimize_stmt).collect()
+}
 
 pub fn compile_program(
     program: &HSharpProgram,
@@ -211,13 +337,11 @@ pub fn compile_program(
     // Phase 1: Registration & Templating
     let mut type_map: HashMap<String, StructOrUnion> = HashMap::new();
     let mut generic_templates: HashMap<String, (Vec<String>, Vec<(String, HType)>)> = HashMap::new();
-
     // Inject core String struct
     type_map.insert("String".to_string(), StructOrUnion::Struct(vec![
         ("ptr".to_string(), HType::Pointer(Box::new(HType::I8))),
                                                                 ("len".to_string(), HType::I64),
     ]));
-
     // Separate Concrete Structs from Generic Templates
     for stmt in &program.stmts {
         match stmt {
@@ -234,15 +358,19 @@ pub fn compile_program(
             _ => {}
         }
     }
-
     // Phase 2: Monomorphization / Instantiation
     // Clone stmts to modify types in place
     let mut modified_stmts = program.stmts.clone();
     scan_and_instantiate_stmts(&mut modified_stmts, &generic_templates, &mut type_map);
-
+    // Phase 2.5: Optimization Pass
+    modified_stmts = optimize_stmts(modified_stmts);
     // Phase 3: Compiler Setup
     let mut flag_builder = settings::builder();
-    flag_builder.set("opt_level", "speed").unwrap();
+    flag_builder.set("opt_level", "speed_and_size").unwrap();
+    flag_builder.set("enable_simd", "true").unwrap();
+    flag_builder.set("enable_verifier", "false").unwrap();  // tylko w release
+    flag_builder.set("regalloc_checker", "false").unwrap();
+    flag_builder.set("is_pic", "false").unwrap();  // statyczne binarki
     let flags = settings::Flags::new(flag_builder);
     let isa_builder = cranelift_native::builder()
     .map_err(|msg| anyhow::anyhow!("{}", msg))
@@ -254,20 +382,17 @@ pub fn compile_program(
         cranelift_module::default_libcall_names(),
     )?;
     let mut module = ObjectModule::new(builder);
-
     // Runtime imports
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
     let malloc_id = module.declare_function("malloc", Linkage::Import, &sig)?;
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64));
     let free_id = module.declare_function("free", Linkage::Import, &sig)?;
-
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I32));
     let write_int_id = module.declare_function("write_int", Linkage::Import, &sig)?;
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64));
     let write_str_id = module.declare_function("write_str", Linkage::Import, &sig)?;
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::F64));
     let write_float_id = module.declare_function("write_float", Linkage::Import, &sig)?;
-
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
     let arena_new_id = module.declare_function("arena_new", Linkage::Import, &sig)?;
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
@@ -276,21 +401,16 @@ pub fn compile_program(
     let arena_free_id = module.declare_function("arena_free", Linkage::Import, &sig)?;
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.params.push(AbiParam::new(cl_types::I64)); sig.params.push(AbiParam::new(cl_types::I64));
     let memcpy_id = module.declare_function("memcpy", Linkage::Import, &sig)?;
-
     let mut string_constants: HashMap<String, DataId> = HashMap::new();
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
     let mut func_types: HashMap<String, (Vec<HType>, HType)> = HashMap::new();
     let mut func_sigs: HashMap<String, Signature> = HashMap::new();
-
     func_types.insert("write_int".to_string(), (vec![HType::I32], HType::Unit));
     func_ids.insert("write_int".to_string(), write_int_id);
-
     func_types.insert("write_float".to_string(), (vec![HType::F64], HType::Unit));
     func_ids.insert("write_float".to_string(), write_float_id);
-
     func_types.insert("write_str".to_string(), (vec![HType::Struct("String".to_string(), vec![])], HType::Unit));
     func_ids.insert("write_str".to_string(), write_str_id);
-
     // Prepare functions
     let mut flattened_stmts = Vec::new();
     for stmt in &modified_stmts {
@@ -306,7 +426,6 @@ pub fn compile_program(
             _ => flattened_stmts.push(stmt.clone())
         }
     }
-
     // Declaration Pass
     for stmt in &flattened_stmts {
         if let HSharpStmt::FunctionDef(name, params, ret, body_opt) = stmt {
@@ -334,7 +453,6 @@ pub fn compile_program(
             func_sigs.insert(name.clone(), sig);
         }
     }
-
     // Compilation Pass
     for stmt in &flattened_stmts {
         if let HSharpStmt::FunctionDef(name, params, ret, body_opt) = stmt {
@@ -347,22 +465,17 @@ pub fn compile_program(
                 builder.append_block_params_for_function_params(entry_block);
                 builder.switch_to_block(entry_block);
                 builder.seal_block(entry_block);
-
                 let mut vars: Vec<HashMap<String, Value>> = vec![HashMap::new()];
                 let mut type_env: Vec<HashMap<String, HType>> = vec![HashMap::new()];
-
                 for (i, (pname, pty)) in params.iter().enumerate() {
                     if pty.param_type() == cl_types::INVALID { continue; }
-
                     let param_repr = builder.block_params(entry_block)[i];
                     let is_aggregate = !pty.is_value_type() || matches!(pty, HType::Slice(_));
                     // Note: pty here is already instantiated (e.g. List_I32), so size() works
                     let size = pty.size(&type_map);
                     let align = pty.alignment(&type_map);
-
                     let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
                     let addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
-
                     if !is_aggregate {
                         builder.ins().store(MemFlags::trusted(), param_repr, addr, 0);
                     } else {
@@ -370,16 +483,13 @@ pub fn compile_program(
                         let memcpy = module.declare_func_in_func(memcpy_id, builder.func);
                         builder.ins().call(memcpy, &[addr, param_repr, sz]);
                     }
-
                     vars.last_mut().unwrap().insert(pname.clone(), addr);
                     type_env.last_mut().unwrap().insert(pname.clone(), pty.clone());
                 }
-
                 let capacity = builder.ins().iconst(cl_types::I64, 1_048_576);
                 let new_call = module.declare_func_in_func(arena_new_id, builder.func);
                 let call_inst = builder.ins().call(new_call, &[capacity]);
                 let arena = builder.inst_results(call_inst)[0];
-
                 let mut state = CompilerState {
                     malloc_id, free_id, write_int_id, write_str_id, write_float_id,
                     arena_new_id, arena_alloc_id, arena_free_id, memcpy_id,
@@ -388,13 +498,10 @@ pub fn compile_program(
                     func_ids: &func_ids, func_types: &func_types, type_map: &type_map,
                     arena, in_direct: false,
                 };
-
                 let val = compile_expr(&mut builder, &mut module, &mut state, body, None)?;
-
                 if !is_block_terminated(&builder) {
                     let free_call = module.declare_func_in_func(arena_free_id, builder.func);
                     builder.ins().call(free_call, &[arena]);
-
                     let ret_ty = ret.param_type();
                     if ret_ty != cl_types::INVALID {
                         let val_ty = builder.func.dfg.value_type(val);
@@ -410,13 +517,11 @@ pub fn compile_program(
                         builder.ins().return_(&[]);
                     }
                 }
-
                 builder.finalize();
                 module.define_function(func_ids[name], &mut codegen_ctx)?;
             }
         }
     }
-
     let product = module.finish();
     let bytes = product.emit()?;
     fs::write(output_path, bytes).context("Failed to write object file")?;
