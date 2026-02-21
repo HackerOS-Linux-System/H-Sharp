@@ -2,13 +2,14 @@ pub mod ast;
 pub mod codegen;
 pub mod typechecker;
 pub mod types;
+
 use crate::ast::*;
 use crate::codegen::{compile_expr, CompilerState, is_block_terminated};
+use crate::typechecker::FuncSig;
 use crate::types::{StructOrUnion, HTypeExt};
 use anyhow::{Context, Result};
 use cranelift::prelude::*;
 use cranelift::prelude::isa::CallConv;
-// Rename the cranelift types module to avoid conflict with our local 'types' module
 use cranelift::prelude::types as cl_types;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataId, FuncId, Linkage, Module};
@@ -36,7 +37,6 @@ fn mangle_name(name: &str, args: &[HType]) -> String {
     mangled
 }
 
-// Recursively substitute 'Generic("T")' with concrete types provided in 'mapping'
 fn substitute_type(ty: &HType, mapping: &HashMap<String, HType>) -> HType {
     match ty {
         HType::Generic(name) => mapping.get(name)
@@ -53,7 +53,6 @@ fn substitute_type(ty: &HType, mapping: &HashMap<String, HType>) -> HType {
     }
 }
 
-// Convert "fake structs" from Parser (Struct("T")) into Generic("T") based on defined params
 fn normalize_struct_fields(
     fields: &[(String, HType)],
                            generic_params: &[String]
@@ -81,7 +80,6 @@ fn normalize_type(ty: &HType, params: &[String]) -> HType {
     }
 }
 
-// Scan AST to find HType::Struct(name, args) where args > 0 and instantiate them
 fn instantiate_struct(
     ty: &HType,
     templates: &HashMap<String, (Vec<String>, Vec<(String, HType)>)>,
@@ -89,13 +87,10 @@ fn instantiate_struct(
 ) -> HType {
     match ty {
         HType::Struct(name, args) if !args.is_empty() => {
-            // It's a generic usage!
             if let Some((params, fields)) = templates.get(name) {
-                // Recursively resolve args first
                 let concrete_args: Vec<HType> = args.iter().map(|a| instantiate_struct(a, templates, type_map)).collect();
                 let mangled = mangle_name(name, &concrete_args);
                 if !type_map.contains_key(&mangled) {
-                    // Instantiate!
                     if params.len() != concrete_args.len() {
                         panic!("Generic argument count mismatch for struct '{}': expected {}, got {}", name, params.len(), concrete_args.len());
                     }
@@ -103,14 +98,11 @@ fn instantiate_struct(
                     let concrete_fields: Vec<(String, HType)> = fields.iter().map(|(fname, fty)| {
                         (fname.clone(), substitute_type(fty, &mapping))
                     }).collect();
-                    // Recursively ensure fields are instantiated too (e.g. struct A<T> { b: B<T> })
                     let final_fields: Vec<(String, HType)> = concrete_fields.iter().map(|(fnm, fty)| {
                         (fnm.clone(), instantiate_struct(fty, templates, type_map))
                     }).collect();
                     type_map.insert(mangled.clone(), StructOrUnion::Struct(final_fields));
                 }
-                // Return concrete type pointing to mangled name.
-                // NOTE: We strip args here because the mangled name is unique and points to a concrete struct layout.
                 return HType::Struct(mangled, vec![]);
             }
             ty.clone()
@@ -122,7 +114,6 @@ fn instantiate_struct(
     }
 }
 
-// Traverse AST helper
 fn scan_and_instantiate_stmts(
     stmts: &mut [HSharpStmt],
     templates: &HashMap<String, (Vec<String>, Vec<(String, HType)>)>,
@@ -137,7 +128,7 @@ fn scan_and_instantiate_stmts(
                 scan_and_instantiate_expr(expr, templates, type_map);
             },
             HSharpStmt::Expr(e) => scan_and_instantiate_expr(e, templates, type_map),
-            HSharpStmt::FunctionDef(_, params, ret, body_opt) => {
+            HSharpStmt::FunctionDef(_, params, ret, body_opt, _) => {
                 for (_, pty) in params {
                     *pty = instantiate_struct(pty, templates, type_map);
                 }
@@ -158,8 +149,9 @@ fn scan_and_instantiate_expr(
 ) {
     match expr {
         HSharpExpr::Block(stmts) => scan_and_instantiate_stmts(stmts, templates, type_map),
-        HSharpExpr::Alloc(e) | HSharpExpr::Dealloc(e) | HSharpExpr::Deref(e) | HSharpExpr::AddrOf(e) |
+        HSharpExpr::Alloc(e) | HSharpExpr::Dealloc(e) |
         HSharpExpr::Write(e) | HSharpExpr::Return(e) | HSharpExpr::Direct(e) => scan_and_instantiate_expr(e, templates, type_map),
+        HSharpExpr::Unary(_, e) => scan_and_instantiate_expr(e, templates, type_map),
         HSharpExpr::Assign(l, r) | HSharpExpr::BinOp(_, l, r) | HSharpExpr::While(l, r) => {
             scan_and_instantiate_expr(l, templates, type_map);
             scan_and_instantiate_expr(r, templates, type_map);
@@ -182,12 +174,6 @@ fn scan_and_instantiate_expr(
             for a in args { scan_and_instantiate_expr(a, templates, type_map); }
         },
         HSharpExpr::StructLit(_name, args) => {
-            // Check if 'name' is a generic template.
-            // NOTE: StructLit with generics (e.g., Vec<i32>{...}) is hard to parse as Ident<Types> currently.
-            // If the user provides a raw name "Vec", it might be ambiguous without inference.
-            // For MVP: We recursively check arguments. If the struct expects generics but none are provided here,
-            // we rely on the type checker or Let binding to carry the type, but instantiation happens on Type names.
-            // A more advanced compiler would infer T from the types of 'args'.
             for a in args { scan_and_instantiate_expr(a, templates, type_map); }
         },
         _ => {}
@@ -197,11 +183,15 @@ fn scan_and_instantiate_expr(
 // --- Optimizer ---
 
 fn lit_int(val: i64) -> HSharpExpr {
-    HSharpExpr::Literal(HSharpLiteral::Int(val))
+    HSharpExpr::Literal(HSharpLiteral::Int(val as i32))
 }
 
 fn lit_bool(val: bool) -> HSharpExpr {
     HSharpExpr::Literal(HSharpLiteral::Bool(val))
+}
+
+fn expr_unit() -> HSharpExpr {
+    HSharpExpr::Block(vec![])
 }
 
 pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
@@ -211,12 +201,14 @@ pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
             let r = optimize_expr(*r);
             match (&l, &r) {
                 (HSharpExpr::Literal(HSharpLiteral::Int(a)), HSharpExpr::Literal(HSharpLiteral::Int(b))) => {
+                    let a = *a as i64;
+                    let b = *b as i64;
                     match op {
                         HSharpOp::Add => lit_int(a + b),
                         HSharpOp::Sub => lit_int(a - b),
                         HSharpOp::Mul => lit_int(a * b),
-                        HSharpOp::Div => if *b != 0 { lit_int(a / b) } else { HSharpExpr::BinOp(op, Box::new(l), Box::new(r)) },
-                        HSharpOp::Mod => if *b != 0 { lit_int(a % b) } else { HSharpExpr::BinOp(op, Box::new(l), Box::new(r)) },
+                        HSharpOp::Div => if b != 0 { lit_int(a / b) } else { HSharpExpr::BinOp(op, Box::new(l), Box::new(r)) },
+                        HSharpOp::Mod => if b != 0 { lit_int(a % b) } else { HSharpExpr::BinOp(op, Box::new(l), Box::new(r)) },
                         HSharpOp::Eq => lit_bool(a == b),
                         HSharpOp::Ne => lit_bool(a != b),
                         HSharpOp::Lt => lit_bool(a < b),
@@ -247,8 +239,12 @@ pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
         HSharpExpr::Block(stmts) => {
             let stmts = optimize_stmts(stmts);
             if stmts.len() == 1 {
-                if let HSharpStmt::Expr(e) = stmts.into_iter().next().unwrap() {
-                    e
+                if let Some(HSharpStmt::Expr(_)) = stmts.first() {
+                    if let HSharpStmt::Expr(e) = stmts.into_iter().next().unwrap() {
+                        e
+                    } else {
+                        unreachable!()
+                    }
                 } else {
                     HSharpExpr::Block(stmts)
                 }
@@ -262,7 +258,7 @@ pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
             let els = els.map(|e| Box::new(optimize_expr(*e)));
             match cond {
                 HSharpExpr::Literal(HSharpLiteral::Bool(true)) => then,
-                HSharpExpr::Literal(HSharpLiteral::Bool(false)) => els.map(|e| *e).unwrap_or(HSharpExpr::Unit),
+                HSharpExpr::Literal(HSharpLiteral::Bool(false)) => els.map(|e| *e).unwrap_or_else(expr_unit),
                 _ => HSharpExpr::If(Box::new(cond), Box::new(then), els)
             }
         },
@@ -270,7 +266,7 @@ pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
             let cond = optimize_expr(*cond);
             let body = optimize_expr(*body);
             match cond {
-                HSharpExpr::Literal(HSharpLiteral::Bool(false)) => HSharpExpr::Unit,
+                HSharpExpr::Literal(HSharpLiteral::Bool(false)) => expr_unit(),
                 _ => HSharpExpr::While(Box::new(cond), Box::new(body))
             }
         },
@@ -306,10 +302,9 @@ pub fn optimize_expr(expr: HSharpExpr) -> HSharpExpr {
             let e = optimize_expr(*e);
             HSharpExpr::Cast(ty, Box::new(e))
         },
+        HSharpExpr::Unary(op, e) => HSharpExpr::Unary(op, Box::new(optimize_expr(*e))),
         HSharpExpr::Alloc(e) => HSharpExpr::Alloc(Box::new(optimize_expr(*e))),
         HSharpExpr::Dealloc(e) => HSharpExpr::Dealloc(Box::new(optimize_expr(*e))),
-        HSharpExpr::Deref(e) => HSharpExpr::Deref(Box::new(optimize_expr(*e))),
-        HSharpExpr::AddrOf(e) => HSharpExpr::AddrOf(Box::new(optimize_expr(*e))),
         HSharpExpr::Write(e) => HSharpExpr::Write(Box::new(optimize_expr(*e))),
         HSharpExpr::Return(e) => HSharpExpr::Return(Box::new(optimize_expr(*e))),
         HSharpExpr::Direct(e) => HSharpExpr::Direct(Box::new(optimize_expr(*e))),
@@ -321,7 +316,8 @@ fn optimize_stmt(stmt: HSharpStmt) -> HSharpStmt {
     match stmt {
         HSharpStmt::Let(name, ty_opt, expr) => HSharpStmt::Let(name, ty_opt, optimize_expr(expr)),
         HSharpStmt::Expr(e) => HSharpStmt::Expr(optimize_expr(e)),
-        HSharpStmt::FunctionDef(name, params, ret, body_opt) => HSharpStmt::FunctionDef(name, params, ret, body_opt.map(optimize_expr)),
+        HSharpStmt::FunctionDef(name, params, ret, body_opt, is_pub) =>
+        HSharpStmt::FunctionDef(name, params, ret, body_opt.map(|b| Box::new(optimize_expr(*b))), is_pub),
         other => other,
     }
 }
@@ -334,22 +330,20 @@ pub fn compile_program(
     program: &HSharpProgram,
     output_path: &str,
 ) -> Result<()> {
-    // Phase 1: Registration & Templating
     let mut type_map: HashMap<String, StructOrUnion> = HashMap::new();
     let mut generic_templates: HashMap<String, (Vec<String>, Vec<(String, HType)>)> = HashMap::new();
-    // Inject core String struct
+
     type_map.insert("String".to_string(), StructOrUnion::Struct(vec![
         ("ptr".to_string(), HType::Pointer(Box::new(HType::I8))),
                                                                 ("len".to_string(), HType::I64),
     ]));
-    // Separate Concrete Structs from Generic Templates
+
     for stmt in &program.stmts {
         match stmt {
             HSharpStmt::StructDef(name, generics, fields) => {
                 if generics.is_empty() {
                     type_map.insert(name.clone(), StructOrUnion::Struct(fields.clone()));
                 } else {
-                    // Normalize fields: Convert Struct("T") -> Generic("T")
                     let normalized_fields = normalize_struct_fields(fields, generics);
                     generic_templates.insert(name.clone(), (generics.clone(), normalized_fields));
                 }
@@ -358,19 +352,17 @@ pub fn compile_program(
             _ => {}
         }
     }
-    // Phase 2: Monomorphization / Instantiation
-    // Clone stmts to modify types in place
+
     let mut modified_stmts = program.stmts.clone();
     scan_and_instantiate_stmts(&mut modified_stmts, &generic_templates, &mut type_map);
-    // Phase 2.5: Optimization Pass
     modified_stmts = optimize_stmts(modified_stmts);
-    // Phase 3: Compiler Setup
+
     let mut flag_builder = settings::builder();
     flag_builder.set("opt_level", "speed_and_size").unwrap();
     flag_builder.set("enable_simd", "true").unwrap();
-    flag_builder.set("enable_verifier", "false").unwrap();  // tylko w release
+    flag_builder.set("enable_verifier", "false").unwrap();
     flag_builder.set("regalloc_checker", "false").unwrap();
-    flag_builder.set("is_pic", "false").unwrap();  // statyczne binarki
+    flag_builder.set("is_pic", "false").unwrap();
     let flags = settings::Flags::new(flag_builder);
     let isa_builder = cranelift_native::builder()
     .map_err(|msg| anyhow::anyhow!("{}", msg))
@@ -382,7 +374,7 @@ pub fn compile_program(
         cranelift_module::default_libcall_names(),
     )?;
     let mut module = ObjectModule::new(builder);
-    // Runtime imports
+
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64)); sig.returns.push(AbiParam::new(cl_types::I64));
     let malloc_id = module.declare_function("malloc", Linkage::Import, &sig)?;
     let mut sig = Signature::new(CallConv::SystemV); sig.params.push(AbiParam::new(cl_types::I64));
@@ -403,34 +395,64 @@ pub fn compile_program(
     let memcpy_id = module.declare_function("memcpy", Linkage::Import, &sig)?;
     let mut string_constants: HashMap<String, DataId> = HashMap::new();
     let mut func_ids: HashMap<String, FuncId> = HashMap::new();
-    let mut func_types: HashMap<String, (Vec<HType>, HType)> = HashMap::new();
+
+    let mut func_types: HashMap<String, FuncSig> = HashMap::new();
     let mut func_sigs: HashMap<String, Signature> = HashMap::new();
-    func_types.insert("write_int".to_string(), (vec![HType::I32], HType::Unit));
+
+    func_types.insert("write_int".to_string(), FuncSig {
+        params: vec![("i".to_string(), HType::I32)],
+                      ret: HType::Unit,
+                      is_async: false,
+                      is_extern: true,
+                      variadic: false,
+    });
     func_ids.insert("write_int".to_string(), write_int_id);
-    func_types.insert("write_float".to_string(), (vec![HType::F64], HType::Unit));
+
+    func_types.insert("write_float".to_string(), FuncSig {
+        params: vec![("f".to_string(), HType::F64)],
+                      ret: HType::Unit,
+                      is_async: false,
+                      is_extern: true,
+                      variadic: false,
+    });
     func_ids.insert("write_float".to_string(), write_float_id);
-    func_types.insert("write_str".to_string(), (vec![HType::Struct("String".to_string(), vec![])], HType::Unit));
+
+    func_types.insert("write_str".to_string(), FuncSig {
+        params: vec![("s".to_string(), HType::Struct("String".to_string(), vec![]))],
+                      ret: HType::Unit,
+                      is_async: false,
+                      is_extern: true,
+                      variadic: false,
+    });
     func_ids.insert("write_str".to_string(), write_str_id);
-    // Prepare functions
+
     let mut flattened_stmts = Vec::new();
     for stmt in &modified_stmts {
         match stmt {
             HSharpStmt::Impl(struct_name, methods) => {
                 for m in methods {
-                    if let HSharpStmt::FunctionDef(fn_name, params, ret, body_opt) = m {
+                    if let HSharpStmt::FunctionDef(fn_name, params, ret, body_opt, _) = m {
                         let mangled = format!("{}_{}", struct_name, fn_name);
-                        flattened_stmts.push(HSharpStmt::FunctionDef(mangled, params.clone(), ret.clone(), body_opt.clone()));
+                        flattened_stmts.push(HSharpStmt::FunctionDef(mangled, params.clone(), ret.clone(), body_opt.clone(), false));
                     }
                 }
             },
             _ => flattened_stmts.push(stmt.clone())
         }
     }
-    // Declaration Pass
+
     for stmt in &flattened_stmts {
-        if let HSharpStmt::FunctionDef(name, params, ret, body_opt) = stmt {
-            let param_tys = params.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
-            func_types.insert(name.clone(), (param_tys.clone(), ret.clone()));
+        if let HSharpStmt::FunctionDef(name, params, ret, body_opt, _) = stmt {
+            let param_tys: Vec<HType> = params.iter().map(|(_, t)| t.clone()).collect();
+
+            func_types.insert(name.clone(), FuncSig {
+                params: params.clone(),
+                              ret: ret.clone(),
+                              is_async: false,
+                              is_extern: body_opt.is_none(),
+                              variadic: false,
+            });
+
             let mut sig = module.make_signature();
             for pty in &param_tys {
                 let cl_ty = pty.param_type();
@@ -453,9 +475,9 @@ pub fn compile_program(
             func_sigs.insert(name.clone(), sig);
         }
     }
-    // Compilation Pass
+
     for stmt in &flattened_stmts {
-        if let HSharpStmt::FunctionDef(name, params, ret, body_opt) = stmt {
+        if let HSharpStmt::FunctionDef(name, params, ret, body_opt, _) = stmt {
             if let Some(body) = body_opt {
                 let mut codegen_ctx = cranelift::codegen::Context::new();
                 codegen_ctx.func.signature = func_sigs.get(name).unwrap().clone();
@@ -468,10 +490,10 @@ pub fn compile_program(
                 let mut vars: Vec<HashMap<String, Value>> = vec![HashMap::new()];
                 let mut type_env: Vec<HashMap<String, HType>> = vec![HashMap::new()];
                 for (i, (pname, pty)) in params.iter().enumerate() {
-                    if pty.param_type() == cl_types::INVALID { continue; }
+                    let cl_ty_param = pty.param_type();
+                    if cl_ty_param == cl_types::INVALID { continue; }
                     let param_repr = builder.block_params(entry_block)[i];
                     let is_aggregate = !pty.is_value_type() || matches!(pty, HType::Slice(_));
-                    // Note: pty here is already instantiated (e.g. List_I32), so size() works
                     let size = pty.size(&type_map);
                     let align = pty.alignment(&type_map);
                     let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
