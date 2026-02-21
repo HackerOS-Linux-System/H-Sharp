@@ -1,5 +1,5 @@
-use crate::ast::HType;
-use cranelift::prelude::types as cl_types; // Alias to avoid conflict with module name
+pub use crate::ast::HType;
+use cranelift::prelude::types as cl_types;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -20,13 +20,12 @@ impl HTypeExt for HType {
     fn size(&self, type_map: &HashMap<String, StructOrUnion>) -> u32 {
         match self {
             HType::I8 | HType::U8 | HType::Bool => 1,
-            HType::I16 | HType::U16 => 2,
+            HType::U16 => 2,
             HType::I32 | HType::U32 | HType::F32 => 4,
             HType::I64 | HType::U64 | HType::F64 | HType::Pointer(_) => 8,
             HType::Slice(_) => 16, // Ptr(8) + Len(8)
             HType::Unit => 0,
             HType::Array(inner, len) => inner.size(type_map) * *len as u32,
-            // FIX: Ignore generic args vector with `_`, we rely on the mangled name in type_map
             HType::Struct(name, _) | HType::Union(name) => type_map
             .get(name)
             .map(|s| s.calculate_size(type_map))
@@ -35,18 +34,18 @@ impl HTypeExt for HType {
                 "Generic type '{}' should have been monomorphized before size calculation! Compiler Error.",
                 g
             ),
+            _ => 0,
         }
     }
 
     fn alignment(&self, type_map: &HashMap<String, StructOrUnion>) -> u32 {
         match self {
             HType::I8 | HType::U8 | HType::Bool => 1,
-            HType::I16 | HType::U16 => 2,
+            HType::U16 => 2,
             HType::I32 | HType::U32 | HType::F32 => 4,
             HType::I64 | HType::U64 | HType::F64 | HType::Pointer(_) | HType::Slice(_) => 8,
             HType::Unit => 1,
             HType::Array(inner, _) => inner.alignment(type_map),
-            // FIX: Ignore generic args vector with `_`
             HType::Struct(name, _) | HType::Union(name) => type_map
             .get(name)
             .map(|s| s.calculate_alignment(type_map))
@@ -55,13 +54,14 @@ impl HTypeExt for HType {
                 "Generic type '{}' should have been monomorphized before alignment calculation! Compiler Error.",
                 g
             ),
+            _ => 1,
         }
     }
 
     fn cl_type(&self) -> cl_types::Type {
         match self {
             HType::I8 | HType::U8 | HType::Bool => cl_types::I8,
-            HType::I16 | HType::U16 => cl_types::I16,
+            HType::U16 => cl_types::I16,
             HType::I32 | HType::U32 => cl_types::I32,
             HType::I64 | HType::U64 => cl_types::I64,
             HType::F32 => cl_types::F32,
