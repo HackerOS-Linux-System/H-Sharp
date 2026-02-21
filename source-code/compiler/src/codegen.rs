@@ -1,9 +1,9 @@
 use crate::ast::*;
-use crate::typechecker::TypeChecker;
+use crate::typechecker::{TypeChecker, FuncSig};
 use crate::types::{StructOrUnion, HTypeExt};
 use anyhow::Result;
 use cranelift::prelude::*;
-use cranelift::prelude::types as cl_types; // Alias for cranelift types
+use cranelift::prelude::types as cl_types;
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::ObjectModule;
@@ -23,7 +23,7 @@ pub struct CompilerState<'a> {
     pub type_env: &'a mut Vec<HashMap<String, HType>>,
     pub string_constants: &'a mut HashMap<String, DataId>,
     pub func_ids: &'a HashMap<String, FuncId>,
-    pub func_types: &'a HashMap<String, (Vec<HType>, HType)>,
+    pub func_types: &'a HashMap<String, FuncSig>,
     pub type_map: &'a HashMap<String, StructOrUnion>,
     pub arena: Value,
     pub in_direct: bool,
@@ -73,8 +73,8 @@ fn compile_lvalue(
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Undefined variable: {}", name))
         },
-        HSharpExpr::Deref(inner) => {
-            // *ptr = val. The address is the value of 'ptr' expression.
+        // Deref (*ptr = val). The address is the value of 'ptr' expression.
+        HSharpExpr::Unary(UnaryOp::Deref, inner) => {
             compile_expr(builder, module, state, inner, loop_ctx)
         },
         HSharpExpr::Field(inner, field_name) => {
@@ -102,14 +102,14 @@ fn compile_lvalue(
                         let len = builder.ins().load(cl_types::I64, MemFlags::trusted(), base_addr, 8);
                         let idx_i64 = builder.ins().sextend(cl_types::I64, idx_val); // Ensure comparison in I64
                         let out_of_bounds = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx_i64, len);
-                        builder.ins().trapnz(out_of_bounds, TrapCode::User(1));
+                        builder.ins().trapnz(out_of_bounds, TrapCode::user(1).unwrap());
                     },
                     HType::Array(_, size) => {
                         // Static array: len is constant known at compile time
                         let len = builder.ins().iconst(cl_types::I64, *size as i64);
                         let idx_i64 = builder.ins().sextend(cl_types::I64, idx_val);
                         let out_of_bounds = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, idx_i64, len);
-                        builder.ins().trapnz(out_of_bounds, TrapCode::User(1));
+                        builder.ins().trapnz(out_of_bounds, TrapCode::user(1).unwrap());
                     },
                     _ => {} // Pointer - unchecked
                 }
@@ -229,7 +229,8 @@ pub fn compile_expr(
             HSharpLiteral::Int(n) => builder.ins().iconst(cl_types::I32, *n as i64),
                                        HSharpLiteral::Bool(b) => builder.ins().iconst(cl_types::I8, if *b { 1 } else { 0 }),
                                        HSharpLiteral::Float(f) => builder.ins().f64const(*f),
-                                       HSharpLiteral::String(s) => {
+                                       HSharpLiteral::Byte(b) => builder.ins().iconst(cl_types::I8, *b as i64),
+                                       HSharpLiteral::String(s) | HSharpLiteral::RawString(s) => {
                                            let data_id = if let Some(&id) = state.string_constants.get(s) { id } else {
                                                let name = format!("str_{}", state.string_constants.len());
                                                let mut desc = DataDescription::new();
@@ -334,13 +335,27 @@ pub fn compile_expr(
         HSharpExpr::Dealloc(_) => {
             Ok(builder.ins().iconst(cl_types::I32, 0))
         },
-        HSharpExpr::AddrOf(expr) => compile_lvalue(builder, module, state, expr, loop_ctx),
-        HSharpExpr::Deref(expr) => {
-            let ptr = compile_expr(builder, module, state, expr, loop_ctx)?;
-            if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
-                Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), ptr, 0))
-            } else {
-                Ok(ptr)
+        // Unary Ops: AddrOf(BitAnd), Deref(Mul), Neg(Sub), BitNot(Not)
+        HSharpExpr::Unary(op, inner) => {
+            match op {
+                UnaryOp::AddrOf => compile_lvalue(builder, module, state, inner, loop_ctx),
+                UnaryOp::Deref => {
+                    let ptr = compile_expr(builder, module, state, inner, loop_ctx)?;
+                    if ty.is_value_type() && !matches!(ty, HType::Slice(_)) && !matches!(ty, HType::Struct(_, _)) {
+                        Ok(builder.ins().load(ty.cl_type(), MemFlags::trusted(), ptr, 0))
+                    } else {
+                        Ok(ptr)
+                    }
+                },
+                UnaryOp::Neg => {
+                    let v = compile_expr(builder, module, state, inner, loop_ctx)?;
+                    Ok(builder.ins().ineg(v))
+                },
+                UnaryOp::BitNot => {
+                    // Assuming BitNot or BoolNot depending on type.
+                    let v = compile_expr(builder, module, state, inner, loop_ctx)?;
+                    Ok(builder.ins().bnot(v))
+                }
             }
         },
         HSharpExpr::SizeOf(t) => {
@@ -642,15 +657,8 @@ pub fn compile_expr(
                     };
                     Ok(builder.ins().icmp(cc, l, r))
                 },
+                _ => Err(anyhow::anyhow!("Unsupported binary operator in codegen: {:?}", op))
             }
-        },
-        HSharpExpr::BitNot(inner) => {
-            let v = compile_expr(builder, module, state, inner, loop_ctx)?;
-            Ok(builder.ins().bnot(v))
-        },
-        HSharpExpr::Neg(inner) => {
-            let v = compile_expr(builder, module, state, inner, loop_ctx)?;
-            Ok(builder.ins().ineg(v))
         },
         HSharpExpr::Block(stmts) => {
             state.vars.push(HashMap::new()); state.type_env.push(HashMap::new());
@@ -754,36 +762,6 @@ pub fn compile_expr(
                     let sz = builder.ins().iconst(cl_types::I64, elem_size as i64);
                     let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
                     builder.ins().call(memcpy, &[addr, val, sz]);
-                }
-            }
-            Ok(base_addr)
-        },
-        // Assuming HSharpExpr has a variant like Enum(name, option<Box<HSharpExpr>>)
-        HSharpExpr::Enum(name, payload) => {
-            let enum_ty = ty.clone();
-            let enum_name = match enum_ty {
-                HType::Enum(n) => n, // Assuming HType::Enum(String)
-                _ => return Err(anyhow::anyhow!("Enum type mismatch")),
-            };
-            let enum_def = state.type_map.get(&enum_name).ok_or_else(|| anyhow::anyhow!("Unknown enum: {}", enum_name))?;
-            let tag = enum_def.variant_index(name).ok_or_else(|| anyhow::anyhow!("Unknown variant: {}", name))?;
-            let size = enum_ty.size(state.type_map);
-            let align = enum_ty.alignment(state.type_map);
-            let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, align.ilog2() as u8));
-            let base_addr = builder.ins().stack_addr(cl_types::I64, slot, 0);
-            let tag_val = builder.ins().iconst(cl_types::I32, tag as i64);
-            builder.ins().store(MemFlags::trusted(), tag_val, base_addr, 0); // tag at offset 0
-            if let Some(p) = payload {
-                let payload_ty = get_expr_type(p, state)?;
-                let payload_val = compile_expr(builder, module, state, p, loop_ctx)?;
-                let payload_addr = builder.ins().iadd_imm(base_addr, 4); // payload after i32 tag
-                if payload_ty.is_value_type() && !matches!(payload_ty, HType::Slice(_)) && !matches!(payload_ty, HType::Struct(_, _)) {
-                    builder.ins().store(MemFlags::trusted(), payload_val, payload_addr, 0);
-                } else {
-                    let payload_size = payload_ty.size(state.type_map);
-                    let sz = builder.ins().iconst(cl_types::I64, payload_size as i64);
-                    let memcpy = module.declare_func_in_func(state.memcpy_id, builder.func);
-                    builder.ins().call(memcpy, &[payload_addr, payload_val, sz]);
                 }
             }
             Ok(base_addr)
