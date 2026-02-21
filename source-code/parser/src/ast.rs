@@ -20,7 +20,7 @@ pub enum HSharpOp {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
-    Neg, BitNot, Deref, AddrOf
+    Neg, BitNot, Deref, AddrOf,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -71,7 +71,6 @@ pub enum HSharpExpr {
     Cast(HType, Box<HSharpExpr>),
     SizeOf(HType),
     StructLit(String, Vec<HSharpExpr>),
-    // Enum/Union literal: EnumName, VariantName, Args
     EnumLit(String, String, Vec<HSharpExpr>),
     ArrayLit(Vec<HSharpExpr>),
     Field(Box<HSharpExpr>, String),
@@ -96,14 +95,14 @@ pub enum EnumVariant {
 pub enum HSharpStmt {
     Let(String, Option<HType>, HSharpExpr),
     Expr(HSharpExpr),
-    FunctionDef(String, Vec<(String, HType)>, HType, Option<Box<HSharpExpr>>, bool), // Added is_async bool
+    FunctionDef(String, Vec<(String, HType)>, HType, Option<Box<HSharpExpr>>, bool),
     StructDef(String, Vec<String>, Vec<(String, HType)>),
     UnionDef(String, Vec<(String, HType)>),
     Impl(String, Vec<HSharpStmt>),
     Import(String, Vec<RequireItem>),
     ConstDef(String, HType, HSharpExpr),
     TypeAlias(String, HType),
-    EnumDef(String, Vec<(String, EnumVariant)>), // Variant name + Variant Type
+    EnumDef(String, Vec<(String, EnumVariant)>),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
