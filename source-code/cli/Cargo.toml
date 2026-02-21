@@ -1,6 +1,6 @@
 [package]
 name = "h-sharp"
-version = "0.1.0"
+version = "0.0.3"
 edition = "2021"
 
 [dependencies]
@@ -22,3 +22,4 @@ console = "0.15.8"
 ratatui = "0.26.1"
 crossterm = "0.27.0"
 mimalloc = { version = "0.1", default-features = false }
+
