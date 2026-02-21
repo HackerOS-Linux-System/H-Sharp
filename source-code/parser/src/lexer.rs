@@ -1,12 +1,13 @@
 use chumsky::prelude::*;
 use chumsky::text;
 use std::hash::{Hash, Hasher};
+
 #[derive(Clone, Debug)]
 pub enum Token {
-    Num(i64), // Basic number without suffix
-    TypedNum(i64, String), // Number with type suffix like u8, i64
-    Float(f64), // Basic float without suffix
-    TypedFloat(f64, String),// Float with suffix like f32, f64
+    Num(i64),
+    TypedNum(i64, String),
+    Float(f64),
+    TypedFloat(f64, String),
     Ident(String),
     Let,
     Direct,
@@ -18,7 +19,7 @@ pub enum Token {
     I8Type,
     I32Type,
     I64Type,
-    U8Type, // Added unsigned
+    U8Type,
     U16Type,
     U32Type,
     U64Type,
@@ -63,7 +64,7 @@ pub enum Token {
     LBracket,
     RBracket,
     As,
-    String(String),
+    Str(String),   // renamed from String to avoid collision
     Comma,
     Struct,
     Union,
@@ -72,50 +73,51 @@ pub enum Token {
     Dot,
     Ellipsis,
     DoubleArrow,
-    BitOr, // |
-    BitXor, // ^
-    BitNot, // ~
-    Shl, // <<
-    Shr, // >>
-    PlusEq, // +=
-    MinusEq, // -=
-    MulEq, // *=
-    DivEq, // /=
-    ModEq, // %=
-    AndEq, // &=
-    OrEq, // |=
-    XorEq, // ^=
-    ShlEq, // <<=
-    ShrEq, // >>=
-    DotDot, // ..
-    DotDotEq, // ..=
-    Question, // ?
-    Enum, // Added for enum
-    Const, // Added for constants
-    Type, // Added for type alias
-    Async, // Added for async
-    Await, // Added for await
-    ByteChar(u8), // b'A'
-    RawString(String), // r"..."
-    MultilineString(String), // """..."""
-    HexString(Vec<u8>), // x"DEADBEEF"
-    ByteString(Vec<u8>), // b"hello"
-    ColonColon, // ::
-    Bang, // !
-    At, // @
-    Hash, // #
-    Tilde, // ~
-    Attribute(String), // #[inline]
+    BitOr,
+    BitXor,
+    BitNot,
+    Shl,
+    Shr,
+    PlusEq,
+    MinusEq,
+    MulEq,
+    DivEq,
+    ModEq,
+    AndEq,
+    OrEq,
+    XorEq,
+    ShlEq,
+    ShrEq,
+    DotDot,
+    DotDotEq,
+    Question,
+    Enum,
+    Const,
+    Type,
+    Async,
+    Await,
+    ByteChar(u8),
+    RawString(String),
+    MultilineString(String),
+    HexString(Vec<u8>),
+    ByteString(Vec<u8>),
+    ColonColon,
+    Bang,
+    At,
+    Hash,
+    Tilde,
+    Attribute(String),
 }
+
 impl PartialEq for Token {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Token::Num(a), Token::Num(b)) => a == b,
-            (Token::TypedNum(a, sa), Token::TypedNum(b, sb) ) => a == b && sa == sb,
+            (Token::TypedNum(a, sa), Token::TypedNum(b, sb)) => a == b && sa == sb,
             (Token::Float(a), Token::Float(b)) => a.to_bits() == b.to_bits(),
             (Token::TypedFloat(a, sa), Token::TypedFloat(b, sb)) => a.to_bits() == b.to_bits() && sa == sb,
             (Token::Ident(a), Token::Ident(b)) => a == b,
-            (Token::String(a), Token::String(b)) => a == b,
+            (Token::Str(a), Token::Str(b)) => a == b,
             (Token::RawString(a), Token::RawString(b)) => a == b,
             (Token::MultilineString(a), Token::MultilineString(b)) => a == b,
             (Token::HexString(a), Token::HexString(b)) => a == b,
@@ -126,17 +128,19 @@ impl PartialEq for Token {
         }
     }
 }
+
 impl Eq for Token {}
+
 impl Hash for Token {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
             Token::Num(i) => i.hash(state),
-            Token::TypedNum(i, s) => { i.hash(state); s.hash(state); },
+            Token::TypedNum(i, s) => { i.hash(state); s.hash(state); }
             Token::Float(f) => f.to_bits().hash(state),
-            Token::TypedFloat(f, s) => { f.to_bits().hash(state); s.hash(state); },
+            Token::TypedFloat(f, s) => { f.to_bits().hash(state); s.hash(state); }
             Token::Ident(s) => s.hash(state),
-            Token::String(s) => s.hash(state),
+            Token::Str(s) => s.hash(state),
             Token::RawString(s) => s.hash(state),
             Token::MultilineString(s) => s.hash(state),
             Token::HexString(v) => v.hash(state),
@@ -147,6 +151,7 @@ impl Hash for Token {
         }
     }
 }
+
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -155,11 +160,11 @@ impl std::fmt::Display for Token {
             Token::Float(n) => write!(f, "{}", n),
             Token::TypedFloat(n, s) => write!(f, "{}{}", n, s),
             Token::Ident(s) => write!(f, "{}", s),
-            Token::String(s) => write!(f, "{:?}", s),
+            Token::Str(s) => write!(f, "{:?}", s),
             Token::RawString(s) => write!(f, "r{:?}", s),
             Token::MultilineString(s) => write!(f, "\"\"\"{}\"\"\"", s),
-            Token::HexString(v) => write!(f, "x\"{:?}\"", v.iter().map(|b| format!("{:02X}", b)).collect::<String>()),
-            Token::ByteString(v) => write!(f, "b\"{:?}\"", v.iter().map(|b| format!("{:02X}", b)).collect::<String>()),
+            Token::HexString(v) => write!(f, "x\"{}\"", v.iter().map(|b| format!("{:02X}", b)).collect::<String>()),
+            Token::ByteString(v) => write!(f, "b\"{}\"", v.iter().map(|b| format!("{:02X}", b)).collect::<String>()),
             Token::ByteChar(b) => write!(f, "b'{}'", *b as char),
             Token::Attribute(s) => write!(f, "#[{}]", s),
             Token::Ellipsis => write!(f, "..."),
@@ -167,72 +172,67 @@ impl std::fmt::Display for Token {
         }
     }
 }
+
 pub type Span = std::ops::Range<usize>;
+
 pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
-    // Helper for digits with underscores
-    let digit_with_underscore = filter(|c: &char| c.is_digit(10) || *c == '_').repeated();
     // Decimal number
-    let decimal = text::digits(10)
-    .then(digit_with_underscore)
-    .map(|(first, rest)| first + &rest.into_iter().collect::<String>())
-    .try_map(|s: String, span| s.replace("_", "").parse::<i64>().map_err(|e| Simple::custom(span, e.to_string())));
+    let decimal = text::int(10)
+    .try_map(|s: String, span| {
+        s.replace('_', "").parse::<i64>().map_err(|e| Simple::custom(span, e.to_string()))
+    });
+
     // Hex number: 0x...
     let hex = just("0x")
     .ignore_then(
         filter(|c: &char| matches!(*c, '0'..='9' | 'a'..='f' | 'A'..='F' | '_'))
         .repeated()
-        .at_least(1)
+        .at_least(1),
     )
-    .map(|digits: Vec<char>|
-    digits.into_iter()
-    .filter(|c| *c != '_')
-    .collect::<String>()
-    )
-    .try_map(|s, span|
-    i64::from_str_radix(&s, 16)
-    .map_err(|e| Simple::custom(span, e.to_string()))
-    );
+    .map(|digits: Vec<char>| digits.into_iter().filter(|c| *c != '_').collect::<String>())
+    .try_map(|s, span| {
+        i64::from_str_radix(&s, 16).map_err(|e| Simple::custom(span, e.to_string()))
+    });
+
     // Binary number: 0b...
     let binary = just("0b")
     .ignore_then(
         filter(|c: &char| matches!(*c, '0' | '1' | '_'))
         .repeated()
-        .at_least(1)
+        .at_least(1),
     )
-    .map(|digits: Vec<char>|
-    digits.into_iter()
-    .filter(|c| *c != '_')
-    .collect::<String>()
-    )
-    .try_map(|s, span|
-    i64::from_str_radix(&s, 2)
-    .map_err(|e| Simple::custom(span, e.to_string()))
-    );
+    .map(|digits: Vec<char>| digits.into_iter().filter(|c| *c != '_').collect::<String>())
+    .try_map(|s, span| {
+        i64::from_str_radix(&s, 2).map_err(|e| Simple::custom(span, e.to_string()))
+    });
+
     // Octal number: 0o...
     let octal = just("0o")
     .ignore_then(
         filter(|c: &char| matches!(*c, '0'..='7' | '_'))
         .repeated()
-        .at_least(1)
+        .at_least(1),
     )
-    .map(|digits: Vec<char>|
-    digits.into_iter()
-    .filter(|c| *c != '_')
-    .collect::<String>()
-    )
-    .try_map(|s, span|
-    i64::from_str_radix(&s, 8)
-    .map_err(|e| Simple::custom(span, e.to_string()))
-    );
-    // Type suffix for integers: u8, u16, u32, u64, i8, i32, i64
-    let type_suffix = choice((
-        just('u').then(text::digits(10)).map(|(prefix, digits)| format!("{}{}", prefix, digits)),
-                              just('i').then(text::digits(10)).map(|(prefix, digits)| format!("{}{}", prefix, digits)),
+    .map(|digits: Vec<char>| digits.into_iter().filter(|c| *c != '_').collect::<String>())
+    .try_map(|s, span| {
+        i64::from_str_radix(&s, 8).map_err(|e| Simple::custom(span, e.to_string()))
+    });
+
+    // Type suffix for integers
+    let int_type_suffix = choice((
+        just("u8").to("u8".to_string()),
+                                  just("u16").to("u16".to_string()),
+                                  just("u32").to("u32".to_string()),
+                                  just("u64").to("u64".to_string()),
+                                  just("i8").to("i8".to_string()),
+                                  just("i32").to("i32".to_string()),
+                                  just("i64").to("i64".to_string()),
     ))
     .or_not();
-    // Number with optional suffix
+
+    // Number with optional suffix — hex/binary/octal before decimal to avoid prefix clash
     let num_with_suffix = choice((hex, binary, octal, decimal))
-    .then(type_suffix)
+    .then(int_type_suffix)
     .map(|(val, suffix)| {
         if let Some(s) = suffix {
             Token::TypedNum(val, s)
@@ -240,26 +240,23 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
             Token::Num(val)
         }
     });
-    // Float: optional integer part, decimal part, with underscores
+
+    // Float: integer.fraction
     let float = text::int(10)
     .then_ignore(just('.'))
     .then(text::digits(10))
-    .then(
-        filter(|c: &char| c.is_digit(10) || *c == '_')
-        .repeated()
-    )
-    .map(|((int, frac), extra)| {
-        int + "." + &frac + &extra.into_iter().collect::<String>()
-    })
+    .map(|(int, frac): (String, String)| format!("{}.{}", int, frac))
     .try_map(|s: String, span| {
-        s.replace("_", "").parse::<f64>().map_err(|e| Simple::custom(span, e.to_string()))
+        s.parse::<f64>().map_err(|e| Simple::custom(span, e.to_string()))
     });
-    // Float suffix: f32 or f64
-    let float_suffix = just('f')
-    .then(text::digits(10))
-    .map(|(_, d)| format!("f{}", d))
+
+    // Float suffix
+    let float_suffix = choice((
+        just("f32").to("f32".to_string()),
+                               just("f64").to("f64".to_string()),
+    ))
     .or_not();
-    // Float with optional suffix
+
     let float_with_suffix = float
     .then(float_suffix)
     .map(|(val, suffix)| {
@@ -269,9 +266,11 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
             Token::Float(val)
         }
     });
+
     // Ident
     let ident = text::ident().map(Token::Ident);
-    // Keywords
+
+    // Keywords — must come before ident
     let kw1a = choice((
         text::keyword("let").to(Token::Let),
                        text::keyword("direct").to(Token::Direct),
@@ -304,7 +303,6 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
                        text::keyword("async").to(Token::Async),
                        text::keyword("await").to(Token::Await),
     ));
-    let kw1 = kw1a.or(kw1b).or(kw1c);
     let kw2a = choice((
         text::keyword("while").to(Token::While),
                        text::keyword("else").to(Token::Else),
@@ -323,9 +321,9 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
                        text::keyword("for").to(Token::For),
                        text::keyword("return").to(Token::Return),
     ));
-    let kw2 = kw2a.or(kw2b);
-    let kw = kw1.or(kw2);
-    // Operators and symbols
+    let kw = kw1a.or(kw1b).or(kw1c).or(kw2a).or(kw2b);
+
+    // Operators (longer first to avoid prefix ambiguity)
     let op_group1 = choice((
         just("::").to(Token::ColonColon),
                             just("=>").to(Token::DoubleArrow),
@@ -387,7 +385,8 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
                             just('?').to(Token::Question),
     ));
     let op = op_group1.or(op_group2).or(op_group3).or(op_group4).or(op_group5);
-    // Escape sequences in strings
+
+    // Escape sequences
     let escape = just('\\').ignore_then(choice((
         just('n').to('\n'),
                                                 just('t').to('\t'),
@@ -399,7 +398,7 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
                                                 .ignore_then(
                                                     filter(|c: &char| c.is_ascii_hexdigit())
                                                     .repeated()
-                                                    .exactly(2)
+                                                    .exactly(2),
                                                 )
                                                 .map(|hex: Vec<char>| {
                                                     let s: String = hex.into_iter().collect();
@@ -409,7 +408,7 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
                                                 .ignore_then(
                                                     filter(|c: &char| c.is_ascii_hexdigit())
                                                     .repeated()
-                                                    .exactly(4)
+                                                    .exactly(4),
                                                 )
                                                 .map(|hex: Vec<char>| {
                                                     let s: String = hex.into_iter().collect();
@@ -419,111 +418,103 @@ pub fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
                                                 .ignore_then(
                                                     filter(|c: &char| c.is_ascii_hexdigit())
                                                     .repeated()
-                                                    .exactly(8)
+                                                    .exactly(8),
                                                 )
                                                 .map(|hex: Vec<char>| {
                                                     let s: String = hex.into_iter().collect();
                                                     char::from_u32(u32::from_str_radix(&s, 16).unwrap_or(0)).unwrap_or('\u{FFFD}')
                                                 }),
     )));
+
     // String with escapes
-    let string_char = filter(|c| *c != '"' && *c != '\\').or(escape);
+    let string_char = filter(|c: &char| *c != '"' && *c != '\\').or(escape.clone());
     let string = just('"')
     .ignore_then(string_char.repeated())
     .then_ignore(just('"'))
-    .map(|chars: Vec<char>| Token::String(chars.into_iter().collect::<String>()));
+    .map(|chars: Vec<char>| Token::Str(chars.into_iter().collect()));
+
     // Raw string: r"..."
-    let raw_string = just('r').ignore_then(just('"'))
-    .ignore_then(filter(|c| *c != '"').repeated())
+    let raw_string = just("r\"")
+    .ignore_then(filter(|c: &char| *c != '"').repeated())
     .then_ignore(just('"'))
-    .map(|chars: Vec<char>| Token::RawString(chars.into_iter().collect::<String>()));
+    .map(|chars: Vec<char>| Token::RawString(chars.into_iter().collect()));
+
     // Byte char: b'A'
-    let byte_char = just('b').ignore_then(just('\''))
-    .ignore_then(filter(|c| *c != '\'').map(|c| c as u8))
+    let byte_char = just("b'")
+    .ignore_then(filter(|c: &char| *c != '\'').map(|c| c as u8))
     .then_ignore(just('\''))
     .map(Token::ByteChar);
-    // Multiline string: """..."""
+
+    // Multiline string: """..."""  — use take_until to match closing """
     let multiline_string = just("\"\"\"")
-    .ignore_then(
-        none_of("\"\"\"").repeated()
-    )
-    .then_ignore(just("\"\"\""))
-    .map(|chars: Vec<char>| Token::MultilineString(chars.into_iter().collect::<String>()));
+    .ignore_then(take_until(just("\"\"\"")))
+    .map(|(chars, _): (Vec<char>, _)| Token::MultilineString(chars.into_iter().collect()));
+
     // Hex string: x"DEADBEEF"
-    let hex_string = just('x')
-    .ignore_then(just('"'))
+    let hex_string = just("x\"")
     .ignore_then(
-        filter(|c: &char| c.is_ascii_hexdigit() || c.is_whitespace())
-        .repeated()
+        filter(|c: &char| c.is_ascii_hexdigit() || c.is_whitespace()).repeated(),
     )
     .then_ignore(just('"'))
-    .try_map(|chars: Vec<char>, span: std::ops::Range<usize>| {
-        let s: String = chars.into_iter()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    .try_map(|chars: Vec<char>, span: Span| {
+        let s: String = chars.into_iter().filter(|c| !c.is_whitespace()).collect();
         if s.len() % 2 != 0 {
             return Err(Simple::custom(span, "Odd hex string length"));
         }
         (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i+2], 16)
-        .map_err(|e| Simple::custom(span.clone(), e.to_string())))
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+            .map_err(|e| Simple::custom(span.clone(), e.to_string()))
+        })
         .collect::<Result<Vec<u8>, _>>()
         .map(Token::HexString)
     });
+
     // Byte string: b"hello"
-    let byte_string = just('b')
-    .ignore_then(just('"'))
-    .ignore_then(filter(|c| *c != '"').repeated())
+    let byte_string = just("b\"")
+    .ignore_then(filter(|c: &char| *c != '"').repeated())
     .then_ignore(just('"'))
-    .map(|chars: Vec<char>|
-    Token::ByteString(
-        chars.into_iter().map(|c| c as u8).collect()
-    )
-    );
+    .map(|chars: Vec<char>| Token::ByteString(chars.into_iter().map(|c| c as u8).collect()));
+
     // Attributes: #[inline]
-    let attribute = just('#')
-    .ignore_then(just('['))
-    .ignore_then(
-        filter(|c: &char| *c != ']').repeated()
-    )
+    let attribute = just("#[")
+    .ignore_then(filter(|c: &char| *c != ']').repeated())
     .then_ignore(just(']'))
-    .map(|chars: Vec<char>|
-    Token::Attribute(chars.into_iter().collect::<String>())
-    );
-    // Combined token parser with order
+    .map(|chars: Vec<char>| Token::Attribute(chars.into_iter().collect()));
+
+    // Token order matters: longer/more specific patterns first
     let token = multiline_string
     .or(hex_string)
     .or(byte_string)
     .or(raw_string)
     .or(byte_char)
-    .or(num_with_suffix)
     .or(float_with_suffix)
+    .or(num_with_suffix)
     .or(attribute)
     .or(kw)
     .or(ident)
     .or(op)
     .or(string);
-    // Comments: @ line and @* block *@
+
+    // Comments
     let line_comment = just('@')
-    .then(take_until(
-        just('\n').to(()).or(end())
-    ))
+    .then(take_until(just('\n').to(()).or(end())))
     .ignored();
-    let block_comment = just("@*")
-    .then(take_until(just("*@")))
-    .ignored();
-    let comment = block_comment.or(line_comment); // Block before line
+    let block_comment = just("@*").then(take_until(just("*@"))).ignored();
+    let comment = block_comment.or(line_comment);
+
     // Whitespace
     let whitespace = filter(|c: &char| c.is_whitespace())
     .repeated()
     .at_least(1)
     .ignored();
-    // Padding
+
     let padding = whitespace.or(comment).repeated();
+
     token
     .map_with_span(|tok, span| (tok, span))
-    .padded_by(padding.clone())
+    .padded_by(padding)
     .repeated()
     .then_ignore(end())
 }
