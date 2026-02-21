@@ -14,16 +14,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn parse_code(src: &str, filename: &str) -> Result<HSharpProgram> {
-    // Lexer
     let (tokens, lex_errs) = lexer().parse_recovery(src);
 
     if !lex_errs.is_empty() {
-        print_errors(src, filename, lex_errs.into_iter().map(|e| e.map(|c| c.to_string())).collect());
+        print_errors(
+            src,
+            filename,
+            lex_errs
+            .into_iter()
+            .map(|e| e.map(|c| c.to_string()))
+            .collect(),
+        );
         return Err(anyhow::anyhow!("Lexer failed"));
     }
     let tokens = tokens.unwrap();
 
-    // Parser
     let len = src.chars().count();
     let (program, parse_errs) = parser().parse_recovery(Stream::from_iter(
         len..len + 1,
@@ -41,14 +46,17 @@ pub fn parse_code(src: &str, filename: &str) -> Result<HSharpProgram> {
     Ok(program)
 }
 
-fn print_errors<T: std::fmt::Debug + std::fmt::Display + std::hash::Hash + std::cmp::Eq>(src: &str, filename: &str, errs: Vec<Simple<T>>) {
+fn print_errors<T>(src: &str, filename: &str, errs: Vec<Simple<T>>)
+where
+T: std::fmt::Debug + std::fmt::Display + std::hash::Hash + Eq,
+{
     for err in errs {
         let msg = if let Some(label) = err.label() {
             label.to_string()
         } else {
             match err.found() {
                 Some(f) => format!("Unexpected token '{}'", f),
-                None => "Unexpected end of file".to_string()
+                None => "Unexpected end of file".to_string(),
             }
         };
 
@@ -64,35 +72,29 @@ fn print_errors<T: std::fmt::Debug + std::fmt::Display + std::hash::Hash + std::
     }
 }
 
-// Funkcja pomocnicza do znajdowania ścieżki biblioteki
 fn find_library_path(lib_name: &str, mod_name: &str) -> Option<PathBuf> {
     let base_libs = Path::new("/usr/lib/h-sharp/libs");
 
-    // 1. Sprawdź bezpośrednio w libs (stary sposób / domyślny)
     let direct_path = base_libs.join(lib_name).join(format!("{}.h#", mod_name));
     if direct_path.exists() {
         return Some(direct_path);
     }
 
-    // 2. Sprawdź w envs (izolowane środowiska)
     let envs_path = base_libs.join("envs");
     if let Ok(entries) = fs::read_dir(envs_path) {
-        // Sortujemy, aby zachować determinizm (np. env przed env2)
-        let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
         paths.sort();
 
         for env_path in paths {
             if env_path.is_dir() {
-                // Sprawdź czy biblioteka jest bezpośrednio w env (np. env/lib.h#)
-                // lub w podkatalogu (env/lib/mod.h#) - w H# zazwyczaj biblioteka to plik .h#
-
-                // Przypadek A: Install wrzucił plik .h# bezpośrednio do env folderu
                 let direct_file = env_path.join(format!("{}.h#", lib_name));
                 if direct_file.exists() && mod_name == lib_name {
                     return Some(direct_file);
                 }
 
-                // Przypadek B: Struktura katalogowa
                 let sub_dir_file = env_path.join(lib_name).join(format!("{}.h#", mod_name));
                 if sub_dir_file.exists() {
                     return Some(sub_dir_file);
@@ -110,6 +112,7 @@ fn resolve_imports(
     _current_file: &str,
 ) -> Result<()> {
     let mut new_stmts = Vec::new();
+
     for stmt in program.stmts.drain(..) {
         if let HSharpStmt::Import(from, requires) = stmt {
             for require in requires {
@@ -118,9 +121,14 @@ fn resolve_imports(
                     RequireItem::Specific(m, s) => (m, Some(vec![s])),
                 };
 
-                // Używamy nowej logiki wyszukiwania
-                let file_path_buf = find_library_path(&from, &mod_name)
-                .ok_or_else(|| anyhow::anyhow!("Library not found: {}/{}. Please install it using 'h# install {}'", from, mod_name, from))?;
+                let file_path_buf = find_library_path(&from, &mod_name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Library not found: {}/{}. Please install it using 'h# install {}'",
+                        from,
+                        mod_name,
+                        from
+                    )
+                })?;
 
                 let file_path = file_path_buf.to_string_lossy().to_string();
 
@@ -129,20 +137,31 @@ fn resolve_imports(
                 }
                 visited.insert(file_path.clone());
 
-                let sub_src = fs::read_to_string(&file_path).unwrap_or_else(|_| String::new());
-                if sub_src.is_empty() { continue; }
+                let sub_src = fs::read_to_string(&file_path).unwrap_or_default();
+                if sub_src.is_empty() {
+                    continue;
+                }
 
                 let (tokens, _) = lexer().parse_recovery(sub_src.as_str());
                 if let Some(toks) = tokens {
                     let len = sub_src.chars().count();
-                    let (sub_prog, _) = parser().parse_recovery(Stream::from_iter(len..len+1, toks.into_iter()));
+                    let (sub_prog, _) = parser().parse_recovery(Stream::from_iter(
+                        len..len + 1,
+                        toks.into_iter(),
+                    ));
                     if let Some(mut sp) = sub_prog {
                         resolve_imports(&mut sp, visited, &file_path)?;
                         if let Some(symbols) = opt_symbols {
-                            let added = sp.stmts.into_iter().filter(|s| match s {
-                                HSharpStmt::FunctionDef(n, ..) | HSharpStmt::StructDef(n, ..) | HSharpStmt::UnionDef(n, ..) => symbols.contains(n),
-                                                                    _ => false
-                            }).collect::<Vec<_>>();
+                            let added = sp
+                            .stmts
+                            .into_iter()
+                            .filter(|s| match s {
+                                HSharpStmt::FunctionDef(n, ..)
+                                | HSharpStmt::StructDef(n, ..)
+                                | HSharpStmt::UnionDef(n, ..) => symbols.contains(n),
+                                    _ => false,
+                            })
+                            .collect::<Vec<_>>();
                             new_stmts.extend(added);
                         } else {
                             new_stmts.extend(sp.stmts);
@@ -154,6 +173,7 @@ fn resolve_imports(
             new_stmts.push(stmt);
         }
     }
+
     program.stmts = new_stmts;
     Ok(())
 }
