@@ -25,6 +25,7 @@ use wasmi::{Engine, Linker, Module, Store};
 use lexopt::prelude::*;
 use reqwest::blocking::get;
 use which::which;
+use h_sharp_compiler::compile_program;
 
 const H_SHARP_LIB_PATH: &str = "/usr/lib/h-sharp/libs";
 // URL Bazowy do plików .h# (pojedyncze pliki)
@@ -32,10 +33,8 @@ const OFFICIAL_REPO_RAW: &str = "https://raw.githubusercontent.com/HackerOS-Linu
 // URL Bazowy do katalogów (dla ghdir)
 const OFFICIAL_REPO_TREE: &str = "https://github.com/HackerOS-Linux-System/H-Sharp/tree/main/libs/add-ons";
 const COMMUNITY_REPO_URL: &str = "https://raw.githubusercontent.com/HackerOS-Linux-System/H-Sharp/main/libs/community/repo.hacker";
-
 // Wczytaj runtime.c jako stałą stringową podczas kompilacji
 const RUNTIME_C: &str = include_str!("runtime.c");
-
 // Funkcja do pobierania linkera na podstawie targetu
 fn get_linker(target: &str) -> (String, Vec<String>) {
     match target {
@@ -65,7 +64,6 @@ fn get_linker(target: &str) -> (String, Vec<String>) {
         _ => ("cc".into(), vec!["-static".into()]),
     }
 }
-
 // Helper to draw clean boxes around text
 fn print_boxed(title: &str, content: &str, color: &str) {
     let lines: Vec<&str> = content.lines().collect();
@@ -88,7 +86,6 @@ fn print_boxed(title: &str, content: &str, color: &str) {
     }
     println!("{}{}{}", bottom, h_line, bottom_right);
 }
-
 struct Args {
     subcommand: String,
     input: Option<String>,
@@ -98,7 +95,6 @@ struct Args {
     community: bool,
     target: String,
 }
-
 impl Default for Args {
     fn default() -> Self {
         Self {
@@ -112,7 +108,6 @@ impl Default for Args {
         }
     }
 }
-
 fn parse_args() -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
     let mut args = Args::default();
@@ -165,7 +160,6 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     }
     Ok(args)
 }
-
 fn print_help() {
     print_boxed(
         "H# CLI",
@@ -173,7 +167,6 @@ fn print_help() {
                 "cyan"
     );
 }
-
 fn main() -> Result<()> {
     let args = match parse_args() {
         Ok(a) => a,
@@ -223,7 +216,6 @@ fn main() -> Result<()> {
         }
     }
 }
-
 fn handle_compile(input: String, mut output: String, keep_temps: bool, target: &str) -> Result<()> {
     if target == "wasm" && output == "a.out" {
         output = "a.wasm".to_string();
@@ -248,7 +240,7 @@ fn handle_compile(input: String, mut output: String, keep_temps: bool, target: &
         Ok(_) => {}
         Err(e) => {
             pb.finish_and_clear();
-            return Err(e.context("Codegen failed"));
+            return Err(anyhow::Error::from(e).context("Codegen failed"));
         }
     }
     pb.set_message("Generating runtime...");
@@ -280,7 +272,6 @@ fn handle_compile(input: String, mut output: String, keep_temps: bool, target: &
     print_boxed("Success", &format!("Build successful!\nBinary: ./{}", output), "green");
     Ok(())
 }
-
 fn handle_install(library: String, is_community: bool) -> Result<()> {
     print_boxed("Installation", &format!("Library: {}\nSource: {}", library, if is_community { "Community Repo" } else { "Official Repo" }), "cyan");
     let base_path = Path::new(H_SHARP_LIB_PATH);
@@ -403,7 +394,6 @@ fn handle_install(library: String, is_community: bool) -> Result<()> {
     print_boxed("Installed", &format!("Add-on installed successfully (Directory mode).\nLocation: {}", final_dest_path.display()), "green");
     Ok(())
 }
-
 fn handle_remove(library: String) -> Result<()> {
     let base_path = Path::new(H_SHARP_LIB_PATH).join("envs");
     if !base_path.exists() {
@@ -435,7 +425,6 @@ fn handle_remove(library: String) -> Result<()> {
     }
     Ok(())
 }
-
 fn handle_search(library: String) -> Result<()> {
     let mut results = Vec::new();
     let base_path = Path::new(H_SHARP_LIB_PATH).join("envs");
@@ -494,7 +483,6 @@ fn handle_search(library: String) -> Result<()> {
     }
     Ok(())
 }
-
 fn run_search_tui<B: Backend>(
     terminal: &mut Terminal<B>,
     query: &str,
@@ -548,7 +536,6 @@ fn run_search_tui<B: Backend>(
         }
     }
 }
-
 fn handle_update(library: Option<String>) -> Result<()> {
     if let Some(lib) = library {
         print_boxed("Update", &format!("Updating {}...", lib), "yellow");
@@ -560,7 +547,6 @@ fn handle_update(library: Option<String>) -> Result<()> {
     print_boxed("Info", "Update functionality is not fully implemented yet.", "yellow");
     Ok(())
 }
-
 fn verify_wasm_environment() -> Result<()> {
     let engine = Engine::default();
     let wat = r#"(module)"#;
