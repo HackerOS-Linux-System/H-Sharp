@@ -1,0 +1,22 @@
+[package]
+name = "hsharp-compiler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+hsharp-parser = { path = "../parser" }
+cranelift = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-object = { workspace = true }
+cranelift-jit = { workspace = true }
+cranelift-native = { workspace = true }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+object = { workspace = true }
+target-lexicon = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap.workspace = true
