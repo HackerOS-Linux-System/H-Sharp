@@ -1,545 +1,88 @@
-! ═══════════════════════════════════════════════════════════════
-! showcase.hl — pełny program demonstracyjny hacker-lang
-! Pokazuje WSZYSTKIE dostępne konstrukcje języka w realnym
-! kontekście: system zarządzania zadaniami z API HTTP
-! ═══════════════════════════════════════════════════════════════
+! Przykładowy skrypt H# (.hl)
+! Wszystkie pliki .hl są automatycznie skryptami
 
-! ── Zależności systemowe ──────────────────────────────────────
+! ── Zależności systemowe ─────────────────────────────────────────
+! // sprawdza czy jest w PATH, jeśli nie - sudo apt install -y
 // curl
-// jq
-// sqlite3
+// git
+// wget
 
-! ── Biblioteki ───────────────────────────────────────────────
-# <core/http>
-# <core/json> use [parse, stringify]
-# <bytes/crypto> use [sha256, hmac]
-# <vira/tools> use [scan]
+! ── Zmienne ──────────────────────────────────────────────────────
+$projekt = "H#"
+$wersja = "0.1.0"
+$data = > date +%Y-%m-%d
 
-! ── Stałe globalne ────────────────────────────────────────────
-%VERSION = "1.0.0"
-%MAX_RETRIES = 3
-%DB_PATH = "/var/lib/tasks/tasks.db"
-%API_BASE = "https://api.tasks.local/v2"
+! ── Wyświetlanie ;; ──────────────────────────────────────────────
+;; "Projekt:" $projekt
+;; "Wersja:" $wersja
+;; "Data:" $data
 
-! ── Typy wyliczeniowe ─────────────────────────────────────────
-==Status [pending, active, done, failed, cancelled]
-==Priority [low, medium, high, critical]
-==Role [guest, user, admin, superadmin]
+! ── Komendy ──────────────────────────────────────────────────────
+> echo "Aktualizuję system..."
+> sudo apt update -qq
 
-! ── Typy algebraiczne (ADT) ───────────────────────────────────
-==type TaskResult [
-    Ok [task_id: str, status: str],
-    Err [code: int, message: str],
-    Retry [attempt: int, reason: str]
+! Ze zmiennymi skryptowymi jako ENV (UPPERCASE)
+>> echo "Buduję: $PROJEKT $WERSJA"
+
+! Izolowane środowisko (bez dziedziczenia env)
+>>> curl -s https://example.com/api/status
+
+! ── Pipe ─────────────────────────────────────────────────────────
+> ls /tmp | grep ".log" | wc -l
+
+! ── Warunek ? ────────────────────────────────────────────────────
+? $wersja == "0.1.0" [
+    ;; "Tryb development"
+    > echo "dev build"
+]
+?? [
+    ;; "Tryb produkcyjny"
 ]
 
-==type Shape [
-    Circle [radius: float],
-    Rect [w: float, h: float],
-    Triangle [base: float, height: float],
-    Point
+! Sprawdzenie kodu wyjścia
+> ls /nieistniejacy/katalog
+? $? == "0" [
+    ;; "OK"
+]
+?? [
+    ;; "Błąd - katalog nie istnieje"
 ]
 
-==type AuthToken [
-    Bearer [token: str, expires: int],
-    ApiKey [key: str],
-    None
+! ── Pętle @ ──────────────────────────────────────────────────────
+! Zakres liczb
+@ $i w 1..4 [
+    ;; "Krok:" $i
 ]
 
-! ── Struktury ─────────────────────────────────────────────────
-struct Task [id: str, title: str, priority: str, status: str, owner: str]
-struct User [id: str, name: str, email: str, role: str]
-struct ApiResponse [status: int, body: str, headers: str]
-
-! ── Interfejsy ────────────────────────────────────────────────
-==interface Serializable [to_json, from_json]
-==interface Validatable [validate, sanitize]
-==interface Repository [
-    find_by_id,
-    find_all,
-    save,
-    delete
+! Włącznie (1..=5 → 1 2 3 4 5)
+@ $n w 1..=3 [
+    >> echo "Liczba: $N"
 ]
 
-! ── Import modułu zewnętrznego ────────────────────────────────
-<< "lib/helpers.hl" in helpers
-<< "lib/validators.hl"
-
-! ── Kompilacja warunkowa ──────────────────────────────────────
-*{debug}
-log "tryb debug aktywny"
-*{end}
-
-*{arch: x86_64}
->> echo "architektura x86_64"
-*{end}
-
-*{os: linux}
-// systemctl
-*{end}
-
-! ═══════════════════════════════════════════════════════════════
-! MODUŁ: auth
-! ═══════════════════════════════════════════════════════════════
-=; auth def
-
-  ! ── Stałe modułu ──────────────────────────────────────────
-  %TOKEN_TTL = 3600
-  %SALT_ROUNDS = 12
-
-  ! ── Atrybut + prywatna funkcja pomocnicza ─────────────────
-  |] no_mangle
-  :_hash_password [str -> str] def
-    salt = "random_salt_here"
-    hash = crypto.sha256 "$1:$salt"
-    out $hash
-  done
-
-  ! ── Publiczna funkcja logowania ───────────────────────────
-  |] inline
-  pub :login [str str -> str] def
-    user = $1
-    pass = $2
-    hashed = .hash_password $pass
-    token = crypto.hmac "$user:$hashed"
-    log "login: $user"
-    out $token
-  done
-
-  ! ── Walidacja tokenu ──────────────────────────────────────
-  pub :validate_token [str -> bool] def
-    token = $1
-    ? $token == "" |> out false
-    result = http.get "$API_BASE/auth/verify?token=$token"
-    result ?! "błąd weryfikacji tokenu"
-    out true
-  done
-
-  ! ── Implementacja interfejsu ──────────────────────────────
-  ;;Token impl Serializable def
-    :to_json def
-      out "{\"token\": \"$1\"}"
-    done
-    :from_json def
-      data = $1
-      out $data
-    done
-  done
-
-=; done
-
-! ═══════════════════════════════════════════════════════════════
-! MODUŁ: net — zagnieżdżony
-! ═══════════════════════════════════════════════════════════════
-=; net def
-
-  =; http def
-
-    pub :get [str -> str] def
-      url = $1
-      response = http.get $url
-      out $response
-    done
-
-    pub :post [str str -> str] def
-      url = $1
-      body = $2
-      response = http.post $url $body
-      out $response
-    done
-
-    :_retry [str int -> str] def
-      url = $1
-      attempt = $2 [i32]
-      ? $attempt >= $MAX_RETRIES |> out "MAX_RETRIES_EXCEEDED"
-      result = http.get $url
-      try .get $url catch recur $url ($attempt + 1)
-    done
-
-  =; done
-
-  =; ws def
-
-    pub :connect [str -> str] def
-      endpoint = $1
-      handle = spawn >> wscat -c $endpoint
-      out $handle
-    done
-
-    pub :send [str str -> str] def
-      handle = $1
-      msg = $2
-      await >> echo $msg | wscat
-      out "sent"
-    done
-
-  =; done
-
-=; done
-
-! ═══════════════════════════════════════════════════════════════
-! KLASA: TaskManager
-! ═══════════════════════════════════════════════════════════════
-;;TaskManager def
-
-  ! ── Arena allocator dla dużych buforów zadań ──────────────
-  :: buffer [2mb] def
-  done
-
-  ! ── Implementacja repozytorium ────────────────────────────
-  ;;TaskManager impl Repository def
-
-    |] deprecated "użyj find_by_id_v2"
-    :find_by_id [str -> str] def
-      id = $1
-      row = sqlite3.query "SELECT * FROM tasks WHERE id=$id"
-      row ?! "nie znaleziono zadania: $id"
-      out $row
-    done
-
-    pub :find_by_id_v2 [str -> str] def
-      id = $1
-      cache_key = "task:$id"
-      cached = redis.get $cache_key
-      ? $cached != "" |> out $cached
-      row = sqlite3.query "SELECT * FROM tasks WHERE id=$id"
-      out $row
-    done
-
-    pub :find_all def
-      rows = sqlite3.query "SELECT * FROM tasks ORDER BY priority DESC"
-      out $rows
-    done
-
-    pub :save [str -> str] def
-      task_json = $1
-      result = sqlite3.exec "INSERT OR REPLACE INTO tasks VALUES(?)" $task_json
-      result ?! "błąd zapisu zadania"
-      out "ok"
-    done
-
-    pub :delete [str -> bool] def
-      id = $1
-      query = "DELETE FROM tasks WHERE id=$id"
-      sqlite3.exec $query
-      out true
-    done
-
-  done
-
-  ! ── Funkcja generyczna z constraint ───────────────────────
-  :serialize [T impl Serializable -> str] def
-    obj = $1
-    out $obj.to_json
-  done
-
-  ! ── Przetwarzanie wsadowe z potokiem ──────────────────────
-  pub :process_batch [str -> str] def
-    input = $1
-    .parse_input $input |> .validate_all |> .execute_all |> .report
-  done
-
-done
-
-! ═══════════════════════════════════════════════════════════════
-! FUNKCJE GLOBALNE
-! ═══════════════════════════════════════════════════════════════
-
-! ── Funkcja rekurencyjna (ogonowa) — silnia ────────────────────
-:factorial [int -> int] def
-  n = $1
-  acc = $2
-  ? $n <= 1 |> out $acc
-  recur ($n - 1) ($n * $acc)
-done
-
-! ── Fibonacci z rekurencją ogonową ────────────────────────────
-:fib [int int int -> int] def
-  n = $1
-  a = $2
-  b = $3
-  ? $n == 0 |> out $a
-  recur ($n - 1) $b ($a + $b)
-done
-
-! ── Funkcja z dopasowaniem ADT (fat arrow) ────────────────────
-:area [str -> float] def
-  shape = $1
-  match $shape =>
-    Circle [r] => out ($r * $r * 3.14159)
-    Rect [w, h] => out ($w * $h)
-    Triangle [base, height] => out ($base * $height * 0.5)
-    Point => out 0.0
-done
-
-! ── Funkcja z pattern matching (stary styl) ───────────────────
-:classify_priority [str -> str] def
-  p = $1
-  match $p |>
-    critical > out "NATYCHMIASTOWE"
-    high     > out "PILNE"
-    medium   > out "NORMALNE"
-    low      > out "ODŁOŻONE"
-done
-
-! ── Lambdy i funkcje wyższego rzędu ───────────────────────────
-:apply_all [str -> str] def
-  items = $1
-  double    = { $x -> $x * 2 }
-  to_upper  = { $s -> str.upper $s }
-  add_prefix = { $s -> "task_$s" }
-  result = list.map $items $double
-  out $result
-done
-
-! ── Destrukturyzacja ──────────────────────────────────────────
-:parse_user_data [str -> str] def
-  raw = $1
-  {name, email, role} = $raw
-  [head | tail] = $raw
-  log "user: $name"
-  out "$name:$email"
-done
-
-! ── Do-notacja (sekwencyjny blok) ─────────────────────────────
-:run_pipeline [str -> str] def
-  input = $1
-  result = do
-    validated = .validate $input
-    sanitized = .sanitize $validated
-    stored    = .save $sanitized
-    notified  = .notify $stored
-  done
-  out $result
-done
-
-! ── Try/catch ─────────────────────────────────────────────────
-:safe_fetch [str -> str] def
-  url = $1
-  try http.get $url catch out "FETCH_ERROR"
-done
-
-! ── Defer — sprzątanie zasobów ────────────────────────────────
-:with_db_connection [str -> str] def
-  query = $1
-  conn = db.open $DB_PATH
-  defer db.close $conn
-  result = db.exec $conn $query
-  out $result
-done
-
-! ── Async — spawn / await ─────────────────────────────────────
-:fetch_parallel [str str -> str] def
-  url_a = $1
-  url_b = $2
-  job_a = spawn http.get $url_a
-  job_b = spawn http.get $url_b
-  res_a = await $job_a
-  res_b = await $job_b
-  out "$res_a|$res_b"
-done
-
-! ── Lock / unlock (sekcja krytyczna) ──────────────────────────
-:update_counter [str -> int] def
-  key = $1
-  lock $counter = redis.get $key
-  new_val = $counter + 1
-  redis.set $key $new_val
-  unlock $counter
-  out $new_val
-done
-
-! ── Mutacje kolekcji ──────────────────────────────────────────
-:manage_queue [str -> str] def
-  task = $1
-  $queue.push $task
-  $seen.set $task true
-  first = $queue.get 0
-  $queue.pop
-  $cache.del "stale_key"
-  out $first
-done
-
-! ── Arena allocator — funkcja z własną pamięcią ───────────────
-:: image_processor [512kb] def
-  data = $1
-  >> convert $data -resize 800x600 output.jpg
-  out "processed"
-done
-
-! ── Zewnętrzne biblioteki C ───────────────────────────────────
--- /usr/lib/x86_64-linux-gnu/libsqlite3.so
--- static /usr/lib/x86_64-linux-gnu/libssl.a
--- /usr/lib/libcrypto.so use [SHA256, AES_encrypt, RAND_bytes]
-
-! ── Pluginy ───────────────────────────────────────────────────
-\\ notifier --silent
-\\ db-backup /var/backups/tasks
-
-! ── Blok zasięgu leksykalnego (;;scope) ───────────────────────
-;;scope def
-  temp_result = "tylko wewnątrz scope"
-  .print $temp_result
-done
-
-! ── Scope block =: (zmienne nie wyciekają) ────────────────────
-=:
-  local_x = 42
-  local_msg = "nie wyciekam na zewnątrz"
-  .print $local_msg
-=:
-
-! ── Wieloliniowy potok z | ────────────────────────────────────
-:transform_tasks [str -> str] def
-  source = $1
-  .fetch $source
-  | .filter_active
-  | .sort_by_priority
-  | .paginate 20
-  | .to_json
-done
-
-! ── Wynik z Result unwrap ?! ──────────────────────────────────
-:load_config [str -> str] def
-  path = $1
-  content = file.read $path ?! "nie można odczytać konfiguracji"
-  parsed = json.parse $content ?! "błędny format JSON"
-  out $parsed
-done
-
-! ── Wyrażenia arytmetyczne i logiczne ─────────────────────────
-:calculate_score [str -> int] def
-  base = 100 [i32]
-  multiplier = 1.5 [f64]
-  penalty = 10 [u8]
-  tasks_done = $1
-  bonus = $tasks_done * 5
-  total = $base + $bonus - $penalty
-  is_passing = $total >= 60
-  out $total
-done
-
-! ── Interpolacja stringów ─────────────────────────────────────
-:build_report [str -> str] def
-  user = $1
-  count = $2
-  ts = $3
-  msg = "Raport dla $user: $(count) zadań ukończonych o $(ts)"
-  summary = "użytkownik=$user wynik=$(count * 10) pkt"
-  out $msg
-done
-
-! ── Testy jednostkowe ─────────────────────────────────────────
-==test "factorial działa poprawnie" [
-  assert (factorial 0 1) == 1 "0! powinno być 1"
-  assert (factorial 5 1) == 120 "5! powinno być 120"
-  assert (factorial 10 1) == 3628800 "10! powinno być 3628800"
+! Po wyjściu komendy
+@ $plik w > ls /tmp [
+    ;; "Plik:" $plik
 ]
 
-==test "fib działa poprawnie" [
-  assert (fib 0 0 1) == 0 "fib(0) == 0"
-  assert (fib 1 0 1) == 1 "fib(1) == 1"
-  assert (fib 10 0 1) == 55 "fib(10) == 55"
+! ── Funkcje skryptowe ;fn / ;call ────────────────────────────────
+;fn powitaj $imie $wersja [
+    ;; "Cześć" $imie "- używasz H#" $wersja
 ]
 
-==test "area oblicza poprawnie" [
-  assert (area "Circle 5.0") == 78.53975 "pole koła r=5"
-  assert (area "Rect 4.0 3.0") == 12.0 "pole prostokąta 4x3"
-  assert (area "Point") == 0.0 "pole punktu == 0"
+;fn sprawdz_dep $pkg [
+    // $pkg
+    ;; $pkg "gotowy"
 ]
 
-==test "api auth działa" [
-  token = auth.login "admin" "secret"
-  assert $token != "" "token nie może być pusty"
-  valid = auth.validate_token $token
-  assert $valid == true "token powinien być ważny"
-]
+;call powitaj "Hacker" $wersja
+;call sprawdz_dep "jq"
+;call sprawdz_dep "build-essential"
 
-! ═══════════════════════════════════════════════════════════════
-! PROGRAM GŁÓWNY
-! ═══════════════════════════════════════════════════════════════
+! ── Przechwycenie wyjścia komendy ────────────────────────────────
+$hostname = > hostname
+$kernel = > uname -r
+;; "Host:" $hostname "| Kernel:" $kernel
 
-! ── Zmienne globalne (@) ──────────────────────────────────────
-@APP_NAME = "TaskManager"
-@DEBUG = false
-
-! ── Inicjalizacja aplikacji ───────────────────────────────────
-log "uruchamianie $APP_NAME v$VERSION"
-
-! ── Wieloliniowa mapa konfiguracji ────────────────────────────
-config = {
-  host: "localhost",
-  port: 8080,
-  db: "/var/lib/tasks/tasks.db",
-  log_level: "info"
-}
-
-! ── Wieloliniowa lista priorytetów ────────────────────────────
-priorities = [
-  "critical",
-  "high",
-  "medium",
-  "low"
-]
-
-! ── Przypisanie lambdy do zmiennej ────────────────────────────
-greet = { $name -> "Witaj, $name!" }
-is_admin = { $role -> $role == "admin" }
-format_task = { $id, $title -> "[$(id)] $(title)" }
-
-! ── Wywołania metod modułu ────────────────────────────────────
-raw_data = http.get "$API_BASE/tasks"
-parsed   = json.parse $raw_data
-token    = auth.login "admin" "haslo123"
-
-! ── Wywołanie metod z modułu net ──────────────────────────────
-response = net.http.get "$API_BASE/health"
-ws_conn  = net.ws.connect "wss://api.tasks.local/ws"
-
-! ── Instrukcje warunkowe ──────────────────────────────────────
-? $DEBUG == true |> log "debug: połączono z API"
-?? $token == "" |> log "błąd: brak tokenu"
-?: |> log "info: zalogowano poprawnie"
-
-! ── Pętle ─────────────────────────────────────────────────────
-= 3 |> .retry_connect
-
-for item in $priorities |> .print $item
-
-while $queue.get 0 != "" |> .process_next
-
-! ── Wywołanie w tle ───────────────────────────────────────────
-& .sync_remote_tasks
-
-! ── Izolowane wywołanie (nowe środowisko) ────────────────────
->>> sqlite3 $DB_PATH ".tables"
-
-! ── Raw shell bez substytucji ─────────────────────────────────
->> echo "wersja: $VERSION"
-
-! ── Explicit pipe/redirect ────────────────────────────────────
-|> .start_server
-
-! ── Wieloliniowa lista jako argument wywołania ────────────────
-.process_items [
-  "task-001",
-  "task-002",
-  "task-003"
-]
-
-! ── Obsługa błędów — try/catch ───────────────────────────────
-try db.connect $DB_PATH catch log "błąd połączenia z bazą"
-try json.parse $raw_data catch out "{}"
-
-! ── Sudo — operacje wymagające uprawnień ──────────────────────
-^>> systemctl restart tasks-api
-^.setup_firewall_rules
-
-! ── Import pliku ──────────────────────────────────────────────
-<< "config/production.hl"
-<< "migrations/001_init.hl" in migration
-
-! ── Zakończenie programu ──────────────────────────────────────
-log "inicjalizacja zakończona"
-out "ready"
-end 0
+! ── Zakończenie ──────────────────────────────────────────────────
+;; "Skrypt zakończony pomyślnie!"
+;exit 0
