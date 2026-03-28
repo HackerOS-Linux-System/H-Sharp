@@ -1,7 +1,64 @@
 [workspace]
 members = [
-    "source-code/hl-runtime",
-    "source-code/hl-plsa",
-    "source-code/hl-compiler",
+    "parser",
+    "compiler",
+    "scripting",
+    "cli",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "1.8.0"
+edition = "2021"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+license = "MIT"
+
+[workspace.dependencies]
+# Parsing
+logos = "0.14"
+chumsky = "0.9"
+ariadne = "0.4"
+
+# Codegen
+cranelift = "0.111"
+cranelift-module = "0.111"
+cranelift-object = "0.111"
+cranelift-jit = "0.111"
+cranelift-native = "0.111"
+cranelift-codegen = "0.111"
+cranelift-frontend = "0.111"
+object = "0.36"
+target-lexicon = "0.12"
+
+# CLI
+clap = { version = "4", features = ["derive", "color"] }
+colored = "2"
+indicatif = "0.17"
+dialoguer = "0.11"
+
+# .hk parser (Bytes index)
+hk-parser = "0.2.1"
+indexmap = "2"
+
+# Utils
+thiserror = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Networking (bytes package manager)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+tokio = { version = "1", features = ["full"] }
+
+# Scripting / shell
+shlex = "1"
+which = "6"
+walkdir = "2"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
