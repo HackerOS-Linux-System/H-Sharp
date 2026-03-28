@@ -1,0 +1,34 @@
+[package]
+name = "hsharp-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "h#"
+path = "src/main.rs"
+
+[[bin]]
+name = "hl"
+path = "src/hl.rs"
+
+[dependencies]
+hsharp-parser = { path = "../parser" }
+hsharp-compiler = { path = "../compiler" }
+hsharp-scripting = { path = "../scripting" }
+
+clap = { workspace = true }
+colored = { workspace = true }
+indicatif = { workspace = true }
+dialoguer = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+hk-parser = "0.2.1"
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+which = { workspace = true }
