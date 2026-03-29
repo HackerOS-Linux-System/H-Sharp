@@ -1,20 +1,11 @@
-*.hacker linguist-detectable=true
-*.hacker linguist-documentation=false
-*.hacker linguist-language=Hacker-Lang
+*.h# linguist-detectable=true
+*.h# linguist-documentation=false
+*.h# linguist-language=H#
 
-*.hk linguist-detectable=true
-*.hk linguist-documentation=false
-*.hk linguist-language=Hacker-Lang
+*.h-sharp linguist-detectable=true
+*.h-sharp linguist-documentation=false
+*.h-sharp linguist-language=H#
 
-
-*.hl linguist-detectable=true
-*.hl linguist-documentation=false
-*.hl linguist-language=Hacker-Lang
-
-*.hla linguist-detectable=true
-*.hla linguist-documentation=false
-*.hla linguist-language=Hacker-Lang
-
-*.io linguist-detectable=true
-*.io linguist-documentation=false
-*.io linguist-language=Hacker-Lang
+*.hsp linguist-detectable=true
+*.hsp linguist-documentation=false
+*.hsp linguist-language=H#
