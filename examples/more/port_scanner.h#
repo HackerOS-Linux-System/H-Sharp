@@ -1,0 +1,97 @@
+# H# Port Scanner Example
+# Demonstrates: loops, structs, functions, match, string ops
+#
+# Build: hsharp build --target linux-x86_64
+# Run:   hsharp preview examples/port_scanner.h#
+
+import "std:io::net"
+import "std:io::keyboard"
+import "std:time"
+
+struct ScanResult do
+    pub host: string
+    pub port: int
+    pub open: bool
+    pub banner: string
+end
+
+fn banner() do
+    println("╔══════════════════════════════╗")
+    println("║   H# Port Scanner  v0.1      ║")
+    println("╚══════════════════════════════╝")
+    println("")
+end
+
+fn scan_range(host: string, start_port: int, end_port: int) do
+    println("Scanning " + host + " ports " + to_string(start_port) + ".." + to_string(end_port))
+    println("")
+
+    let mut open_count: int = 0
+
+    for port in start_port..=end_port do
+        # In real impl this calls std:io::net::tcp::scan_port
+        # For demo we simulate some open ports
+        let open: bool = port == 22 || port == 80 || port == 443 || port == 8080
+
+        if open then do
+            open_count += 1
+            println("[OPEN]   " + to_string(port) + "/tcp")
+        end
+    end
+
+    println("")
+    println("Scan complete. " + to_string(open_count) + " port(s) open.")
+end
+
+fn classify_port(port: int) -> string do
+    match port do
+        21   => "FTP"
+        22   => "SSH"
+        23   => "Telnet"
+        25   => "SMTP"
+        53   => "DNS"
+        80   => "HTTP"
+        110  => "POP3"
+        143  => "IMAP"
+        443  => "HTTPS"
+        445  => "SMB"
+        3306 => "MySQL"
+        5432 => "PostgreSQL"
+        6379 => "Redis"
+        8080 => "HTTP-Alt"
+        _    => "Unknown"
+    end
+end
+
+fn hex_dump(data: bytes) do
+    println("Hex dump:")
+    println(data.to_hex())
+end
+
+fn main() do
+    banner()
+
+    let target: string = "192.168.1.1"
+    let start_p: int = 1
+    let end_p: int = 1024
+
+    println("Target: " + target)
+    println("")
+
+    scan_range(target, start_p, end_p)
+
+    println("")
+    println("Port classifications:")
+    println("  22  → " + classify_port(22))
+    println("  80  → " + classify_port(80))
+    println("  443 → " + classify_port(443))
+    println("  9999 → " + classify_port(9999))
+
+    println("")
+
+    # Demo: unsafe arena block for raw buffer processing
+    unsafe arena(65536) do
+        let raw: bytes = [0x48, 0x23, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF]
+        hex_dump(raw)
+    end
+end
