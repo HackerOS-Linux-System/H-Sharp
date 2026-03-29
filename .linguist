@@ -1,13 +1,14 @@
 ---
-language: Hacker Lang
+language: H-Sharp
 type: programming
 extensions:
-  - .hk
-  - .hacker
-  - .hl
-color: "#C82909"  # Jasnoszary
-tm_scope: source.hl
+  - .hsp
+  - .h-sharp
+  - .h#
+color: "#b81414"
+tm_scope: showcase.h#
 ace_mode: text
 group: Custom
 aliases:
-  - Hacker-Lang
+  - H-Sharp
+  - H#
