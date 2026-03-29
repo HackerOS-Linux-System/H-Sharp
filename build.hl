@@ -1,8 +1,3 @@
-// golang
-// python3.13
 // cargo
-// odin
 
 > cargo build --release
-! > cd source-code && cd virus && cargo build --release
-! ^^^^ build virus if you need
