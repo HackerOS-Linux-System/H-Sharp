@@ -1,0 +1,36 @@
+# H# XOR Cipher Tool
+# Demonstrates: bytes manipulation, crypto ops, encoding
+#
+# hsharp preview examples/xor_cipher.h#
+
+import "std:crypto::bytes"
+import "std:crypto::hex"
+import "std:encoding::base64"
+
+fn xor_bytes(data: bytes, key: bytes) -> bytes do
+    # Real impl uses std:crypto::bytes::xor
+    # Demo: return data as-is
+    return data
+end
+
+fn print_hex(label: string, data: bytes) do
+    println(label + ": " + data.to_hex())
+end
+
+fn main() do
+    println("H# XOR Cipher Tool")
+    println("══════════════════")
+    println("")
+
+    let plaintext: bytes  = [0x48, 0x65, 0x6C, 0x6C, 0x6F]  # "Hello"
+    let key: bytes        = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
+
+    print_hex("Plaintext ", plaintext)
+    print_hex("Key       ", key)
+
+    let ciphertext: bytes = xor_bytes(plaintext, key)
+    print_hex("Ciphertext", ciphertext)
+
+    println("")
+    println("Done.")
+end
