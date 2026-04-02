@@ -1,9 +1,11 @@
 [workspace]
 members = [
-    "parser",
-    "compiler",
-    "scripting",
-    "cli",
+    "source-code/parser",
+    "source-code/compiler",
+    "source-code/cli",
+    "source-code/bytes",
+    "source-code/interpreter",
+    "source-code/std",
 ]
 resolver = "2"
 
@@ -14,51 +16,17 @@ authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "MIT"
 
 [workspace.dependencies]
-# Parsing
-logos = "0.14"
-chumsky = "0.9"
-ariadne = "0.4"
-
-# Codegen
-cranelift = "0.111"
-cranelift-module = "0.111"
-cranelift-object = "0.111"
-cranelift-jit = "0.111"
-cranelift-native = "0.111"
-cranelift-codegen = "0.111"
-cranelift-frontend = "0.111"
-object = "0.36"
-target-lexicon = "0.12"
-
-# CLI
-clap = { version = "4", features = ["derive", "color"] }
-colored = "2"
+# Shared deps
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive", "color"] }
+colored = "2.0"
 indicatif = "0.17"
-dialoguer = "0.11"
-
-# .hk parser (Bytes index)
-hk-parser = "0.2.1"
-indexmap = "2"
-
-# Utils
-thiserror = "1"
-anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-
-# Networking (bytes package manager)
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-tokio = { version = "1", features = ["full"] }
-
-# Scripting / shell
-shlex = "1"
-which = "6"
-walkdir = "2"
-tempfile = "3"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
+tokio = { version = "1.35", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+dirs = "5.0"
+walkdir = "2.4"
+regex = "1.10"
+indexmap = "2.0"
