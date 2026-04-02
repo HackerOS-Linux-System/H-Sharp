@@ -1,360 +1,560 @@
-use logos::Logos;
-use std::fmt;
+use crate::span::{Span, Position};
+use crate::error::{ParseError, ParseErrorKind};
 
-/// Callback do ręcznego parsowania komentarzy blokowych !== ... ==!
-/// logos nie obsługuje non-greedy ani złożonych zagnieżdżeń -
-/// robimy to ręcznie w funkcji post-process.
-fn lex_block_comment(lex: &mut logos::Lexer<Token>) -> Option<String> {
-    let remainder = lex.remainder();
-    // Szukamy ==! który kończy komentarz
-    if let Some(end) = remainder.find("==!") {
-        let content = &remainder[..end + 3]; // włącznie z ==!
-        lex.bump(end + 3);
-        Some(format!("!=={}", content))
-    } else {
-        // Brak zamknięcia - konsumujemy do końca
-        let len = remainder.len();
-        lex.bump(len);
-        Some(format!("!=={}", remainder))
-    }
-}
-
-#[derive(Logos, Debug, Clone, PartialEq)]
-#[logos(skip r"[ \t\r]+")]
-pub enum Token {
-
-    // ── Komentarze ─────────────────────────────────────────────────────────
-    // WAŻNA KOLEJNOŚĆ: bardziej specyficzne tokeny PRZED ogólnymi
-
-    /// Wielolinijkowy komentarz !== ... ==!
-    /// Parsowany ręcznie żeby uniknąć crash logos_derive
-    #[token("!==", lex_block_comment)]
-    BlockComment(String),
-
-    /// Komentarz dokumentacyjny !! (przed zwykłym !)
-    #[regex(r"!![^\n]*", |lex| lex.slice()[2..].trim().to_owned())]
-    DocComment(String),
-
-    /// Zwykły komentarz ! (priority wyższy niż Bang)
-    #[regex(r"![^=!\n][^\n]*", priority = 3, callback = |lex| lex.slice().to_owned())]
-    Comment(String),
-
-    /// Samotny ! (bez tekstu po nim, np. na końcu linii)
-    #[regex(r"![^\n]*", priority = 2, callback = |lex| lex.slice().to_owned())]
-    CommentBang(String),
-
-    // ── Atrybuty *{ ... } ──────────────────────────────────────────────────
-    #[regex(r"\*\{[^}]*\}", |lex| lex.slice().to_owned())]
-    Attribute(String),
-
-    // ── String literals ────────────────────────────────────────────────────
-    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
-    let s = lex.slice();
-    s[1..s.len()-1].to_owned()
-    })]
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    // Literals
+    Integer(i64),
+    Float(f64),
     StringLit(String),
-
-    #[regex(r"'[^'\\]'|'\\.'", |lex| {
-    let s = lex.slice();
-    let inner = &s[1..s.len()-1];
-    if inner.starts_with('\\') {
-        match inner.chars().nth(1).unwrap_or('\0') {
-            'n'  => '\n',
-            't'  => '\t',
-            'r'  => '\r',
-            '\\' => '\\',
-            '\'' => '\'',
-            '0'  => '\0',
-            c    => c,
-        }
-    } else {
-        inner.chars().next().unwrap_or('\0')
-    }
-    })]
-    CharLit(char),
-
-    // Float PRZED Int żeby "3.14" nie było parsowane jako Int(3) + Dot + Int(14)
-    #[regex(r"[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", |lex| {
-    lex.slice().parse::<f64>().unwrap_or(0.0)
-    })]
-    FloatLit(f64),
-
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().unwrap_or(0))]
-    IntLit(i64),
-
-    // Ujemne liczby obsługujemy przez UnaryOp::Neg w parserze
-
-    #[token("true")]
-    True,
-
-    #[token("false")]
-    False,
-
-    #[token("nil")]
+    ByteLit(Vec<u8>),
+    Bool(bool),
     Nil,
 
-    // ── Słowa kluczowe (przed Ident!) ──────────────────────────────────────
-    #[token("fn")]      Fn,
-    #[token("Claas")]   Class,
-    #[token("write")]   Write,
-    #[token("return")]  Return,
-    #[token("let")]     Let,
-    #[token("mut")]     Mut,
-    #[token("const")]   Const,
-    #[token("if")]      If,
-    #[token("else")]    Else,
-    #[token("elsif")]   Elsif,
-    #[token("while")]   While,
-    #[token("for")]     For,
-    #[token("in")]      In,
-    #[token("match")]   Match,
-    #[token("pub")]     Pub,
-    #[token("self")]    SelfKw,
-    #[token("super")]   Super,
-    #[token("new")]     New,
-    #[token("and")]     And,
-    #[token("or")]      Or,
-    #[token("not")]     Not,
-    #[token("break")]   Break,
-    #[token("next")]    Next,
-    #[token("raise")]   Raise,
-    #[token("rescue")]  Rescue,
-    #[token("ensure")]  Ensure,
-    #[token("trait")]   Trait,
-    #[token("impl")]    Impl,
-    #[token("enum")]    Enum,
-    #[token("type")]    Type,
-    #[token("where")]   Where,
-    #[token("as")]      As,
-    #[token("is")]      Is,
-    #[token("do")]      Do,
-    #[token("end")]     End,
-    #[token("yield")]   Yield,
-    #[token("when")]    When,
-    #[token("import")]  Import,
-
-    // Typy wbudowane
-    #[token("Int")]    TyInt,
-    #[token("Float")]  TyFloat,
-    #[token("Bool")]   TyBool,
-    #[token("Str")]    TyStr,
-    #[token("Char")]   TyChar,
-    #[token("Void")]   TyVoid,
-    #[token("List")]   TyList,
-    #[token("Map")]    TyMap,
-    #[token("Option")] TyOption,
-    #[token("Result")] TyResult,
-    #[token("Arc")]    TyArc,
-    #[token("Box")]    TyBox,
-
-    // ── Arena allocator :: ─────────────────────────────────────────────────
-    #[token("::")]  DoubleColon,
-
-    // ── Import # ───────────────────────────────────────────────────────────
-    #[token("#")]   Hash,
-
-    // ── Sekcja skryptowa --- ───────────────────────────────────────────────
-    #[token("---")] ScriptOpen,
-
-    // ── Operatory (dłuższe PRZED krótszymi!) ──────────────────────────────
-    #[token("..=")] DotDotEq,
-    #[token("...")]  DotDotDot,
-    #[token("..")]  DotDot,
-    #[token("->")]  Arrow,
-    #[token("=>")]  FatArrow,
-    #[token("==")]  EqEq,
-    #[token("!=")]  NotEq,
-    #[token("<=")]  LtEq,
-    #[token(">=")]  GtEq,
-    #[token("+=")]  PlusEq,
-    #[token("-=")]  MinusEq,
-    #[token("*=")]  StarEq,
-    #[token("/=")]  SlashEq,
-    #[token("**")]  StarStar,
-    #[token("&&")]  AndAnd,
-    #[token("||")]  OrOr,
-    #[token("<<")]  LShift,
-    #[token(">>")]  RShift,
-    #[token("<")]   Lt,
-    #[token(">")]   Gt,
-    #[token("=")]   Eq,
-    #[token("+")]   Plus,
-    #[token("-")]   Minus,
-    #[token("*")]   Star,
-    #[token("/")]   Slash,
-    #[token("%")]   Percent,
-    #[token("&")]   Amp,
-    #[token("|")]   Pipe,
-    #[token("^")]   Caret,
-    #[token("~")]   Tilde,
-    #[token("?")]   Question,
-    #[token("@")]   At,
-    #[token("$")]   Dollar,
-
-    // ── Delimitery ─────────────────────────────────────────────────────────
-    #[token("[")] LBracket,
-    #[token("]")] RBracket,
-    #[token("(")] LParen,
-    #[token(")")] RParen,
-    #[token("{")] LBrace,
-    #[token("}")] RBrace,
-    #[token(",")] Comma,
-    #[token(";")] Semicolon,
-    #[token(":")] Colon,
-    #[token(".")] Dot,
-
-    #[token("\n")] Newline,
-
-    // ── Identyfikatory (na końcu!) ─────────────────────────────────────────
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*[?!]?", |lex| lex.slice().to_owned())]
+    // Identifiers & keywords
     Ident(String),
+
+    // Keywords
+    Fn,
+    Let,
+    Mut,
+    If,
+    Else,
+    Elsif,
+    While,
+    For,
+    In,
+    Return,
+    Import,
+    Pub,
+    Struct,
+    Enum,
+    Impl,
+    Trait,
+    Match,
+    Do,
+    End,
+    Then,
+    Type,
+    As,
+    Self_,
+    New,
+    Break,
+    Continue,
+    Unsafe,
+    Arena,
+
+    // Directives (~ and ~~)
+    Directive(String),        // ~ "dynamic:..."
+    FastDirective(String),    // ~~ "fast:..."
+
+    // Types
+    TInt,
+    TUint,
+    TI8, TI16, TI32, TI64, TI128,
+    TU8, TU16, TU32, TU64, TU128,
+    TF32, TF64,
+    TBool,
+    TString,
+    TBytes,
+    TVoid,
+    TAny,
+
+    // Operators
+    Plus, Minus, Star, Slash, Percent,
+    Eq, NotEq, Lt, Gt, LtEq, GtEq,
+    And, Or, Not,
+    BitAnd, BitOr, BitXor, BitNot, Shl, Shr,
+    Assign,
+    PlusAssign, MinusAssign, StarAssign, SlashAssign,
+    Arrow,      // ->
+    FatArrow,   // =>
+    DotDot,     // ..
+    DotDotEq,   // ..=
+    Dot,        // .
+    ColonColon, // ::
+    Colon,      // :
+    Semicolon,  // ;
+    Comma,      // ,
+    Pipe,       // |
+    Question,   // ?
+    At,         // @
+
+    // Delimiters
+    LParen, RParen,
+    LBrace, RBrace,
+    LBracket, RBracket,
+
+    // Special
+    Newline,
+    EOF,
 }
 
-impl fmt::Display for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Token::Ident(s)        => write!(f, "{}", s),
-            Token::StringLit(s)    => write!(f, "\"{}\"", s),
-            Token::IntLit(n)       => write!(f, "{}", n),
-            Token::FloatLit(n)     => write!(f, "{}", n),
-            Token::CharLit(c)      => write!(f, "'{}'", c),
-            Token::DocComment(s)   => write!(f, "!! {}", s),
-            Token::Comment(s)      => write!(f, "{}", s),
-            Token::BlockComment(s) => write!(f, "{}", s),
-            Token::Attribute(s)    => write!(f, "{}", s),
-            _                      => write!(f, "{:?}", self),
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+    pub text: String,
+}
+
+impl Token {
+    pub fn new(kind: TokenKind, span: Span, text: impl Into<String>) -> Self {
+        Self { kind, span, text: text.into() }
+    }
+}
+
+pub struct Lexer {
+    source: Vec<char>,
+    pos: usize,
+    line: usize,
+    col: usize,
+    file: String,
+}
+
+impl Lexer {
+    pub fn new(source: &str, file: impl Into<String>) -> Self {
+        Self {
+            source: source.chars().collect(),
+            pos: 0,
+            line: 1,
+            col: 1,
+            file: file.into(),
         }
     }
-}
 
-// ─── Spanned token ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct Spanned<T> {
-    pub inner: T,
-    pub span:  std::ops::Range<usize>,
-}
-
-impl<T> Spanned<T> {
-    pub fn new(inner: T, span: std::ops::Range<usize>) -> Self {
-        Self { inner, span }
+    fn current(&self) -> Option<char> {
+        self.source.get(self.pos).copied()
     }
-}
 
-// ─── Błąd leksowania ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct LexError {
-    pub span:    std::ops::Range<usize>,
-    pub message: String,
-}
-
-impl fmt::Display for LexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Błąd leksowania w {:?}: {}", self.span, self.message)
+    fn peek(&self, offset: usize) -> Option<char> {
+        self.source.get(self.pos + offset).copied()
     }
-}
 
-// ─── Publiczne API ────────────────────────────────────────────────────────────
+    fn advance(&mut self) -> Option<char> {
+        let ch = self.source.get(self.pos).copied();
+        if let Some(c) = ch {
+            self.pos += 1;
+            if c == '\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+        }
+        ch
+    }
 
-/// Leksuje kod źródłowy H#.
-/// Komentarze (poza Doc) są pomijane w strumieniu wynikowym.
-pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, Vec<LexError>> {
-    let mut tokens = Vec::new();
-    let mut errors  = Vec::new();
+    fn position(&self) -> Position {
+        Position { line: self.line, col: self.col, offset: self.pos }
+    }
 
-    for (result, span) in Token::lexer(source).spanned() {
-        match result {
-            Ok(tok) => {
-                match &tok {
-                    // Pomijamy komentarze - nie trafiają do parsera
-                    Token::Comment(_)
-                    | Token::CommentBang(_)
-                    | Token::BlockComment(_) => {}
-                    // DocComment zachowujemy (może być użyty do generowania docs)
-                    _ => tokens.push(Spanned::new(tok, span)),
+    fn skip_whitespace_no_newline(&mut self) {
+        while let Some(ch) = self.current() {
+            if ch == ' ' || ch == '\t' || ch == '\r' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn read_string(&mut self, start: Position) -> Result<Token, ParseError> {
+        let mut s = String::new();
+        loop {
+            match self.advance() {
+                None => return Err(ParseError::new(
+                    ParseErrorKind::UnterminatedString,
+                    Span::new(start, self.position(), self.file.clone()),
+                    "unterminated string literal",
+                    vec!["close the string with a double-quote `\"`".to_string()],
+                )),
+                Some('"') => break,
+                Some('\\') => {
+                    match self.advance() {
+                        Some('n') => s.push('\n'),
+                        Some('t') => s.push('\t'),
+                        Some('r') => s.push('\r'),
+                        Some('\\') => s.push('\\'),
+                        Some('"') => s.push('"'),
+                        Some('0') => s.push('\0'),
+                        Some(c) => {
+                            return Err(ParseError::new(
+                                ParseErrorKind::InvalidEscape,
+                                Span::new(start, self.position(), self.file.clone()),
+                                format!("unknown escape sequence `\\{}`", c),
+                                vec![format!("valid escapes: \\n, \\t, \\r, \\\\, \\\", \\0")],
+                            ));
+                        }
+                        None => return Err(ParseError::new(
+                            ParseErrorKind::UnterminatedString,
+                            Span::new(start, self.position(), self.file.clone()),
+                            "unterminated escape sequence",
+                            vec![],
+                        )),
+                    }
+                }
+                Some(c) => s.push(c),
+            }
+        }
+        let end = self.position();
+        Ok(Token::new(TokenKind::StringLit(s.clone()), Span::new(start, end, self.file.clone()), format!("\"{}\"", s)))
+    }
+
+    fn read_number(&mut self, start: Position) -> Token {
+        let mut num = String::new();
+        let mut is_float = false;
+        let mut is_hex = false;
+        let mut is_bin = false;
+
+        let first = self.advance().unwrap();
+        num.push(first);
+
+        if first == '0' {
+            if let Some('x') | Some('X') = self.current() {
+                is_hex = true;
+                num.push(self.advance().unwrap());
+                while let Some(c) = self.current() {
+                    if c.is_ascii_hexdigit() || c == '_' {
+                        num.push(self.advance().unwrap());
+                    } else { break; }
+                }
+            } else if let Some('b') | Some('B') = self.current() {
+                is_bin = true;
+                num.push(self.advance().unwrap());
+                while let Some('0'..='1' | '_') = self.current() {
+                    num.push(self.advance().unwrap());
                 }
             }
-            Err(_) => {
-                let text = source
-                .get(span.clone())
-                .unwrap_or("?")
-                .to_owned();
-                errors.push(LexError {
-                    span,
-                    message: format!("Nierozpoznany znak: `{}`", text),
-                });
+        }
+
+        if !is_hex && !is_bin {
+            while let Some(c) = self.current() {
+                if c.is_ascii_digit() || c == '_' {
+                    num.push(self.advance().unwrap());
+                } else { break; }
             }
+            if self.current() == Some('.') && self.peek(1).map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                is_float = true;
+                num.push(self.advance().unwrap());
+                while let Some(c) = self.current() {
+                    if c.is_ascii_digit() || c == '_' {
+                        num.push(self.advance().unwrap());
+                    } else { break; }
+                }
+            }
+            if let Some('e') | Some('E') = self.current() {
+                is_float = true;
+                num.push(self.advance().unwrap());
+                if let Some('+') | Some('-') = self.current() {
+                    num.push(self.advance().unwrap());
+                }
+                while let Some(c) = self.current() {
+                    if c.is_ascii_digit() {
+                        num.push(self.advance().unwrap());
+                    } else { break; }
+                }
+            }
+        }
+
+        let end = self.position();
+        let clean = num.replace('_', "");
+        let span = Span::new(start, end, self.file.clone());
+
+        if is_float {
+            let v: f64 = clean.parse().unwrap_or(0.0);
+            Token::new(TokenKind::Float(v), span, num)
+        } else if is_hex {
+            let v = i64::from_str_radix(&clean[2..], 16).unwrap_or(0);
+            Token::new(TokenKind::Integer(v), span, num)
+        } else if is_bin {
+            let v = i64::from_str_radix(&clean[2..], 2).unwrap_or(0);
+            Token::new(TokenKind::Integer(v), span, num)
+        } else {
+            let v: i64 = clean.parse().unwrap_or(0);
+            Token::new(TokenKind::Integer(v), span, num)
         }
     }
 
-    if errors.is_empty() { Ok(tokens) } else { Err(errors) }
-}
-
-// ─── Testy ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fn_write() {
-        let src = "fn hello [\n    write \"Hello H#\"\n]";
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| t.inner == Token::Fn));
-        assert!(toks.iter().any(|t| t.inner == Token::Write));
+    fn read_ident(&mut self, start: Position) -> Token {
+        let mut s = String::new();
+        while let Some(c) = self.current() {
+            if c.is_alphanumeric() || c == '_' {
+                s.push(self.advance().unwrap());
+            } else { break; }
+        }
+        let end = self.position();
+        let span = Span::new(start, end, self.file.clone());
+        let kind = match s.as_str() {
+            "fn"       => TokenKind::Fn,
+            "let"      => TokenKind::Let,
+            "mut"      => TokenKind::Mut,
+            "if"       => TokenKind::If,
+            "else"     => TokenKind::Else,
+            "elsif"    => TokenKind::Elsif,
+            "while"    => TokenKind::While,
+            "for"      => TokenKind::For,
+            "in"       => TokenKind::In,
+            "return"   => TokenKind::Return,
+            "import"   => TokenKind::Import,
+            "pub"      => TokenKind::Pub,
+            "struct"   => TokenKind::Struct,
+            "enum"     => TokenKind::Enum,
+            "impl"     => TokenKind::Impl,
+            "trait"    => TokenKind::Trait,
+            "match"    => TokenKind::Match,
+            "do"       => TokenKind::Do,
+            "end"      => TokenKind::End,
+            "then"     => TokenKind::Then,
+            "type"     => TokenKind::Type,
+            "as"       => TokenKind::As,
+            "self"     => TokenKind::Self_,
+            "new"      => TokenKind::New,
+            "break"    => TokenKind::Break,
+            "continue" => TokenKind::Continue,
+            "unsafe"   => TokenKind::Unsafe,
+            "arena"    => TokenKind::Arena,
+            "true"     => TokenKind::Bool(true),
+            "false"    => TokenKind::Bool(false),
+            "nil"      => TokenKind::Nil,
+            "int"      => TokenKind::TInt,
+            "uint"     => TokenKind::TUint,
+            "i8"       => TokenKind::TI8,
+            "i16"      => TokenKind::TI16,
+            "i32"      => TokenKind::TI32,
+            "i64"      => TokenKind::TI64,
+            "i128"     => TokenKind::TI128,
+            "u8"       => TokenKind::TU8,
+            "u16"      => TokenKind::TU16,
+            "u32"      => TokenKind::TU32,
+            "u64"      => TokenKind::TU64,
+            "u128"     => TokenKind::TU128,
+            "f32"      => TokenKind::TF32,
+            "f64"      => TokenKind::TF64,
+            "bool"     => TokenKind::TBool,
+            "string"   => TokenKind::TString,
+            "bytes"    => TokenKind::TBytes,
+            "void"     => TokenKind::TVoid,
+            "any"      => TokenKind::TAny,
+            _          => TokenKind::Ident(s.clone()),
+        };
+        Token::new(kind, span, s)
     }
 
-    #[test]
-    fn test_komentarz_pomijany() {
-        let src = "! to jest komentarz\nfn foo []";
-        let toks = lex(src).expect("lex failed");
-        assert!(!toks.iter().any(|t| matches!(&t.inner, Token::Comment(_))));
-        assert!(toks.iter().any(|t| t.inner == Token::Fn));
-    }
+    pub fn tokenize(&mut self) -> Result<Vec<Token>, Vec<ParseError>> {
+        let mut tokens = Vec::new();
+        let mut errors = Vec::new();
 
-    #[test]
-    fn test_doc_comment() {
-        let src = "!! Dokumentacja\nfn bar []";
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| matches!(&t.inner, Token::DocComment(_))));
-    }
+        loop {
+            self.skip_whitespace_no_newline();
+            let start = self.position();
 
-    #[test]
-    fn test_liczby() {
-        let src = "42 3.14 0";
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| t.inner == Token::IntLit(42)));
-        assert!(toks.iter().any(|t| matches!(&t.inner, Token::FloatLit(f) if (*f - 3.14).abs() < 0.001)));
-    }
+            match self.current() {
+                None => {
+                    tokens.push(Token::new(TokenKind::EOF, Span::new(start.clone(), start, self.file.clone()), ""));
+                    break;
+                }
+                Some('#') => {
+                    // Comment — skip to end of line
+                    while let Some(c) = self.current() {
+                        if c == '\n' { break; }
+                        self.advance();
+                    }
+                }
+                Some('\n') => {
+                    self.advance();
+                    tokens.push(Token::new(TokenKind::Newline, Span::new(start, self.position(), self.file.clone()), "\n"));
+                }
+                Some('\r') => { self.advance(); }
+                Some('"') => {
+                    self.advance();
+                    match self.read_string(start) {
+                        Ok(t) => tokens.push(t),
+                        Err(e) => errors.push(e),
+                    }
+                }
+                Some('~') => {
+                    self.advance();
+                    let is_fast = self.current() == Some('~');
+                    if is_fast { self.advance(); }
+                    self.skip_whitespace_no_newline();
+                    if self.current() == Some('"') {
+                        self.advance();
+                        let s_start = self.position();
+                        match self.read_string(s_start) {
+                            Ok(t) => {
+                                if let TokenKind::StringLit(s) = t.kind {
+                                    let kind = if is_fast {
+                                        TokenKind::FastDirective(s.clone())
+                                    } else {
+                                        TokenKind::Directive(s.clone())
+                                    };
+                                    tokens.push(Token::new(kind, Span::new(start, self.position(), self.file.clone()), s));
+                                }
+                            }
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                }
+                Some(c) if c.is_ascii_digit() => {
+                    tokens.push(self.read_number(start));
+                }
+                Some(c) if c.is_alphabetic() || c == '_' => {
+                    tokens.push(self.read_ident(start));
+                }
+                Some('-') => {
+                    self.advance();
+                    if self.current() == Some('>') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::Arrow, Span::new(start, self.position(), self.file.clone()), "->"));
+                    } else if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::MinusAssign, Span::new(start, self.position(), self.file.clone()), "-="));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Minus, Span::new(start, self.position(), self.file.clone()), "-"));
+                    }
+                }
+                Some('+') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::PlusAssign, Span::new(start, self.position(), self.file.clone()), "+="));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Plus, Span::new(start, self.position(), self.file.clone()), "+"));
+                    }
+                }
+                Some('*') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::StarAssign, Span::new(start, self.position(), self.file.clone()), "*="));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Star, Span::new(start, self.position(), self.file.clone()), "*"));
+                    }
+                }
+                Some('/') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::SlashAssign, Span::new(start, self.position(), self.file.clone()), "/="));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Slash, Span::new(start, self.position(), self.file.clone()), "/"));
+                    }
+                }
+                Some('%') => { self.advance(); tokens.push(Token::new(TokenKind::Percent, Span::new(start, self.position(), self.file.clone()), "%")); }
+                Some('=') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::Eq, Span::new(start, self.position(), self.file.clone()), "=="));
+                    } else if self.current() == Some('>') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::FatArrow, Span::new(start, self.position(), self.file.clone()), "=>"));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Assign, Span::new(start, self.position(), self.file.clone()), "="));
+                    }
+                }
+                Some('!') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::NotEq, Span::new(start, self.position(), self.file.clone()), "!="));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Not, Span::new(start, self.position(), self.file.clone()), "!"));
+                    }
+                }
+                Some('<') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::LtEq, Span::new(start, self.position(), self.file.clone()), "<="));
+                    } else if self.current() == Some('<') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::Shl, Span::new(start, self.position(), self.file.clone()), "<<"));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Lt, Span::new(start, self.position(), self.file.clone()), "<"));
+                    }
+                }
+                Some('>') => {
+                    self.advance();
+                    if self.current() == Some('=') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::GtEq, Span::new(start, self.position(), self.file.clone()), ">="));
+                    } else if self.current() == Some('>') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::Shr, Span::new(start, self.position(), self.file.clone()), ">>"));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Gt, Span::new(start, self.position(), self.file.clone()), ">"));
+                    }
+                }
+                Some('&') => {
+                    self.advance();
+                    if self.current() == Some('&') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::And, Span::new(start, self.position(), self.file.clone()), "&&"));
+                    } else {
+                        tokens.push(Token::new(TokenKind::BitAnd, Span::new(start, self.position(), self.file.clone()), "&"));
+                    }
+                }
+                Some('|') => {
+                    self.advance();
+                    if self.current() == Some('|') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::Or, Span::new(start, self.position(), self.file.clone()), "||"));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Pipe, Span::new(start, self.position(), self.file.clone()), "|"));
+                    }
+                }
+                Some('^') => { self.advance(); tokens.push(Token::new(TokenKind::BitXor, Span::new(start, self.position(), self.file.clone()), "^")); }
+                Some('.') => {
+                    self.advance();
+                    if self.current() == Some('.') {
+                        self.advance();
+                        if self.current() == Some('=') {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::DotDotEq, Span::new(start, self.position(), self.file.clone()), "..="));
+                        } else {
+                            tokens.push(Token::new(TokenKind::DotDot, Span::new(start, self.position(), self.file.clone()), ".."));
+                        }
+                    } else {
+                        tokens.push(Token::new(TokenKind::Dot, Span::new(start, self.position(), self.file.clone()), "."));
+                    }
+                }
+                Some(':') => {
+                    self.advance();
+                    if self.current() == Some(':') {
+                        self.advance();
+                        tokens.push(Token::new(TokenKind::ColonColon, Span::new(start, self.position(), self.file.clone()), "::"));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Colon, Span::new(start, self.position(), self.file.clone()), ":"));
+                    }
+                }
+                Some(';') => { self.advance(); tokens.push(Token::new(TokenKind::Semicolon, Span::new(start, self.position(), self.file.clone()), ";")); }
+                Some(',') => { self.advance(); tokens.push(Token::new(TokenKind::Comma, Span::new(start, self.position(), self.file.clone()), ",")); }
+                Some('?') => { self.advance(); tokens.push(Token::new(TokenKind::Question, Span::new(start, self.position(), self.file.clone()), "?")); }
+                Some('@') => { self.advance(); tokens.push(Token::new(TokenKind::At, Span::new(start, self.position(), self.file.clone()), "@")); }
+                Some('(') => { self.advance(); tokens.push(Token::new(TokenKind::LParen, Span::new(start, self.position(), self.file.clone()), "(")); }
+                Some(')') => { self.advance(); tokens.push(Token::new(TokenKind::RParen, Span::new(start, self.position(), self.file.clone()), ")")); }
+                Some('{') => { self.advance(); tokens.push(Token::new(TokenKind::LBrace, Span::new(start, self.position(), self.file.clone()), "{")); }
+                Some('}') => { self.advance(); tokens.push(Token::new(TokenKind::RBrace, Span::new(start, self.position(), self.file.clone()), "}")); }
+                Some('[') => { self.advance(); tokens.push(Token::new(TokenKind::LBracket, Span::new(start, self.position(), self.file.clone()), "[")); }
+                Some(']') => { self.advance(); tokens.push(Token::new(TokenKind::RBracket, Span::new(start, self.position(), self.file.clone()), "]")); }
+                Some(c) => {
+                    let ch = c;
+                    self.advance();
+                    errors.push(ParseError::new(
+                        ParseErrorKind::UnexpectedChar(ch),
+                        Span::new(start, self.position(), self.file.clone()),
+                        format!("unexpected character `{}`", ch),
+                        vec![format!("remove or replace this character")],
+                    ));
+                }
+            }
+        }
 
-    #[test]
-    fn test_string() {
-        let src = r#""Cześć świecie""#;
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| matches!(&t.inner, Token::StringLit(s) if s == "Cześć świecie")));
-    }
-
-    #[test]
-    fn test_operator_kolejnosc() {
-        // ** musi być przed *
-        let src = "2 ** 8";
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| t.inner == Token::StarStar));
-        assert!(!toks.iter().any(|t| t.inner == Token::Star));
-    }
-
-    #[test]
-    fn test_atrybut() {
-        let src = "*{derive(Debug)}";
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| matches!(&t.inner, Token::Attribute(_))));
-    }
-
-    #[test]
-    fn test_script_open() {
-        let src = "---\n> echo test\n---";
-        let toks = lex(src).expect("lex failed");
-        assert!(toks.iter().any(|t| t.inner == Token::ScriptOpen));
+        if errors.is_empty() {
+            Ok(tokens)
+        } else {
+            Err(errors)
+        }
     }
 }
