@@ -1,107 +1,65 @@
 pub mod codegen;
-pub mod typeck;
-
-pub use codegen::{Codegen, CodegenError};
-pub use typeck::{TypeChecker, TypeError};
+pub mod typechecker;
+pub mod target;
 
 use hsharp_parser::ast::Module;
-use thiserror::Error;
 use std::path::Path;
 
-#[derive(Error, Debug)]
-pub enum CompileError {
-    #[error("Błąd parsowania:\n{0}")]
-    Parse(String),
+pub use codegen::CodegenError;
+pub use typechecker::TypeError;
+pub use target::TargetTriple;
 
-    #[error("Błąd typów:\n{errors}")]
-    Type { errors: String },
-
-    #[error("Błąd generowania kodu: {0}")]
-    Codegen(#[from] CodegenError),
-
-    #[error("Błąd IO: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Błąd linkowania: {0}")]
-    Link(String),
-}
-
-/// Opcje kompilacji
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
-    /// Cel: natywny (x86_64-linux itp.) lub dany triple
-    pub target: Option<String>,
-    /// Optymalizacje
+    pub target: TargetTriple,
     pub optimize: bool,
-    /// Debug info
-    pub debug: bool,
-    /// Statyczne linkowanie (domyślnie true)
     pub static_link: bool,
-    /// Wyjściowy plik
-    pub output: Option<String>,
+    pub debug_info: bool,
+    pub output: String,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
-            target: None,
-            optimize: false,
-            debug: false,
+            target: TargetTriple::host(),
+            optimize: true,
             static_link: true,
-            output: None,
+            debug_info: false,
+            output: "output".to_string(),
         }
     }
 }
 
-/// Pełny pipeline: source -> type check -> codegen -> obiekt -> binarka
-pub fn compile_source(
-    source: &str,
-    file_name: &str,
-    opts: &CompileOptions,
-) -> Result<Vec<u8>, CompileError> {
-    // 1. Parsowanie
-    let module = hsharp_parser::parse(source, file_name)
-    .map_err(CompileError::Parse)?;
-
-    // 2. Type checking
-    let mut tc = TypeChecker::new();
-    if !tc.check_module(&module) {
-        let errs = tc.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
-        return Err(CompileError::Type { errors: errs });
-    }
-
-    // 3. Codegen
-    let triple = if let Some(t) = &opts.target {
-        t.parse::<target_lexicon::Triple>()
-        .unwrap_or_else(|_| target_lexicon::Triple::host())
-    } else {
-        target_lexicon::Triple::host()
-    };
-
-    let mut cg = Codegen::new(triple)?;
-    let obj_bytes = cg.compile_module(&module)?;
-
-    Ok(obj_bytes)
+#[derive(Debug)]
+pub enum CompileError {
+    Type(TypeError),
+    Codegen(CodegenError),
+    Io(std::io::Error),
+    Linker(String),
 }
 
-/// Kompiluje plik H# do pliku obiektowego (.o)
-pub fn compile_file(
-    source_path: &Path,
-    opts: &CompileOptions,
-) -> Result<(), CompileError> {
-    let source = std::fs::read_to_string(source_path)?;
-    let file_name = source_path.file_stem()
-    .and_then(|s| s.to_str())
-    .unwrap_or("module");
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompileError::Type(e) => write!(f, "type error: {}", e),
+            CompileError::Codegen(e) => write!(f, "codegen error: {}", e),
+            CompileError::Io(e) => write!(f, "io error: {}", e),
+            CompileError::Linker(s) => write!(f, "linker error: {}", s),
+        }
+    }
+}
 
-    let obj_bytes = compile_source(&source, file_name, opts)?;
+pub fn compile(module: &Module, opts: &CompileOptions) -> Result<(), CompileError> {
+    // 1. Type check
+    let mut tc = typechecker::TypeChecker::new();
+    tc.check_module(module).map_err(CompileError::Type)?;
 
-    let output = opts.output.as_deref().unwrap_or("a.o");
-    std::fs::write(output, &obj_bytes)?;
+    // 2. Code generation
+    let mut cg = codegen::Codegen::new(&module.file, opts);
+    cg.compile_module(module).map_err(CompileError::Codegen)?;
+
+    // 3. Emit object file
+    cg.emit_object(&opts.output).map_err(CompileError::Codegen)?;
 
     Ok(())
 }
-
-/// Interpretuje moduł H# - nie generuje binarki, wykonuje bezpośrednio
-/// (uproszczony interpreter - tylko dla skryptów .hl)
-pub mod interpreter;
