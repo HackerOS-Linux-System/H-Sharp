@@ -1,0 +1,16 @@
+[package]
+name = "hsharp-interpreter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hsharp_interpreter"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "=1.0.79"
+thiserror = "=1.0.56"
+serde = { version = "=1.0.195", features = ["derive"] }
+serde_json = "=1.0.108"
+colored = "=2.0.4"
+hsharp-parser = { path = "../parser" }
