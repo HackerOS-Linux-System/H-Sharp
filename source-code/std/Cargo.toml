@@ -1,0 +1,11 @@
+[package]
+name = "hsharp-std"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hsharp_std"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "=1.0.79"
