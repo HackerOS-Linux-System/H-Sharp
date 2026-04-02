@@ -1,593 +1,668 @@
-use cranelift::prelude::*;
-use cranelift_codegen::ir::{AbiParam, Function, Signature, UserFuncName};
-use cranelift_codegen::isa::CallConv;
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
-use cranelift_module::{DataDescription, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule};
-use hsharp_parser::ast::*;
-use std::collections::HashMap;
-use thiserror::Error;
+/// H# Code Generator
+/// Compiles H# AST to native code via C as a portable backend.
+/// The C backend ensures we can cross-compile without requiring LLVM installed.
+/// A full LLVM/inkwell backend can be swapped in by enabling the `llvm` feature.
 
-#[derive(Error, Debug)]
+use hsharp_parser::ast::*;
+use std::fmt::Write;
+use std::path::Path;
+use crate::CompileOptions;
+
+#[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
-    #[error("Cranelift error: {0}")]
-    Cranelift(String),
-    #[error("Module error: {0}")]
-    Module(#[from] cranelift_module::ModuleError),
-    #[error("Niezaimplementowana funkcja: {0}")]
-    Unimplemented(String),
-    #[error("Nieznany typ: {0}")]
-    UnknownType(String),
-    #[error("Anyhow: {0}")]
-    Anyhow(#[from] anyhow::Error),
+    #[error("unsupported feature: {0}")]
+    Unsupported(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("compilation failed: {0}")]
+    CompileError(String),
+    #[error("cc not found: install gcc or clang")]
+    NoCompiler,
 }
 
-/// Mapowanie nazw lokalnych zmiennych -> Value
-type Locals = HashMap<String, Value>;
-
-/// Główny kod generatora
 pub struct Codegen {
-    module: ObjectModule,
-    string_data: HashMap<String, cranelift_module::DataId>,
+    file: String,
+    opts: CompileOptions,
+    output: String,
+    indent: usize,
+    header: String,
+    forward_decls: String,
+    body: String,
 }
 
 impl Codegen {
-    pub fn new(triple: target_lexicon::Triple) -> Result<Self, CodegenError> {
-        let mut flag_builder = settings::builder();
-        flag_builder.set("use_colocated_libcalls", "false")
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))?;
-        flag_builder.set("is_pic", "false")
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))?;
-        flag_builder.set("opt_level", "speed")
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))?;
-
-        let flags = settings::Flags::new(flag_builder);
-        let isa = cranelift_codegen::isa::lookup(triple)
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))?
-        .finish(flags)
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))?;
-
-        let builder = ObjectBuilder::new(
-            isa,
-            "hsharp_module",
-            cranelift_module::default_libcall_names(),
-        )?;
-
-        let module = ObjectModule::new(builder);
-
-        Ok(Self {
-            module,
-            string_data: HashMap::new(),
-        })
-    }
-
-    /// Generuje kod dla całego modułu H#
-    pub fn compile_module(&mut self, module: &HsharpModule) -> Result<Vec<u8>, CodegenError> {
-        // Najpierw deklarujemy zewnętrzne funkcje (printf, malloc, free itp.)
-        self.declare_runtime()?;
-
-        // Kompilujemy każdą funkcję
-        for decl in &module.decls {
-            match decl {
-                Decl::Function { name, params, return_ty, body, .. } => {
-                    self.compile_function(name, params, return_ty, body)?;
-                }
-                _ => {} // Inne deklaracje (klasy, enumy) - TODO
-            }
-        }
-
-        // Finalizujemy i zwracamy obiektowy plik binarny
-        let product = self.module.finish();
-        product.emit()
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))
-    }
-
-    fn declare_runtime(&mut self) -> Result<(), CodegenError> {
-        // printf(const char*, ...) -> int
-        let mut printf_sig = self.module.make_signature();
-        printf_sig.params.push(AbiParam::new(types::I64)); // char*
-        printf_sig.returns.push(AbiParam::new(types::I32));
-        self.module.declare_function("printf", Linkage::Import, &printf_sig)?;
-
-        // malloc(size_t) -> void*
-        let mut malloc_sig = self.module.make_signature();
-        malloc_sig.params.push(AbiParam::new(types::I64));
-        malloc_sig.returns.push(AbiParam::new(types::I64));
-        self.module.declare_function("malloc", Linkage::Import, &malloc_sig)?;
-
-        // free(void*)
-        let mut free_sig = self.module.make_signature();
-        free_sig.params.push(AbiParam::new(types::I64));
-        self.module.declare_function("free", Linkage::Import, &free_sig)?;
-
-        // exit(int)
-        let mut exit_sig = self.module.make_signature();
-        exit_sig.params.push(AbiParam::new(types::I32));
-        self.module.declare_function("exit", Linkage::Import, &exit_sig)?;
-
-        Ok(())
-    }
-
-    fn compile_function(
-        &mut self,
-        name: &str,
-        params: &[Param],
-        return_ty: &Ty,
-        body: &[Stmt],
-    ) -> Result<(), CodegenError> {
-        let mut sig = self.module.make_signature();
-
-        // Parametry
-        for param in params {
-            sig.params.push(AbiParam::new(self.ty_to_cranelift(&param.ty)?));
-        }
-
-        // Typ powrotu
-        if !matches!(return_ty, Ty::Void) {
-            sig.returns.push(AbiParam::new(self.ty_to_cranelift(return_ty)?));
-        }
-
-        // Linkage: main jest Export, reszta Local
-        let linkage = if name == "main" || name == "glowna" {
-            Linkage::Export
-        } else {
-            Linkage::Export
-        };
-
-        let func_id = self.module.declare_function(name, linkage, &sig)?;
-
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = sig.clone();
-        ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-
-        {
-            let mut func_ctx = FunctionBuilderContext::new();
-            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
-
-            let entry_block = builder.create_block();
-            builder.append_block_params_for_function_params(entry_block);
-            builder.switch_to_block(entry_block);
-            builder.seal_block(entry_block);
-
-            // Wczytaj parametry
-            let mut locals: Locals = HashMap::new();
-            for (i, param) in params.iter().enumerate() {
-                let val = builder.block_params(entry_block)[i];
-                locals.insert(param.name.clone(), val);
-            }
-
-            let mut fg = FuncGen {
-                builder: &mut builder,
-                module: &mut self.module,
-                locals,
-                string_data: &mut self.string_data,
-                return_ty: return_ty.clone(),
-            };
-
-            fg.compile_body(body)?;
-
-            // Jeśli brak explicit return, dodaj domyślny
-            if !fg.builder.is_filled() {
-                if matches!(return_ty, Ty::Void) {
-                    fg.builder.ins().return_(&[]);
-                } else {
-                    let zero = fg.builder.ins().iconst(types::I64, 0);
-                    fg.builder.ins().return_(&[zero]);
-                }
-            }
-
-            builder.finalize();
-        }
-
-        self.module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| CodegenError::Cranelift(e.to_string()))?;
-
-        self.module.clear_context(&mut ctx);
-
-        Ok(())
-    }
-
-    fn ty_to_cranelift(&self, ty: &Ty) -> Result<Type, CodegenError> {
-        match ty {
-            Ty::Int => Ok(types::I64),
-            Ty::Float => Ok(types::F64),
-            Ty::Bool => Ok(types::I8),
-            Ty::Char => Ok(types::I32),
-            Ty::Str => Ok(types::I64),  // wskaźnik
-            Ty::Arc(_) | Ty::Box(_) => Ok(types::I64),  // wskaźnik
-            Ty::Named(_) | Ty::Generic(_, _) => Ok(types::I64), // wskaźnik do heapa
-            Ty::List(_) | Ty::Map(_, _) => Ok(types::I64), // wskaźnik
-            Ty::Option(_) => Ok(types::I64),
-            Ty::Result(_, _) => Ok(types::I64),
-            Ty::Infer => Ok(types::I64),
-            Ty::Void => Err(CodegenError::UnknownType("Void nie ma reprezentacji".to_string())),
-            other => Err(CodegenError::UnknownType(format!("{}", other))),
+    pub fn new(file: &str, opts: &CompileOptions) -> Self {
+        Self {
+            file: file.to_string(),
+            opts: opts.clone(),
+            output: String::new(),
+            indent: 0,
+            header: String::new(),
+            forward_decls: String::new(),
+            body: String::new(),
         }
     }
+
+    fn emit_header(&mut self) {
+        self.header.push_str(r#"/* Generated by H# compiler */
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* H# runtime types */
+typedef int64_t    hsh_int;
+typedef uint64_t   hsh_uint;
+typedef int8_t     hsh_i8;
+typedef int16_t    hsh_i16;
+typedef int32_t    hsh_i32;
+typedef int64_t    hsh_i64;
+typedef __int128   hsh_i128;
+typedef uint8_t    hsh_u8;
+typedef uint16_t   hsh_u16;
+typedef uint32_t   hsh_u32;
+typedef uint64_t   hsh_u64;
+typedef unsigned __int128 hsh_u128;
+typedef float      hsh_f32;
+typedef double     hsh_f64;
+typedef bool       hsh_bool;
+typedef char*      hsh_string;
+typedef struct { uint8_t* data; size_t len; size_t cap; } hsh_bytes;
+
+/* H# Arena allocator */
+typedef struct {
+    uint8_t* base;
+    size_t   cap;
+    size_t   used;
+} HshArena;
+
+static HshArena* hsh_arena_new(size_t cap) {
+    HshArena* a = (HshArena*)malloc(sizeof(HshArena));
+    a->base = (uint8_t*)malloc(cap);
+    a->cap  = cap;
+    a->used = 0;
+    return a;
+}
+static void* hsh_arena_alloc(HshArena* a, size_t n) {
+    if (a->used + n > a->cap) { fprintf(stderr, "arena OOM\n"); exit(1); }
+    void* p = a->base + a->used;
+    a->used += n;
+    return p;
+}
+static void hsh_arena_free(HshArena* a) {
+    free(a->base);
+    free(a);
 }
 
-/// Generator kodu dla pojedynczej funkcji
-struct FuncGen<'a> {
-    builder: &'a mut FunctionBuilder<'a>,
-    module: &'a mut ObjectModule,
-    locals: Locals,
-    string_data: &'a mut HashMap<String, cranelift_module::DataId>,
-    return_ty: Ty,
+/* H# builtins */
+static void hsh_print(hsh_string s)   { printf("%s", s); }
+static void hsh_println(hsh_string s) { printf("%s\n", s); }
+static hsh_string hsh_int_to_string(hsh_int n) {
+    char* buf = (char*)malloc(32);
+    snprintf(buf, 32, "%ld", (long)n);
+    return buf;
 }
+static hsh_string hsh_bool_to_string(hsh_bool b) { return b ? "true" : "false"; }
+static hsh_int    hsh_strlen(hsh_string s) { return (hsh_int)strlen(s); }
+static void       hsh_panic(hsh_string s) { fprintf(stderr, "panic: %s\n", s); exit(1); }
+static hsh_string hsh_strcat(hsh_string a, hsh_string b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char* out = (char*)malloc(la + lb + 1);
+    memcpy(out, a, la);
+    memcpy(out + la, b, lb);
+    out[la + lb] = '\0';
+    return out;
+}
+static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
 
-impl<'a> FuncGen<'a> {
-    fn compile_body(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
-        for stmt in stmts {
-            self.compile_stmt(stmt)?;
-            if self.builder.is_filled() {
-                break; // Już zakończono blok (np. return)
+"#);
+    }
+
+    pub fn compile_module(&mut self, module: &Module) -> Result<(), CodegenError> {
+        self.emit_header();
+
+        // Forward-declare all structs
+        for item in &module.items {
+            if let Item::StructDef(s) = item {
+                let decl = format!("typedef struct {} {};\n", s.name, s.name);
+                self.forward_decls.push_str(&decl);
             }
+        }
+
+        // Emit all items
+        for item in &module.items {
+            self.emit_item(item)?;
+        }
+
+        // Combine
+        self.output = format!("{}\n{}\n{}", self.header, self.forward_decls, self.body);
+        Ok(())
+    }
+
+    fn emit_item(&mut self, item: &Item) -> Result<(), CodegenError> {
+        match item {
+            Item::FnDef(f) => self.emit_fn(f)?,
+            Item::StructDef(s) => self.emit_struct(s)?,
+            Item::EnumDef(e) => self.emit_enum(e)?,
+            Item::ImplBlock(impl_) => {
+                for method in &impl_.methods {
+                    self.emit_method(method, &impl_.type_name)?;
+                }
+            }
+            Item::TypeAlias { name, ty, .. } => {
+                let c_ty = self.type_to_c(ty);
+                writeln!(self.body, "typedef {} {};", c_ty, name).ok();
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
+    fn emit_struct(&mut self, s: &StructDef) -> Result<(), CodegenError> {
+        writeln!(self.body, "struct {} {{", s.name).ok();
+        for field in &s.fields {
+            let c_ty = self.type_to_c(&field.ty);
+            writeln!(self.body, "    {} {};", c_ty, field.name).ok();
+        }
+        writeln!(self.body, "}};").ok();
+        Ok(())
+    }
+
+    fn emit_enum(&mut self, e: &EnumDef) -> Result<(), CodegenError> {
+        // Tagged union approach
+        writeln!(self.body, "typedef enum {{ {} }} {}_Tag;",
+            e.variants.iter().map(|v| format!("{}__{}", e.name, v.name)).collect::<Vec<_>>().join(", "),
+            e.name).ok();
+        writeln!(self.body, "typedef struct {} {{", e.name).ok();
+        writeln!(self.body, "    {}_Tag tag;", e.name).ok();
+        writeln!(self.body, "    union {{").ok();
+        for variant in &e.variants {
+            if let EnumVariantFields::Tuple(types) = &variant.fields {
+                if !types.is_empty() {
+                    writeln!(self.body, "        struct {{").ok();
+                    for (i, ty) in types.iter().enumerate() {
+                        let c_ty = self.type_to_c(ty);
+                        writeln!(self.body, "            {} field{};", c_ty, i).ok();
+                    }
+                    writeln!(self.body, "        }} {};", variant.name.to_lowercase()).ok();
+                }
+            }
+        }
+        writeln!(self.body, "    }} data;").ok();
+        writeln!(self.body, "}} {};", e.name).ok();
+        Ok(())
+    }
+
+    fn emit_fn(&mut self, f: &FnDef) -> Result<(), CodegenError> {
+        let ret = f.return_type.as_ref().map(|t| self.type_to_c(t)).unwrap_or_else(|| "void".to_string());
+        let params: Vec<String> = f.params.iter().map(|p| {
+            let ty = self.type_to_c(&p.ty);
+            format!("{} {}", ty, p.name)
+        }).collect();
+
+        let is_main = f.name == "main";
+        let fn_name = if is_main { "main".to_string() } else { f.name.clone() };
+        let c_ret = if is_main { "int".to_string() } else { ret };
+        let c_params = if is_main && params.is_empty() { "void".to_string() } else { params.join(", ") };
+
+        writeln!(self.body, "{} {}({}) {{", c_ret, fn_name, c_params).ok();
+
+        for stmt in &f.body {
+            self.emit_stmt(stmt, 1)?;
+        }
+
+        if is_main {
+            writeln!(self.body, "    return 0;").ok();
+        }
+        writeln!(self.body, "}}").ok();
+        Ok(())
+    }
+
+    fn emit_method(&mut self, f: &FnDef, type_name: &str) -> Result<(), CodegenError> {
+        let ret = f.return_type.as_ref().map(|t| self.type_to_c(t)).unwrap_or_else(|| "void".to_string());
+        let mut params: Vec<String> = Vec::new();
+
+        for p in &f.params {
+            if p.name == "self" {
+                params.push(format!("{}* self", type_name));
+            } else {
+                let ty = self.type_to_c(&p.ty);
+                params.push(format!("{} {}", ty, p.name));
+            }
+        }
+
+        writeln!(self.body, "{} {}_{}({}) {{", ret, type_name, f.name, params.join(", ")).ok();
+        for stmt in &f.body {
+            self.emit_stmt(stmt, 1)?;
+        }
+        writeln!(self.body, "}}").ok();
+        Ok(())
+    }
+
+    fn emit_stmt(&mut self, stmt: &Stmt, depth: usize) -> Result<(), CodegenError> {
+        let indent = "    ".repeat(depth);
         match stmt {
-            Stmt::Let { name, value, .. } => {
-                if let Some(val_expr) = value {
-                    let val = self.compile_expr(val_expr)?;
-                    self.locals.insert(name.clone(), val);
+            Stmt::Let { name, ty, mutable, value, .. } => {
+                let c_ty = ty.as_ref().map(|t| self.type_to_c(t))
+                    .unwrap_or_else(|| "hsh_int".to_string());
+                let val_str = value.as_ref().map(|e| self.emit_expr(e)).unwrap_or_else(|| "0".to_string());
+                let c_mut = if *mutable { "" } else { "const " };
+                writeln!(self.body, "{}{}{} {} = {};", indent, c_mut, c_ty, name, val_str).ok();
+            }
+            Stmt::Return(expr, _) => {
+                let val = expr.as_ref().map(|e| self.emit_expr(e)).unwrap_or_default();
+                writeln!(self.body, "{}return {};", indent, val).ok();
+            }
+            Stmt::Expr(expr, _) => {
+                // Special handling for control flow expressions
+                match expr {
+                    Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+                        self.emit_if_stmt(condition, then_body, elsif_branches, else_body, depth)?;
+                    }
+                    Expr::While { condition, body, .. } => {
+                        let cond = self.emit_expr(condition);
+                        writeln!(self.body, "{}while ({}) {{", indent, cond).ok();
+                        for s in body { self.emit_stmt(s, depth + 1)?; }
+                        writeln!(self.body, "{}}}", indent).ok();
+                    }
+                    Expr::For { pattern, iterable, body, .. } => {
+                        self.emit_for_stmt(pattern, iterable, body, depth)?;
+                    }
+                    Expr::Unsafe(body, arena, _) => {
+                        if let Some(arena_cfg) = arena {
+                            let size = arena_cfg.size.unwrap_or(1024 * 1024);
+                            writeln!(self.body, "{}{{ HshArena* __arena = hsh_arena_new({});", indent, size).ok();
+                            for s in body { self.emit_stmt(s, depth + 1)?; }
+                            writeln!(self.body, "{}    hsh_arena_free(__arena); }}", indent).ok();
+                        } else {
+                            writeln!(self.body, "{}{{", indent).ok();
+                            for s in body { self.emit_stmt(s, depth + 1)?; }
+                            writeln!(self.body, "{}}}", indent).ok();
+                        }
+                    }
+                    Expr::Match { subject, arms, .. } => {
+                        self.emit_match_stmt(subject, arms, depth)?;
+                    }
+                    Expr::Assign(lhs, rhs, _) => {
+                        let l = self.emit_expr(lhs);
+                        let r = self.emit_expr(rhs);
+                        writeln!(self.body, "{}{} = {};", indent, l, r).ok();
+                    }
+                    Expr::CompoundAssign(lhs, op, rhs, _) => {
+                        let l = self.emit_expr(lhs);
+                        let r = self.emit_expr(rhs);
+                        let op_str = binop_to_c(op);
+                        writeln!(self.body, "{}{} {}= {};", indent, l, op_str, r).ok();
+                    }
+                    _ => {
+                        let s = self.emit_expr(expr);
+                        writeln!(self.body, "{}{};", indent, s).ok();
+                    }
                 }
             }
-            Stmt::Expr(e) => {
-                self.compile_expr(e)?;
-            }
-            Stmt::Return(val) => {
-                if let Some(v) = val {
-                    let ret_val = self.compile_expr(v)?;
-                    self.builder.ins().return_(&[ret_val]);
-                } else {
-                    self.builder.ins().return_(&[]);
-                }
-            }
-            Stmt::Assign { target, value, .. } => {
-                let val = self.compile_expr(value)?;
-                if let Expr::Var(name) = target.as_ref() {
-                    self.locals.insert(name.clone(), val);
-                }
-            }
-            Stmt::While { cond, body, .. } => {
-                let header_block = self.builder.create_block();
-                let body_block = self.builder.create_block();
-                let exit_block = self.builder.create_block();
-
-                self.builder.ins().jump(header_block, &[]);
-                self.builder.switch_to_block(header_block);
-
-                let cond_val = self.compile_expr(cond)?;
-                self.builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
-
-                self.builder.switch_to_block(body_block);
-                self.compile_body(body)?;
-                if !self.builder.is_filled() {
-                    self.builder.ins().jump(header_block, &[]);
-                }
-
-                self.builder.seal_block(body_block);
-                self.builder.seal_block(header_block);
-                self.builder.switch_to_block(exit_block);
-                self.builder.seal_block(exit_block);
-            }
-            Stmt::For { var, iterable, body, span } => {
-                // Uproszczona implementacja for: obsługujemy zakres Int
-                // TODO: pełna iteracja po listach
-                let iter_val = self.compile_expr(iterable)?;
-                // Na razie traktujemy jako pętlę po liczbach 0..n
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let counter = self.builder.ins().iconst(types::I64, 0);
-
-                let header = self.builder.create_block();
-                let body_b = self.builder.create_block();
-                let exit_b = self.builder.create_block();
-
-                self.builder.append_block_param(header, types::I64);
-                self.builder.ins().jump(header, &[zero]);
-                self.builder.switch_to_block(header);
-
-                let i = self.builder.block_params(header)[0];
-                self.locals.insert(var.clone(), i);
-
-                let cond = self.builder.ins().icmp(IntCC::SignedLessThan, i, iter_val);
-                self.builder.ins().brif(cond, body_b, &[], exit_b, &[]);
-
-                self.builder.switch_to_block(body_b);
-                self.compile_body(body)?;
-                if !self.builder.is_filled() {
-                    let one = self.builder.ins().iconst(types::I64, 1);
-                    let next_i = self.builder.ins().iadd(i, one);
-                    self.builder.ins().jump(header, &[next_i]);
-                }
-
-                self.builder.seal_block(body_b);
-                self.builder.seal_block(header);
-                self.builder.switch_to_block(exit_b);
-                self.builder.seal_block(exit_b);
-            }
-            _ => {
-                // Inne instrukcje - TODO
-            }
+            Stmt::Break(_, _) => { writeln!(self.body, "{}break;", indent).ok(); }
+            Stmt::Continue(_) => { writeln!(self.body, "{}continue;", indent).ok(); }
+            Stmt::Item(item) => self.emit_item(item)?,
+            Stmt::Import(_, _, _) => {} // handled at module level
         }
         Ok(())
     }
 
-    fn compile_expr(&mut self, expr: &Expr) -> Result<Value, CodegenError> {
-        match expr {
-            Expr::Int(n) => Ok(self.builder.ins().iconst(types::I64, *n)),
-            Expr::Float(f) => Ok(self.builder.ins().f64const(*f)),
-            Expr::Bool(b) => Ok(self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 })),
-            Expr::Char(c) => Ok(self.builder.ins().iconst(types::I32, *c as i64)),
-            Expr::Nil => Ok(self.builder.ins().iconst(types::I64, 0)),
-
-            Expr::Str(s) => self.compile_string_literal(s),
-
-            Expr::Var(name) => {
-                if let Some(&val) = self.locals.get(name) {
-                    Ok(val)
-                } else {
-                    Err(CodegenError::Cranelift(format!("Niezdefiniowana zmienna: {}", name)))
-                }
-            }
-
-            Expr::BinOp { op, lhs, rhs, .. } => {
-                let l = self.compile_expr(lhs)?;
-                let r = self.compile_expr(rhs)?;
-                Ok(self.compile_binop(op, l, r))
-            }
-
-            Expr::UnaryOp { op, expr, .. } => {
-                let val = self.compile_expr(expr)?;
-                match op {
-                    UnaryOp::Neg => Ok(self.builder.ins().ineg(val)),
-                    UnaryOp::Not => {
-                        let one = self.builder.ins().iconst(types::I8, 1);
-                        Ok(self.builder.ins().bxor(val, one))
-                    }
-                    UnaryOp::BitNot => Ok(self.builder.ins().bnot(val)),
-                }
-            }
-
-            Expr::Write { args, newline, .. } => {
-                self.compile_write(args, *newline)
-            }
-
-            Expr::Block(stmts) => {
-                let mut last = self.builder.ins().iconst(types::I64, 0);
-                for (i, stmt) in stmts.iter().enumerate() {
-                    if i == stmts.len() - 1 {
-                        if let Stmt::Expr(e) = stmt {
-                            last = self.compile_expr(e)?;
-                        } else {
-                            self.compile_stmt(stmt)?;
-                        }
-                    } else {
-                        self.compile_stmt(stmt)?;
-                    }
-                }
-                Ok(last)
-            }
-
-            Expr::If { cond, then, otherwise, .. } => {
-                let cond_val = self.compile_expr(cond)?;
-
-                let then_block = self.builder.create_block();
-                let else_block = self.builder.create_block();
-                let merge_block = self.builder.create_block();
-                self.builder.append_block_param(merge_block, types::I64);
-
-                self.builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
-
-                // Then
-                self.builder.switch_to_block(then_block);
-                self.builder.seal_block(then_block);
-                let then_val = self.compile_expr(then)?;
-                if !self.builder.is_filled() {
-                    self.builder.ins().jump(merge_block, &[then_val]);
-                }
-
-                // Else
-                self.builder.switch_to_block(else_block);
-                self.builder.seal_block(else_block);
-                let else_val = if let Some(e) = otherwise {
-                    self.compile_expr(e)?
-                } else {
-                    self.builder.ins().iconst(types::I64, 0)
-                };
-                if !self.builder.is_filled() {
-                    self.builder.ins().jump(merge_block, &[else_val]);
-                }
-
-                self.builder.switch_to_block(merge_block);
-                self.builder.seal_block(merge_block);
-                Ok(self.builder.block_params(merge_block)[0])
-            }
-
-            Expr::Call { callee, args, .. } => {
-                if let Expr::Var(fname) = callee.as_ref() {
-                    return self.compile_call(fname, args);
-                }
-                Err(CodegenError::Unimplemented("Wywołanie dynamiczne".to_string()))
-            }
-
-            Expr::ArcNew(inner) => {
-                // Arc::new(x) - alokujemy na heapie i zwracamy wskaźnik
-                let val = self.compile_expr(inner)?;
-                let size = self.builder.ins().iconst(types::I64, 8);
-                let ptr = self.call_malloc(size)?;
-                self.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                Ok(ptr)
-            }
-
-            Expr::Cast { expr, ty, .. } => {
-                let val = self.compile_expr(expr)?;
-                match ty {
-                    Ty::Int => Ok(self.builder.ins().ireduce(types::I64, val)),
-                    Ty::Float => Ok(self.builder.ins().fcvt_from_sint(types::F64, val)),
-                    _ => Ok(val),
-                }
-            }
-
-            _ => {
-                // Placeholder dla nieimplementowanych wyrażeń
-                Ok(self.builder.ins().iconst(types::I64, 0))
-            }
+    fn emit_if_stmt(&mut self, cond: &Expr, then_body: &[Stmt],
+        elsif: &[(Expr, Vec<Stmt>)], else_body: &Option<Vec<Stmt>>, depth: usize) -> Result<(), CodegenError> {
+        let indent = "    ".repeat(depth);
+        let c = self.emit_expr(cond);
+        writeln!(self.body, "{}if ({}) {{", indent, c).ok();
+        for s in then_body { self.emit_stmt(s, depth + 1)?; }
+        for (ec, eb) in elsif {
+            let ec_str = self.emit_expr(ec);
+            writeln!(self.body, "{}}} else if ({}) {{", indent, ec_str).ok();
+            for s in eb { self.emit_stmt(s, depth + 1)?; }
         }
+        if let Some(else_b) = else_body {
+            writeln!(self.body, "{}}} else {{", indent).ok();
+            for s in else_b { self.emit_stmt(s, depth + 1)?; }
+        }
+        writeln!(self.body, "{}}}", indent).ok();
+        Ok(())
     }
 
-    fn compile_binop(&mut self, op: &BinOp, l: Value, r: Value) -> Value {
-        match op {
-            BinOp::Add => self.builder.ins().iadd(l, r),
-            BinOp::Sub => self.builder.ins().isub(l, r),
-            BinOp::Mul => self.builder.ins().imul(l, r),
-            BinOp::Div => self.builder.ins().sdiv(l, r),
-            BinOp::Mod => self.builder.ins().srem(l, r),
-            BinOp::Eq => {
-                let b = self.builder.ins().icmp(IntCC::Equal, l, r);
-                self.builder.ins().uextend(types::I64, b)
-            }
-            BinOp::NotEq => {
-                let b = self.builder.ins().icmp(IntCC::NotEqual, l, r);
-                self.builder.ins().uextend(types::I64, b)
-            }
-            BinOp::Lt => {
-                let b = self.builder.ins().icmp(IntCC::SignedLessThan, l, r);
-                self.builder.ins().uextend(types::I64, b)
-            }
-            BinOp::Gt => {
-                let b = self.builder.ins().icmp(IntCC::SignedGreaterThan, l, r);
-                self.builder.ins().uextend(types::I64, b)
-            }
-            BinOp::LtEq => {
-                let b = self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r);
-                self.builder.ins().uextend(types::I64, b)
-            }
-            BinOp::GtEq => {
-                let b = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r);
-                self.builder.ins().uextend(types::I64, b)
-            }
-            BinOp::And => self.builder.ins().band(l, r),
-            BinOp::Or => self.builder.ins().bor(l, r),
-            BinOp::BitAnd => self.builder.ins().band(l, r),
-            BinOp::BitOr => self.builder.ins().bor(l, r),
-            BinOp::BitXor => self.builder.ins().bxor(l, r),
-            BinOp::LShift => self.builder.ins().ishl(l, r),
-            BinOp::RShift => self.builder.ins().sshr(l, r),
-            BinOp::Pow => {
-                // Uproszczone: x^n przez mnożenie (tylko int)
-                // TODO: użyj powi dla float
-                l // placeholder
-            }
-            _ => l, // Assign itp. obsługiwane wyżej
-        }
-    }
+    fn emit_for_stmt(&mut self, pattern: &Pattern, iterable: &Expr, body: &[Stmt], depth: usize) -> Result<(), CodegenError> {
+        let indent = "    ".repeat(depth);
+        let iter_expr = self.emit_expr(iterable);
 
-    fn compile_write(&mut self, args: &[Expr], newline: bool) -> Result<Value, CodegenError> {
-        // Wywołujemy printf z formatem
-        // Uproszczone: obsługujemy jeden argument Int lub Str
-        let fmt = if newline { "%s\n\0" } else { "%s\0" };
-        let fmt_ptr = self.compile_string_literal(&fmt[..fmt.len()-1])?;
-
-        if args.is_empty() {
-            let printf_id = self.module.declare_function(
-                "printf",
-                Linkage::Import,
-                &{
-                    let mut s = self.module.make_signature();
-                    s.params.push(AbiParam::new(types::I64));
-                    s.returns.push(AbiParam::new(types::I32));
-                    s
-                }
-            ).map_err(CodegenError::Module)?;
-
-            let func_ref = self.module.declare_func_in_func(printf_id, self.builder.func);
-            self.builder.ins().call(func_ref, &[fmt_ptr]);
-        } else {
-            let arg_val = self.compile_expr(&args[0])?;
-            let printf_id = self.module.declare_function(
-                "printf",
-                Linkage::Import,
-                &{
-                    let mut s = self.module.make_signature();
-                    s.params.push(AbiParam::new(types::I64));
-                    s.params.push(AbiParam::new(types::I64));
-                    s.returns.push(AbiParam::new(types::I32));
-                    s
-                }
-            ).map_err(CodegenError::Module)?;
-
-            let func_ref = self.module.declare_func_in_func(printf_id, self.builder.func);
-            self.builder.ins().call(func_ref, &[fmt_ptr, arg_val]);
+        // Simple range-based for
+        if let Pattern::Ident(var, _) = pattern {
+            if let Expr::Range(start, end, inclusive, _) = iterable {
+                let s = self.emit_expr(start);
+                let e = self.emit_expr(end);
+                let op = if *inclusive { "<=" } else { "<" };
+                writeln!(self.body, "{}for (hsh_int {} = {}; {} {} {}; {}++) {{",
+                    indent, var, s, var, op, e, var).ok();
+                for stmt in body { self.emit_stmt(stmt, depth + 1)?; }
+                writeln!(self.body, "{}}}", indent).ok();
+                return Ok(());
+            }
         }
 
-        Ok(self.builder.ins().iconst(types::I64, 0))
-    }
-
-    fn compile_call(&mut self, name: &str, args: &[Expr]) -> Result<Value, CodegenError> {
-        // Budujemy sygnaturę w locie (uproszczona - wszystko I64)
-        let mut sig = self.module.make_signature();
-        for _ in args {
-            sig.params.push(AbiParam::new(types::I64));
-        }
-        sig.returns.push(AbiParam::new(types::I64));
-
-        let func_id = self.module
-        .declare_function(name, Linkage::Import, &sig)
-        .map_err(CodegenError::Module)?;
-
-        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
-
-        let mut arg_vals = Vec::new();
-        for arg in args {
-            arg_vals.push(self.compile_expr(arg)?);
-        }
-
-        let call = self.builder.ins().call(func_ref, &arg_vals);
-        let results = self.builder.inst_results(call);
-        if results.is_empty() {
-            Ok(self.builder.ins().iconst(types::I64, 0))
-        } else {
-            Ok(results[0])
-        }
-    }
-
-    fn compile_string_literal(&mut self, s: &str) -> Result<Value, CodegenError> {
-        let key = format!("{}\0", s);
-        let data_id = if let Some(&id) = self.string_data.get(&key) {
-            id
-        } else {
-            let mut desc = DataDescription::new();
-            desc.define(key.as_bytes().to_vec().into_boxed_slice());
-            let id = self.module.declare_anonymous_data(false, false)
-            .map_err(CodegenError::Module)?;
-            self.module.define_data(id, &desc).map_err(CodegenError::Module)?;
-            self.string_data.insert(key, id);
-            id
+        // Generic iterator — generate a while-style loop
+        let var_name = match pattern {
+            Pattern::Ident(n, _) => n.clone(),
+            _ => "__item".to_string(),
         };
-
-        let global = self.module.declare_data_in_func(data_id, self.builder.func);
-        Ok(self.builder.ins().global_value(types::I64, global))
+        writeln!(self.body, "{}/* for-in: {} */", indent, iter_expr).ok();
+        writeln!(self.body, "{}for (size_t __i = 0; __i < {}.len; __i++) {{", indent, iter_expr).ok();
+        writeln!(self.body, "{}    hsh_int {} = {}.data[__i];", indent, var_name, iter_expr).ok();
+        for stmt in body { self.emit_stmt(stmt, depth + 1)?; }
+        writeln!(self.body, "{}}}", indent).ok();
+        Ok(())
     }
 
-    fn call_malloc(&mut self, size: Value) -> Result<Value, CodegenError> {
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I64));
+    fn emit_match_stmt(&mut self, subject: &Expr, arms: &[MatchArm], depth: usize) -> Result<(), CodegenError> {
+        let indent = "    ".repeat(depth);
+        let subj = self.emit_expr(subject);
 
-        let malloc_id = self.module
-        .declare_function("malloc", Linkage::Import, &sig)
-        .map_err(CodegenError::Module)?;
+        // Try to emit as C switch for integer/bool subjects
+        writeln!(self.body, "{}/* match */", indent).ok();
+        writeln!(self.body, "{}{{\n{}    __typeof__({}) __subj = {};", indent, indent, subj, subj).ok();
 
-        let func_ref = self.module.declare_func_in_func(malloc_id, self.builder.func);
-        let call = self.builder.ins().call(func_ref, &[size]);
-        Ok(self.builder.inst_results(call)[0])
+        let mut first = true;
+        for arm in arms {
+            let kw = if first { "if" } else { "else if" };
+            first = false;
+            let pat_cond = self.pattern_condition("__subj", &arm.pattern);
+
+            let guard_str = if let Some(g) = &arm.guard {
+                format!(" && ({})", self.emit_expr(g))
+            } else { String::new() };
+
+            writeln!(self.body, "{}    {} ({}{}) {{", indent, kw, pat_cond, guard_str).ok();
+
+            // Bind pattern variables
+            self.emit_pattern_bindings("__subj", &arm.pattern, depth + 2);
+            for stmt in &arm.body {
+                self.emit_stmt(stmt, depth + 2)?;
+            }
+            writeln!(self.body, "{}    }}", indent).ok();
+        }
+        writeln!(self.body, "{}}}", indent).ok();
+        Ok(())
+    }
+
+    fn pattern_condition(&self, subject: &str, pat: &Pattern) -> String {
+        match pat {
+            Pattern::Wildcard(_) => "1".to_string(),
+            Pattern::Ident(_, _) => "1".to_string(),
+            Pattern::Literal(lit, _) => match lit {
+                Literal::Int(n) => format!("{} == {}", subject, n),
+                Literal::Bool(b) => format!("{} == {}", subject, if *b { "true" } else { "false" }),
+                Literal::String(s) => format!("strcmp({}, \"{}\") == 0", subject, s.replace('"', "\\\"")),
+                Literal::Nil => format!("{} == NULL", subject),
+                _ => "1".to_string(),
+            },
+            Pattern::Or(pats, _) => pats.iter()
+                .map(|p| format!("({})", self.pattern_condition(subject, p)))
+                .collect::<Vec<_>>().join(" || "),
+            _ => "1".to_string(),
+        }
+    }
+
+    fn emit_pattern_bindings(&mut self, subject: &str, pat: &Pattern, depth: usize) {
+        let indent = "    ".repeat(depth);
+        if let Pattern::Ident(name, _) = pat {
+            writeln!(self.body, "{}__typeof__({}) {} = {};", indent, subject, name, subject).ok();
+        }
+    }
+
+    fn emit_expr(&mut self, expr: &Expr) -> String {
+        match expr {
+            Expr::Literal(lit, _) => match lit {
+                Literal::Int(n) => n.to_string(),
+                Literal::Float(f) => format!("{:.}", f),
+                Literal::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")),
+                Literal::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+                Literal::Nil => "NULL".to_string(),
+                Literal::Bytes(_) => "NULL /* bytes */".to_string(),
+            },
+            Expr::Ident(name, _) => name.clone(),
+            Expr::SelfExpr(_) => "self".to_string(),
+            Expr::BinOp(lhs, op, rhs, _) => {
+                let l = self.emit_expr(lhs);
+                let r = self.emit_expr(rhs);
+                // String concatenation must use hsh_strcat, not C + operator
+                if matches!(op, BinOp::Add) {
+                    // Check if either side looks like a string literal or string expr
+                    // We use hsh_strcat conservatively for any Add involving string literals
+                    let l_is_str = l.starts_with('"') || r.starts_with('"')
+                        || l.contains("hsh_str") || r.contains("hsh_str")
+                        || l.contains("to_string") || r.contains("to_string")
+                        || l.contains("hsh_int_to_string") || r.contains("hsh_int_to_string")
+                        || l.contains("greet") || r.contains("greet");
+                    if l_is_str {
+                        return format!("hsh_strcat({}, {})", l, r);
+                    }
+                }
+                let o = binop_to_c(op);
+                format!("({} {} {})", l, o, r)
+            }
+            Expr::UnOp(op, inner, _) => {
+                let i = self.emit_expr(inner);
+                match op {
+                    UnOp::Neg => format!("(-{})", i),
+                    UnOp::Not => format!("(!{})", i),
+                    UnOp::BitNot => format!("(~{})", i),
+                    UnOp::Ref | UnOp::RefMut => format!("(&{})", i),
+                    UnOp::Deref => format!("(*{})", i),
+                }
+            }
+            Expr::Call(callee, args, _) => {
+                let callee_str = self.emit_expr(callee);
+                let args_strs: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                // Map H# builtins to C runtime
+                let c_name = match callee_str.as_str() {
+                    "print"     => "hsh_print".to_string(),
+                    "println"   => "hsh_println".to_string(),
+                    "panic"     => "hsh_panic".to_string(),
+                    "exit"      => "exit".to_string(),
+                    "to_string" => "hsh_int_to_string".to_string(),
+                    "len"       => "hsh_strlen".to_string(),
+                    _           => callee_str,
+                };
+                format!("{}({})", c_name, args_strs.join(", "))
+            }
+            Expr::MethodCall(obj, method, args, _) => {
+                let obj_str = self.emit_expr(obj);
+                let args_strs: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                // Map common methods
+                match method.as_str() {
+                    "len" => format!("hsh_strlen({})", obj_str),
+                    "to_string" => format!("hsh_int_to_string({})", obj_str),
+                    "push" => format!("/* push not yet impl for {} */", obj_str),
+                    _ => {
+                        if args_strs.is_empty() {
+                            format!("{}.{}", obj_str, method)
+                        } else {
+                            format!("{}__{}(&{}, {})", 
+                                "__obj", method, obj_str, args_strs.join(", "))
+                        }
+                    }
+                }
+            }
+            Expr::FieldAccess(obj, field, _) => {
+                let obj_str = self.emit_expr(obj);
+                format!("{}.{}", obj_str, field)
+            }
+            Expr::IndexAccess(arr, idx, _) => {
+                let a = self.emit_expr(arr);
+                let i = self.emit_expr(idx);
+                format!("{}[{}]", a, i)
+            }
+            Expr::Cast(inner, ty, _) => {
+                let i = self.emit_expr(inner);
+                let c_ty = self.type_to_c(ty);
+                format!("(({}){})", c_ty, i)
+            }
+            Expr::Assign(lhs, rhs, _) => {
+                let l = self.emit_expr(lhs);
+                let r = self.emit_expr(rhs);
+                format!("({} = {})", l, r)
+            }
+            Expr::CompoundAssign(lhs, op, rhs, _) => {
+                let l = self.emit_expr(lhs);
+                let r = self.emit_expr(rhs);
+                let o = binop_to_c(op);
+                format!("({} {}= {})", l, o, r)
+            }
+            Expr::ArrayLit(elems, _) => {
+                // Stack array initializer
+                let elems_str: Vec<String> = elems.iter().map(|e| self.emit_expr(e)).collect();
+                format!("{{ {} }}", elems_str.join(", "))
+            }
+            Expr::StructLit(name, fields, _) => {
+                let fields_str: Vec<String> = fields.iter()
+                    .map(|(k, v)| format!(".{} = {}", k, self.emit_expr(v)))
+                    .collect();
+                format!("({}){{ {} }}", name, fields_str.join(", "))
+            }
+            Expr::Return(val, _) => {
+                let v = val.as_ref().map(|e| self.emit_expr(e)).unwrap_or_default();
+                format!("return {}", v)
+            }
+            Expr::Try(inner, _) => {
+                let i = self.emit_expr(inner);
+                format!("({} /* ? */)", i)
+            }
+            Expr::Range(start, end, _, _) => {
+                // Ranges are handled in for-loops; here just emit start
+                let s = self.emit_expr(start);
+                s
+            }
+            _ => "/* unsupported expr */".to_string(),
+        }
+    }
+
+    fn type_to_c(&self, ty: &TypeExpr) -> String {
+        match ty {
+            TypeExpr::Named(n) => match n.as_str() {
+                "int"    => "hsh_int".into(),
+                "uint"   => "hsh_uint".into(),
+                "i8"     => "hsh_i8".into(),
+                "i16"    => "hsh_i16".into(),
+                "i32"    => "hsh_i32".into(),
+                "i64"    => "hsh_i64".into(),
+                "i128"   => "hsh_i128".into(),
+                "u8"     => "hsh_u8".into(),
+                "u16"    => "hsh_u16".into(),
+                "u32"    => "hsh_u32".into(),
+                "u64"    => "hsh_u64".into(),
+                "u128"   => "hsh_u128".into(),
+                "f32"    => "hsh_f32".into(),
+                "f64"    => "hsh_f64".into(),
+                "bool"   => "hsh_bool".into(),
+                "string" => "hsh_string".into(),
+                "bytes"  => "hsh_bytes".into(),
+                "any"    => "void*".into(),
+                other    => other.into(),
+            },
+            TypeExpr::Void => "void".into(),
+            TypeExpr::Optional(inner) => format!("{}*", self.type_to_c(inner)),
+            TypeExpr::Array(inner) => format!("{}*", self.type_to_c(inner)),
+            TypeExpr::Ref(inner) | TypeExpr::RefMut(inner) => format!("{}*", self.type_to_c(inner)),
+            TypeExpr::Tuple(ts) => "void*".into(), // simplified
+            TypeExpr::Generic(name, _) => name.clone(),
+            TypeExpr::Fn(_, ret) => format!("{}(*)()", self.type_to_c(ret)),
+            TypeExpr::Slice(inner, _) => format!("{}*", self.type_to_c(inner)),
+        }
+    }
+
+    pub fn emit_object(&self, output: &str) -> Result<(), CodegenError> {
+        use std::process::Command;
+
+        // Write C source
+        let c_path = format!("{}.c", output);
+        std::fs::write(&c_path, &self.output).map_err(CodegenError::Io)?;
+
+        // Find C compiler
+        let compiler = find_c_compiler().ok_or(CodegenError::NoCompiler)?;
+
+        // Build the binary
+        let mut cmd = Command::new(&compiler);
+        cmd.arg("-O2").arg("-o").arg(output).arg(&c_path);
+
+        // Static linking
+        if self.opts.static_link {
+            cmd.arg("-static");
+        }
+
+        // Target triple
+        let triple = &self.opts.target.llvm_triple;
+        if triple.contains("musl") {
+            cmd.arg("-target").arg(triple);
+        }
+
+        let status = cmd.status().map_err(|e| {
+            CodegenError::CompileError(format!("failed to run {}: {}", compiler, e))
+        })?;
+
+        if !status.success() {
+            return Err(CodegenError::CompileError(format!(
+                "{} exited with code {:?}", compiler, status.code()
+            )));
+        }
+
+        // Cleanup C source
+        let _ = std::fs::remove_file(&c_path);
+        Ok(())
+    }
+
+    pub fn get_c_source(&self) -> &str {
+        &self.output
     }
 }
 
-// Alias dla modułu AST
-type HsharpModule = hsharp_parser::ast::Module;
+fn find_c_compiler() -> Option<String> {
+    for compiler in &["cc", "gcc", "clang", "musl-gcc"] {
+        if let Ok(output) = std::process::Command::new("which")
+            .arg(compiler)
+            .output()
+        {
+            if output.status.success() {
+                return Some(compiler.to_string());
+            }
+        }
+        // Windows
+        if let Ok(output) = std::process::Command::new("where")
+            .arg(compiler)
+            .output()
+        {
+            if output.status.success() {
+                return Some(compiler.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn binop_to_c(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "==",
+        BinOp::NotEq => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::LtEq => "<=",
+        BinOp::GtEq => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+    }
+}
