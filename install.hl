@@ -1,5 +1,5 @@
 // curl
 
-> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v1.8/h# -o /usr/bin/h#
-> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v1.8/bytes -o /usr/bin/bytes
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.1/h# -o /usr/bin/h#
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.1/bytes -o /usr/bin/bytes
 > sudo chmod a+x /usr/bin/h# /usr/bin/bytes
