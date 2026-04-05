@@ -1,6 +1,5 @@
-/// H# Standard Library — Rust implementation
-/// These modules are compiled into the H# runtime and available
-/// via `import "std:..."` in H# source files.
+//! H# Standard Library
+//! Import via: use "std -> module -> sub" from "alias"
 
 pub mod io;
 pub mod crypto;
@@ -13,10 +12,26 @@ pub mod time;
 pub mod collections;
 pub mod fmt;
 pub mod bytes_util;
+// Data formats
+pub mod json;
+pub mod yaml;
+pub mod toml_fmt;
+// Security
+pub mod sec;
+// HTTP
+pub mod http;
+// OS
+pub mod os;
+// Math
+pub mod math;
+// String utils
+pub mod strings;
+// Path
+pub mod path;
+// Env
+pub mod env;
 
-/// Re-exports for the prelude (auto-imported into every H# program)
 pub mod prelude {
-    pub use crate::io::print::println;
-    pub use crate::io::print::print;
+    pub use crate::io::print::{write, writeln};
     pub use crate::fmt::to_string;
 }
