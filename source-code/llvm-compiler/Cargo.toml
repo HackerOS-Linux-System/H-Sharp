@@ -1,0 +1,28 @@
+[package]
+name = "hsharp-llvm-compiler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hsharp_llvm_compiler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hsharp-compiler-llvm"
+path = "src/bin.rs"
+
+[dependencies]
+anyhow    = "=1.0.79"
+thiserror = "=1.0.56"
+colored   = "=2.0.4"
+inkwell   = { version = "0.4", features = ["llvm17-0"] }
+hsharp-parser   = { path = "../parser" }
+hsharp-compiler = { path = "../compiler" }
+
+[build-dependencies]
+# nothing special
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
