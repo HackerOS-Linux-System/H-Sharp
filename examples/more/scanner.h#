@@ -1,0 +1,20 @@
+;; H# Port Scanner — HackerOS cybersec tool
+;; use "std -> sec" from "sec"
+
+fn scan_range(host: string, start: int, end_port: int) is
+    write("Scanning " + host + " ports " + to_string(start) + "-" + to_string(end_port))
+    let mut found: int = 0
+    for port in start..=end_port is
+        let open: bool = false
+        if open is
+            write("[OPEN] " + to_string(port) + "/tcp")
+            found += 1
+        end
+    end
+    write("Done. " + to_string(found) + " open port(s).")
+end
+
+fn main() is
+    write("H# CyberSec Scanner v0.1")
+    scan_range("127.0.0.1", 1, 1024)
+end
