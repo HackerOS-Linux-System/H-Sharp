@@ -1,365 +1,257 @@
-# H# Programming Language
+# ![H# - Programing Language for HackerOS.](https://github.com/HackerOS-Linux-System/H-Sharp/blob/main/images/logo.png)
+# H# — H-Sharp Language v0.1
 
-**H#** (H-Sharp) is a compiled, statically-typed programming language designed for **cybersecurity professionals**. It aims to replace Python in security tooling with a language that compiles to fast, fully-static native binaries.
+**HackerOS-first compiled language** — built for the HackerOS distribution.  
+Fast, safe, expressive. Replaces Python for CLI tools, GUI apps, cybersec utilities, and everyday scripts.
 
----
+## Use Cases in HackerOS
 
-## Features
+| Use Case | H# Feature |
+|----------|-----------|
+| CLI tools | Fast native binaries, pattern matching, argument parsing |
+| GUI apps | GTK/iced bindings via `std -> gui` |
+| Cybersec tools | `std -> sec` (XOR, hex, port scan, hash) |
+| Replace Python | Same ergonomics, 10-100x faster, `bytes` PM for Python interop |
+| Web/HTTP | `std -> net -> tcp`, `std -> http` |
+| System scripting | `std -> os`, `std -> process`, `std -> env` |
+| Data processing | `std -> json`, `std -> yaml`, `std -> toml_fmt` |
 
-| Feature | Description |
-|---|---|
-| **Syntax** | Ruby/Python-inspired, clean and readable |
-| **Type system** | Static typing with inference |
-| **Memory safety** | Rust-like ownership model in semantics |
-| **Unsafe + Arena** | `unsafe arena` blocks with arena allocator |
-| **Cross-compilation** | Linux, Windows, macOS (x86\_64 & ARM64) |
-| **Static binaries** | Fully static by default (musl on Linux) |
-| **Preview mode** | Built-in interpreter for rapid dev iteration |
-| **Elm-like errors** | Beautiful, pinpointed error messages |
+## Install
 
----
+```bash
+hacker unpack h# # if you wont only h# cli tool
+
+hacker unpack h#-utils # if you wont vira/bytes/bit
+```
 
 ## Quick Start
 
 ```bash
-# Create a new cybersec project
-h# new mytool --template cybersec
+# Interpreter preview (fast iteration)
+h# preview hello.h#
 
-cd mytool
+# Compile native binary (Cranelift, fast compile)
+h# build hello.h# -o hello
 
-# Run in interpreter (fast dev loop)
-h# preview src/main.h#
+# Release binary (LLVM O3+AVX2, fast runtime)
+hsharp-compiler-llvm hello.h# --release -o hello
 
-# Compile to native binary
-h# build
+# Vira: project build tool (compilation)
+vira new myapp && cd myapp
+vira build --release
 
-# Cross-compile to Windows
-h# build --target windows-x86_64
-
-# Check syntax + types only
-h# check
+# bytes: JIT interpreter (RAM cache, no artifacts)
+bytes new myapp && cd myapp
+bytes run
 ```
 
----
+## Syntax
 
-## H# Syntax
+```hsharp
+;; Line comment
+/// Doc comment
+// Block comment \\
 
-### Hello World
-```h-sharp
-fn main() do
-    println("Hello from H#!")
-end
-```
+use "std -> io" from "io"
+use "std -> json" from "json"
+use "std -> sec" from "sec"
+use "vira -> scanner/1.2" from "scanner"
+use "github.com/user/mylib" from "mylib"
+use "python -> numpy" from "np"       ;; bytes PM only
 
-### Variables & Types
-```h-sharp
-let x: int = 42
-let mut counter: int = 0
-let name: string = "hsharp"
-let flag: bool = true
-let ratio: f64 = 3.14
-let data: bytes = [0xDE, 0xAD, 0xBE, 0xEF]
-```
-
-### Functions
-```h-sharp
-fn add(a: int, b: int) -> int do
-    return a + b
+fn greet(name: string) -> string is
+    return "Hello, " + name + "!"
 end
 
-# Single-expression shorthand
-fn square(n: int) -> int = n * n
-```
-
-### Control Flow
-```h-sharp
-# if / elsif / else
-if score > 90 then do
-    println("A")
-elsif score > 70 then do
-    println("B")
-else do
-    println("C")
-end
-
-# while
-let mut i: int = 0
-while i < 10 do
-    i += 1
-end
-
-# for-in with range
-for i in 0..10 do
-    println(to_string(i))
-end
-
-# for-in inclusive range
-for i in 1..=5 do
-    println(to_string(i))
-end
-
-# match (pattern matching)
-match status_code do
-    200 => println("OK")
-    404 => println("Not Found")
-    500 => println("Server Error")
-    _   => println("Unknown")
-end
-```
-
-### Structs
-```h-sharp
-struct Packet do
-    pub src_ip: string
-    pub dst_ip: string
-    pub port: int
-    pub data: bytes
-end
-
-impl Packet do
-    pub fn new(src: string, dst: string, port: int) -> Packet do
-        return Packet { src_ip: src, dst_ip: dst, port: port, data: [] }
+fn factorial(n: int) -> int is
+    match n is
+        0 | 1 => return 1
+        _     => return n * factorial(n - 1)
     end
+end
 
-    pub fn summary(self) -> string do
-        return self.src_ip + " -> " + self.dst_ip
+fn main() is
+    write(greet("HackerOS"))
+    write("10! = " + to_string(factorial(10)))
+
+    let mut total: int = 0
+    for i in 1..=100 is
+        total += i
+    end
+    write("Sum 1..100 = " + to_string(total))
+
+    ;; Unsafe modes
+    unsafe arena(4096) is
+        ;; Arena bump allocator — zero free() overhead
+    end
+    unsafe manual is
+        ;; Raw malloc/free control
     end
 end
 ```
 
-### Enums
-```h-sharp
-enum ScanResult do
-    Open
-    Closed
-    Filtered(string)
-end
+## Three Compilation Modes
+
+```
+h# preview file.h#      → Tree-walk interpreter (instant start)
+h# build   file.h#      → Cranelift native (fast compile, good speed)
+hsharp-compiler-llvm --release → LLVM O3+AVX2 (slow compile, fastest runtime)
 ```
 
-### Traits
-```h-sharp
-trait Scanner do
-    fn scan(self, target: string) -> ScanResult
-    fn name(self) -> string do
-        return "GenericScanner"
-    end
-end
-```
-
-### Generics
-```h-sharp
-struct Pair<A, B> do
-    pub first: A
-    pub second: B
-end
-```
-
-### Unsafe + Arena Allocator
-```h-sharp
-fn process_buffer(size: int) do
-    unsafe arena(1048576) do   # 1MB arena
-        # all allocations here come from the arena
-        # automatically freed when block exits
-        let buf: bytes = alloc(size)
-    end
-end
-```
-
-### Type Casting
-```h-sharp
-let n: int = 42
-let f: f64 = n as f64
-let b: u8 = n as u8
-```
-
-### Optional Types
-```h-sharp
-fn find_user(id: int) -> string? do
-    return nil
-end
-
-let user = find_user(1)?   # propagate nil with ?
-```
-
----
-
-## Import System
-
-```h-sharp
-# Standard library
-import "std:io::keyboard"
-import "std:io::net"
-import "std:crypto::hash"
-import "std:crypto::hex"
-import "std:encoding::base64"
-
-# Bytes package registry
-import "bytes:scanner"
-import "bytes:scanner/1.2"    # specific version
-
-# Local files
-import "file:lib.h#"
-import "file:../utils.h#"
-
-# Native libraries
-import "lib:static::openssl.a"    # static linking
-import "lib:dynamic::libssl.so"   # dynamic linking
-```
-
----
-
-## Compilation Directives
-
-```h-sharp
-# Dynamic linking (default is static)
-~ "dynamic:openssl"
-~ "dynamic"              # all libs dynamic
-
-# Fast compilation (larger binary, no LTO)
-~~ "fast:all"
-~~ "fast:debug"
-```
-
----
-
-## Available Targets
-
-| Target | Description |
-|---|---|
-| `linux-x86_64` | Linux x86\_64 musl (fully static) **[default on Linux]** |
-| `linux-x86_64-gnu` | Linux x86\_64 glibc |
-| `linux-aarch64` | Linux ARM64 |
-| `windows-x86_64` | Windows x86\_64 MSVC |
-| `windows-aarch64` | Windows ARM64 |
-| `macos-x86_64` | macOS Intel |
-| `macos-aarch64` | macOS Apple Silicon |
+## vira — Project Build Manager
 
 ```bash
-h# targets          # list all
-h# build --target windows-x86_64
+vira new myapp --template cybersec
+vira build [--release]
+vira add scanner/1.2
+vira add github.com/user/repo
+vira install
+vira search crypto
+vira settings        # TUI settings (progress bar theme etc.)
+vira clean           # remove .cache/
 ```
 
----
+### vira.hcl
 
-## Standard Library Modules
+```hcl
+project "myapp" {
+  version = "0.1.0"
+  h_sharp = "0.1"
+  src_dir = "src"
+}
 
-```
-std:io::keyboard       — stdin/stdout/stderr
-std:io::net            — TCP/UDP networking
-std:io::file           — file I/O
-std:crypto::hash       — hashing (SHA-2, MD5, etc.)
-std:crypto::hex        — hex encode/decode
-std:crypto::bytes      — XOR, ROT13, byte manipulation
-std:encoding::base64   — Base64 encode/decode
-std:encoding::url      — URL encode/decode
-std:regex              — regular expressions
-std:time               — timestamps, sleep
-std:fs                 — filesystem utilities
-std:process            — subprocess execution
-std:collections        — HashMap, HashSet, VecDeque
-```
+output {
+  type = "binary"   # binary | so | a | hsl
+  # name = "libmyapp"
+}
 
----
-
-## bytes — Package Manager
-
-```bash
-bytes add scanner           # add latest
-bytes add scanner/1.2       # add specific version
-bytes remove scanner        # remove
-bytes install               # install all from h#.json
-bytes update                # update all to latest
-bytes list                  # list installed
-bytes search <query>        # search registry
-bytes info <package>        # package details
-```
-
-Package index: `https://github.com/Bytes-Repository/repository/blob/main/index.json`
-
----
-
-## Project Structure
-
-```
-myproject/
-├── h#.json           ← project manifest + dependencies
-├── bytes.lock        ← dependency lockfile
-├── .gitignore
-├── src/
-│   └── main.h#       ← main source file
-└── build/
-    ├── myproject     ← compiled binary (also copied to root)
-    └── packages/     ← downloaded library sources
-```
-
-### h#.json
-```json
-{
-  "name": "myproject",
-  "version": "0.1.0",
-  "dependencies": {
-    "scanner": "1.2",
-    "exploit-db": "0.9"
-  }
+dependencies {
+  scanner        = "1.2"
+  github.com/user/repo = "latest"
 }
 ```
 
----
+### Output types
 
-## Build Commands Reference
+| Type | Extension | Use |
+|------|-----------|-----|
+| `binary` | — | Executable (default) |
+| `so` | `.so` | Shared library |
+| `a` | `.a` | Static library |
+| `hsl` | `.hsl` | H# native library (like Rust's .rlib) |
+
+## bytes — RAM-JIT Package Manager
 
 ```bash
-h# preview [file]             # interpret & run (dev mode)
-h# build                      # compile project
-h# build --target <target>    # cross-compile
-h# build --debug              # with debug symbols
-h# build --no-opt             # disable optimizations
-h# check [file]               # syntax + type check only
-h# new <name> [--template T]  # create new project
-h# targets                    # list cross-compilation targets
+bytes new myapp && cd myapp
+bytes run                        # JIT (RAM cache)
+bytes run --tier interpreter     # Pure interpreter
+bytes run --tier bytecode        # Bytecode VM
+bytes add scanner                # H# package
+bytes python numpy               # Python package
+bytes install                    # Install all from bytes.toml
+bytes clean                      # Clear /dev/shm cache
 ```
 
-Templates: `app` (default), `cybersec`, `network`, `lib`
+### bytes.toml
 
----
+```toml
+[package]
+name = "myapp"
+version = "0.1.0"
+entry = "src/main.h#"
+
+[jit]
+tier = "jit"          # interpreter | bytecode | jit
+hot_thresh = 100      # JIT after 100 calls
+
+[dependencies]
+scanner = "1.2"
+
+[python]
+version = "3.13"
+packages = ["numpy", "cryptography", "pandas"]
+```
+
+### Python Interop
+
+```hsharp
+;; bytes.toml: python packages = ["numpy"]
+use "python -> numpy" from "np"
+use "python -> cryptography" from "crypto"
+
+fn main() is
+    let result: string = np_call("mean", "[1,2,3,4,5]")
+    write("numpy mean: " + result)
+end
+```
+
+## Standard Library
+
+```hsharp
+use "std -> io"           from "io"       ;; write, writeln, keyboard, file
+use "std -> json"         from "json"     ;; parse, stringify
+use "std -> yaml"         from "yaml"     ;; parse, stringify
+use "std -> toml_fmt"     from "toml"     ;; parse
+use "std -> sec"          from "sec"      ;; xor, rot13, scan_port, hex
+use "std -> crypto -> hex" from "hex"     ;; encode/decode
+use "std -> http"         from "http"     ;; GET, POST
+use "std -> net -> tcp"   from "tcp"      ;; TcpStream
+use "std -> math"         from "math"     ;; sin, cos, PI, sqrt
+use "std -> strings"      from "str"      ;; trim, split, join, pad
+use "std -> path"         from "path"     ;; join, filename, exists
+use "std -> fs"           from "fs"       ;; read, write, exists
+use "std -> os"           from "os"       ;; platform, hostname, username
+use "std -> env"          from "env"      ;; get, set, args, cwd
+use "std -> time"         from "t"        ;; now_unix, sleep_ms
+use "std -> collections"  from "col"      ;; HashMap, HashSet
+use "std -> encoding -> base64" from "b64" ;; encode, decode
+use "std -> process"      from "proc"     ;; run, spawn
+use "std -> regex"        from "re"       ;; is_match
+```
 
 ## Architecture
 
 ```
-hsharp/
-├── parser/       ← lexer + parser → AST  (lib)
-├── compiler/     ← type checker + C backend codegen  (lib)
-├── interpreter/  ← tree-walk interpreter for preview mode  (lib)
-├── cli/          ← hsharp CLI tool  (binary)
-├── bytes/        ← bytes package manager  (binary)
-└── std/          ← standard library Rust implementations  (lib)
+H# Source (.h# / .hsp)
+│
+├── h# preview   → Interpreter (tree-walk, zero compile)
+├── h# build     → Cranelift backend (fast compile, native .o)
+├── hsharp-compiler-llvm --release → LLVM O3+AVX2 (production)
+│
+├── vira build       → invokes hsharp-compiler-llvm for release
+│                       invokes hsharp build for debug
+│
+└── bytes run        → JIT in RAM (/dev/shm/bytes-PID/)
+                        Tier 1: interpreter (hsharp preview)
+                        Tier 2: bytecode (cached .h#bc in RAM)
+                        Tier 3: JIT (cranelift → binary in RAM)
+
+Bootstrap (always Rust):   parser + compiler + cranelift + llvm
+Rewritable in H# later:    cli, vira, bytes, interpreter, std
 ```
 
-The compiler uses **C as a portable backend** — H# source is compiled to
-optimized C, then passed to `gcc`/`clang`/`musl-gcc` for native code
-generation. This avoids LLVM installation requirements while still
-producing Rust/C-level performance binaries.
+## File Extensions
 
----
+- `.h#` — H# source (main format)
+- `.hsp` — H# source (alternate)
+- `.hsl` — H# library (vira output type)
+- `.h#bc` — H# bytecode (bytes PM cache, in RAM)
 
-## Error Messages (Elm-style)
+## Build from Source
 
+```bash
+# Standard build (Cranelift only)
+cargo build --release
+
+# With LLVM compiler (requires llvm-17-dev)
+LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release
+
+# HackerOS install location
+install -m755 target/release/hsharp               ~/.hackeros/H#/bins/
+install -m755 target/release/vira                 ~/.hackeros/H#/bins/
+install -m755 target/release/bytes                ~/.hackeros/H#/bins/
+install -m755 target/release/hsharp-compiler-llvm ~/.hackeros/H#/bins/
 ```
--- SYNTAX ERROR (src/main.h#) -------
---> src/main.h#:5:15
 
-   4 | fn add(a: int, b: int) -> int do
-   5 |     return a ++ b
-                    ^^
-   6 | end
-
-Error: unexpected token `+`
-
-  Hint: did you mean `+` (addition)?
-```
-
----
-
-## License
-
-MIT — HackerOS Team
+Requires: Rust ≥ 1.75, gcc/cc, llvm-17-dev (for LLVM backend)
