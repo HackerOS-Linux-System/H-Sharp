@@ -1,0 +1,23 @@
+;; H# Python interop example (bytes PM only)
+;; Install: bytes add numpy && bytes run python_interop.h#
+
+;; use "python -> numpy" from "np"
+;; use "python -> cryptography" from "crypto"
+
+fn main() is
+    write("H# ↔ Python interop demo")
+    write("")
+    write("With bytes PM you can use Python libraries:")
+    write("  numpy → scientific computing")
+    write("  pandas → data analysis")
+    write("  cryptography → advanced crypto")
+    write("  requests → HTTP (prefer std -> http though)")
+    write("")
+    write("Import syntax:")
+    write("  use \"python -> numpy\" from \"np\"")
+    write("  use \"python -> numpy/1.26\" from \"np\"   ;; pinned version")
+    write("")
+    write("Then call:")
+    write("  let arr = np_call(\"array\", \"[1,2,3,4,5]\")")
+    write("  let mean = np_eval(\"numpy.mean([1,2,3])\")")
+end
