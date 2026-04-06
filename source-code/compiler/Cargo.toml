@@ -14,3 +14,14 @@ serde = { version = "=1.0.195", features = ["derive"] }
 serde_json = "=1.0.108"
 colored = "=2.0.4"
 hsharp-parser = { path = "../parser" }
+
+# Cranelift native code generation
+cranelift-codegen  = "=0.100.0"
+cranelift-frontend = "=0.100.0"
+cranelift-module   = "=0.100.0"
+cranelift-object   = "=0.100.0"
+cranelift-native   = "=0.100.0"
+
+# Object file writing
+object = "=0.32.2"
+target-lexicon = "0.12"
