@@ -1,36 +1,43 @@
-# H# XOR Cipher Tool
-# Demonstrates: bytes manipulation, crypto ops, encoding
-#
-# hsharp preview examples/xor_cipher.h#
+;; H# XOR Cipher Tool — HackerOS crypto example
+;; Preview: hsharp preview examples/xor_cipher.h#
 
-import "std:crypto::bytes"
-import "std:crypto::hex"
-import "std:encoding::base64"
+use "std -> crypto -> hex" from "hex"
+use "std -> sec"           from "sec"
+use "std -> encoding -> base64" from "b64"
 
-fn xor_bytes(data: bytes, key: bytes) -> bytes do
-    # Real impl uses std:crypto::bytes::xor
-    # Demo: return data as-is
-    return data
+fn xor_bytes(data: string, key: string) -> string is
+    ;; sec::xor(data_bytes, key_bytes) — real impl
+    return "xored:" + data
 end
 
-fn print_hex(label: string, data: bytes) do
-    println(label + ": " + data.to_hex())
+fn print_hex(label: string, data: string) is
+    write(label + ": " + data)
 end
 
-fn main() do
-    println("H# XOR Cipher Tool")
-    println("══════════════════")
-    println("")
+fn to_base64(data: string) -> string is
+    ;; b64::encode(data)
+    return "base64:" + data
+end
 
-    let plaintext: bytes  = [0x48, 0x65, 0x6C, 0x6C, 0x6F]  # "Hello"
-    let key: bytes        = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
+fn main() is
+    write("H# XOR Cipher Tool")
+    write("══════════════════")
+    write("")
+
+    let plaintext: string = "48656C6C6F"  ;; "Hello" in hex
+    let key:       string = "AABBCCDDEE"
 
     print_hex("Plaintext ", plaintext)
     print_hex("Key       ", key)
 
-    let ciphertext: bytes = xor_bytes(plaintext, key)
+    let ciphertext: string = xor_bytes(plaintext, key)
     print_hex("Ciphertext", ciphertext)
 
-    println("")
-    println("Done.")
+    let decoded: string = xor_bytes(ciphertext, key)
+    print_hex("Decrypted ", decoded)
+
+    write("")
+    write("Base64 encoded: " + to_base64(plaintext))
+    write("")
+    write("Done.")
 end
