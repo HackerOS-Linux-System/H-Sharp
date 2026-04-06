@@ -15,17 +15,34 @@ pub enum TypeExpr {
     Ref(Box<TypeExpr>),               // &T
     RefMut(Box<TypeExpr>),            // &mut T
     Void,
+    // Explicit numeric aliases (sugar for Named but typed directly)
+    I8, I16, I32, I64, I128,
+    U8, U16, U32, U64, U128,
+    F32, F64,
+    Bool, String, Bytes,
 }
 
 // ─── Import paths ─────────────────────────────────────────────────────────────
 
+/// Import path parsed from: use "std -> time -> clock" from "alias"
+/// or: use "github.com/user/repo" from "alias"
+/// or: use "vira -> pkgname/1.0" from "alias"
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ImportKind {
-    Std(String),             // "std:io::keyboard"
-    Bytes(String, Option<String>), // "bytes:sandbox/1.2"
-    File(String),            // "file:lib.h#"
-    LibStatic(String),       // "lib:static::file.so"
-    LibDynamic(String),      // "lib:dynamic::file.so"
+    /// use "std -> module -> sub" from "alias"
+    Std { path: Vec<String>, alias: Option<String> },
+    /// use "vira -> pkgname" or "vira -> pkgname/1.2" from "alias"
+    Vira { name: String, version: Option<String>, alias: Option<String> },
+    /// use "file -> path/to/lib.h#" from "alias"
+    File { path: String, alias: Option<String> },
+    /// use "lib:static -> file.a" from "alias"
+    LibStatic { path: String, alias: Option<String> },
+    /// use "lib:dynamic -> file.so" from "alias"
+    LibDynamic { path: String, alias: Option<String> },
+    /// use "github.com/user/repo" from "alias"  (Vira Go-style)
+    GitRepo { url: String, alias: Option<String> },
+    /// use "python -> numpy" from "np"  — Python package interop via bytes
+    Python { name: String, version: Option<String>, alias: Option<String> },
 }
 
 // ─── Literals ─────────────────────────────────────────────────────────────────
@@ -192,8 +209,16 @@ pub struct MatchArm {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UnsafeMode {
+    Arena(Option<usize>),   // unsafe arena / unsafe arena(N)
+    Manual,                  // unsafe manual — raw malloc/free
+    Raw,                     // unsafe — no allocator wrapper
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArenaConfig {
     pub size: Option<usize>,
+    pub mode: UnsafeMode,
 }
 
 // ─── Statements ───────────────────────────────────────────────────────────────
