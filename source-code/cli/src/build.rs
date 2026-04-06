@@ -110,6 +110,7 @@ pub fn run(output: Option<String>, target: Option<String>, debug: bool, no_opt: 
         static_link: true,
         debug_info: debug,
         output: format!("build/{}", out_name),
+        use_cranelift: true,
     };
 
     let mut c_sources = Vec::new();
