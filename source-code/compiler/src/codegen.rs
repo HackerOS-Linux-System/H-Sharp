@@ -569,10 +569,26 @@ static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
             TypeExpr::Optional(inner) => format!("{}*", self.type_to_c(inner)),
             TypeExpr::Array(inner) => format!("{}*", self.type_to_c(inner)),
             TypeExpr::Ref(inner) | TypeExpr::RefMut(inner) => format!("{}*", self.type_to_c(inner)),
-            TypeExpr::Tuple(ts) => "void*".into(), // simplified
+            TypeExpr::Tuple(_ts) => "void*".into(), // simplified
             TypeExpr::Generic(name, _) => name.clone(),
             TypeExpr::Fn(_, ret) => format!("{}(*)()", self.type_to_c(ret)),
             TypeExpr::Slice(inner, _) => format!("{}*", self.type_to_c(inner)),
+            // Explicit numeric type aliases
+            TypeExpr::I8   => "hsh_i8".into(),
+            TypeExpr::I16  => "hsh_i16".into(),
+            TypeExpr::I32  => "hsh_i32".into(),
+            TypeExpr::I64  => "hsh_i64".into(),
+            TypeExpr::I128 => "hsh_i128".into(),
+            TypeExpr::U8   => "hsh_u8".into(),
+            TypeExpr::U16  => "hsh_u16".into(),
+            TypeExpr::U32  => "hsh_u32".into(),
+            TypeExpr::U64  => "hsh_u64".into(),
+            TypeExpr::U128 => "hsh_u128".into(),
+            TypeExpr::F32  => "hsh_f32".into(),
+            TypeExpr::F64  => "hsh_f64".into(),
+            TypeExpr::Bool   => "hsh_bool".into(),
+            TypeExpr::String => "hsh_string".into(),
+            TypeExpr::Bytes  => "hsh_bytes".into(),
         }
     }
 
