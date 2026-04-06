@@ -70,6 +70,22 @@ impl HType {
             ),
             TypeExpr::Generic(name, _args) => HType::Named(name.clone()),
             TypeExpr::Slice(inner, _) => HType::Array(Box::new(Self::from_type_expr(inner))),
+            // Explicit numeric type aliases added to AST
+            TypeExpr::I8          => HType::I8,
+            TypeExpr::I16         => HType::I16,
+            TypeExpr::I32         => HType::I32,
+            TypeExpr::I64         => HType::I64,
+            TypeExpr::I128        => HType::I128,
+            TypeExpr::U8          => HType::U8,
+            TypeExpr::U16         => HType::U16,
+            TypeExpr::U32         => HType::U32,
+            TypeExpr::U64         => HType::U64,
+            TypeExpr::U128        => HType::U128,
+            TypeExpr::F32         => HType::F32,
+            TypeExpr::F64         => HType::F64,
+            TypeExpr::Bool        => HType::Bool,
+            TypeExpr::String      => HType::Str,
+            TypeExpr::Bytes       => HType::Bytes,
         }
     }
 
