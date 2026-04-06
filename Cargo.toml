@@ -1,18 +1,21 @@
 [workspace]
 members = [
-    "source-code/parser",
-    "source-code/compiler",
-    "source-code/cli",
-    "source-code/bytes",
-    "source-code/interpreter",
-    "source-code/std",
+    "parser",
+    "compiler",
+    "cli",
+    "bytes",
+    "interpreter",
+    "std",
+    "vira",
+    "llvm-compiler",  # Requires: apt install llvm-17-dev libpolly-17-dev libzstd-dev
+    # Build with LLVM: LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release -p hsharp-llvm-compiler
 ]
 resolver = "2"
 
 [workspace.package]
-version = "1.8.0"
+version = "0.1.0"
 edition = "2021"
-authors = ["HackerOS Team <hackeros068@gmail.com>"]
+authors = ["H# Language Team"]
 license = "MIT"
 
 [workspace.dependencies]
