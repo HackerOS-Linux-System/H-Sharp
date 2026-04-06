@@ -1,0 +1,18 @@
+;; H# HTTP micro-server — HackerOS web tool
+;; use "std -> net -> tcp" from "tcp"
+
+fn handle_request(method: string, path: string) -> string is
+    if method == "GET" is
+        if path == "/" is
+            return "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>H# Web!</h1>"
+        end
+    end
+    return "HTTP/1.0 404 Not Found\r\n\r\nNot Found"
+end
+
+fn main() is
+    let port: int = 8080
+    write("H# HTTP server on port " + to_string(port))
+    write("In HackerOS: use std -> net -> tcp for real TCP listener")
+    ;; tcp::listen("0.0.0.0", port, handle_request)
+end
