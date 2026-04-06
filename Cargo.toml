@@ -15,8 +15,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["H# Language Team"]
-license = "MIT"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+license = "BSD-3"
 
 [workspace.dependencies]
 # Shared deps
