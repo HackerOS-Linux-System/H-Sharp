@@ -14,7 +14,7 @@ pub enum TokenKind {
     // Identifiers & keywords
     Ident(String),
 
-    // Keywords
+    // Keywords (updated syntax)
     Fn,
     Let,
     Mut,
@@ -25,14 +25,15 @@ pub enum TokenKind {
     For,
     In,
     Return,
-    Import,
+    Use,          // use "std -> time" from "t"
+    From,         // from keyword in use stmt
     Pub,
     Struct,
     Enum,
     Impl,
     Trait,
     Match,
-    Do,
+    Is,           // is (replaces do)
     End,
     Then,
     Type,
@@ -43,10 +44,17 @@ pub enum TokenKind {
     Continue,
     Unsafe,
     Arena,
+    Manual,       // unsafe manual — manual memory management mode
+    Write,        // write() builtin (replaces println)
 
     // Directives (~ and ~~)
     Directive(String),        // ~ "dynamic:..."
     FastDirective(String),    // ~~ "fast:..."
+
+    // Comments (stored for doc generation)
+    DocComment(String),       // /// doc comment
+    BlockCommentStart,        // //
+    BlockCommentEnd,          // \
 
     // Types
     TInt,
@@ -295,14 +303,15 @@ impl Lexer {
             "for"      => TokenKind::For,
             "in"       => TokenKind::In,
             "return"   => TokenKind::Return,
-            "import"   => TokenKind::Import,
+            "use"      => TokenKind::Use,
+            "from"     => TokenKind::From,
             "pub"      => TokenKind::Pub,
             "struct"   => TokenKind::Struct,
             "enum"     => TokenKind::Enum,
             "impl"     => TokenKind::Impl,
             "trait"    => TokenKind::Trait,
             "match"    => TokenKind::Match,
-            "do"       => TokenKind::Do,
+            "is"       => TokenKind::Is,
             "end"      => TokenKind::End,
             "then"     => TokenKind::Then,
             "type"     => TokenKind::Type,
@@ -313,6 +322,8 @@ impl Lexer {
             "continue" => TokenKind::Continue,
             "unsafe"   => TokenKind::Unsafe,
             "arena"    => TokenKind::Arena,
+            "manual"   => TokenKind::Manual,
+            "write"    => TokenKind::Write,
             "true"     => TokenKind::Bool(true),
             "false"    => TokenKind::Bool(false),
             "nil"      => TokenKind::Nil,
@@ -353,8 +364,49 @@ impl Lexer {
                     tokens.push(Token::new(TokenKind::EOF, Span::new(start.clone(), start, self.file.clone()), ""));
                     break;
                 }
+                // Doc comment ///
+                Some('/') if self.peek(1) == Some('/') && self.peek(2) == Some('/') => {
+                    self.advance(); self.advance(); self.advance(); // consume ///
+                    let mut doc = String::new();
+                    while let Some(c) = self.current() {
+                        if c == '\n' { break; }
+                        doc.push(self.advance().unwrap());
+                    }
+                    tokens.push(Token::new(TokenKind::DocComment(doc.trim().to_string()), Span::new(start, self.position(), self.file.clone()), "///"));
+                }
+                // Block comment // ... \
+                Some('/') if self.peek(1) == Some('/') => {
+                    self.advance(); self.advance(); // consume //
+                    tokens.push(Token::new(TokenKind::BlockCommentStart, Span::new(start.clone(), self.position(), self.file.clone()), "//"));
+                    // skip until \ on its own line
+                    loop {
+                        while let Some(c) = self.current() {
+                            if c == '\n' { self.advance(); break; }
+                            self.advance();
+                        }
+                        // check if next line starts with \ (block comment end)
+                        let saved_pos = self.pos;
+                        let saved_line = self.line;
+                        let saved_col = self.col;
+                        self.skip_whitespace_no_newline();
+                        if self.current() == Some('\\') && self.peek(1).map(|c| c == '\\').unwrap_or(false) {
+                            self.advance(); self.advance();
+                            tokens.push(Token::new(TokenKind::BlockCommentEnd, Span::new(start, self.position(), self.file.clone()), "\\\\"));
+                            break;
+                        }
+                        if matches!(self.current(), None) { break; }
+                        // not end, continue skipping
+                    }
+                }
+                Some(';') if self.peek(1) == Some(';') => {
+                    // ;; line comment — skip to end of line
+                    while let Some(c) = self.current() {
+                        if c == '\n' { break; }
+                        self.advance();
+                    }
+                }
+                // Legacy # comment (keep for compatibility during transition)
                 Some('#') => {
-                    // Comment — skip to end of line
                     while let Some(c) = self.current() {
                         if c == '\n' { break; }
                         self.advance();
