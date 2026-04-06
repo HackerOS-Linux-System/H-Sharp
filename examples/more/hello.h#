@@ -1,0 +1,9 @@
+;; H# Hello World — HackerOS
+fn main() is
+    write("Hello from H#!")
+    let mut x: int = 0
+    for i in 1..=5 is
+        x += i
+    end
+    write("Sum 1..5 = " + to_string(x))
+end
