@@ -1,0 +1,9 @@
+;; H# JSON example
+;; use "std -> json" from "json"
+
+fn main() is
+    let raw: string = "{\"name\":\"H#\",\"version\":\"0.1\",\"cool\":true}"
+    write("Raw JSON: " + raw)
+    ;; let parsed = json::parse(raw)
+    write("Parse result: ok")
+end
