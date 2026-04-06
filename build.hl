@@ -1,3 +1,27 @@
 // cargo
 
-> cargo build --release
+> LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! 1. Dodaj repo z LLVM toolchain 17 (unstable)
+! sudo tee /etc/apt/sources.list.d/llvm17.list << 'EOF'
+! Types: deb
+! Architectures: amd64
+! Signed-By: /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+! URIs: https://apt.llvm.org/unstable/
+! Suites: llvm-toolchain-17
+! Components: main
+! EOF
+
+! 2. Dodaj klucz GPG
+! wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+!  sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+
+! 3. Zainstaluj tylko te pakiety (bez clang-17 który ma konflikty)
+! sudo apt update
+! sudo apt install llvm-17-dev libpolly-17-dev libzstd-dev
+
+! 4. Buduj
+! LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release -p hsharp-llvm-compiler
+
+! Instalacja ^^^^^
