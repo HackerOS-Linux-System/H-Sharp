@@ -1,0 +1,33 @@
+;; H# CLI Tool — HackerOS command line tool example
+;; Perfect Python script replacement
+
+use "std -> env" from "env"
+
+fn show_help() is
+    write("Usage: mytool [--verbose] [--output FILE] <input>")
+    write("  --verbose   Show detailed output")
+    write("  --output    Output file path")
+end
+
+fn main() is
+    let mut verbose: bool  = false
+    let mut output:  string = "output.txt"
+    let mut input:   string = ""
+
+    ;; Parse command line arguments
+    ;; env::args() returns [string] array
+    let mut i: int = 0
+    while i < 10 is
+        ;; In real impl: iterate env::args()
+        ;; For demo: show usage
+        i += 1
+    end
+
+    if verbose is
+        write("[verbose] Processing...")
+    end
+
+    write("H# CLI Tool v0.1")
+    write("Output: " + output)
+    write("Done.")
+end
