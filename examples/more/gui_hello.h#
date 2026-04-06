@@ -1,0 +1,26 @@
+;; H# GUI App — HackerOS desktop application
+;; Uses GTK/iced via std -> gui (future std module)
+
+fn on_click(label: string) -> string is
+    return "Button clicked: " + label
+end
+
+fn build_ui() is
+    write("H# GUI App")
+    write("══════════")
+    write("")
+    write("In HackerOS, H# supports:")
+    write("  std -> gui -> gtk     GTK4 native apps")
+    write("  std -> gui -> iced    Pure-H# reactive GUI")
+    write("")
+    write("Example usage:")
+    write("  use \"std -> gui -> gtk\" from \"gtk\"")
+    write("  gtk::window(\"Hello H#\", 400, 300)")
+    write("  gtk::button(\"Click me\", on_click)")
+    write("  gtk::run()")
+end
+
+fn main() is
+    build_ui()
+    write("GUI app would open here on HackerOS")
+end
