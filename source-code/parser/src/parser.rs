@@ -124,7 +124,7 @@ impl Parser {
             }
 
             // Imports
-            if matches!(self.current().kind, TokenKind::Import) {
+            if matches!(self.current().kind, TokenKind::Use) {
                 match self.parse_import() {
                     Ok((kind, alias, span)) => imports.push((kind, alias, span)),
                     Err(e) => { self.errors.report(e); self.recover(); }
@@ -146,7 +146,7 @@ impl Parser {
         // Skip until next statement boundary
         while !matches!(self.current().kind,
             TokenKind::EOF | TokenKind::Newline | TokenKind::Fn | TokenKind::Struct |
-            TokenKind::Enum | TokenKind::Impl | TokenKind::Pub | TokenKind::Import) {
+            TokenKind::Enum | TokenKind::Impl | TokenKind::Pub | TokenKind::Use) {
             self.advance();
         }
     }
@@ -155,34 +155,48 @@ impl Parser {
 
     fn parse_import(&mut self) -> Result<(ImportKind, Option<String>, Span), ParseError> {
         let start = self.current().span.clone();
-        self.advance(); // consume 'import'
+        self.advance(); // consume 'use'
 
+        // Parse: use "std -> time -> clock" from "alias"
+        // or:    use "vira -> pkgname/1.0" from "alias"
+        // or:    use "github.com/user/repo" from "alias"
         let path_tok = if let TokenKind::StringLit(s) = &self.current().kind.clone() {
             let s = s.clone();
             self.advance();
             s
         } else {
-            return Err(self.error("expected import path string", vec!["write: import \"std:io::keyboard\"".to_string()]));
+            return Err(self.error(
+                "expected use path string after `use`",
+                vec![
+                    r#"write: use "std -> io -> keyboard" from "kb""#.to_string(),
+                    r#"or:    use "vira -> scanner/1.2" from "scanner""#.to_string(),
+                    r#"or:    use "github.com/user/repo" from "repo""#.to_string(),
+                ],
+            ));
         };
 
-        // Parse alias: import "..." as alias
-        let alias = if matches!(self.current().kind, TokenKind::As) {
+        // Parse optional: from "alias"
+        let alias = if matches!(self.current().kind, TokenKind::From) {
             self.advance();
-            let (name, _) = self.expect_ident()?;
-            Some(name)
+            if let TokenKind::StringLit(a) = &self.current().kind.clone() {
+                let a = a.clone();
+                self.advance();
+                Some(a)
+            } else {
+                return Err(self.error("expected alias string after `from`", vec![]));
+            }
         } else {
             None
         };
 
         let span = start.merge(&self.current().span);
-
-        let kind = parse_import_path(&path_tok).ok_or_else(|| {
+        let kind = parse_use_path(&path_tok, alias.clone()).ok_or_else(|| {
             ParseError::new(
-                ParseErrorKind::Custom("invalid import path".into()),
+                ParseErrorKind::Custom("invalid use path".into()),
                 span.clone(),
-                format!("unknown import scheme in `{}`", path_tok),
+                format!("cannot parse use path `{}`", path_tok),
                 vec![
-                    "valid schemes: std:, bytes:, file:, lib:static::, lib:dynamic::".to_string(),
+                    r#"valid forms: "std -> module -> sub", "vira -> pkg/1.0", "github.com/user/repo""#.to_string(),
                 ],
             )
         })?;
@@ -276,10 +290,9 @@ impl Parser {
     fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.skip_newlines();
         let mut stmts = Vec::new();
-        // H# uses 'do...end' or indentation-aware blocks
-        // For simplicity, we use 'do' ... 'end'
+        // H# uses 'is...end' blocks
         // But also support single-line: fn foo() -> int = expr
-        if matches!(self.current().kind, TokenKind::Do) {
+        if matches!(self.current().kind, TokenKind::Is) {
             self.advance();
             self.skip_newlines();
             while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
@@ -303,8 +316,8 @@ impl Parser {
             stmts.push(Stmt::Return(Some(expr), span));
         } else {
             return Err(self.error(
-                "expected `do` to start a function body",
-                vec!["write `do` before the function body and `end` after".to_string()],
+                "expected `is` to start a function body",
+                vec!["write `is` before the function body and `end` after".to_string()],
             ));
         }
         Ok(stmts)
@@ -318,8 +331,8 @@ impl Parser {
         self.skip_newlines();
 
         let mut fields = Vec::new();
-        // struct fields: do ... end
-        if matches!(self.current().kind, TokenKind::Do) {
+        // struct fields: is ... end
+        if matches!(self.current().kind, TokenKind::Is) {
             self.advance();
             self.skip_newlines();
             while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
@@ -350,7 +363,7 @@ impl Parser {
         self.skip_newlines();
 
         let mut variants = Vec::new();
-        if matches!(self.current().kind, TokenKind::Do) {
+        if matches!(self.current().kind, TokenKind::Is) {
             self.advance();
             self.skip_newlines();
             while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
@@ -388,7 +401,7 @@ impl Parser {
         self.skip_newlines();
 
         let mut methods = Vec::new();
-        if matches!(self.current().kind, TokenKind::Do) {
+        if matches!(self.current().kind, TokenKind::Is) {
             self.advance();
             self.skip_newlines();
             while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
@@ -407,7 +420,7 @@ impl Parser {
                     } else { None };
 
                     self.skip_newlines();
-                    let default_body = if matches!(self.current().kind, TokenKind::Do) {
+                    let default_body = if matches!(self.current().kind, TokenKind::Is) {
                         Some(self.parse_block()?)
                     } else { None };
 
@@ -442,7 +455,7 @@ impl Parser {
 
         self.skip_newlines();
         let mut methods = Vec::new();
-        if matches!(self.current().kind, TokenKind::Do) {
+        if matches!(self.current().kind, TokenKind::Is) {
             self.advance();
             self.skip_newlines();
             while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
@@ -589,7 +602,7 @@ impl Parser {
                 } else { None };
                 Ok(Stmt::Return(expr, span))
             }
-            TokenKind::Import => {
+            TokenKind::Use => {
                 let (kind, alias, span) = self.parse_import()?;
                 Ok(Stmt::Import(kind, alias, span))
             }
@@ -768,6 +781,32 @@ impl Parser {
                 self.advance();
                 Ok(Expr::SelfExpr(span))
             }
+            // Keywords that can also be used as function call names
+            TokenKind::Write | TokenKind::Manual | TokenKind::Arena => {
+                // Treat as identifier — allows write(...), arena(...), etc.
+                let name = match &self.current().kind {
+                    TokenKind::Write  => "write".to_string(),
+                    TokenKind::Manual => "manual".to_string(),
+                    TokenKind::Arena  => "arena".to_string(),
+                    _ => unreachable!(),
+                };
+                let span = self.current().span.clone();
+                self.advance();
+                // If followed by ( it's a function call
+                if matches!(self.current().kind, TokenKind::LParen) {
+                    self.advance(); // consume (
+                    let mut args = Vec::new();
+                    while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                        args.push(self.parse_expr(0)?);
+                        if matches!(self.current().kind, TokenKind::Comma) { self.advance(); }
+                    }
+                    if matches!(self.current().kind, TokenKind::RParen) { self.advance(); }
+                    let s = span.merge(&self.current().span);
+                    Ok(Expr::Call(Box::new(Expr::Ident(name, span.clone())), args, s))
+                } else {
+                    Ok(Expr::Ident(name, span))
+                }
+            }
             TokenKind::Ident(_) => self.parse_ident_expr(),
             TokenKind::Minus => {
                 self.advance();
@@ -845,7 +884,7 @@ impl Parser {
             TokenKind::Match => self.parse_match(),
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
-            TokenKind::Do => {
+            TokenKind::Is => {
                 let body = self.parse_block()?;
                 let s = start.merge(&self.current().span);
                 Ok(Expr::Do { body, span: s })
@@ -866,7 +905,7 @@ impl Parser {
                             None
                         }
                     } else { None };
-                    Some(ArenaConfig { size })
+                    Some(ArenaConfig { size, mode: crate::ast::UnsafeMode::Arena(size) })
                 } else { None };
                 let body = self.parse_block()?;
                 let s = start.merge(&self.current().span);
@@ -980,7 +1019,7 @@ impl Parser {
         self.advance(); // 'match'
         let subject = self.parse_expr(0)?;
         self.skip_newlines();
-        self.expect(&TokenKind::Do)?;
+        self.expect(&TokenKind::Is)?;
         self.skip_newlines();
 
         let mut arms = Vec::new();
@@ -994,7 +1033,7 @@ impl Parser {
                 Some(self.parse_expr(0)?)
             } else { None };
             self.expect(&TokenKind::FatArrow)?;
-            let body = if matches!(self.current().kind, TokenKind::Do) {
+            let body = if matches!(self.current().kind, TokenKind::Is) {
                 self.parse_block()?
             } else {
                 let e = self.parse_expr(0)?;
@@ -1152,37 +1191,79 @@ fn token_kind_name(kind: &TokenKind) -> &'static str {
         TokenKind::Arrow => "->",
         TokenKind::FatArrow => "=>",
         TokenKind::Assign => "=",
-        TokenKind::Do => "do",
+        TokenKind::Is => "is",
         TokenKind::End => "end",
         TokenKind::In => "in",
         _ => "token",
     }
 }
 
-fn parse_import_path(path: &str) -> Option<ImportKind> {
-    if let Some(rest) = path.strip_prefix("std:") {
-        Some(ImportKind::Std(rest.to_string()))
-    } else if let Some(rest) = path.strip_prefix("bytes:") {
-        let (pkg, ver) = if let Some(idx) = rest.rfind('/') {
-            let pkg = &rest[..idx];
-            let ver = &rest[idx+1..];
-            // heuristic: if it looks like a version number
-            if ver.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                (pkg.to_string(), Some(ver.to_string()))
-            } else {
-                (rest.to_string(), None)
-            }
-        } else {
-            (rest.to_string(), None)
-        };
-        Some(ImportKind::Bytes(pkg, ver))
-    } else if let Some(rest) = path.strip_prefix("file:") {
-        Some(ImportKind::File(rest.to_string()))
-    } else if let Some(rest) = path.strip_prefix("lib:static::") {
-        Some(ImportKind::LibStatic(rest.to_string()))
-    } else if let Some(rest) = path.strip_prefix("lib:dynamic::") {
-        Some(ImportKind::LibDynamic(rest.to_string()))
-    } else {
-        None
+/// Parse new H# use path syntax:
+/// "std -> io -> keyboard"        → Std { path: ["io","keyboard"], alias }
+/// "vira -> scanner/1.2"          → Vira { name:"scanner", version:"1.2", alias }
+/// "python -> numpy"              → Python { name:"numpy", version:None, alias }
+/// "python -> numpy/1.26"         → Python { name:"numpy", version:"1.26", alias }
+/// "github.com/user/repo"         → GitRepo { url, alias }
+/// "gitlab.com/user/repo"         → GitRepo { url, alias }
+/// "file -> path/lib.h#"          → File { path, alias }
+/// "lib:static -> file.a"         → LibStatic { path, alias }
+/// "lib:dynamic -> file.so"       → LibDynamic { path, alias }
+fn parse_use_path(path: &str, alias: Option<String>) -> Option<ImportKind> {
+    // Split on " -> " (with spaces)
+    let arrow = " -> ";
+
+    // Python interop: "python -> numpy" or "python -> numpy/1.26"
+    if path.starts_with("python") && path.contains(arrow) {
+        let rest = path.splitn(2, arrow).nth(1)?.trim();
+        let (name, ver) = if let Some(idx) = rest.rfind('/') {
+            let n = &rest[..idx]; let v = &rest[idx+1..];
+            if v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                (n.to_string(), Some(v.to_string()))
+            } else { (rest.to_string(), None) }
+        } else { (rest.to_string(), None) };
+        return Some(ImportKind::Python { name, version: ver, alias });
     }
+
+    if path.starts_with("std") && path.contains(arrow) {
+        let parts: Vec<String> = path.split(arrow)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "std")
+            .collect();
+        if !parts.is_empty() {
+            return Some(ImportKind::Std { path: parts, alias });
+        }
+    }
+    if path.starts_with("vira") && path.contains(arrow) {
+        let rest = path.splitn(2, arrow).nth(1)?.trim();
+        let (name, ver) = if let Some(idx) = rest.rfind('/') {
+            let n = &rest[..idx];
+            let v = &rest[idx+1..];
+            if v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                (n.to_string(), Some(v.to_string()))
+            } else { (rest.to_string(), None) }
+        } else { (rest.to_string(), None) };
+        return Some(ImportKind::Vira { name, version: ver, alias });
+    }
+    if path.starts_with("file") && path.contains(arrow) {
+        let p = path.splitn(2, arrow).nth(1)?.trim().to_string();
+        return Some(ImportKind::File { path: p, alias });
+    }
+    if path.starts_with("lib:static") && path.contains(arrow) {
+        let p = path.splitn(2, arrow).nth(1)?.trim().to_string();
+        return Some(ImportKind::LibStatic { path: p, alias });
+    }
+    if path.starts_with("lib:dynamic") && path.contains(arrow) {
+        let p = path.splitn(2, arrow).nth(1)?.trim().to_string();
+        return Some(ImportKind::LibDynamic { path: p, alias });
+    }
+    // Go-style git repo: github.com/user/repo or gitlab.com/user/repo
+    if path.starts_with("github.com/") || path.starts_with("gitlab.com/") || path.starts_with("git.sr.ht/") {
+        return Some(ImportKind::GitRepo { url: path.to_string(), alias });
+    }
+    // Backward-compat with old std: syntax
+    if let Some(rest) = path.strip_prefix("std:") {
+        let parts: Vec<String> = rest.split("::").map(|s| s.to_string()).collect();
+        return Some(ImportKind::Std { path: parts, alias });
+    }
+    None
 }
