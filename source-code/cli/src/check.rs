@@ -57,3 +57,49 @@ pub fn run(file: Option<PathBuf>) {
         std::process::exit(1);
     }
 }
+
+/// Check multiple files — called when specific files are passed on CLI
+pub fn run_multi(files: Vec<std::path::PathBuf>) {
+    if files.is_empty() {
+        // No files specified → check all
+        run(None);
+    } else if files.len() == 1 {
+        run(Some(files.into_iter().next().unwrap()));
+    } else {
+        // Multiple files
+        use colored::Colorize;
+        println!("{} {} file(s)\n", "Checking:".cyan().bold(), files.len());
+        let mut total_errors = 0usize;
+        for src_path in &files {
+            let source = match std::fs::read_to_string(src_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{} {}: {}", "Error:".red().bold(), src_path.display(), e);
+                    total_errors += 1;
+                    continue;
+                }
+            };
+            let result = hsharp_parser::parse(&source, &src_path.display().to_string());
+            if result.has_errors() {
+                total_errors += result.errors.len();
+                eprint!("{}", result.render_errors());
+            } else {
+                println!("  {} {}", "✓".green().bold(), src_path.display().to_string().dimmed());
+            }
+        }
+        println!();
+        if total_errors == 0 {
+            println!("{}", "✓ No errors found.".green().bold());
+        } else {
+            eprintln!("{} Found {}.", "✗".red().bold(), format!("{} error(s)", total_errors).red());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_header() {
+    use colored::Colorize;
+    println!("  {} {}  —  HackerOS-first compiled language",
+        "H# Language".cyan().bold(), "0.1.0".cyan());
+    println!();
+}
