@@ -13,7 +13,7 @@ mod preview;
     name = "hsharp",
     bin_name = "hsharp",
     version = env!("CARGO_PKG_VERSION"),
-    about = "H# — the cybersecurity-first compiled language",
+    about = "H# — the HackerOS-first compiled language",
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -38,9 +38,10 @@ pub enum Command {
     Preview {
         file: Option<std::path::PathBuf>,
     },
-    /// Check syntax and types only
+    /// Check syntax and types only (accepts multiple files)
     Check {
-        file: Option<std::path::PathBuf>,
+        #[arg(help = "File(s) to check (omit = check all .h# files)")]
+        files: Vec<std::path::PathBuf>,
     },
     /// Create a new H# project
     New {
@@ -58,7 +59,7 @@ fn main() {
     match cli.command {
         Command::Build { output, target, debug, no_opt } => build::run(output, target, debug, no_opt),
         Command::Preview { file }  => preview::run(file),
-        Command::Check { file }    => check::run(file),
+        Command::Check { files }   => check::run_multi(files),
         Command::New { name, template } => new::run(name, template),
         Command::Targets => {
             println!("{}\n", "Available cross-compilation targets:".bold());
@@ -71,7 +72,7 @@ fn main() {
 }
 
 fn print_banner() {
-    println!("{}", "  H# Language 0.1.0  —  cybersecurity-first compiled language".cyan().bold());
+    println!("{}", "  H# Language 0.1.0  —  HackerOS-first compiled language".cyan().bold());
     println!();
 }
 
