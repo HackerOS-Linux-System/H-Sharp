@@ -35,3 +35,6 @@ pub mod prelude {
     pub use crate::io::print::{write, writeln};
     pub use crate::fmt::to_string;
 }
+
+// GTK4 GUI bindings
+pub mod gtk;
