@@ -463,10 +463,14 @@ static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
                 let c_name = match callee_str.as_str() {
                     "print"     => "hsh_print".to_string(),
                     "println"   => "hsh_println".to_string(),
+                    // New H# 0.1 syntax: write() = println(), writeln() = println()
+                    "write"     => "hsh_println".to_string(),
+                    "writeln"   => "hsh_println".to_string(),
                     "panic"     => "hsh_panic".to_string(),
                     "exit"      => "exit".to_string(),
                     "to_string" => "hsh_int_to_string".to_string(),
                     "len"       => "hsh_strlen".to_string(),
+                    "assert"    => "hsh_assert".to_string(),
                     _           => callee_str,
                 };
                 format!("{}({})", c_name, args_strs.join(", "))
