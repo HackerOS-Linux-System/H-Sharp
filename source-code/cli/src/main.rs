@@ -24,6 +24,8 @@ pub struct Cli {
 pub enum Command {
     /// Build the project to a native binary
     Build {
+        #[arg(help = "Source file(s) to build (omit to build all .h# in project)")]
+        files: Vec<std::path::PathBuf>,
         #[arg(short, long)]
         output: Option<String>,
         /// Target (linux-x86_64, windows-x86_64, macos-aarch64, ...)
@@ -57,7 +59,7 @@ fn main() {
     print_banner();
     let cli = Cli::parse();
     match cli.command {
-        Command::Build { output, target, debug, no_opt } => build::run(output, target, debug, no_opt),
+        Command::Build { files, output, target, debug, no_opt } => build::run(files, output, target, debug, no_opt),
         Command::Preview { file }  => preview::run(file),
         Command::Check { files }   => check::run_multi(files),
         Command::New { name, template } => new::run(name, template),
