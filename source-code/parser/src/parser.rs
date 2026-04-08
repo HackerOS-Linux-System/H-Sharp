@@ -1212,6 +1212,18 @@ fn parse_use_path(path: &str, alias: Option<String>) -> Option<ImportKind> {
     // Split on " -> " (with spaces)
     let arrow = " -> ";
 
+    // Bytes repository: "bytes -> pkgname" or "bytes -> pkgname/1.2"
+    if path.starts_with("bytes") && path.contains(arrow) {
+        let rest = path.splitn(2, arrow).nth(1)?.trim();
+        let (name, ver) = if let Some(idx) = rest.rfind('/') {
+            let n = &rest[..idx]; let v = &rest[idx+1..];
+            if v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                (n.to_string(), Some(v.to_string()))
+            } else { (rest.to_string(), None) }
+        } else { (rest.to_string(), None) };
+        return Some(ImportKind::BytesRepo { name, version: ver, alias });
+    }
+
     // Python interop: "python -> numpy" or "python -> numpy/1.26"
     if path.starts_with("python") && path.contains(arrow) {
         let rest = path.splitn(2, arrow).nth(1)?.trim();
