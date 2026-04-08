@@ -16,7 +16,7 @@ use crate::config::{BytesProject, default_bytes_toml, ram_cache_dir};
 use crate::jit::BytesRunner;
 use crate::registry::Registry;
 use crate::python_interop::{resolve_python_import, setup_python_deps};
-use crate::progress::Bar;
+use crate::progress::{BytesBar, BarTheme};
 
 const VERSION: &str = "0.1.0";
 
@@ -191,8 +191,8 @@ fn cmd_add(pkg: &str, ver: &str) -> anyhow::Result<()> {
     let cache = ram_cache_dir().join("packages");
     std::fs::create_dir_all(&cache)?;
 
-    let mut bar = Bar::new(2);
-    bar.set_label(format!("resolving {}", pkg));
+    let mut bar = BytesBar::new(2, BarTheme::Default);
+    bar.set_status(format!("resolving {}", pkg));
     bar.inc(1);
 
     let registry = Registry::fetch();
@@ -205,7 +205,7 @@ fn cmd_add(pkg: &str, ver: &str) -> anyhow::Result<()> {
     let pkg_file = cache.join(format!("{}.h#", pkg));
     std::fs::write(&pkg_file, format!(";; bytes pkg: {} v{}\n;; source: {}\n", pkg, ver, url))?;
 
-    bar.set_label(format!("cached {}", pkg));
+    bar.set_status(format!("cached {}", pkg));
     bar.inc(1);
     bar.finish(&format!("added {}@{} → RAM cache", pkg.cyan(), ver.green()));
     println!("  {} {}", "use:".dimmed(), format!("use \"vira -> {}\" from \"{}\"", pkg, pkg).cyan());
@@ -233,11 +233,11 @@ fn cmd_install(verbose: bool) -> anyhow::Result<()> {
     // Install H# deps
     if !project.dependencies.is_empty() {
         let total = project.dependencies.len() as u64;
-        let mut bar = Bar::new(total);
+        let mut bar = BytesBar::new(total, BarTheme::Default);
         let registry = Registry::fetch();
 
         for (pkg, ver) in &project.dependencies {
-            bar.set_label(format!("fetching {}", pkg));
+            bar.set_status(format!("fetching {}", pkg));
             let pkg_cache = cache.join("packages");
             std::fs::create_dir_all(&pkg_cache)?;
             let url = registry.find(pkg)
