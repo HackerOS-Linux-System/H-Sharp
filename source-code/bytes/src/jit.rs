@@ -236,5 +236,5 @@ fn find_hsharp() -> anyhow::Result<String> {
             return Ok(name.to_string());
         }
     }
-    Err(anyhow::anyhow!("h# not found. Install from: hacker unpack h#"))
+    Err(anyhow::anyhow!("hsharp not found. Install from: https://hackeros.dev/h-sharp"))
 }
