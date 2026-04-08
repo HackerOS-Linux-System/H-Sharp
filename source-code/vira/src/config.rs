@@ -145,6 +145,16 @@ impl ViraProject {
         }
         None
     }
+
+    /// Project-local .cache directory (next to vira.hcl, like .git/)
+    pub fn cache_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(".cache")
+    }
+
+    /// Project-local build directory
+    pub fn build_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("build")
+    }
 }
 
 /// Generate default vira.hcl content for new project
