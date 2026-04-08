@@ -6,10 +6,14 @@ use walkdir::WalkDir;
 
 use hsharp_compiler::{CompileOptions, TargetTriple};
 
-pub fn run(output: Option<String>, target: Option<String>, debug: bool, no_opt: bool) {
+pub fn run(files: Vec<std::path::PathBuf>, output: Option<String>, target: Option<String>, debug: bool, no_opt: bool) {
     println!("{}\n", "H# Build System".cyan().bold());
 
-    let sources = collect_sources(".");
+    let sources = if files.is_empty() {
+        collect_sources(".")
+    } else {
+        files
+    };
     if sources.is_empty() {
         eprintln!("{} no .h#, .hsp, or .h-sharp files found", "Error:".red().bold());
         std::process::exit(1);
@@ -98,90 +102,110 @@ pub fn run(output: Option<String>, target: Option<String>, debug: bool, no_opt: 
         std::process::exit(1);
     }
 
-    // ── 3. Codegen ────────────────────────────────────────────────────────────
+    // ── 3. Compile with Cranelift (native, no C transpilation) ─────────────
     let pb3 = mp.add(ProgressBar::new(modules.len() as u64));
     pb3.set_style(bar_style.clone());
     pb3.enable_steady_tick(Duration::from_millis(80));
-    pb3.set_message("Generating C backend...");
+    pb3.set_message("Cranelift codegen...");
 
+    // out_name is already resolved (from output arg or project name)
+    let resolved_out = format!("build/{}", out_name);
     let opts = CompileOptions {
         target: triple.clone(),
         optimize: !no_opt,
         static_link: true,
         debug_info: debug,
-        output: format!("build/{}", out_name),
+        output: resolved_out.clone(),
         use_cranelift: true,
     };
 
-    let mut c_sources = Vec::new();
-    for (src_path, _source, module) in &modules {
-        pb3.set_message(format!("Compiling {}...", src_path.file_name().unwrap_or_default().to_string_lossy()));
-        let mut cg = hsharp_compiler::codegen::Codegen::new(&src_path.display().to_string(), &opts);
-        if let Err(e) = cg.compile_module(module) {
-            pb3.finish_and_clear();
-            eprintln!("{} Codegen error: {}", "Error:".red().bold(), e);
-            has_errors = true;
-            break;
-        }
-        let c_path = format!("build/{}.c", src_path.file_stem().unwrap_or_default().to_string_lossy());
-        if let Err(e) = std::fs::write(&c_path, cg.get_c_source()) {
-            pb3.finish_and_clear();
-            eprintln!("{} Cannot write C source: {}", "Error:".red().bold(), e);
-            has_errors = true;
-            break;
-        }
-        c_sources.push(c_path);
-        pb3.inc(1);
-    }
-    pb3.finish_with_message(format!("{} Code generation done", "✓".green()));
+    // For single-file builds we compile directly
+    // For multi-file projects, compile each and link together
+    if modules.len() == 1 {
+        let (src_path, _source, module) = &modules[0];
+        pb3.set_message(format!("Compiling {} (Cranelift)...", src_path.file_name().unwrap_or_default().to_string_lossy()));
 
-    if has_errors {
-        std::process::exit(1);
-    }
+        let mut cg = hsharp_compiler::cranelift_codegen::CraneliftCodegen::new(&opts)
+            .unwrap_or_else(|e| { eprintln!("{} Cranelift init: {}", "Error:".red().bold(), e); std::process::exit(1); });
 
-    // ── 4. Link ───────────────────────────────────────────────────────────────
-    let pb4 = mp.add(ProgressBar::new_spinner());
-    pb4.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan.bold} {msg}").unwrap());
-    pb4.enable_steady_tick(Duration::from_millis(80));
-    let link_kind = if opts.static_link { "static" } else { "dynamic" };
-    pb4.set_message(format!("Linking → {} binary...", link_kind));
-
-    let out_bin = format!("{}{}", opts.output, triple.exe_suffix());
-    match link_binaries(&c_sources, &out_bin, &opts) {
-        Ok(()) => pb4.finish_with_message(format!("{} Linked: {}", "✓".green(), out_bin)),
-        Err(e) => {
-            pb4.finish_with_message(format!("{} Link failed: {}", "✗".red(), e));
-            eprintln!("\n{} Build failed.", "✗".red().bold());
-            for c in &c_sources { let _ = std::fs::remove_file(c); }
+        if let Err(e) = cg.declare_functions(module) {
+            eprintln!("{} {}", "Error:".red().bold(), e);
             std::process::exit(1);
         }
-    }
-    for c in &c_sources { let _ = std::fs::remove_file(c); }
+        if let Err(e) = cg.compile_module(module) {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        }
+        pb3.finish_with_message(format!("{} Compiled (Cranelift)", "✓".green()));
 
-    // Copy binary next to source
-    let bin_name = format!("{}{}", out_name, triple.exe_suffix());
-    let _ = std::fs::copy(&out_bin, &bin_name);
+        let pb4 = mp.add(ProgressBar::new_spinner());
+        pb4.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan.bold} {msg}").unwrap());
+        pb4.enable_steady_tick(Duration::from_millis(80));
+        pb4.set_message("Linking native binary...");
+
+        match hsharp_compiler::cranelift_codegen::emit_module(cg, &resolved_out) {
+            Ok(()) => pb4.finish_with_message(format!("{} Linked: {}", "✓".green(), opts.output)),
+            Err(e) => {
+                pb4.finish_and_clear();
+                eprintln!("\n{} Link failed: {}", "✗".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Multi-file: compile each to object, then link
+        let mut obj_paths = Vec::new();
+        for (src_path, _source, module) in &modules {
+            pb3.set_message(format!("Compiling {}...", src_path.file_name().unwrap_or_default().to_string_lossy()));
+            let obj_out = format!("build/{}", src_path.file_stem().unwrap_or_default().to_string_lossy());
+            let obj_opts = CompileOptions { output: obj_out.clone(), ..opts.clone() };
+
+            let mut cg = hsharp_compiler::cranelift_codegen::CraneliftCodegen::new(&obj_opts)
+                .unwrap_or_else(|e| { eprintln!("{} {}", "Error:".red().bold(), e); std::process::exit(1); });
+            if let Err(e) = cg.declare_functions(module) { eprintln!("{} {}", "Error:".red().bold(), e); std::process::exit(1); }
+            if let Err(e) = cg.compile_module(module)    { eprintln!("{} {}", "Error:".red().bold(), e); std::process::exit(1); }
+            obj_paths.push(obj_out);
+            pb3.inc(1);
+        }
+        pb3.finish_with_message(format!("{} Code generation done", "✓".green()));
+
+        // Link all objects together
+        let pb4 = mp.add(ProgressBar::new_spinner());
+        pb4.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan.bold} {msg}").unwrap());
+        pb4.enable_steady_tick(Duration::from_millis(80));
+        pb4.set_message("Linking...");
+
+        let compiler = find_c_compiler().unwrap_or("cc");
+        let out_bin = format!("{}{}", opts.output, triple.exe_suffix());
+        let mut cmd = std::process::Command::new(compiler);
+        for obj in &obj_paths { cmd.arg(format!("{}.o", obj)); }
+        cmd.arg("-o").arg(&out_bin);
+        if opts.static_link { cmd.arg("-static"); }
+
+        match cmd.output() {
+            Ok(o) if o.status.success() => pb4.finish_with_message(format!("{} Linked: {}", "✓".green(), out_bin)),
+            Ok(o) => {
+                pb4.finish_and_clear();
+                eprintln!("\n{} Link failed:\n{}", "✗".red().bold(), String::from_utf8_lossy(&o.stderr));
+                std::process::exit(1);
+            }
+            Err(e) => {
+                pb4.finish_and_clear();
+                eprintln!("\n{} {}", "✗".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Print summary
+    let bin_name = format!("{}{}", resolved_out, triple.exe_suffix());
 
     println!();
     println!("{}", "─".repeat(52).dimmed());
     println!("  {} {}", "Binary: ".bold(), bin_name.cyan());
     println!("  {} {}", "Target: ".bold(), triple.llvm_triple);
-    println!("  {} {}", "Linking:".bold(), link_kind);
+    println!("  {} {}", "Backend:".bold(), "Cranelift (native)".green());
     println!("{}", "─".repeat(52).dimmed());
     println!("\n  {} Build complete!", "✓".green().bold());
-}
-
-fn link_binaries(c_sources: &[String], output: &str, opts: &CompileOptions) -> Result<(), String> {
-    let compiler = find_c_compiler().ok_or("no C compiler found (install gcc or clang)")?;
-    let mut cmd = std::process::Command::new(&compiler);
-    cmd.arg("-O2").args(c_sources).arg("-o").arg(output);
-    if opts.static_link { cmd.arg("-static"); }
-    if opts.debug_info  { cmd.arg("-g"); }
-    let out = cmd.output().map_err(|e| format!("failed to run {}: {}", compiler, e))?;
-    if !out.status.success() {
-        return Err(format!("linker error:\n{}", String::from_utf8_lossy(&out.stderr)));
-    }
-    Ok(())
 }
 
 fn find_c_compiler() -> Option<&'static str> {
@@ -218,3 +242,4 @@ fn detect_project_name() -> String {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "output".to_string())
 }
+
