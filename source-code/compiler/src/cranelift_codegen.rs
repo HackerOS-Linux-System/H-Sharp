@@ -739,7 +739,8 @@ fn call_fn(
     }}}
 
     match name {
-        "println" => {
+        // write() and writeln() are H# 0.1 syntax — map to hsh_println
+        "write" | "println" | "writeln" => {
             let a = str_arg!(0);
             let r = module.declare_func_in_func(builtins.println, b.func);
             b.ins().call(r, &[a]);
