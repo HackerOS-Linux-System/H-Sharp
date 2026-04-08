@@ -107,7 +107,7 @@ pub fn run() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("No vira.hcl found in current directory"))?;
             let project = ViraProject::load(&hcl)?;
             println!("  {} Updating packages...", "vira".cyan().bold());
-            let registry = Registry::fetch().unwrap_or_default();
+            let registry = Registry::fetch();
             for (name, _ver) in &project.dependencies {
                 if let Some(entry) = registry.find(name) {
                     println!("  {} {} → {}", "↑".cyan(), name.cyan(), entry.latest.green());
@@ -126,7 +126,7 @@ pub fn run() -> anyhow::Result<()> {
             let spinner = indicatif::ProgressBar::new_spinner();
             spinner.enable_steady_tick(std::time::Duration::from_millis(80));
             spinner.set_message("Fetching registry...");
-            let registry = Registry::fetch().unwrap_or_default();
+            let registry = Registry::fetch();
             spinner.finish_and_clear();
             let results = registry.search(query);
             println!("  Found {} result(s)\n", results.len());
@@ -134,13 +134,13 @@ pub fn run() -> anyhow::Result<()> {
         }
         "info" => {
             let pkg = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: vira info <package>"))?;
-            let registry = Registry::fetch().unwrap_or_default();
+            let registry = Registry::fetch();
             match registry.find(pkg) {
                 None => eprintln!("  {} `{}` not found in registry", "✗".red(), pkg),
                 Some(e) => {
                     println!("  {} {}", "Package:".bold(), e.name.cyan().bold());
                     println!("  {} {}", "Latest: ".bold(), e.latest.green());
-                    println!("  {} {}", "Versions:".bold(), e.versions.join(", "));
+                    println!("  {} {}", "Versions:".bold(), e.versions.as_deref().unwrap_or(&[]).join(", "));
                     if let Some(d) = &e.description { println!("  {} {}", "Desc:   ".bold(), d); }
                     if let Some(a) = &e.author      { println!("  {} {}", "Author: ".bold(), a); }
                     if let Some(l) = &e.license     { println!("  {} {}", "License:".bold(), l); }
@@ -150,6 +150,18 @@ pub fn run() -> anyhow::Result<()> {
         }
         "clean" => {
             installer.clean()?;
+        }
+        "cache" => {
+            use crate::config::ViraProject;
+            let cache = ViraProject::cache_dir();
+            if cache.exists() {
+                let size = dir_size_kb(&cache);
+                println!("  {} {}", "cache:".bold(), cache.display().to_string().cyan());
+                println!("  {} {} KB", "size: ".dimmed(), size);
+                println!("  {} vira clean", "clear:".dimmed());
+            } else {
+                println!("  {} (empty)", "cache:".dimmed());
+            }
         }
         "settings" => {
             run_settings_tui()?;
@@ -205,20 +217,90 @@ fn cmd_new(name: &str, template: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_build(release: bool) -> anyhow::Result<()> {
-    let mode = if release { "release" } else { "debug" };
-    println!("  {} Building ({})...", "vira".cyan().bold(), mode);
+    use colored::*;
 
-    // Invoke h# compiler
-    let hsharp = find_hsharp()?;
-    let mut cmd = std::process::Command::new(&hsharp);
-    cmd.arg("build");
-    if release { cmd.arg("--no-debug"); }
+    if release {
+        // Release: use hsharp-compiler-llvm (LLVM O3+AVX2) installed in ~/.hackeros/H#/bins/
+        println!("  {} Building (release — LLVM O3+AVX2)...", "vira".cyan().bold());
+        let llvm_compiler = find_llvm_compiler()?;
 
-    let status = cmd.status()?;
-    if !status.success() {
-        anyhow::bail!("h# build failed");
+        // Collect all .h# source files
+        let sources = collect_hsharp_sources();
+        if sources.is_empty() {
+            anyhow::bail!("No .h# source files found");
+        }
+
+        // Compile each source with LLVM compiler
+        for src in &sources {
+            println!("  {} {} (LLVM)", "compiling".dimmed(), src.cyan());
+            let mut cmd = std::process::Command::new(&llvm_compiler);
+            cmd.arg(src).arg("--release");
+            if let Some(hcl_path) = crate::config::ViraProject::find() {
+                if let Ok(proj) = crate::config::ViraProject::load(&hcl_path) {
+                    let stem = std::path::Path::new(src)
+                        .file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    let out = format!("build/{}", proj.output_name.as_deref().unwrap_or(&stem));
+                    cmd.arg("-o").arg(&out);
+                }
+            }
+            let out = cmd.output()?;
+            if !out.status.success() {
+                eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+                anyhow::bail!("LLVM compiler failed for {}", src);
+            }
+        }
+        println!("  {} release binary ready in build/", "✓".green().bold());
+    } else {
+        // Debug: use hsharp build (Cranelift — fast compile)
+        println!("  {} Building (debug — Cranelift)...", "vira".cyan().bold());
+        let hsharp = find_hsharp()?;
+        let status = std::process::Command::new(&hsharp)
+            .arg("build")
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("hsharp build failed");
+        }
     }
     Ok(())
+}
+
+/// Find hsharp-compiler-llvm in HackerOS bins or PATH
+fn find_llvm_compiler() -> anyhow::Result<String> {
+    use std::path::Path;
+    // HackerOS standard location
+    let hackeros = dirs::home_dir()
+        .map(|h| h.join(".hackeros/H#/bins/hsharp-compiler-llvm"));
+    if let Some(p) = hackeros {
+        if p.exists() { return Ok(p.display().to_string()); }
+    }
+    // PATH
+    for name in &["hsharp-compiler-llvm", "/usr/local/bin/hsharp-compiler-llvm"] {
+        if Path::new(name).exists() { return Ok(name.to_string()); }
+        if std::process::Command::new("which").arg(name)
+            .output().map(|o| o.status.success()).unwrap_or(false) {
+            return Ok(name.to_string());
+        }
+    }
+    anyhow::bail!(
+        "hsharp-compiler-llvm not found.\n  Install: sudo install -m755 bin/hsharp-compiler-llvm /usr/local/bin/\n  or run: LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release -p hsharp-llvm-compiler"
+    )
+}
+
+fn collect_hsharp_sources() -> Vec<String> {
+    let exts = ["h#", "hsp"];
+    let exclude = ["build/", ".cache/", "target/"];
+    walkdir::WalkDir::new(".")
+        .max_depth(5).into_iter().filter_map(|e| e.ok())
+        .filter(|e| {
+            let p = e.path();
+            if !e.file_type().is_file() { return false; }
+            let ext_ok = p.extension().and_then(|s| s.to_str())
+                .map(|x| exts.contains(&x)).unwrap_or(false);
+            let not_excluded = !exclude.iter().any(|ex| p.starts_with(ex));
+            ext_ok && not_excluded
+        })
+        .map(|e| e.path().display().to_string())
+        .collect()
 }
 
 fn cmd_run(extra_args: &[String]) -> anyhow::Result<()> {
@@ -384,4 +466,16 @@ fn main() is
 end
 "#, name = name),
     }
+}
+
+fn dir_size_kb(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(e) = std::fs::read_dir(path) {
+        for entry in e.flatten() {
+            let p = entry.path();
+            if p.is_dir() { total += dir_size_kb(&p); }
+            else if let Ok(m) = p.metadata() { total += m.len(); }
+        }
+    }
+    total / 1024
 }
