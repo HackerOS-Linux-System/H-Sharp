@@ -19,10 +19,7 @@ inkwell   = { version = "0.4", features = ["llvm17-0"] }
 hsharp-parser   = { path = "../parser" }
 hsharp-compiler = { path = "../compiler" }
 
-[build-dependencies]
-# nothing special
-
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1
