@@ -16,7 +16,9 @@ pub struct Installer {
 
 impl Installer {
     pub fn new(settings: ViraSettings) -> Self {
-        let cache_dir = std::path::PathBuf::from(&settings.cache_dir);
+        // .cache is always project-local (next to vira.hcl, like node_modules)
+        let cache_dir = ViraProject::cache_dir();
+        std::fs::create_dir_all(&cache_dir).ok();
         Self { settings, cache_dir }
     }
 
@@ -35,7 +37,7 @@ impl Installer {
         let spinner_msg = "Fetching package registry...";
         print!("  {} {}", "·".cyan(), spinner_msg);
         std::io::Write::flush(&mut std::io::stdout()).ok();
-        let registry = Registry::fetch().unwrap_or_default();
+        let registry = Registry::fetch();
         println!("\r  {} {}          ", "✓".green(), "Registry loaded".dimmed());
 
         // Build ordered queue: deps + final binary
@@ -111,6 +113,15 @@ impl Installer {
                 std::fs::write(&pkg_file, placeholder)?;
                 Ok(pkg_cache)
             }
+            ResolvedDep::Python { package, version: ver } => {
+                let placeholder = format!(
+                    ";; Python package: {}\n;; Install via: bytes python {}\n",
+                    package, package
+                );
+                let pkg_file = pkg_cache.join(format!("py_{}.h#", package));
+                std::fs::write(&pkg_file, placeholder)?;
+                Ok(pkg_cache)
+            }
         }
     }
 
@@ -120,7 +131,7 @@ impl Installer {
         println!("  {} Adding {} ...", "vira".cyan().bold(), name.cyan());
         println!();
 
-        let registry = Registry::fetch().unwrap_or_default();
+        let registry = Registry::fetch();
         let queue = vec![name.to_string(), format!("[link] {}", name)];
         build_display(&queue, &self.settings.progress_theme);
 
