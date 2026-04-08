@@ -43,6 +43,8 @@ pub enum ImportKind {
     GitRepo { url: String, alias: Option<String> },
     /// use "python -> numpy" from "np"  — Python package interop via bytes
     Python { name: String, version: Option<String>, alias: Option<String> },
+    /// use "bytes -> pkgname" from "alias"  — Bytes Repository (Bytes-Repository/repository)
+    BytesRepo { name: String, version: Option<String>, alias: Option<String> },
 }
 
 // ─── Literals ─────────────────────────────────────────────────────────────────
