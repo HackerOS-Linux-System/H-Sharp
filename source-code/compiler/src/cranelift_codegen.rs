@@ -1,6 +1,3 @@
-//! H# → Cranelift native code generator.
-//! Two-pass: declare functions → compile bodies → emit .o → link binary.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -711,7 +708,7 @@ fn lit_val(b: &mut FunctionBuilder, module: &mut ObjectModule, sp: &mut StrPool,
             let ct = hint.unwrap_or(types::F64);
             if ct == types::F32 { b.ins().f32const(*f as f32) } else { b.ins().f64const(*f) }
         }
-        Literal::Bool(bl)  => b.ins().iconst(types::I8, if *bl { 1 } else { 0 }),
+        Literal::Bool(bl)  => b.ins().iconst(types::I64, if *bl { 1 } else { 0 }),
         Literal::Nil       => b.ins().iconst(types::I64, 0),
         Literal::String(s) => {
             let did = sp.intern(s, module);
@@ -784,10 +781,10 @@ fn call_fn(
         }
         "assert" => {
             let cond = if let Some(ex) = args.first() {
-                let v = e!(ex, Some(types::I8));
+                let v = e!(ex, Some(types::I64));
                 let t = b.func.dfg.value_type(v);
-                if t != types::I8 { b.ins().ireduce(types::I8, v) } else { v }
-            } else { b.ins().iconst(types::I8, 0) };
+                if t == types::I8 { b.ins().uextend(types::I64, v) } else { v }
+            } else { b.ins().iconst(types::I64, 0) };
             let msg = str_arg!(1);
             let r = module.declare_func_in_func(builtins.hsh_assert, b.func);
             b.ins().call(r, &[cond, msg]);
@@ -844,8 +841,8 @@ fn short_and(
     let lv   = as_bool(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, l)?;
     let rhs  = b.create_block();
     let exit = b.create_block();
-    b.append_block_param(exit, types::I8);
-    let zero = b.ins().iconst(types::I8, 0);
+    b.append_block_param(exit, types::I64);
+    let zero = b.ins().iconst(types::I64, 0);
     b.ins().brif(lv, rhs, &[], exit, &[zero]);
     b.switch_to_block(rhs); b.seal_block(rhs);
     let rv = as_bool(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, r)?;
@@ -862,8 +859,8 @@ fn short_or(
     let lv   = as_bool(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, l)?;
     let rhs  = b.create_block();
     let exit = b.create_block();
-    b.append_block_param(exit, types::I8);
-    let one  = b.ins().iconst(types::I8, 1);
+    b.append_block_param(exit, types::I64);
+    let one  = b.ins().iconst(types::I64, 1);
     b.ins().brif(lv, exit, &[one], rhs, &[]);
     b.switch_to_block(rhs); b.seal_block(rhs);
     let rv = as_bool(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, r)?;
@@ -892,9 +889,15 @@ fn as_bool(
     sp: &mut StrPool, fids: &HashMap<String, FuncId>, fsigs: &HashMap<String, Signature>,
     fn_name: &str, ret_type: &Option<TypeExpr>, e: &Expr,
 ) -> R<Value> {
-    let v  = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, e, Some(types::I8))?;
+    // Use None hint so numeric literals keep their natural I64 type
+    let v  = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, e, None)?;
     let ty = b.func.dfg.value_type(v);
-    if ty == types::I8 { return Ok(v); }
+    // A bool-typed variable (I64 0/1) is fine as-is
+    if ty == types::I64 { return Ok(v); }
+    // Upcast small types to I64 for consistent comparison
+    if ty == types::I8 || ty == types::I16 || ty == types::I32 {
+        return Ok(b.ins().uextend(types::I64, v));
+    }
     let z = zero(b, ty);
     if ty.is_float() { Ok(b.ins().fcmp(FloatCC::NotEqual, v, z)) }
     else { Ok(b.ins().icmp(IntCC::NotEqual, v, z)) }
@@ -906,7 +909,7 @@ fn pat_cond(b: &mut FunctionBuilder, pat: &Pattern, sv: Value, sty: types::Type)
         Pattern::Literal(lit, _) => {
             let lv = match lit {
                 Literal::Int(n)  => b.ins().iconst(sty, *n),
-                Literal::Bool(v) => b.ins().iconst(types::I8, if *v { 1 } else { 0 }),
+                Literal::Bool(v) => b.ins().iconst(sty, if *v { 1 } else { 0 }),
                 Literal::Nil     => b.ins().iconst(sty, 0),
                 _                => return None,
             };
