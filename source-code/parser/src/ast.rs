@@ -252,6 +252,7 @@ pub enum Item {
     TraitDef(TraitDef),
     ImplBlock(ImplBlock),
     TypeAlias { name: String, ty: TypeExpr, pub_: bool, span: Span },
+    Extern(ExternBlock),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,4 +360,29 @@ pub struct Module {
     pub directives: Vec<Directive>,
     pub items: Vec<Item>,
     pub imports: Vec<(ImportKind, Option<String>, Span)>,
+}
+
+/// extern static [c] is ... end
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternBlock {
+    pub lang:      ExternLang,
+    pub link_kind: ExternLinkKind,
+    pub library:   Option<String>,
+    pub functions: Vec<ExternFnDecl>,
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExternLang { C, Rust, Cpp }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExternLinkKind { Static, Dynamic }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternFnDecl {
+    pub name:        String,
+    pub params:      Vec<Param>,
+    pub return_type: Option<TypeExpr>,
+    pub variadic:    bool,
+    pub span:        Span,
 }
