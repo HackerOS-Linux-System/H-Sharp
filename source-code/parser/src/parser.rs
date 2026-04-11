@@ -219,9 +219,10 @@ impl Parser {
             TokenKind::Trait => self.parse_trait(pub_).map(Item::TraitDef),
             TokenKind::Impl => self.parse_impl().map(Item::ImplBlock),
             TokenKind::Type => self.parse_type_alias(pub_).map(|ta| ta),
+            TokenKind::Extern => self.parse_extern_block_inline(),
             _ => Err(self.error(
                 format!("unexpected token `{}` at top level", self.current().text),
-                vec!["expected fn, struct, enum, trait, impl, or type".to_string()],
+                vec!["expected fn, struct, enum, trait, impl, type, or extern".to_string()],
             )),
         }
     }
@@ -285,6 +286,84 @@ impl Parser {
             }
         }
         Ok(params)
+    }
+
+    fn parse_extern_block_inline(&mut self) -> Result<Item, ParseError> {
+        use crate::ast::{ExternBlock, ExternLang, ExternLinkKind, ExternFnDecl};
+        let span = self.current().span.clone();
+        self.advance(); // consume 'extern'
+
+        // link kind: static | dynamic
+        let link_kind = {
+            let kw = if let TokenKind::Ident(ref s) = self.current().kind { s.clone() } else { String::new() };
+            match kw.as_str() {
+                "static"  => { self.advance(); ExternLinkKind::Static }
+                "dynamic" => { self.advance(); ExternLinkKind::Dynamic }
+                _         => ExternLinkKind::Static,
+            }
+        };
+
+        // language: [c] [rust] [cpp]
+        let mut lang = ExternLang::C;
+        let mut library = None;
+        if matches!(self.current().kind, TokenKind::LBracket) {
+            self.advance(); // [
+            {
+                let s = if let TokenKind::Ident(ref ss) = self.current().kind { ss.clone() } else { String::new() };
+                lang = match s.as_str() {
+                    "rust" | "Rust" => ExternLang::Rust,
+                    "cpp"           => ExternLang::Cpp,
+                    _               => ExternLang::C,
+                };
+            }
+            self.advance();
+            if matches!(self.current().kind, TokenKind::Comma) {
+                self.advance();
+                if let TokenKind::StringLit(s) = &self.current().kind.clone() {
+                    library = Some(s.clone());
+                    self.advance();
+                }
+            }
+            if matches!(self.current().kind, TokenKind::RBracket) { self.advance(); }
+        }
+
+        // is ... end
+        self.skip_newlines();
+        if matches!(self.current().kind, TokenKind::Is) { self.advance(); }
+        self.skip_newlines();
+
+        let mut functions = Vec::new();
+        while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
+            self.skip_newlines();
+            if matches!(self.current().kind, TokenKind::End | TokenKind::EOF) { break; }
+            if matches!(self.current().kind, TokenKind::Fn) {
+                self.advance();
+                let fspan = self.current().span.clone();
+                let (name, _) = self.expect_ident()?;
+                self.expect(&TokenKind::LParen)?;
+                let mut params = Vec::new();
+                let mut variadic = false;
+                while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                    // Check for ... variadic
+                    if matches!(self.current().kind, TokenKind::DotDot) {
+                        variadic = true; self.advance(); break;
+                    }
+                    let (pname, _) = self.expect_ident()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let ty = self.parse_type()?;
+                    params.push(Param { name: pname, ty, mutable: false, span: fspan.clone() });
+                    if matches!(self.current().kind, TokenKind::Comma) { self.advance(); }
+                }
+                self.expect(&TokenKind::RParen)?;
+                let ret = if matches!(self.current().kind, TokenKind::Arrow) {
+                    self.advance(); Some(self.parse_type()?)
+                } else { None };
+                functions.push(ExternFnDecl { name, params, return_type: ret, variadic, span: fspan });
+            }
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::End)?;
+        Ok(Item::Extern(ExternBlock { lang, link_kind, library, functions, span }))
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
