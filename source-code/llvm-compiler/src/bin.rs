@@ -1,7 +1,3 @@
-/// h#-compiler — LLVM-backed H# compiler
-/// Installed at: ~/.hackeros/H#/bins/h#-compiler
-/// Called by vira for --release builds.
-
 use colored::*;
 use hsharp_compiler::CompileOptions;
 use hsharp_llvm_compiler::compile_llvm;
