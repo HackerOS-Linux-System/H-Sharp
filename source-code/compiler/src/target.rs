@@ -1,4 +1,3 @@
-/// Cross-compilation targets for H#
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetTriple {
     pub arch: Arch,
