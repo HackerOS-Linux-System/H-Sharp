@@ -1,21 +1,28 @@
-/// LLVM optimization for H# — uses TargetMachine-based new pass manager
-/// In LLVM 17, optimization level is passed to TargetMachine which handles opt internally.
-/// For legacy PM (still functional in LLVM 17), we use PassManager with subset of passes.
-
 use inkwell::module::Module;
-use inkwell::passes::PassManager;
+use inkwell::targets::TargetMachine;
 
-/// Apply module-level optimizations.
-/// In inkwell 0.4 + LLVM17, optimization is primarily via TargetMachine opt level.
-/// This applies only the passes that are still available in legacy PM.
-pub fn optimize_module(module: &Module, _level: u32) {
-    let pm: PassManager<Module> = PassManager::create(());
-    // Note: Most named passes removed from legacy PM in LLVM17.
-    // Actual optimization happens via TargetMachine::OptimizationLevel::Aggressive
-    // which runs the new pass manager internally during machine code emission.
-    pm.run_on(module);
+/// Optimize the LLVM module using LLVM 20's new pass manager.
+/// opt_level: 0=O0, 1=O1, 2=O2, 3=O3 (aggressive)
+pub fn optimize_module(module: &Module, machine: &TargetMachine, opt_level: u32) {
+    // LLVM 20 exposes run_passes via TargetMachine
+    let passes = match opt_level {
+        0 => "",
+        1 => "default<O1>",
+        2 => "default<O2>",
+        _ => "default<O3>",
+    };
+
+    if passes.is_empty() { return; }
+
+    use inkwell::passes::PassBuilderOptions;
+    let opts = PassBuilderOptions::create();
+    opts.set_loop_unrolling(opt_level >= 2);
+    opts.set_loop_vectorization(opt_level >= 2);
+    opts.set_loop_slp_vectorization(opt_level >= 3);
+    opts.set_merge_functions(opt_level >= 2);
+
+    if let Err(e) = module.run_passes(passes, machine, opts) {
+        // Non-fatal: optimization failure doesn't prevent linking
+        eprintln!("  warn: optimization pass failed: {}", e.to_string());
+    }
 }
-
-/// Function-level optimization — no-op in LLVM17 new PM mode
-/// (optimization done by TargetMachine at codegen time)
-pub fn optimize_function<'ctx>(_module: &Module<'ctx>, _level: u32) {}
