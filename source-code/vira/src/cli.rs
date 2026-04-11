@@ -1,22 +1,3 @@
-/// Vira CLI — H# package manager and build tool
-/// Uses lexopt for argument parsing, colored + indicatif for output.
-///
-/// Usage:
-///   vira new <name> [--template T]   Create new H# project
-///   vira build [--release]           Build project (calls h#)
-///   vira run [args...]               Build + run
-///   vira add <pkg> [version]         Add dependency
-///   vira remove <pkg>                Remove dependency
-///   vira install                     Install all deps from vira.hcl
-///   vira update                      Update all packages
-///   vira list                        List installed packages
-///   vira search <query>              Search registry
-///   vira info <pkg>                  Show package info
-///   vira clean                       Remove .cache/
-///   vira settings                    TUI settings editor
-///   vira --version / -V              Print version
-///   vira --help / -h                 Print help
-
 use colored::*;
 use crate::config::{ViraProject, default_vira_hcl};
 use crate::installer::Installer;
@@ -61,7 +42,7 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     let settings = ViraSettings::load();
-    let installer = Installer::new(settings.clone());
+    let installer = Installer::new();
 
     let cmd = args[0].as_str();
     match cmd {
@@ -88,18 +69,18 @@ pub fn run() -> anyhow::Result<()> {
             } else {
                 (pkg.clone(), ver.to_string())
             };
-            installer.add(&name, &ver2)?;
+            { let reg = Registry::fetch(); installer.install_package(&name, Some(&ver2), &reg)?; }
         }
         "remove" | "rm" => {
             let pkg = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: vira remove <package>"))?;
-            installer.remove(pkg)?;
+            { let pkg_dir = std::path::PathBuf::from(".cache").join(pkg); if pkg_dir.exists() { std::fs::remove_dir_all(&pkg_dir)?; println!("  {} removed {}", "✓".green(), pkg.cyan()); } else { println!("  {} {} not in cache", "!".yellow(), pkg); } }
         }
         "install" => {
             print_header();
             let hcl = ViraProject::find()
                 .ok_or_else(|| anyhow::anyhow!("No vira.hcl found in current directory"))?;
             let project = ViraProject::load(&hcl)?;
-            installer.install_project(&project)?;
+            { let reg = Registry::fetch(); installer.install_all(&project, &reg)?; }
         }
         "update" => {
             print_header();
@@ -110,14 +91,14 @@ pub fn run() -> anyhow::Result<()> {
             let registry = Registry::fetch();
             for (name, _ver) in &project.dependencies {
                 if let Some(entry) = registry.find(name) {
-                    println!("  {} {} → {}", "↑".cyan(), name.cyan(), entry.latest.green());
+                    println!("  {} {} → {}", "↑".cyan(), name.cyan(), entry.latest_version().unwrap_or_default().green());
                 }
             }
-            installer.install_project(&project)?;
+            { let reg = Registry::fetch(); installer.install_all(&project, &reg)?; }
         }
         "list" | "ls" => {
             print_header();
-            installer.list_installed()?;
+            { let pkgs = installer.list(); for (n,v) in &pkgs { println!("  {} {}", n.cyan(), v.green()); } if pkgs.is_empty() { println!("  {}", "(none)".dimmed()); } }
         }
         "search" => {
             let query = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: vira search <query>"))?;
@@ -139,11 +120,11 @@ pub fn run() -> anyhow::Result<()> {
                 None => eprintln!("  {} `{}` not found in registry", "✗".red(), pkg),
                 Some(e) => {
                     println!("  {} {}", "Package:".bold(), e.name.cyan().bold());
-                    println!("  {} {}", "Latest: ".bold(), e.latest.green());
-                    println!("  {} {}", "Versions:".bold(), e.versions.as_deref().unwrap_or(&[]).join(", "));
+                    println!("  {} {}", "Latest: ".bold(), e.latest_version().unwrap_or_default().green());
+                    println!("  {} {}", "Versions:".bold(), e.versions.as_ref().map(|v| v.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
                     if let Some(d) = &e.description { println!("  {} {}", "Desc:   ".bold(), d); }
-                    if let Some(a) = &e.author      { println!("  {} {}", "Author: ".bold(), a); }
-                    if let Some(l) = &e.license     { println!("  {} {}", "License:".bold(), l); }
+                    if let Some(a) = &e.description      { println!("  {} {}", "Author: ".bold(), a); }
+                    ;  // license not in registry format
                     println!("\n  {}", format!("vira add {}", e.name).dimmed());
                 }
             }
@@ -264,25 +245,20 @@ fn cmd_build(release: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Find hsharp-compiler-llvm in HackerOS bins or PATH
+/// Find hhc (HackerOS H# Compiler) — /usr/bin/hhc
 fn find_llvm_compiler() -> anyhow::Result<String> {
     use std::path::Path;
-    // HackerOS standard location
-    let hackeros = dirs::home_dir()
-        .map(|h| h.join(".hackeros/H#/bins/hsharp-compiler-llvm"));
-    if let Some(p) = hackeros {
+    // HackerOS primary location
+    for p in &["/usr/bin/hhc", "/usr/local/bin/hhc"] {
+        if Path::new(p).exists() { return Ok(p.to_string()); }
+    }
+    // HackerOS bins dir
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".hackeros/H#/bins/hhc");
         if p.exists() { return Ok(p.display().to_string()); }
     }
-    // PATH
-    for name in &["hsharp-compiler-llvm", "/usr/local/bin/hsharp-compiler-llvm"] {
-        if Path::new(name).exists() { return Ok(name.to_string()); }
-        if std::process::Command::new("which").arg(name)
-            .output().map(|o| o.status.success()).unwrap_or(false) {
-            return Ok(name.to_string());
-        }
-    }
     anyhow::bail!(
-        "hsharp-compiler-llvm not found.\n  Install: sudo install -m755 bin/hsharp-compiler-llvm /usr/local/bin/\n  or run: LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release -p hsharp-llvm-compiler"
+        "hhc not found.\n  Install: hacker unpack h#-utils\n  Remove:  hacker pack h#-utils"
     )
 }
 
@@ -324,17 +300,19 @@ fn cmd_run(extra_args: &[String]) -> anyhow::Result<()> {
     std::process::exit(status.code().unwrap_or(0));
 }
 
+/// Find h# binary — /usr/bin/h# (HackerOS) or fallback
 fn find_hsharp() -> anyhow::Result<String> {
-    for name in &["hsharp", "h#"] {
-        if std::process::Command::new("which").arg(name)
-            .output().map(|o| o.status.success()).unwrap_or(false)
-        {
-            return Ok(name.to_string());
-        }
+    use std::path::Path;
+    // HackerOS primary binary location
+    for p in &["/usr/bin/h#", "/usr/local/bin/h#"] {
+        if Path::new(p).exists() { return Ok(p.to_string()); }
     }
-    // Try local: ./hsharp
-    if std::path::Path::new("./hsharp").exists() { return Ok("./hsharp".into()); }
-    Err(anyhow::anyhow!("h# compiler not found in PATH. Install hsharp first."))
+    // Fallback: HackerOS bins dir
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".hackeros/H#/bins/h#");
+        if p.exists() { return Ok(p.display().to_string()); }
+    }
+    anyhow::bail!("h# not found.\n  Install: hacker unpack h#\n  Remove:  hacker pack h#")
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
