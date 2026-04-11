@@ -10,10 +10,10 @@ mod preview;
 
 #[derive(Parser)]
 #[command(
-    name = "hsharp",
-    bin_name = "hsharp",
+    name = "/usr/bin/h#",
+    bin_name = "/usr/bin/h#",
     version = env!("CARGO_PKG_VERSION"),
-    about = "H# — the HackerOS-first compiled language",
+    about = "h# — HackerOS-first compiled language",
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -38,7 +38,8 @@ pub enum Command {
     },
     /// Preview / interpret without compiling
     Preview {
-        file: Option<std::path::PathBuf>,
+        #[arg(required = true, help = "Source file to preview (e.g. main.h#)")]
+        file: std::path::PathBuf,
     },
     /// Check syntax and types only (accepts multiple files)
     Check {
@@ -60,7 +61,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Build { files, output, target, debug, no_opt } => build::run(files, output, target, debug, no_opt),
-        Command::Preview { file }  => preview::run(file),
+        Command::Preview { file }  => preview::run(Some(file)),
         Command::Check { files }   => check::run_multi(files),
         Command::New { name, template } => new::run(name, template),
         Command::Targets => {
@@ -74,7 +75,7 @@ fn main() {
 }
 
 fn print_banner() {
-    println!("{}", "  H# Language 0.1.0  —  HackerOS-first compiled language".cyan().bold());
+    println!("{}", "  h# v0.2.0  —  HackerOS-first compiled language".cyan().bold());
     println!();
 }
 
