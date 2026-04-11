@@ -528,7 +528,8 @@ impl Interpreter {
                 }
                 return Ok(Value::Nil);
             }
-            "println" => {
+            // H# 0.1: write() is the primary output function
+            "write" | "writeln" | "println" | "print" => {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
                 if self.captured_output {
                     self.stdout.push_str(&s);
