@@ -1,12 +1,3 @@
-/// Isolated temporary library environment for bytes PM
-///
-/// Libraries are stored in ~/.hackeros/H#/libs/<session-id>/
-/// Mounted as tmpfs (RAM-backed) so they vanish on reboot.
-/// Each session gets its own namespace for isolation.
-///
-/// For libs with system dependencies (Debian packages),
-/// bytes downloads them into the isolated env via dpkg-deb extraction.
-
 use std::path::{Path, PathBuf};
 use colored::*;
 
