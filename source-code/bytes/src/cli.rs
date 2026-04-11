@@ -1,16 +1,3 @@
-/// bytes CLI — H# RAM-JIT package manager
-///
-/// bytes new <n>          Create new bytes project
-/// bytes run [file]       Run with JIT (RAM cache)
-/// bytes add <pkg>        Add H# or python dependency
-/// bytes install          Install all deps from bytes.toml
-/// bytes clean            Clear RAM cache
-/// bytes info <pkg>       Show package info
-/// bytes search <q>       Search vira registry
-/// bytes python <pkg>     Install python package into venv
-/// bytes --version / -V   Print version
-/// bytes --help / -h      Print help
-
 use colored::*;
 use crate::config::{BytesProject, default_bytes_toml, ram_cache_dir};
 use crate::jit::BytesRunner;
