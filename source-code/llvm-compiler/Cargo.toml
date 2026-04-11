@@ -1,6 +1,6 @@
 [package]
 name = "hsharp-llvm-compiler"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -8,14 +8,14 @@ name = "hsharp_llvm_compiler"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hsharp-compiler-llvm"
+name = "hhc"
 path = "src/bin.rs"
 
 [dependencies]
-anyhow    = "=1.0.79"
-thiserror = "=1.0.56"
-colored   = "=2.0.4"
-inkwell   = { version = "0.4", features = ["llvm17-0"] }
+anyhow    = "1"
+thiserror = "1"
+colored   = "2"
+inkwell = { version = "0.8.0", features = ["llvm21-1"] }
 hsharp-parser   = { path = "../parser" }
 hsharp-compiler = { path = "../compiler" }
 
