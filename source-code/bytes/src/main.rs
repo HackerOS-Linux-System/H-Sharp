@@ -1,7 +1,3 @@
-/// bytes — H# RAM-JIT package manager
-/// Libraries in: ~/.hackeros/H#/libs/<session>/ (tmpfs, RAM-backed, cleaned on reboot)
-/// Vira cache in: ~/.hackeros/H#/.cache/ (persistent, isolated env per package)
-
 mod cli;
 mod config;
 mod registry;
@@ -11,6 +7,9 @@ mod progress;
 mod isolation;
 
 fn main() {
+    // Clean up sessions from dead processes (handles unexpected shutdowns)
+    crate::config::cleanup_stale_sessions();
+
     if let Err(e) = cli::run() {
         eprintln!("\x1b[31merror:\x1b[0m {}", e);
         std::process::exit(1);
