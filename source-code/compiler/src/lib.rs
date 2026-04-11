@@ -87,3 +87,5 @@ fn compile_c_fallback(module: &Module, opts: &CompileOptions) -> Result<(), Comp
         .map_err(|e| CompileError::Codegen(e.to_string()))?;
     Ok(())
 }
+pub mod regions;
+pub mod ffi;
