@@ -1,5 +1,3 @@
-/// H# type → Cranelift type mappings and helpers
-
 use cranelift_codegen::ir::{types, Type, AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
 use hsharp_parser::ast::TypeExpr;
@@ -16,7 +14,7 @@ pub fn htype_to_cl(ty: &TypeExpr) -> Option<Type> {
             "i8"     | "u8"   => Some(types::I8),
             "f64"             => Some(types::F64),
             "f32"             => Some(types::F32),
-            "bool"            => Some(types::I8),  // 0/1
+            "bool"            => Some(types::I64), // 0/1 as I64 — consistent with comparison types
             "string"          => Some(types::I64), // pointer
             "bytes"           => Some(types::I64), // pointer to hsh_bytes struct
             "any"             => Some(types::I64), // opaque pointer
@@ -46,7 +44,7 @@ pub fn htype_to_cl(ty: &TypeExpr) -> Option<Type> {
         TypeExpr::U128 => Some(types::I64),
         TypeExpr::F32 => Some(types::F32),
         TypeExpr::F64 => Some(types::F64),
-        TypeExpr::Bool => Some(types::I8),
+        TypeExpr::Bool => Some(types::I64), // use I64 for bools (avoid icmp type mismatches)
         TypeExpr::String => Some(types::I64),
         TypeExpr::Bytes  => Some(types::I64),
     }
