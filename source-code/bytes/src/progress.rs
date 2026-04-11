@@ -1,8 +1,3 @@
-/// bytes progress bar — [#------] style with theme switcher
-/// Default: [#------] [42%] [status]
-/// Arrow:   [>-------] [42%] [status]
-/// Cargo:   [===>    ] [42%] [status]
-
 use colored::*;
 use std::io::Write;
 
