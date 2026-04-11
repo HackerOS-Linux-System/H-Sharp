@@ -1,203 +1,147 @@
-/// H# Python interop — use "python -> numpy" from "np"
-/// Installs Python packages into a venv cached in RAM or project .cache/
-/// Generates H# FFI bindings via ctypes/cffi and calls Python from H# via subprocess or embedding
-
-use colored::*;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use colored::*;
 
-/// Python package specification from H# imports
-#[derive(Debug, Clone)]
-pub struct PyPackage {
-    pub name:    String,
-    pub version: Option<String>,
-    pub alias:   String,
-}
+// PythonConfig lives in crate::config — imported below
+use crate::config::PythonConfig;
 
-impl PyPackage {
-    pub fn from_import(path: &str, alias: &str) -> Option<Self> {
-        // parse: "python -> numpy" or "python -> numpy/1.26"
-        let rest = path.strip_prefix("python")?
-            .trim_start_matches(" -> ")
-            .trim_start_matches("->")
-            .trim();
-
-        let (name, version) = if let Some(slash) = rest.rfind('/') {
-            let v = &rest[slash+1..];
-            if v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                (rest[..slash].to_string(), Some(v.to_string()))
-            } else {
-                (rest.to_string(), None)
-            }
-        } else {
-            (rest.to_string(), None)
-        };
-
-        Some(Self { name, version, alias: alias.to_string() })
-    }
-}
-
+/// Python virtual environment in RAM session
 pub struct PythonEnv {
-    pub python_bin: String,
-    pub venv_path:  PathBuf,
-    pub site_packages: PathBuf,
+    pub venv_dir: PathBuf,
+    pub python:   String,
+    pub pip:      String,
 }
 
 impl PythonEnv {
-    /// Create or reuse a Python venv for bytes
-    pub fn setup(version: &str, venv_dir: &Path) -> anyhow::Result<Self> {
-        let python_bin = find_python(version)?;
+    /// Create/open venv at path using system Python (not statically linked)
+    pub fn setup(version: &str, base: &Path) -> anyhow::Result<Self> {
+        let venv_dir = base.to_path_buf();
+        std::fs::create_dir_all(&venv_dir)?;
 
-        if !venv_dir.join("pyvenv.cfg").exists() {
+        // Find system Python — NOT linked statically, uses /usr/bin/python3
+        let python_bin = find_system_python(version)?;
+
+        let python = venv_dir.join("bin/python3").display().to_string();
+        let pip    = venv_dir.join("bin/pip").display().to_string();
+
+        // Create venv if not exists
+        if !venv_dir.join("bin/python3").exists() {
             eprintln!("  {} Python venv ({})...", "creating".cyan(), python_bin);
-            let ok = Command::new(&python_bin)
-                .args(["-m", "venv", venv_dir.to_str().unwrap_or(".")])
-                .status()?.success();
-            if !ok { anyhow::bail!("failed to create Python venv"); }
+            let ok = std::process::Command::new(&python_bin)
+                .args(["-m", "venv", "--system-site-packages",
+                       &venv_dir.display().to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                anyhow::bail!(
+                    "failed to create Python venv. Is python3 installed?\n  \
+                     Install: sudo apt install python3 python3-venv"
+                );
+            }
         }
 
-        // Find site-packages
-        let site_pkg = if cfg!(target_os = "windows") {
-            venv_dir.join("Lib").join("site-packages")
-        } else {
-            // Find python3.X directory
-            let lib = venv_dir.join("lib");
-            if lib.exists() {
-                if let Ok(entries) = std::fs::read_dir(&lib) {
-                    entries.flatten()
-                        .find(|e| e.file_name().to_string_lossy().starts_with("python"))
-                        .map(|e| e.path().join("site-packages"))
-                        .unwrap_or_else(|| lib.join("site-packages"))
-                } else {
-                    lib.join("site-packages")
-                }
-            } else {
-                venv_dir.join("site-packages")
-            }
-        };
-
-        let venv_python = if cfg!(target_os = "windows") {
-            venv_dir.join("Scripts").join("python.exe")
-        } else {
-            venv_dir.join("bin").join("python3")
-        };
-
-        Ok(Self {
-            python_bin: venv_python.display().to_string(),
-            venv_path: venv_dir.to_path_buf(),
-            site_packages: site_pkg,
-        })
+        Ok(Self { venv_dir, python, pip })
     }
 
     /// Install a Python package into the venv
+    /// Python libs are installed into venv (NOT statically linked)
+    /// System Python runtime is used as-is
     pub fn install_package(&self, name: &str, version: Option<&str>) -> anyhow::Result<()> {
-        let spec = if let Some(v) = version {
-            format!("{}=={}", name, v)
-        } else {
-            name.to_string()
+        let pkg_spec = match version {
+            Some(v) => format!("{}=={}", name, v),
+            None    => name.to_string(),
         };
+        eprintln!("  {} {} (python)", "installing".cyan(), pkg_spec.yellow());
 
-        eprintln!("  {} {} (python)", "installing".cyan(), spec.yellow());
-        let pip = if cfg!(target_os = "windows") {
-            self.venv_path.join("Scripts").join("pip.exe")
-        } else {
-            self.venv_path.join("bin").join("pip3")
-        };
+        let ok = std::process::Command::new(&self.pip)
+            .args(["install", "--quiet", &pkg_spec])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
 
-        let ok = Command::new(&pip)
-            .args(["install", "--quiet", &spec])
-            .status()?.success();
-        if !ok { anyhow::bail!("pip install {} failed", spec); }
+        if !ok {
+            anyhow::bail!("pip install {} failed", pkg_spec);
+        }
         eprintln!("  {} {}", "✓".green(), name.cyan());
         Ok(())
     }
 
-    /// Generate H# FFI binding snippet for a Python package
-    /// The binding calls Python via subprocess (most portable approach)
-    pub fn generate_hsharp_binding(&self, pkg: &PyPackage) -> String {
-        format!(r#";;  H# ↔ Python binding for: {}
-;;  Generated by bytes — do not edit manually
-;;  Calls Python via subprocess with JSON serialization
+    /// Generate H# FFI binding stub for a Python package
+    /// The stub allows calling Python functions from H# via subprocess bridge
+    pub fn generate_hsharp_binding(&self, pkg_name: &str) -> String {
+        let alias = pkg_name.replace('-', "_").replace('.', "_");
+        format!(r#"
+;; H# Python binding for: {pkg}
+;; Generated by bytes PM — calls Python via subprocess bridge
+;; Runtime: system Python3 (NOT statically linked)
 
-fn {alias}_call(func: string, args_json: string) -> string is
-    ;; Calls {name}.func(*args) via Python subprocess
-    ;; Returns JSON-encoded result
-    let script: string = "import {name}, json, sys; args=json.loads(sys.argv[2]); print(json.dumps({name}.__dict__[sys.argv[1]](*args) if isinstance({name}.__dict__.get(sys.argv[1]), type(lambda:0)) else str(getattr({name}, sys.argv[1]))))"
-    let result: string = exec_python(script, func, args_json)
-    return result
+use "std -> process" from "proc"
+
+pub fn {alias}_call(func: string, args: string) -> string is
+    ;; Calls: python3 -c "import {pkg}; print({pkg}.<func>(<args>))"
+    let cmd: string = "python3 -c \"import {pkg}; print({pkg}.\" + func + \"(\" + args + \"))\""
+    return proc::shell(cmd)
 end
 
-fn {alias}_eval(expr: string) -> string is
-    let script: string = "import {name}, json; print(json.dumps(eval(expr)))"
-    return exec_python(script, expr, "[]")
+pub fn {alias}_eval(expr: string) -> string is
+    let cmd: string = "python3 -c \"import {pkg}; print(\" + expr + \")\""
+    return proc::shell(cmd)
 end
 
-;; Low-level: call Python interpreter and return stdout
-fn exec_python(script: string, arg1: string, arg2: string) -> string is
-    ;; Implementation uses std::process::Command internally
-    return "__py_call__:" + script + "|" + arg1 + "|" + arg2
+pub fn {alias}_import() -> bool is
+    let cmd: string = "python3 -c \"import {pkg}\" && echo ok"
+    let result: string = proc::shell(cmd)
+    return result == "ok"
 end
-"#,
-        pkg.name,
-        alias = pkg.alias,
-        name  = pkg.name)
+"#, pkg = pkg_name, alias = alias)
     }
 
-    /// Write binding file to cache
-    pub fn write_binding(&self, pkg: &PyPackage, cache_dir: &Path) -> anyhow::Result<PathBuf> {
-        let binding = self.generate_hsharp_binding(pkg);
-        let path = cache_dir.join(format!("{}_py_binding.h#", pkg.alias));
-        std::fs::write(&path, binding)?;
-        Ok(path)
+    /// Install all packages from config
+    pub fn install_all(&self, config: &PythonConfig) -> anyhow::Result<()> {
+        for pkg in &config.packages {
+            self.install_package(pkg, None)?;
+        }
+        Ok(())
     }
 }
 
-/// Install all python packages from bytes.toml [python] section
-pub fn setup_python_deps(config: &crate::config::PythonConfig, cache_dir: &Path) -> anyhow::Result<PythonEnv> {
-    let venv_dir = config.venv.as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cache_dir.join("pyenv"));
-
-    std::fs::create_dir_all(&venv_dir)?;
-    let env = PythonEnv::setup(&config.version, &venv_dir)?;
-
-    for pkg in &config.packages {
-        // Parse "numpy==1.26" or "numpy"
-        let (name, version) = if let Some(eq) = pkg.find("==") {
-            (&pkg[..eq], Some(pkg[eq+2..].to_string()))
-        } else {
-            (pkg.as_str(), None)
-        };
-        env.install_package(name, version.as_deref())?;
-    }
-
-    Ok(env)
+/// Setup Python deps for a bytes project
+pub fn setup_python_deps(config: &PythonConfig, cache: &Path) -> anyhow::Result<()> {
+    let env = PythonEnv::setup(&config.version, cache)?;
+    env.install_all(config)
 }
 
-/// Resolve a "python -> pkg" import and set up bindings
-pub fn resolve_python_import(path: &str, alias: &str, cache_dir: &Path, python_ver: &str) -> anyhow::Result<PathBuf> {
-    let pkg = PyPackage::from_import(path, alias)
-        .ok_or_else(|| anyhow::anyhow!("invalid python import: {}", path))?;
-
-    let venv_dir = cache_dir.join("pyenv");
-    std::fs::create_dir_all(&venv_dir)?;
-    let env = PythonEnv::setup(python_ver, &venv_dir)?;
-    env.install_package(&pkg.name, pkg.version.as_deref())?;
-    env.write_binding(&pkg, cache_dir)
+/// Resolve a python import into a generated H# binding
+pub fn resolve_python_import(pkg_name: &str, version: Option<&str>) -> String {
+    // Returns the H# binding stub source
+    let env_stub = PythonEnv {
+        venv_dir: PathBuf::new(),
+        python:   "python3".into(),
+        pip:      "pip3".into(),
+    };
+    env_stub.generate_hsharp_binding(pkg_name)
 }
 
-fn find_python(version: &str) -> anyhow::Result<String> {
-    // Try exact version first: python3.13, python3.14
-    for candidate in &[
+/// Find the system Python binary (NOT statically linked, uses system runtime)
+fn find_system_python(version: &str) -> anyhow::Result<String> {
+    // Prefer versioned binary
+    let candidates = [
         format!("python{}", version),
-        format!("python3.{}", version.trim_start_matches("3.")),
         "python3".to_string(),
         "python".to_string(),
-    ] {
-        if Command::new(candidate).arg("--version").output()
-            .map(|o| o.status.success()).unwrap_or(false) {
+    ];
+
+    for candidate in &candidates {
+        let ok = std::process::Command::new("which")
+            .arg(candidate)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
             return Ok(candidate.clone());
         }
     }
-    Err(anyhow::anyhow!("Python {} not found. Install: apt install python{}", version, version))
+    anyhow::bail!(
+        "python3 not found.\n  Install: hacker unpack python3\n  Or: sudo apt install python3 python3-venv"
+    )
 }
