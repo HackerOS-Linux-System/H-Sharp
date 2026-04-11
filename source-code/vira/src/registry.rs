@@ -1,151 +1,251 @@
-/// Vira registry — vira-io/repository + Bytes-Repository
-/// use "vira -> pkgname" from "alias"   → vira registry
-/// use "bytes -> pkgname" from "alias"  → bytes repository
-
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-const VIRA_INDEX: &str = "https://raw.githubusercontent.com/vira-io/repository/main/repo-list.json";
-const BYTES_INDEX: &str = "https://raw.githubusercontent.com/Bytes-Repository/repository/main/index.json";
+pub const VIRA_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/vira-io/repository/main/repo-list.json";
+pub const BYTES_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/Bytes-Repository/repository/main/index.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PackageEntry {
-    pub name:        String,
-    pub latest:      String,
-    pub versions:    Option<Vec<String>>,
-    pub git:         Option<String>,
-    pub description: Option<String>,
-    pub keywords:    Option<Vec<String>>,
-    pub author:      Option<String>,
-    pub license:     Option<String>,
+// ── Real JSON structure from vira-io/repository ──────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoListJson {
+    pub libraries: Vec<LibraryEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LibraryEntry {
+    pub name:        String,
+    pub description: Option<String>,
+    /// versions map: "0.1.0" -> "https://github.com/.../lib.a"
+    pub versions:    Option<HashMap<String, String>>,
+    /// git repo url (for community libraries without prebuilt .a)
+    pub git:         Option<String>,
+}
+
+impl LibraryEntry {
+    /// Latest version string (semver-highest or last in map)
+    pub fn latest_version(&self) -> Option<String> {
+        let versions = self.versions.as_ref()?;
+        if versions.is_empty() { return None; }
+        // Parse as semver and pick highest; fall back to last key
+        let mut keys: Vec<&String> = versions.keys().collect();
+        keys.sort_by(|a, b| semver_cmp(a, b));
+        keys.last().map(|s| s.to_string())
+    }
+
+    /// Download URL for a specific version, or latest if None
+    pub fn url_for(&self, version: Option<&str>) -> Option<String> {
+        let versions = self.versions.as_ref()?;
+        match version {
+            Some(v) => versions.get(v).cloned(),
+            None    => {
+                let latest = self.latest_version()?;
+                versions.get(&latest).cloned()
+            }
+        }
+    }
+}
+
+/// Simple semver comparison (handles "0.1.0", "0.2", "0.3.1" etc.)
+fn semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    };
+    let av = parse(a);
+    let bv = parse(b);
+    let len = av.len().max(bv.len());
+    for i in 0..len {
+        let ai = av.get(i).copied().unwrap_or(0);
+        let bi = bv.get(i).copied().unwrap_or(0);
+        match ai.cmp(&bi) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+// ── Registry ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
 pub struct Registry {
-    pub packages: Vec<PackageEntry>,
-    pub source:   String,
+    pub libraries: Vec<LibraryEntry>,
+    pub source:    String,
 }
 
 impl Registry {
-    /// Fetch from Vira registry (default)
+    /// Load from local cache file
+    pub fn load_cache(cache_path: &PathBuf) -> Option<Self> {
+        let data = std::fs::read_to_string(cache_path).ok()?;
+        let parsed: RepoListJson = serde_json::from_str(&data).ok()?;
+        Some(Self { libraries: parsed.libraries, source: "cache".into() })
+    }
+
+    /// Fetch from remote URL, save to cache
+    pub fn fetch_and_cache(url: &str, cache_path: &PathBuf) -> Self {
+        match http_get(url) {
+            Ok(body) => {
+                // Save to cache
+                if let Some(parent) = cache_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::write(cache_path, &body).ok();
+                match serde_json::from_str::<RepoListJson>(&body) {
+                    Ok(parsed) => Self { libraries: parsed.libraries, source: "remote".into() },
+                    Err(e) => {
+                        eprintln!("  warn: failed to parse registry: {}", e);
+                        Self::load_cache(cache_path).unwrap_or_default()
+                    }
+                }
+            }
+            Err(_) => {
+                // Offline — use cache
+                Self::load_cache(cache_path).unwrap_or_default()
+            }
+        }
+    }
+
+    /// Fetch vira registry (.cache/vira-registry.json in project dir)
+    pub fn fetch_vira() -> Self {
+        let cache = PathBuf::from(".cache/vira-registry.json");
+        Self::fetch_and_cache(VIRA_INDEX_URL, &cache)
+    }
+
+    /// Fetch bytes registry (~/.hackeros/H#/.cache/bytes-registry.json)
+    pub fn fetch_bytes() -> Self {
+        let cache = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".hackeros/H#/.cache/bytes-registry.json");
+        Self::fetch_and_cache(BYTES_INDEX_URL, &cache)
+    }
+
+    /// Compatibility: default fetch = vira registry
     pub fn fetch() -> Self { Self::fetch_vira() }
 
-    pub fn fetch_vira() -> Self {
-        let mut r = Self::fetch_url(VIRA_INDEX);
-        r.source = "vira".into();
-        r
+    pub fn find(&self, name: &str) -> Option<&LibraryEntry> {
+        self.libraries.iter().find(|l| l.name == name)
     }
 
-    pub fn fetch_bytes() -> Self {
-        let mut r = Self::fetch_url(BYTES_INDEX);
-        r.source = "bytes".into();
-        r
-    }
-
-    fn fetch_url(url: &str) -> Self {
-        let result: Option<Self> = (|| {
-            let (host, path) = parse_url(url)?;
-            let body = http_get(&host, &path).ok()?;
-            serde_json::from_str(&body).ok()
-        })();
-        result.unwrap_or_default()
-    }
-
-    pub fn find(&self, name: &str) -> Option<&PackageEntry> {
-        self.packages.iter().find(|p| p.name == name)
-    }
-
-    pub fn search(&self, query: &str) -> Vec<&PackageEntry> {
+    pub fn search(&self, query: &str) -> Vec<&LibraryEntry> {
         let q = query.to_lowercase();
-        self.packages.iter().filter(|p|
-            p.name.to_lowercase().contains(&q)
-            || p.description.as_deref().unwrap_or("").to_lowercase().contains(&q)
-        ).collect()
+        self.libraries.iter().filter(|l| {
+            l.name.to_lowercase().contains(&q)
+            || l.description.as_deref().unwrap_or("").to_lowercase().contains(&q)
+        }).collect()
     }
 }
 
-/// Resolve import kind to download URL
+// ── Resolved dependency ───────────────────────────────────────────────────────
+
+#[derive(Debug)]
 pub enum ResolvedDep {
-    Registry { name: String, version: String, download_url: String },
-    Git      { url: String, alias: String, version: String },
-    Python   { package: String, version: Option<String> },
+    /// Pre-built static archive (.a) from vira registry
+    Archive { name: String, version: String, download_url: String },
+    /// Git repository (clone + build)
+    Git     { url: String, alias: String, version: String },
+    /// Python package (handled by bytes)
+    Python  { package: String, version: Option<String> },
 }
 
-/// Resolve a dependency name to download URL
-pub fn resolve_dep(name: &str, version: &str, registry: &Registry) -> anyhow::Result<ResolvedDep> {
-    // GitHub/GitLab direct
+/// Resolve a dependency name+version to a download URL
+pub fn resolve_dep(name: &str, version: Option<&str>, registry: &Registry)
+    -> anyhow::Result<ResolvedDep>
+{
+    // GitHub/GitLab direct URL
     if name.starts_with("github.com/") || name.starts_with("gitlab.com/") {
         let alias = name.split('/').last().unwrap_or(name).to_string();
-        return Ok(ResolvedDep::Git { url: format!("https://{}", name), alias, version: version.to_string() });
+        return Ok(ResolvedDep::Git {
+            url:     format!("https://{}", name),
+            alias,
+            version: version.unwrap_or("latest").to_string(),
+        });
     }
-    // Vira registry
-    let ver = if version == "latest" || version.is_empty() {
-        registry.find(name).map(|e| e.latest.clone()).unwrap_or_else(|| "latest".into())
-    } else { version.to_string() };
-    let url = registry.find(name)
-        .and_then(|e| e.git.as_deref())
-        .map(|g| g.to_string())
-        .unwrap_or_else(|| format!("https://github.com/vira-io/{}", name));
-    Ok(ResolvedDep::Registry { name: name.to_string(), version: ver, download_url: url })
-}
 
-fn parse_url(url: &str) -> Option<(String, String)> {
-    let u = url.trim_start_matches("https://").trim_start_matches("http://");
-    let (host, path) = u.split_once('/')?;
-    Some((host.to_string(), format!("/{}", path)))
-}
+    // Registry lookup
+    match registry.find(name) {
+        None => {
+            // Not in registry — try as git
+            Ok(ResolvedDep::Git {
+                url:     format!("https://github.com/vira-io/{}", name),
+                alias:   name.to_string(),
+                version: version.unwrap_or("latest").to_string(),
+            })
+        }
+        Some(entry) => {
+            // Has git-only (community library)
+            if entry.versions.is_none() || entry.versions.as_ref().unwrap().is_empty() {
+                if let Some(git) = &entry.git {
+                    return Ok(ResolvedDep::Git {
+                        url:     git.clone(),
+                        alias:   name.to_string(),
+                        version: version.unwrap_or("latest").to_string(),
+                    });
+                }
+            }
 
-fn http_get(host: &str, path: &str) -> anyhow::Result<String> {
-    let addr = format!("{}:443", host);
-    // Try HTTPS via HTTP/1.0 (simple approach)
-    // Fall back to HTTP on port 80
-    let addr80 = format!("{}:80", host.replace("raw.githubusercontent.com", "raw.githubusercontent.com"));
+            // Resolve version
+            let ver_str = match version {
+                Some(v) => v.to_string(),
+                None    => entry.latest_version()
+                    .ok_or_else(|| anyhow::anyhow!("no versions available for {}", name))?,
+            };
 
-    // Use raw.githubusercontent.com via HTTPS would need TLS...
-    // For now use HTTP redirect via curl/wget as fallback
-    let output = std::process::Command::new("curl")
-        .args(["-s", "--max-time", "8", &format!("https://{}{}", host, path)])
-        .output();
+            let url = entry.url_for(Some(&ver_str))
+                .or_else(|| entry.url_for(None))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "version {} not found for {}. Available: {:?}",
+                    ver_str, name,
+                    entry.versions.as_ref().map(|v| v.keys().collect::<Vec<_>>())
+                ))?;
 
-    if let Ok(out) = output {
-        if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+            Ok(ResolvedDep::Archive {
+                name:         name.to_string(),
+                version:      ver_str,
+                download_url: url,
+            })
         }
     }
-
-    // Try wget
-    let output = std::process::Command::new("wget")
-        .args(["-q", "-O", "-", "--timeout=8", &format!("https://{}{}", host, path)])
-        .output();
-
-    if let Ok(out) = output {
-        if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).to_string());
-        }
-    }
-
-    Err(anyhow::anyhow!("cannot fetch {}{}", host, path))
 }
 
-pub fn print_results(results: &[&PackageEntry], source: &str) {
+/// Print search results
+pub fn print_search_results(results: &[&LibraryEntry]) {
     use colored::*;
     if results.is_empty() {
         println!("  {}", "No packages found.".dimmed());
         return;
     }
-    println!("  {} {:<25} {:<12} {}", "SRC".bold(), "PACKAGE".bold(), "LATEST".bold(), "DESCRIPTION".bold());
-    println!("  {}", "─".repeat(70).dimmed());
-    for p in results {
-        let desc = p.description.as_deref().unwrap_or("—");
-        let desc = if desc.len() > 38 { &desc[..38] } else { desc };
-        println!("  {} {:<25} {:<12} {}",
-            source.cyan().dimmed(),
-            p.name.cyan(),
-            p.latest.green(),
-            desc.dimmed());
+    println!("  {:<25} {:<10} {}", "PACKAGE".bold(), "LATEST".bold(), "DESCRIPTION".bold());
+    println!("  {}", "─".repeat(65).dimmed());
+    for l in results {
+        let latest = l.latest_version().unwrap_or_else(|| "git".into());
+        let desc   = l.description.as_deref().unwrap_or("—");
+        let desc   = if desc.len() > 38 { &desc[..38] } else { desc };
+        println!("  {:<25} {:<10} {}", l.name.cyan(), latest.green(), desc.dimmed());
     }
 }
 
-pub fn print_search_results(results: &[&PackageEntry]) {
-    print_results(results, "vira");
+// ── HTTP helper ───────────────────────────────────────────────────────────────
+
+fn http_get(url: &str) -> anyhow::Result<String> {
+    // Try curl first (most reliable)
+    let curl = std::process::Command::new("curl")
+        .args(["-s", "-L", "--max-time", "10", "--fail", url])
+        .output();
+    if let Ok(out) = curl {
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+        }
+    }
+    // Fallback: wget
+    let wget = std::process::Command::new("wget")
+        .args(["-q", "-O", "-", "--timeout=10", url])
+        .output();
+    if let Ok(out) = wget {
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+        }
+    }
+    anyhow::bail!("failed to fetch {}", url)
 }
