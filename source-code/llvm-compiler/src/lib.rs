@@ -1,7 +1,3 @@
-/// H# LLVM/inkwell native code generator
-/// Installed at: ~/.hackeros/H#/bins/h#-compiler
-/// Called by vira for release builds.
-
 pub mod codegen;
 pub mod types;
 pub mod builtins;
@@ -15,10 +11,15 @@ pub use codegen::CodegenError;
 
 /// Compile H# module to native binary via LLVM
 pub fn compile_llvm(module: &Module, opts: &CompileOptions) -> Result<(), CodegenError> {
-    let mut cg = LlvmCodegen::new(opts)?;
-    cg.declare_functions(module)?;
-    cg.compile_module(module)?;
-    cg.emit(&opts.output, opts.optimize)
+    // ensure output directory exists
+    if let Some(parent) = std::path::Path::new(&opts.output).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    // compile_full handles: declare → compile → optimize → emit_binary
+    let cg = LlvmCodegen::new(opts)?;
+    cg.compile_full(module)
 }
 
 /// Compile to LLVM IR text (for inspection / --emit-ir)
