@@ -100,6 +100,6 @@ pub fn run_multi(files: Vec<std::path::PathBuf>) {
 fn print_header() {
     use colored::Colorize;
     println!("  {} {}  —  HackerOS-first compiled language",
-        "H# Language".cyan().bold(), "0.1.0".cyan());
+        "h#".cyan().bold(), "v0.2.0".cyan());
     println!();
 }
