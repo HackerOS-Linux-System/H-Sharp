@@ -1,5 +1,3 @@
-/// bytes registry — uses same vira-io/repository as vira
-
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
