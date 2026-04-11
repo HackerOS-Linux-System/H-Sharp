@@ -1,7 +1,3 @@
-/// H# → LLVM IR code generator using inkwell
-/// Produces optimized native code for release builds.
-/// Installed at: ~/.hackeros/H#/bins/h#-compiler
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -11,7 +7,7 @@ use inkwell::{
     context::Context,
     builder::Builder,
     module::Module,
-    values::{BasicValueEnum, FunctionValue, PointerValue, GlobalValue},
+    values::{BasicValueEnum, FunctionValue, PointerValue},
     types::{BasicTypeEnum, BasicType},
     targets::{
         CodeModel, FileType, InitializationConfig, RelocMode,
@@ -23,7 +19,7 @@ use hsharp_parser::ast::{Module as HshModule, *};
 use hsharp_compiler::CompileOptions;
 use crate::types::htype_to_llvm;
 use crate::builtins::LlvmBuiltins;
-use crate::optimize::{optimize_module, optimize_function};
+use crate::optimize::optimize_module;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
@@ -77,12 +73,32 @@ impl LlvmCodegen {
             )?;
         }
 
-        // Optimization
-        let opt_level = if self.opts.optimize { 3 } else { 1 };
-        optimize_module(&module, opt_level);
+        // Create target machine for optimization
+        Target::initialize_native(&InitializationConfig::default())
+            .map_err(|e| CodegenError::Llvm(e))?;
+        let triple  = TargetMachine::get_default_triple();
+        let target  = Target::from_triple(&triple)
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+        let opt_lvl = if self.opts.optimize { OptimizationLevel::Aggressive } else { OptimizationLevel::Default };
+
+        // Use native CPU with all features for maximum performance (inkwell 0.5)
+        let cpu_name    = TargetMachine::get_host_cpu_name();
+        let cpu_features = TargetMachine::get_host_cpu_features();
+
+        let machine = target.create_target_machine(
+            &triple,
+            cpu_name.to_str().unwrap_or("x86-64"),
+            cpu_features.to_str().unwrap_or("+avx2,+bmi,+bmi2,+sse4.1,+sse4.2"),
+            opt_lvl, RelocMode::PIC, CodeModel::Default,
+        ).ok_or_else(|| CodegenError::Llvm("cannot create target machine".into()))?;
+
+        // Apply new pass manager optimizations
+        let opt_num = if self.opts.optimize { 3 } else { 1 };
+        optimize_module(&module, &machine, opt_num);
+
+        self.emit_binary_with_machine(&module, &machine)
 
         // Emit
-        self.emit_binary(&module)
     }
 
     fn collect_fns<'a>(&self, m: &'a HshModule) -> Vec<FnDef> {
@@ -182,7 +198,6 @@ impl LlvmCodegen {
         }
 
         // Run function-level optimizations
-        optimize_function(module, if self.opts.optimize { 3 } else { 1 });
         Ok(())
     }
 
@@ -195,27 +210,8 @@ impl LlvmCodegen {
         }
     }
 
-    /// Emit optimized binary
-    fn emit_binary(&self, module: &Module) -> R<()> {
-        let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple)
-            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
-
-        let opt_level = if self.opts.optimize {
-            OptimizationLevel::Aggressive
-        } else {
-            OptimizationLevel::Default
-        };
-
-        let machine = target.create_target_machine(
-            &triple,
-            "x86-64",
-            "+avx2",           // Enable AVX2 on modern x86_64
-            opt_level,
-            RelocMode::Default,
-            CodeModel::Default,
-        ).ok_or_else(|| CodegenError::Llvm("cannot create target machine".into()))?;
-
+    /// Emit binary using a pre-built TargetMachine (from compile_full)
+    fn emit_binary_with_machine(&self, module: &Module, machine: &TargetMachine) -> R<()> {
         // Write runtime C
         let rt_c = format!("{}_rt.c", self.opts.output);
         let rt_o = format!("{}_rt.o", self.opts.output);
@@ -235,8 +231,10 @@ impl LlvmCodegen {
         let out = format!("{}{}", self.opts.output, suffix);
         let mut cmd = std::process::Command::new("cc");
         cmd.arg(&obj_path).arg(&rt_o).arg("-o").arg(&out);
+        cmd.arg("-no-pie");      // avoid PIE relocation errors on some distros
         if self.opts.static_link { cmd.arg("-static"); }
-        if self.opts.optimize    { cmd.arg("-O2"); }
+        else { cmd.arg("-fPIE"); }
+        if self.opts.optimize { cmd.arg("-O2"); }
         let result = cmd.output()?;
         if !result.status.success() {
             return Err(CodegenError::Link(
@@ -667,7 +665,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     let mut call_args = Vec::new();
                     for (i, a) in args.iter().enumerate() {
                         let expected = sig.get_param_types().get(i).copied().map(|t| t);
-                        let v = self.expr(a, expected)?;
+                        let v = self.expr(a, None)?;
                         call_args.push(v.into());
                     }
                     let r = self.builder.build_call(fv, &call_args, "call").unwrap();
