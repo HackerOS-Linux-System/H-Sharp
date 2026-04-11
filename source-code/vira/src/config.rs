@@ -1,5 +1,3 @@
-/// vira.hcl project configuration
-
 use std::collections::HashMap;
 use crate::hcl;
 
