@@ -1,4 +1,3 @@
-/// Vira progress bar — three themes: default (H# style), arrow, cargo-like
 use colored::*;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
