@@ -1,218 +1,173 @@
-/// Vira package installer — downloads, builds, caches packages
-/// Progress bar uses configured theme. Shows full queue below bar.
-
+use std::path::{Path, PathBuf};
 use colored::*;
-use std::collections::HashMap;
-use std::time::Duration;
-use crate::progress::{ProgressBar, ProgressTheme, build_display};
-use crate::registry::{Registry, ResolvedDep, resolve_dep, PackageEntry};
-use crate::settings::ViraSettings;
 use crate::config::ViraProject;
+use crate::registry::{Registry, ResolvedDep, resolve_dep};
 
 pub struct Installer {
-    settings: ViraSettings,
-    cache_dir: std::path::PathBuf,
+    cache_dir: PathBuf,
 }
 
 impl Installer {
-    pub fn new(settings: ViraSettings) -> Self {
-        // .cache is always project-local (next to vira.hcl, like node_modules)
+    pub fn new() -> Self {
         let cache_dir = ViraProject::cache_dir();
         std::fs::create_dir_all(&cache_dir).ok();
-        Self { settings, cache_dir }
+        Self { cache_dir }
     }
 
-    /// Install all dependencies from a project
-    pub fn install_project(&self, project: &ViraProject) -> anyhow::Result<()> {
+    /// Install all dependencies from vira.hcl
+    pub fn install_all(&self, project: &ViraProject, registry: &Registry) -> anyhow::Result<()> {
         if project.dependencies.is_empty() {
-            println!("  {}", "No dependencies to install.".dimmed());
+            println!("  {}", "Nothing to install.".dimmed());
             return Ok(());
         }
 
-        println!();
-        println!("  {} {}", "vira".cyan().bold(), "Installing dependencies...".bold());
-        println!();
-
-        // Fetch registry
-        let spinner_msg = "Fetching package registry...";
-        print!("  {} {}", "·".cyan(), spinner_msg);
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-        let registry = Registry::fetch();
-        println!("\r  {} {}          ", "✓".green(), "Registry loaded".dimmed());
-
-        // Build ordered queue: deps + final binary
-        let mut queue: Vec<String> = project.dependencies.keys().cloned().collect();
-        queue.push(format!("[binary] {}", project.name));
-
-        println!();
-        build_display(&queue, &self.settings.progress_theme);
-
-        let total = queue.len() as u64;
-        let mut pb = ProgressBar::new(total, self.settings.progress_theme.clone());
-
-        // Install each dep
-        let mut installed = Vec::new();
-        for (pkg_name, version) in &project.dependencies {
-            pb.set_label(format!("compiling {}", pkg_name));
-            let remaining: Vec<String> = queue.iter()
-                .skip(installed.len())
-                .map(|s| s.clone())
-                .collect();
-            pb.set_queue(remaining);
-            pb.print_queue();
-
-            match self.install_one(&registry, pkg_name, version) {
-                Ok(path) => {
-                    installed.push(path);
-                    pb.inc(1);
-                }
-                Err(e) => {
-                    println!();
-                    eprintln!("  {} Failed to install {}: {}", "✗".red().bold(), pkg_name.cyan(), e);
-                    return Err(e);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        // "Link final binary" step
-        pb.set_label(format!("linking {}", project.name));
-        std::thread::sleep(Duration::from_millis(80));
-        pb.inc(1);
-
-        pb.finish(&format!("All {} package(s) installed", installed.len()));
-
-        println!("  {} Packages cached in: {}", "·".dimmed(), self.cache_dir.display().to_string().cyan());
-        println!("  {} Final binary in:    {}", "·".dimmed(), "build/".cyan());
-        println!();
-        Ok(())
-    }
-
-    /// Install a single package
-    pub fn install_one(&self, registry: &Registry, name: &str, version: &str) -> anyhow::Result<std::path::PathBuf> {
-        let pkg_cache = self.cache_dir.join("packages").join(format!("{}-{}", name, version));
-        std::fs::create_dir_all(&pkg_cache)?;
-
-        // Resolve the dependency
-        match resolve_dep(name, version, registry)? {
-            ResolvedDep::Registry { name: n, version: v, download_url: url } => {
-                let placeholder = format!(
-                    ";; Package: {} v{}\n;; Source: Vira Registry\n;; URL: {}\n\npub fn placeholder() -> string = \"{}-{}\"\n",
-                    n, v, url, n, v
-                );
-                let pkg_file = pkg_cache.join(format!("{}.h#", n));
-                std::fs::write(&pkg_file, placeholder)?;
-                Ok(pkg_cache)
-            }
-            ResolvedDep::Git { url, alias, version: ver } => {
-                let placeholder = format!(
-                    ";; Package: {} (git)\n;; URL: {}\n;; Version: {}\n\npub fn placeholder() -> string = \"{}\"\n",
-                    alias, url, ver, alias
-                );
-                let pkg_file = pkg_cache.join(format!("{}.h#", alias));
-                std::fs::write(&pkg_file, placeholder)?;
-                Ok(pkg_cache)
-            }
-            ResolvedDep::Python { package, version: ver } => {
-                let placeholder = format!(
-                    ";; Python package: {}\n;; Install via: bytes python {}\n",
-                    package, package
-                );
-                let pkg_file = pkg_cache.join(format!("py_{}.h#", package));
-                std::fs::write(&pkg_file, placeholder)?;
-                Ok(pkg_cache)
-            }
-        }
-    }
-
-    /// Add a single package and update vira.hcl
-    pub fn add(&self, name: &str, version: &str) -> anyhow::Result<()> {
-        println!();
-        println!("  {} Adding {} ...", "vira".cyan().bold(), name.cyan());
+        println!("  {} {} package(s)...", "Installing".cyan().bold(), project.dependencies.len());
+        println!("  {} {}", "Cache:".dimmed(), self.cache_dir.display().to_string().cyan());
         println!();
 
-        let registry = Registry::fetch();
-        let queue = vec![name.to_string(), format!("[link] {}", name)];
-        build_display(&queue, &self.settings.progress_theme);
+        let mut errors = 0;
+        for (name, version_spec) in &project.dependencies {
+            // Parse "name/version" or "name" = "version"
+            let (pkg_name, pkg_ver) = if version_spec == "latest" || version_spec.is_empty() {
+                (name.as_str(), None)
+            } else {
+                (name.as_str(), Some(version_spec.as_str()))
+            };
 
-        let mut pb = ProgressBar::new(2, self.settings.progress_theme.clone());
-        pb.set_label(format!("resolving {}", name));
-        pb.inc(0);
-
-        let result_path = self.install_one(&registry, name, version)?;
-        pb.set_label(format!("installing {}", name));
-        pb.inc(1);
-
-        std::thread::sleep(Duration::from_millis(60));
-        pb.set_label("linking".to_string());
-        pb.inc(1);
-
-        pb.finish(&format!("Added {}@{}", name, version));
-
-        // Update vira.hcl
-        if let Some(hcl_path) = ViraProject::find() {
-            if let Ok(mut proj) = ViraProject::load(&hcl_path) {
-                proj.dependencies.insert(name.to_string(), version.to_string());
-                proj.save(&hcl_path)?;
-                println!("  {} Updated {}", "✓".green(), hcl_path.cyan());
-            }
-        }
-
-        println!("  {}", format!("use \"vira -> {}\" from \"{}\"", name, name).dimmed());
-        println!();
-        Ok(())
-    }
-
-    /// Remove a package
-    pub fn remove(&self, name: &str) -> anyhow::Result<()> {
-        // Remove from vira.hcl
-        if let Some(hcl_path) = ViraProject::find() {
-            if let Ok(mut proj) = ViraProject::load(&hcl_path) {
-                proj.dependencies.remove(name);
-                proj.save(&hcl_path)?;
-            }
-        }
-        // Remove from cache
-        let pkg_glob = self.cache_dir.join("packages");
-        if let Ok(entries) = std::fs::read_dir(&pkg_glob) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(name) {
-                    std::fs::remove_dir_all(entry.path()).ok();
+            match self.install_package(pkg_name, pkg_ver, registry) {
+                Ok(path) => println!("  {} {} → {}", "✓".green(), name.cyan(), path.display().to_string().dimmed()),
+                Err(e)   => {
+                    eprintln!("  {} {}: {}", "✗".red(), name.red(), e);
+                    errors += 1;
                 }
             }
         }
-        println!("  {} Removed `{}`", "✓".green().bold(), name.cyan());
+
+        if errors > 0 {
+            anyhow::bail!("{} package(s) failed to install", errors);
+        }
         Ok(())
     }
 
-    /// Clean cache directory
+    /// Install a single package, returns path to cached artifact
+    pub fn install_package(&self, name: &str, version: Option<&str>, registry: &Registry)
+        -> anyhow::Result<PathBuf>
+    {
+        let resolved = resolve_dep(name, version, registry)?;
+
+        match resolved {
+            ResolvedDep::Archive { name, version, download_url } => {
+                self.download_archive(&name, &version, &download_url)
+            }
+            ResolvedDep::Git { url, alias, version } => {
+                self.clone_git(&alias, &url, &version)
+            }
+            ResolvedDep::Python { package, .. } => {
+                println!("  {} Python package {} — use `bytes python {}`",
+                    "info:".cyan(), package.yellow(), package);
+                Ok(self.cache_dir.join(format!("py_{}.placeholder", package)))
+            }
+        }
+    }
+
+    /// Download a pre-built .a archive
+    fn download_archive(&self, name: &str, version: &str, url: &str)
+        -> anyhow::Result<PathBuf>
+    {
+        let pkg_dir = self.cache_dir.join(format!("{}-{}", name, version));
+        let archive = pkg_dir.join(format!("{}.a", name));
+
+        if archive.exists() {
+            return Ok(archive); // already cached
+        }
+        std::fs::create_dir_all(&pkg_dir)?;
+
+        // Download .a with progress
+        print!("  {} {} v{}...", "Downloading".cyan(), name, version);
+        let ok = std::process::Command::new("curl")
+            .args(["-s", "-L", "--max-time", "60", "--fail", url,
+                   "-o", &archive.display().to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !ok {
+            // Try wget fallback
+            let ok2 = std::process::Command::new("wget")
+                .args(["-q", "--timeout=60", "-O", &archive.display().to_string(), url])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok2 {
+                std::fs::remove_dir_all(&pkg_dir).ok();
+                anyhow::bail!("download failed from {}", url);
+            }
+        }
+
+        // Write metadata
+        let meta = serde_json::json!({ "name": name, "version": version, "url": url });
+        std::fs::write(pkg_dir.join("meta.json"), meta.to_string())?;
+
+        println!(" {}", "done".green());
+        Ok(archive)
+    }
+
+    /// Clone a git repository into cache
+    fn clone_git(&self, name: &str, url: &str, version: &str)
+        -> anyhow::Result<PathBuf>
+    {
+        let pkg_dir = self.cache_dir.join(format!("{}-git", name));
+
+        if pkg_dir.exists() {
+            // Already cloned — pull
+            print!("  {} {} (git)...", "Updating".cyan(), name);
+            std::process::Command::new("git")
+                .args(["-C", &pkg_dir.display().to_string(), "pull", "--ff-only"])
+                .output().ok();
+            println!(" {}", "done".green());
+            return Ok(pkg_dir);
+        }
+
+        print!("  {} {} from {}...", "Cloning".cyan(), name, url);
+        let ok = std::process::Command::new("git")
+            .args(["clone", "--depth=1", url, &pkg_dir.display().to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !ok {
+            anyhow::bail!("git clone failed: {}", url);
+        }
+        println!(" {}", "done".green());
+        Ok(pkg_dir)
+    }
+
+    /// Clean the cache directory
     pub fn clean(&self) -> anyhow::Result<()> {
         if self.cache_dir.exists() {
             std::fs::remove_dir_all(&self.cache_dir)?;
+            println!("  {} cleaned {}", "✓".green().bold(), self.cache_dir.display().to_string().cyan());
+        } else {
+            println!("  {}", "Cache already empty.".dimmed());
         }
-        println!("  {} Cleaned cache: {}", "✓".green().bold(), self.cache_dir.display().to_string().cyan());
         Ok(())
     }
 
-    pub fn list_installed(&self) -> anyhow::Result<()> {
-        let pkg_dir = self.cache_dir.join("packages");
-        if !pkg_dir.exists() {
-            println!("  {}", "No packages installed.".dimmed());
-            return Ok(());
-        }
-        println!("  {:<30} {}", "PACKAGE".bold(), "VERSION".bold());
-        println!("  {}", "─".repeat(42).dimmed());
-        if let Ok(entries) = std::fs::read_dir(&pkg_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
+    /// List all cached packages
+    pub fn list(&self) -> Vec<(String, String)> {
+        if !self.cache_dir.exists() { return vec![]; }
+        std::fs::read_dir(&self.cache_dir)
+            .into_iter().flatten().flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // name-version format
                 let parts: Vec<&str> = name.rsplitn(2, '-').collect();
                 if parts.len() == 2 {
-                    println!("  {:<30} {}", parts[1].cyan(), parts[0].green());
+                    Some((parts[1].to_string(), parts[0].to_string()))
                 } else {
-                    println!("  {}", name.cyan());
+                    None
                 }
-            }
-        }
-        Ok(())
+            })
+            .collect()
     }
 }
