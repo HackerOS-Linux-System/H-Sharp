@@ -1,5 +1,3 @@
-/// H# type → LLVM type mapping
-
 use inkwell::context::Context;
 use inkwell::types::{AnyTypeEnum, BasicMetadataTypeEnum, BasicTypeEnum};
 use hsharp_parser::ast::TypeExpr;
