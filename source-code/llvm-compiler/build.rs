@@ -1,12 +1,15 @@
 fn main() {
-    // Auto-detect LLVM 17 installation
-    let llvm_prefix = std::env::var("LLVM_SYS_170_PREFIX")
-        .unwrap_or_else(|_| "/usr/lib/llvm-17".into());
-
-    // Tell cargo to link against LLVM 17 dynamically
-    println!("cargo:rustc-link-search=native={}/lib", llvm_prefix);
-    println!("cargo:rustc-link-lib=dylib=LLVM-17");
-
-    // Set prefix env for llvm-sys
-    println!("cargo:rustc-env=LLVM_SYS_170_PREFIX={}", llvm_prefix);
+    let prefix = std::env::var("LLVM_SYS_181_PREFIX")
+        .or_else(|_| std::env::var("LLVM_SYS_180_PREFIX"))
+        .or_else(|_| std::env::var("LLVM_SYS_170_PREFIX"))
+        .unwrap_or_else(|_| {
+            for p in &["/usr/lib/llvm-18", "/usr/lib/llvm-17"] {
+                if std::path::Path::new(p).join("bin/llvm-config").exists() {
+                    return p.to_string();
+                }
+            }
+            "/usr/lib/llvm-18".into()
+        });
+    println!("cargo:rustc-link-search=native={}/lib", prefix);
+    println!("cargo:rustc-env=LLVM_SYS_181_PREFIX={}", prefix);
 }
