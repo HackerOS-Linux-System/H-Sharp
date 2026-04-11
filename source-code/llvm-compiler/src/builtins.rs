@@ -1,5 +1,3 @@
-/// H# runtime builtins declared as LLVM external functions
-
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::types::FunctionType;
