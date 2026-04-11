@@ -1,3 +1,4 @@
+mod rust_ffi;
 mod cli;
 mod config;
 mod progress;
