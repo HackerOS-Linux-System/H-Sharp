@@ -1,6 +1,3 @@
-/// H# runtime built-in function declarations for Cranelift
-/// These are the C runtime functions that H# builtins map to.
-
 use cranelift_codegen::ir::{types, AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
 use cranelift_module::{Linkage, Module};
