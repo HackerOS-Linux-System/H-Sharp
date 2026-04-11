@@ -1,6 +1,3 @@
-/// bytes.toml project configuration
-/// bytes uses TOML (not HCL like vira)
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -102,4 +99,30 @@ hot_thresh = 100     # JIT-compile after 100 calls
 # version = "3.13"
 # packages = ["numpy", "requests", "cryptography"]
 "#, name = name)
+}
+
+/// Clean sessions from dead processes (called at bytes startup)
+/// This handles the case where sessions weren't cleaned on unexpected shutdown
+pub fn cleanup_stale_sessions() {
+    let libs_base = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".hackeros/H#/libs");
+
+    if !libs_base.exists() { return; }
+
+    if let Ok(entries) = std::fs::read_dir(&libs_base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pid_str) = name.strip_prefix("session-") {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    // Check if process is still alive via /proc/PID
+                    let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid));
+                    if !proc_path.exists() {
+                        // Process is dead — clean up its session
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
+    }
 }
