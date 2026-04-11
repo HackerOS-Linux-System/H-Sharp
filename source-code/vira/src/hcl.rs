@@ -1,6 +1,3 @@
-/// Minimal HCL (HashiCorp Configuration Language) parser for vira.hcl
-/// Supports: string assignments, block declarations, lists, nested blocks.
-
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
