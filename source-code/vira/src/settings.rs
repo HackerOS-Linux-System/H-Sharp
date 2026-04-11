@@ -1,6 +1,3 @@
-/// Vira settings — stored in ~/.config/vira/settings.json
-/// Edit via: vira settings (TUI)
-
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
