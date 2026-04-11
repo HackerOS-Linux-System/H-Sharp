@@ -43,6 +43,7 @@ pub enum TokenKind {
     Break,
     Continue,
     Unsafe,
+    Extern,
     Arena,
     Manual,       // unsafe manual — manual memory management mode
     Write,        // write() builtin (replaces println)
@@ -323,6 +324,7 @@ impl Lexer {
             "unsafe"   => TokenKind::Unsafe,
             "arena"    => TokenKind::Arena,
             "manual"   => TokenKind::Manual,
+            "extern"   => TokenKind::Extern,
             "write"    => TokenKind::Write,
             "true"     => TokenKind::Bool(true),
             "false"    => TokenKind::Bool(false),
