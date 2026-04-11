@@ -1,10 +1,3 @@
-/// bytes JIT engine — tiered execution for H#
-/// Tier 1: tree-walk interpreter (cold start, always available)
-/// Tier 2: bytecode VM (warm, ~5-10x faster than tree-walk)
-/// Tier 3: Cranelift JIT for hot functions (LuaJIT-class performance)
-///
-/// Hot functions detected by call counter → JIT compiled and cached in RAM.
-
 use colored::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -229,12 +222,12 @@ fn find_hsharp() -> anyhow::Result<String> {
     if let Some(p) = hackeros_path { return Ok(p); }
 
     // System PATH
-    for name in &["hsharp", "/usr/bin/hsharp", "/usr/local/bin/hsharp"] {
+    for name in &["/usr/bin/h#", "/usr/bin/hsharp", "/usr/local/bin/hsharp"] {
         if std::path::Path::new(name).exists() { return Ok(name.to_string()); }
         if std::process::Command::new("which").arg(name)
             .output().map(|o| o.status.success()).unwrap_or(false) {
             return Ok(name.to_string());
         }
     }
-    Err(anyhow::anyhow!("hsharp not found. Install from: https://hackeros.dev/h-sharp"))
+    Err(anyhow::anyhow!("h# not found. Install from: hacker unpack h#"))
 }
