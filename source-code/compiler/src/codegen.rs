@@ -1,8 +1,3 @@
-/// H# Code Generator
-/// Compiles H# AST to native code via C as a portable backend.
-/// The C backend ensures we can cross-compile without requiring LLVM installed.
-/// A full LLVM/inkwell backend can be swapped in by enabling the `llvm` feature.
-
 use hsharp_parser::ast::*;
 use std::fmt::Write;
 use std::path::Path;
