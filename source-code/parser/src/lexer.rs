@@ -387,9 +387,9 @@ impl Lexer {
                             self.advance();
                         }
                         // check if next line starts with \ (block comment end)
-                        let saved_pos = self.pos;
-                        let saved_line = self.line;
-                        let saved_col = self.col;
+                        let _saved_pos = self.pos;
+                        let _saved_line = self.line;
+                        let _saved_col = self.col;
                         self.skip_whitespace_no_newline();
                         if self.current() == Some('\\') && self.peek(1).map(|c| c == '\\').unwrap_or(false) {
                             self.advance(); self.advance();
