@@ -1,0 +1,38 @@
+;; H# Standard Library — std -> json
+;; Parser i serializer JSON
+
+struct JsonValue is
+    pub raw: string
+end
+
+;; Sparsuj string JSON
+pub fn parse(s: string) -> JsonValue is
+    return JsonValue { raw: s }
+end
+
+;; Serializuj do string JSON
+pub fn stringify(v: JsonValue) -> string is
+    return v.raw
+end
+
+;; Pobierz string po kluczu
+pub fn get_str(v: JsonValue, key: string) -> string is
+    ;; runtime: extract string field from JSON
+    return ""
+end
+
+;; Pobierz int po kluczu
+pub fn get_int(v: JsonValue, key: string) -> int is
+    ;; runtime: extract int field from JSON
+    return 0
+end
+
+;; Pobierz bool po kluczu
+pub fn get_bool(v: JsonValue, key: string) -> bool is
+    return false
+end
+
+;; Sprawdź czy klucz istnieje
+pub fn has_key(v: JsonValue, key: string) -> bool is
+    return false
+end
