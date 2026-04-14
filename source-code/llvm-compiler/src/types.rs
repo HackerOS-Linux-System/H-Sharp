@@ -1,5 +1,6 @@
 use inkwell::context::Context;
-use inkwell::types::{AnyTypeEnum, BasicMetadataTypeEnum, BasicTypeEnum};
+use inkwell::AddressSpace;
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
 use hsharp_parser::ast::TypeExpr;
 
 pub fn htype_to_llvm<'ctx>(ctx: &'ctx Context, ty: &TypeExpr) -> Option<BasicTypeEnum<'ctx>> {
@@ -13,8 +14,8 @@ pub fn htype_to_llvm<'ctx>(ctx: &'ctx Context, ty: &TypeExpr) -> Option<BasicTyp
             "f64"           => Some(ctx.f64_type().into()),
             "f32"           => Some(ctx.f32_type().into()),
             "bool"          => Some(ctx.i8_type().into()),
-            "string"        => Some(ctx.i8_type().ptr_type(Default::default()).into()),
-            "bytes"         => Some(ctx.i8_type().ptr_type(Default::default()).into()),
+            "string"        => Some(ctx.ptr_type(AddressSpace::default()).into()),
+            "bytes"         => Some(ctx.ptr_type(AddressSpace::default()).into()),
             _               => Some(ctx.i64_type().into()), // opaque ptr
         },
         TypeExpr::Void        => None,
@@ -29,7 +30,7 @@ pub fn htype_to_llvm<'ctx>(ctx: &'ctx Context, ty: &TypeExpr) -> Option<BasicTyp
         TypeExpr::I64 | TypeExpr::U64 | TypeExpr::I128 | TypeExpr::U128 => Some(ctx.i64_type().into()),
         TypeExpr::F32         => Some(ctx.f32_type().into()),
         TypeExpr::F64         => Some(ctx.f64_type().into()),
-        TypeExpr::String | TypeExpr::Bytes => Some(ctx.i8_type().ptr_type(Default::default()).into()),
+        TypeExpr::String | TypeExpr::Bytes => Some(ctx.ptr_type(AddressSpace::default()).into()),
     }
 }
 
