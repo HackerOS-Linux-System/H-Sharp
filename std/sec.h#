@@ -1,0 +1,41 @@
+;; H# Standard Library — std -> sec
+;; Narzędzia cybersecurity: XOR, hex, rot13, scan_port
+
+;; XOR dwa ciągi hex
+pub fn xor_hex(a: string, b: string) -> string is
+    ;; runtime: bytewise XOR of hex strings
+    return "xored:" + a
+end
+
+;; ROT13 encoding
+pub fn rot13(s: string) -> string is
+    ;; runtime: rotate each letter by 13
+    return s
+end
+
+;; Caesar cipher
+pub fn caesar(s: string, shift: int) -> string is
+    return s
+end
+
+;; FNV-1a hash
+pub fn fnv1a(s: string) -> int is
+    return 0
+end
+
+;; Skanuj port TCP — true jeśli otwarty
+;; timeout_ms: maksymalny czas oczekiwania w ms
+pub fn scan_port(host: string, port: int, timeout_ms: int) -> bool is
+    ;; runtime: TCP connect with timeout
+    return false
+end
+
+;; Hex encode bytes
+pub fn hex_encode(data: bytes) -> string is
+    return ""
+end
+
+;; Hex decode string
+pub fn hex_decode(s: string) -> string is
+    return ""
+end
