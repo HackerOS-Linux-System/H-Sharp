@@ -199,11 +199,22 @@ pub fn run(files: Vec<std::path::PathBuf>, output: Option<String>, target: Optio
     // Print summary
     let bin_name = format!("{}{}", resolved_out, triple.exe_suffix());
 
+    // Show extern link flags if any
+    let parse_result = hsharp_parser::parse(
+        &std::fs::read_to_string(&sources[0]).unwrap_or_default(),
+        &sources[0].display().to_string()
+    );
+    let link_flags = hsharp_compiler::ffi_linker::collect_link_flags(&parse_result.module);
+    let link_desc  = hsharp_compiler::ffi_linker::describe_flags(&link_flags);
+
     println!();
     println!("{}", "─".repeat(52).dimmed());
     println!("  {} {}", "Binary: ".bold(), bin_name.cyan());
     println!("  {} {}", "Target: ".bold(), triple.llvm_triple);
     println!("  {} {}", "Backend:".bold(), "Cranelift (native)".green());
+    if !link_desc.is_empty() {
+        println!("  {} {}", "Linked: ".bold(), link_desc.yellow());
+    }
     println!("{}", "─".repeat(52).dimmed());
     println!("\n  {} Build complete!", "✓".green().bold());
 }
@@ -242,4 +253,3 @@ fn detect_project_name() -> String {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "output".to_string())
 }
-
