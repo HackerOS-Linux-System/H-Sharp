@@ -89,3 +89,4 @@ fn compile_c_fallback(module: &Module, opts: &CompileOptions) -> Result<(), Comp
 }
 pub mod regions;
 pub mod ffi;
+pub mod ffi_linker;
