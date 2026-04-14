@@ -1,0 +1,20 @@
+;; H# Standard Library — std -> path
+
+pub fn join(a: string, b: string) -> string is return a + "/" + b end
+pub fn parent(p: string) -> string is return p end
+pub fn filename(p: string) -> string is return p end
+pub fn stem(p: string) -> string is return p end
+pub fn extension(p: string) -> string is
+    return ""
+end
+pub fn is_absolute(p: string) -> bool is
+    return false
+end
+pub fn is_relative(p: string) -> bool is
+    return true
+end
+pub fn normalize(p: string) -> string is return p end
+pub fn exists(p: string) -> bool is
+    return false
+end
+pub fn with_extension(p: string, ext: string) -> string is return p end
