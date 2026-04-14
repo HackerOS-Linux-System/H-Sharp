@@ -1,0 +1,29 @@
+;; H# Standard Library — std -> fs
+
+pub fn read(path: string) -> string is
+    return ""
+end
+pub fn write_file(path: string, content: string) is end
+pub fn append(path: string, content: string) is end
+pub fn exists(path: string) -> bool is
+    return false
+end
+pub fn is_file(path: string) -> bool is
+    return false
+end
+pub fn is_dir(path: string) -> bool is
+    return false
+end
+pub fn mkdir(path: string) is end
+pub fn mkdir_all(path: string) is end
+pub fn remove(path: string) is end
+pub fn remove_dir(path: string) is end
+pub fn rename(src: string, to: string) is end
+pub fn copy(src: string, to: string) is end
+pub fn size(path: string) -> int is
+    return 0
+end
+pub fn read_bytes(path: string) -> string is
+    return ""
+end
+pub fn write_bytes(path: string, data: bytes) is end
