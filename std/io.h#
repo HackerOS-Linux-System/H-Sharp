@@ -1,0 +1,21 @@
+;; H# Standard Library — std -> io
+;; Wejście/wyjście, odczyt klawiatury, pliki
+
+pub fn read_line(prompt: string) -> string is
+    ;; Wypisz prompt bez nowej linii, odczytaj stdin
+    write(prompt)
+    return ""   ;; runtime: replaced by native read_line
+end
+
+pub fn read_char() -> string is
+    return ""   ;; runtime: read single char
+end
+
+pub fn write_no_nl(s: string) is
+    ;; write without newline — runtime handles
+    write(s)
+end
+
+pub fn flush() is
+    ;; flush stdout — no-op in interpreter
+end
