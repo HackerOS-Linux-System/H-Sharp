@@ -1,0 +1,23 @@
+;; H# Standard Library — std -> os
+
+pub fn platform() -> string is return "linux" end
+pub fn hostname() -> string is
+    return ""
+end
+pub fn username() -> string is
+    return ""
+end
+pub fn home_dir() -> string is
+    return ""
+end
+pub fn temp_dir() -> string is return "/tmp" end
+pub fn pid() -> int is
+    return 0
+end
+pub fn is_root() -> bool is
+    return false
+end
+pub fn kernel_version() -> string is
+    return ""
+end
+pub fn arch() -> string is return "x86_64" end
