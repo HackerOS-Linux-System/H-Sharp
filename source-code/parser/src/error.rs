@@ -50,7 +50,7 @@ impl ParseError {
     pub fn render(&self, source: &str) -> String {
         let mut out = String::new();
         let line_idx = self.span.start.line.saturating_sub(1);
-        let source_line = source.lines().nth(line_idx).unwrap_or("");
+        let _source_line = source.lines().nth(line_idx).unwrap_or("");
 
         // Header
         out.push_str(&format!(
