@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> regex
+
+pub fn is_match(pattern: string, text: string) -> bool is
+    return false
+end
+pub fn find(pattern: string, text: string) -> string is
+    return ""
+end
+pub fn find_all(pattern: string, text: string) -> string is
+    return ""
+end
+pub fn replace(pattern: string, text: string, rep: string) -> string is return text end
