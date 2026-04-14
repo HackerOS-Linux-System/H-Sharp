@@ -1,0 +1,16 @@
+;; H# Standard Library — std -> time
+
+pub fn now_unix() -> int is
+    return 0
+end
+pub fn now_ms() -> int is
+    return 0
+end
+pub fn sleep_ms(ms: int) is end
+pub fn sleep_s(s: int) is end
+pub fn format(ts: int, fmt: string) -> string is
+    return ""
+end
+pub fn parse(s: string, fmt: string) -> int is
+    return 0
+end
