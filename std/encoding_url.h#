@@ -1,0 +1,4 @@
+;; H# Standard Library — std -> encoding -> url
+
+pub fn encode(s: string) -> string is return s end
+pub fn decode(s: string) -> string is return s end
