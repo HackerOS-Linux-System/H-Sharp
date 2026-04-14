@@ -132,12 +132,14 @@ impl HType {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct VarInfo {
     ty: HType,
     mutable: bool,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FnSig {
     params: Vec<HType>,
     return_type: HType,
@@ -329,7 +331,7 @@ impl TypeChecker {
                     _ => ty,
                 }
             }
-            Expr::Call(callee, args, _) => {
+            Expr::Call(callee, _args, _) => {
                 if let Expr::Ident(name, _) = callee.as_ref() {
                     if let Some(sig) = self.fns.get(name).cloned() {
                         return sig.return_type.clone();
