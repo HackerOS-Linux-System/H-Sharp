@@ -25,4 +25,3 @@ cranelift-native   = "=0.100.0"
 # Object file writing
 object = "=0.32.2"
 target-lexicon = "0.12"
-
