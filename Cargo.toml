@@ -5,15 +5,13 @@ members = [
     "source-code/cli",
     "source-code/bytes",
     "source-code/interpreter",
-    "source-code/std",
     "source-code/vira",
-    "source-code/llvm-compiler",  # Requires: apt install llvm-17-dev libpolly-17-dev libzstd-dev
-    # Build with LLVM: LLVM_SYS_170_PREFIX=/usr/lib/llvm-17 cargo build --release -p hsharp-llvm-compiler
+    "source-code/llvm-compiler",  # Requires: llvm-21-dev libpolly-21-dev (apt.llvm.org/unstable)
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "BSD-3"
