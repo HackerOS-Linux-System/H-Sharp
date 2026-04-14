@@ -104,12 +104,40 @@ impl Builtins {
 
 /// Generate the H# runtime C source (linked alongside compiled output)
 pub fn runtime_c_source() -> &'static str {
-    r#"/* H# Runtime — linked with cranelift-compiled output */
+    r#"/* H# Runtime — linked with compiled output */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* H# core types */
+typedef const char* hsh_string;
+typedef struct { uint8_t* ptr; size_t len; size_t cap; } hsh_bytes;
+typedef int64_t   hsh_int;
+typedef double    hsh_float;
+typedef int       hsh_bool;
+
+// ── RAII Drop functions ────────────────────────────────────────────────────────
+
+static void hsh_string_free(hsh_string s) {
+    // H# strings are interned — runtime decides when to actually free
+    // For now: no-op (future: ref-counted strings)
+    (void)s;
+}
+
+static void hsh_bytes_free(uint8_t* b) {
+    if (b) free(b);
+}
+
+static void hsh_array_free(void* arr) {
+    if (arr) free(arr);
+}
+
+static void hsh_struct_free(void* ptr) {
+    if (ptr) free(ptr);
+}
+
 
 /* ── String builtins ─────────────────────────────────────────────────── */
 void hsh_print(const char* s)   { if (s) printf("%s", s); }
