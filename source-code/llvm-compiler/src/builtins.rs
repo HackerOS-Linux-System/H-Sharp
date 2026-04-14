@@ -19,7 +19,7 @@ pub struct LlvmBuiltins<'ctx> {
 
 impl<'ctx> LlvmBuiltins<'ctx> {
     pub fn declare(ctx: &'ctx Context, module: &Module<'ctx>) -> Self {
-        let i8_ptr = ctx.i8_type().ptr_type(AddressSpace::default());
+        let i8_ptr = ctx.ptr_type(AddressSpace::default());
         let i64    = ctx.i64_type();
         let i32    = ctx.i32_type();
         let i8     = ctx.i8_type();
