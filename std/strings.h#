@@ -1,0 +1,36 @@
+;; H# Standard Library — std -> strings
+
+pub fn trim(s: string) -> string is return s end
+pub fn trim_start(s: string) -> string is return s end
+pub fn trim_end(s: string) -> string is return s end
+pub fn to_upper(s: string) -> string is return s end
+pub fn to_lower(s: string) -> string is return s end
+pub fn contains(s: string, sub: string) -> bool is
+    return false
+end
+pub fn starts_with(s: string, prefix: string) -> bool is
+    return false
+end
+pub fn ends_with(s: string, suffix: string) -> bool is
+    return false
+end
+pub fn replace(s: string, src_path: string, to: string) -> string is return s end
+pub fn split(s: string, sep: string) -> string is
+    return ""
+end
+pub fn join(parts: [string], sep: string) -> string is
+    return ""
+end
+pub fn repeat(s: string, n: int) -> string is return s end
+pub fn pad_left(s: string, width: int, ch: string) -> string is return s end
+pub fn pad_right(s: string, width: int, ch: string) -> string is return s end
+pub fn char_at(s: string, i: int) -> string is
+    return ""
+end
+pub fn index_of(s: string, sub: string) -> int is
+    return -1
+end
+pub fn substring(s: string, start: int, end_i: int) -> string is return s end
+pub fn is_empty(s: string) -> bool is return len(s) == 0 end
+pub fn strip_prefix(s: string, prefix: string) -> string is return s end
+pub fn strip_suffix(s: string, suffix: string) -> string is return s end
