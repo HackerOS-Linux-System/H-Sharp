@@ -43,6 +43,7 @@ impl LlvmCodegen {
         Ok(Self { context: Context::create(), opts: opts.clone() })
     }
 
+
     pub fn declare_functions(&mut self, _m: &HshModule) -> R<()> { Ok(()) }
     pub fn compile_module(&mut self, _m: &HshModule) -> R<()> { Ok(()) }
 
@@ -57,7 +58,7 @@ impl LlvmCodegen {
         let mut str_globals: HashMap<String, PointerValue> = HashMap::new();
 
         // Pass 1: declare function signatures
-        let mut fns = self.collect_fns(m);
+        let fns = self.collect_fns(m);
         for f in &fns {
             let sig = self.build_fn_type(ctx, f);
             let fv = module.add_function(&f.name, sig, None);
@@ -81,20 +82,32 @@ impl LlvmCodegen {
             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
         let opt_lvl = if self.opts.optimize { OptimizationLevel::Aggressive } else { OptimizationLevel::Default };
 
-        // Use native CPU with all features for maximum performance (inkwell 0.5)
-        let cpu_name    = TargetMachine::get_host_cpu_name();
+        // Use native CPU with all extensions for maximum performance
+        // inkwell 0.8 / LLVM 21: returns CString
+        let cpu_name     = TargetMachine::get_host_cpu_name();
         let cpu_features = TargetMachine::get_host_cpu_features();
+
+        let cpu_str  = cpu_name.to_str().unwrap_or("x86-64");
+        let feat_str = cpu_features.to_str().unwrap_or("+avx2,+bmi,+bmi2,+sse4.1,+sse4.2,+popcnt");
 
         let machine = target.create_target_machine(
             &triple,
-            cpu_name.to_str().unwrap_or("x86-64"),
-            cpu_features.to_str().unwrap_or("+avx2,+bmi,+bmi2,+sse4.1,+sse4.2"),
-            opt_lvl, RelocMode::PIC, CodeModel::Default,
+            cpu_str,
+            feat_str,
+            opt_lvl,
+            RelocMode::PIC,
+            // Use Small code model for smaller binaries (fits in 2GB)
+            CodeModel::Small,
         ).ok_or_else(|| CodegenError::Llvm("cannot create target machine".into()))?;
 
-        // Apply new pass manager optimizations
-        let opt_num = if self.opts.optimize { 3 } else { 1 };
+        // Apply full LLVM 21 optimization pipeline
+        let opt_num = if self.opts.optimize { 3 } else { 0 };
         optimize_module(&module, &machine, opt_num);
+
+        // For release: also run size minimization pass (dead code elim)
+        if self.opts.optimize {
+            crate::optimize::minimize_size(&module, &machine);
+        }
 
         self.emit_binary_with_machine(&module, &machine)
 
@@ -102,7 +115,7 @@ impl LlvmCodegen {
     }
 
     fn collect_fns<'a>(&self, m: &'a HshModule) -> Vec<FnDef> {
-        let mut fns = Vec::new();
+        let mut fns = Vec::new(); // mut needed for push
         for item in &m.items {
             match item {
                 Item::FnDef(f) => fns.push(f.clone()),
@@ -212,34 +225,67 @@ impl LlvmCodegen {
 
     /// Emit binary using a pre-built TargetMachine (from compile_full)
     fn emit_binary_with_machine(&self, module: &Module, machine: &TargetMachine) -> R<()> {
-        // Write runtime C
-        let rt_c = format!("{}_rt.c", self.opts.output);
-        let rt_o = format!("{}_rt.o", self.opts.output);
+        // Compile H# runtime (C) — written to temp dir, invisible to user
+        let tmp_base = std::env::temp_dir().join(format!(
+            "hsharp_rt_{}", std::process::id()
+        ));
+        let rt_c = format!("{}_rt.c", tmp_base.display());
+        let rt_o = format!("{}_rt.o", tmp_base.display());
         std::fs::write(&rt_c, hsharp_compiler::runtime::runtime_c_source())?;
+        let rt_opt = if self.opts.optimize { "-O3" } else { "-O1" };
         let ok = std::process::Command::new("cc")
-            .args(["-O2", "-c", &rt_c, "-o", &rt_o])
+            .args([rt_opt, "-ffunction-sections", "-fdata-sections",
+                   "-fPIC", "-c", &rt_c, "-o", &rt_o])
             .status()?.success();
         if !ok { return Err(CodegenError::Link("runtime compile failed".into())); }
 
-        // Emit .o
+        // Emit LLVM-optimized object file
         let obj_path = format!("{}_main.o", self.opts.output);
         machine.write_to_file(module, FileType::Object, Path::new(&obj_path))
             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
-        // Link
+        // Link with aggressive size + performance flags
         let suffix = self.opts.target.exe_suffix();
-        let out = format!("{}{}", self.opts.output, suffix);
+        let out    = format!("{}{}", self.opts.output, suffix);
         let mut cmd = std::process::Command::new("cc");
         cmd.arg(&obj_path).arg(&rt_o).arg("-o").arg(&out);
-        cmd.arg("-no-pie");      // avoid PIE relocation errors on some distros
+        cmd.arg("-no-pie");
+
+        if self.opts.optimize {
+            // Dead code elimination at link time + strip all symbols
+            cmd.args([
+                "-O3",
+                "-Wl,--gc-sections",    // remove unused code sections
+                "-Wl,--as-needed",      // skip unused library linkage
+                "-Wl,--strip-all",      // strip all symbols (smallest binary)
+                "-flto",                // link-time optimization
+            ]);
+        } else {
+            cmd.arg("-O1");
+        }
+
         if self.opts.static_link { cmd.arg("-static"); }
-        else { cmd.arg("-fPIE"); }
-        if self.opts.optimize { cmd.arg("-O2"); }
+
         let result = cmd.output()?;
         if !result.status.success() {
-            return Err(CodegenError::Link(
-                String::from_utf8_lossy(&result.stderr).to_string()
-            ));
+            // Retry without advanced flags (some linkers don't support all)
+            let mut cmd2 = std::process::Command::new("cc");
+            cmd2.args([&obj_path, &rt_o, "-o", &out, "-no-pie"]);
+            if self.opts.optimize { cmd2.arg("-O2"); cmd2.arg("-Wl,--gc-sections"); }
+            if self.opts.static_link { cmd2.arg("-static"); }
+            let r2 = cmd2.output()?;
+            if !r2.status.success() {
+                return Err(CodegenError::Link(
+                    String::from_utf8_lossy(&result.stderr).to_string()
+                ));
+            }
+        }
+
+        // Post-link strip for maximum binary size reduction
+        if self.opts.optimize {
+            let _ = std::process::Command::new("strip")
+                .args(["--strip-all", "--strip-unneeded", &out])
+                .status();
         }
 
         let _ = std::fs::remove_file(&obj_path);
@@ -272,6 +318,23 @@ struct FnCx<'ctx, 'a> {
 }
 
 impl<'ctx, 'a> FnCx<'ctx, 'a> {
+    /// Unwrap a call site value — extract BasicValueEnum or return i64 zero for void
+    #[inline]
+    fn unwrap_call(&self, r: inkwell::values::CallSiteValue<'ctx>) -> BasicValueEnum<'ctx> {
+        // inkwell 0.8 / LLVM 21: try_as_basic_value returns ValueKind (not Either).
+        // ValueKind doesn't carry the value directly — use as_any_value_enum() instead.
+        use inkwell::values::AnyValue;
+        match r.as_any_value_enum() {
+            inkwell::values::AnyValueEnum::IntValue(v)    => v.into(),
+            inkwell::values::AnyValueEnum::FloatValue(v)  => v.into(),
+            inkwell::values::AnyValueEnum::PointerValue(v) => v.into(),
+            inkwell::values::AnyValueEnum::StructValue(v)  => v.into(),
+            inkwell::values::AnyValueEnum::ArrayValue(v)   => v.into(),
+            inkwell::values::AnyValueEnum::VectorValue(v)  => v.into(),
+            _ => self.ctx.i64_type().const_zero().into(),
+        }
+    }
+
     fn stmts(&mut self, stmts: &[Stmt]) -> R<bool> {
         for stmt in stmts {
             if self.stmt(stmt)? { return Ok(true); }
@@ -298,7 +361,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
             }
 
             Stmt::Return(e, _) => {
-                let ret = if let Some(expr) = e {
+                let _ret_val = if let Some(expr) = e {
                     let hint = self.ret_type.as_ref().and_then(|t| htype_to_llvm(self.ctx, t));
                     let v = self.expr(expr, hint)?;
                     let v = self.coerce_ret(v);
@@ -481,7 +544,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
 
     // ── Expressions ───────────────────────────────────────────────────────────
 
-    fn expr(&mut self, e: &Expr, hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+    fn expr(&mut self, e: &Expr,  hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
         match e {
             Expr::Literal(lit, _) => self.literal(lit, hint),
 
@@ -573,7 +636,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         }
     }
 
-    fn literal(&mut self, lit: &Literal, hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+    fn literal(&mut self, lit: &Literal,  hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
         Ok(match lit {
             Literal::Int(n) => {
                 let t = match hint {
@@ -606,8 +669,8 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         })
     }
 
-    fn call_fn(&mut self, name: &str, args: &[Expr], hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
-        let i8ptr = self.ctx.i8_type().ptr_type(AddressSpace::default());
+    fn call_fn(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+        let i8ptr = self.ctx.ptr_type(AddressSpace::default());
 
         macro_rules! str_arg {
             ($i:expr) => {
@@ -636,12 +699,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     self.expr(e, Some(self.ctx.i64_type().into()))?
                 } else { self.ctx.i64_type().const_zero().into() };
                 let r = self.builder.build_call(self.builtins.hsh_int_to_string, &[a.into()], "ts").unwrap();
-                Ok(r.try_as_basic_value().left().unwrap())
+                Ok(self.unwrap_call(r))
             }
             "len" => {
                 let a = str_arg!(0);
                 let r = self.builder.build_call(self.builtins.hsh_strlen, &[a.into()], "len").unwrap();
-                Ok(r.try_as_basic_value().left().unwrap())
+                Ok(self.unwrap_call(r))
             }
             "panic" => {
                 let a = str_arg!(0);
@@ -664,13 +727,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     let sig = fv.get_type();
                     let mut call_args = Vec::new();
                     for (i, a) in args.iter().enumerate() {
-                        let expected = sig.get_param_types().get(i).copied().map(|t| t);
+
                         let v = self.expr(a, None)?;
                         call_args.push(v.into());
                     }
                     let r = self.builder.build_call(fv, &call_args, "call").unwrap();
-                    Ok(r.try_as_basic_value().left()
-                        .unwrap_or(self.ctx.i64_type().const_zero().into()))
+                    Ok(self.unwrap_call(r))
                 } else {
                     Ok(self.ctx.i64_type().const_zero().into())
                 }
@@ -685,7 +747,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 let r = self.builder.build_call(
                     self.builtins.hsh_strcat, &[lv.into(), rv.into()], "cat"
                 ).unwrap();
-                return Ok(r.try_as_basic_value().left().unwrap());
+                return Ok(self.unwrap_call(r));
             }
         }
 
