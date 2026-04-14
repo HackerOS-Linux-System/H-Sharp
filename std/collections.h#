@@ -1,0 +1,18 @@
+;; H# Standard Library — std -> collections
+;; HashMap, HashSet, Queue, Stack
+
+struct HashMap<K, V> is
+    pub size: int
+end
+
+struct HashSet<T> is
+    pub size: int
+end
+
+struct Queue<T> is
+    pub size: int
+end
+
+struct Stack<T> is
+    pub size: int
+end
