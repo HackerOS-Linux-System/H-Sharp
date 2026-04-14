@@ -6,11 +6,12 @@ use crate::span::Span;
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
-    source: String,
+    #[allow(dead_code)] source: String,
     file: String,
     pub errors: ErrorReporter,
 }
 
+#[allow(dead_code)]
 impl Parser {
     pub fn new(tokens: Vec<Token>, source: String, file: String) -> Self {
         // Filter out newlines for most parsing, but track them for block endings
