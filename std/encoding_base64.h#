@@ -1,0 +1,14 @@
+;; H# Standard Library — std -> encoding -> base64
+
+pub fn encode(data: bytes) -> string is
+    return ""
+end
+pub fn decode(s: string) -> string is
+    return ""
+end
+pub fn encode_str(s: string) -> string is
+    return ""
+end
+pub fn decode_str(s: string) -> string is
+    return ""
+end
