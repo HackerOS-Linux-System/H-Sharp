@@ -1,0 +1,21 @@
+;; H# Standard Library — std -> process
+
+pub fn run(cmd: string) -> string is
+    return ""
+end
+pub fn run_args(cmd: string, args: [string]) -> string is
+    return ""
+end
+pub fn spawn(cmd: string) -> int is
+    return 0
+end
+pub fn kill(pid: int) is end
+pub fn exit_code(pid: int) -> int is
+    return 0
+end
+pub fn which(cmd: string) -> string is
+    return ""
+end
+pub fn shell(cmd: string) -> string is
+    return ""
+end
