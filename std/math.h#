@@ -1,0 +1,48 @@
+;; H# Standard Library — std -> math
+
+pub fn sin(x: f64) -> f64 is
+    return 0.0
+end
+pub fn cos(x: f64) -> f64 is
+    return 0.0
+end
+pub fn tan(x: f64) -> f64 is
+    return 0.0
+end
+pub fn sqrt(x: f64) -> f64 is
+    return 0.0
+end
+pub fn abs(x: f64) -> f64 is
+    return 0.0
+end
+pub fn pow(base: f64, exp: f64) -> f64 is
+    return 0.0
+end
+pub fn floor(x: f64) -> f64 is
+    return 0.0
+end
+pub fn ceil(x: f64) -> f64 is
+    return 0.0
+end
+pub fn round(x: f64) -> f64 is
+    return 0.0
+end
+pub fn log(x: f64) -> f64 is
+    return 0.0
+end
+pub fn log2(x: f64) -> f64 is
+    return 0.0
+end
+pub fn log10(x: f64) -> f64 is
+    return 0.0
+end
+pub fn min(a: f64, b: f64) -> f64 is
+    return 0.0
+end
+pub fn max(a: f64, b: f64) -> f64 is
+    return 0.0
+end
+
+pub fn pi() -> f64 = 3.141592653589793
+pub fn e()  -> f64 = 2.718281828459045
+pub fn tau() -> f64 = 6.283185307179586
