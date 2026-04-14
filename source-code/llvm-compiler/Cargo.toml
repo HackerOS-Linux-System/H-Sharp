@@ -15,11 +15,17 @@ path = "src/bin.rs"
 anyhow    = "1"
 thiserror = "1"
 colored   = "2"
+either    = "1"
+# inkwell 0.8.0 + LLVM 21 (requires Rust 1.85+)
+# On older Rust: use inkwell 0.6 + llvm18-1
 inkwell = { version = "0.8.0", features = ["llvm21-1"] }
 hsharp-parser   = { path = "../parser" }
 hsharp-compiler = { path = "../compiler" }
 
 [profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
+opt-level     = 3       # Maximum optimization
+lto           = "fat"   # Full link-time optimization (slower build, faster binary)
+codegen-units = 1       # Single codegen unit for maximum LTO effectiveness
+panic         = "abort" # Remove panic unwinding code (smaller binary)
+strip         = true    # Strip debug symbols from final binary
+debug         = false   # No debug info in release
