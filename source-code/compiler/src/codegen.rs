@@ -1,6 +1,5 @@
 use hsharp_parser::ast::*;
 use std::fmt::Write;
-use std::path::Path;
 use crate::CompileOptions;
 
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +14,7 @@ pub enum CodegenError {
     NoCompiler,
 }
 
+#[allow(dead_code)]
 pub struct Codegen {
     file: String,
     opts: CompileOptions,
@@ -532,7 +532,7 @@ static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
                 let i = self.emit_expr(inner);
                 format!("({} /* ? */)", i)
             }
-            Expr::Range(start, end, _, _) => {
+            Expr::Range(start, _end, _, _) => {
                 // Ranges are handled in for-loops; here just emit start
                 let s = self.emit_expr(start);
                 s
