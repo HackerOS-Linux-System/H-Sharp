@@ -1,0 +1,27 @@
+;; H# Standard Library — std -> http
+
+pub fn get(url: string) -> string is
+    return ""
+end
+pub fn post(url: string, body: string) -> string is
+    return ""
+end
+pub fn post_json(url: string, json: string) -> string is
+    return ""
+end
+pub fn put(url: string, body: string) -> string is
+    return ""
+end
+pub fn delete(url: string) -> string is
+    return ""
+end
+
+struct Response is
+    pub status: int
+    pub body:   string
+    pub headers: string
+end
+
+pub fn get_full(url: string) -> Response is
+    return Response { status: 0, body: "", headers: "" }
+end
