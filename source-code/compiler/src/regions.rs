@@ -1,56 +1,67 @@
 use std::collections::HashMap;
 
-/// A memory region — corresponds to one `is...end` block
-#[derive(Debug, Clone)]
-pub struct Region {
-    pub id:       RegionId,
-    pub parent:   Option<RegionId>,
-    pub values:   Vec<RegionValue>,
-    pub kind:     RegionKind,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegionId(pub u32);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RegionKind {
-    /// Normal scope (fn body, if/for/while block)
     Scope,
-    /// Arena — bulk-free all at once (unsafe arena(N) is...end)
     Arena { size: usize },
-    /// Manual — raw malloc/free (unsafe manual is...end)
     Manual,
-    /// Function call frame
     Frame,
 }
 
-/// A value tracked by a region
-#[derive(Debug, Clone)]
-pub struct RegionValue {
-    pub name:     String,
-    pub ty:       RegionType,
-    pub owned:    bool,    // true = this region owns + will drop
-    pub moved:    bool,    // true = moved out, don't drop
-}
-
 #[derive(Debug, Clone, PartialEq)]
-pub enum RegionType {
-    Scalar,          // int, float, bool — stack only, no drop
-    String,          // heap-allocated string — needs drop
-    Bytes,           // heap bytes — needs drop
-    Struct(String),  // named struct — needs drop if has Drop impl
-    Array(Box<RegionType>),
-    Ptr,             // raw pointer in unsafe
+pub enum RegionTy {
+    Scalar,          // int/float/bool — no drop
+    StringVal,       // heap string  → hsh_string_free(ptr)
+    BytesVal,        // heap bytes   → hsh_bytes_free(ptr)
+    Struct(String),  // named struct → StructName_drop(ptr)
+    Array(Box<RegionTy>),
 }
 
-impl RegionType {
+impl RegionTy {
     pub fn needs_drop(&self) -> bool {
-        matches!(self, RegionType::String | RegionType::Bytes
-                     | RegionType::Struct(_) | RegionType::Array(_))
+        !matches!(self, RegionTy::Scalar)
+    }
+
+    /// C runtime function name that frees this type
+    pub fn drop_fn(&self) -> Option<&'static str> {
+        match self {
+            RegionTy::StringVal => Some("hsh_string_free"),
+            RegionTy::BytesVal  => Some("hsh_bytes_free"),
+            RegionTy::Array(_)  => Some("hsh_array_free"),
+            _                   => None,
+        }
+    }
+
+    pub fn from_type_name(name: &str) -> Self {
+        match name {
+            "string"              => RegionTy::StringVal,
+            "bytes"               => RegionTy::BytesVal,
+            "int"|"uint"|"bool"|"f64"|"f32"|
+            "i8"|"i16"|"i32"|"i64"|"i128"|
+            "u8"|"u16"|"u32"|"u64"|"u128" => RegionTy::Scalar,
+            other                 => RegionTy::Struct(other.to_string()),
+        }
     }
 }
 
-/// Region stack — tracks active regions during compilation
+#[derive(Debug, Clone)]
+pub struct RegionValue {
+    pub name:   String,
+    pub ty:     RegionTy,
+    pub moved:  bool,  // moved out — skip drop
+}
+
+#[derive(Debug, Clone)]
+pub struct Region {
+    pub id:     RegionId,
+    pub parent: Option<RegionId>,
+    pub kind:   RegionKind,
+    values:     Vec<RegionValue>,
+}
+
 #[derive(Debug, Default)]
 pub struct RegionStack {
     regions: HashMap<RegionId, Region>,
@@ -61,62 +72,48 @@ pub struct RegionStack {
 impl RegionStack {
     pub fn new() -> Self { Self::default() }
 
-    /// Enter a new scope region
-    pub fn push_scope(&mut self) -> RegionId {
-        self.push(RegionKind::Scope)
-    }
-
-    pub fn push_arena(&mut self, size: usize) -> RegionId {
-        self.push(RegionKind::Arena { size })
-    }
-
-    pub fn push_frame(&mut self) -> RegionId {
-        self.push(RegionKind::Frame)
-    }
+    pub fn push_scope(&mut self) -> RegionId  { self.push(RegionKind::Scope) }
+    pub fn push_frame(&mut self) -> RegionId  { self.push(RegionKind::Frame) }
+    pub fn push_arena(&mut self, sz: usize) -> RegionId { self.push(RegionKind::Arena { size: sz }) }
 
     fn push(&mut self, kind: RegionKind) -> RegionId {
         let id = RegionId(self.next_id);
         self.next_id += 1;
-        let parent = self.stack.last().copied();
         self.regions.insert(id, Region {
-            id, parent, values: Vec::new(), kind,
+            id, parent: self.stack.last().copied(), kind, values: Vec::new(),
         });
         self.stack.push(id);
         id
     }
 
-    /// Exit current scope — returns values that need dropping
-    pub fn pop(&mut self) -> Vec<RegionValue> {
+    /// Exit current scope.  Returns (kind, values_needing_drop).
+    pub fn pop(&mut self) -> (RegionKind, Vec<RegionValue>) {
         if let Some(id) = self.stack.pop() {
             if let Some(region) = self.regions.remove(&id) {
-                // Return values that are owned and not moved (need drop code)
-                return region.values.into_iter()
-                    .filter(|v| v.owned && !v.moved && v.ty.needs_drop())
+                let kind = region.kind.clone();
+                let drops: Vec<RegionValue> = region.values.into_iter()
+                    .filter(|v| !v.moved && v.ty.needs_drop())
                     .collect();
+                return (kind, drops);
             }
         }
-        Vec::new()
+        (RegionKind::Scope, Vec::new())
     }
 
-    /// Register a new value in the current scope
-    pub fn declare(&mut self, name: &str, ty: RegionType) {
+    /// Register a new `let` binding in the current scope.
+    pub fn declare(&mut self, name: &str, ty: RegionTy) {
         if let Some(&id) = self.stack.last() {
-            if let Some(region) = self.regions.get_mut(&id) {
-                region.values.push(RegionValue {
-                    name: name.to_string(),
-                    ty,
-                    owned: true,
-                    moved: false,
-                });
+            if let Some(r) = self.regions.get_mut(&id) {
+                r.values.push(RegionValue { name: name.to_string(), ty, moved: false });
             }
         }
     }
 
-    /// Mark a value as moved (transferred ownership)
+    /// Mark a value as moved (ownership transferred — skip drop).
     pub fn mark_moved(&mut self, name: &str) {
         for id in self.stack.iter().rev() {
-            if let Some(region) = self.regions.get_mut(id) {
-                if let Some(v) = region.values.iter_mut().find(|v| v.name == name) {
+            if let Some(r) = self.regions.get_mut(id) {
+                if let Some(v) = r.values.iter_mut().find(|v| v.name == name) {
                     v.moved = true;
                     return;
                 }
@@ -124,42 +121,11 @@ impl RegionStack {
         }
     }
 
-    /// Check if a value is accessible (not moved, in scope)
-    pub fn is_accessible(&self, name: &str) -> bool {
-        for id in self.stack.iter().rev() {
-            if let Some(region) = self.regions.get(id) {
-                if let Some(v) = region.values.iter().find(|v| v.name == name) {
-                    return !v.moved;
-                }
-            }
-        }
-        false
-    }
-
-    /// Current region kind (for unsafe detection)
-    pub fn current_kind(&self) -> Option<&RegionKind> {
-        self.stack.last()
-            .and_then(|id| self.regions.get(id))
-            .map(|r| &r.kind)
-    }
-
     pub fn in_unsafe(&self) -> bool {
-        self.stack.iter().rev().any(|id| {
-            self.regions.get(id).map(|r| matches!(
-                r.kind, RegionKind::Arena { .. } | RegionKind::Manual
-            )).unwrap_or(false)
-        })
-    }
-}
-
-/// Generate drop/free code comment for interpreter/codegen
-/// In Cranelift backend: replaced with actual free() calls
-pub fn drop_hint(value: &RegionValue) -> String {
-    match &value.ty {
-        RegionType::String   => format!("hsh_string_drop(&{})", value.name),
-        RegionType::Bytes    => format!("hsh_bytes_drop(&{})", value.name),
-        RegionType::Struct(n) => format!("{}_drop(&{})", n, value.name),
-        RegionType::Array(_) => format!("hsh_array_drop(&{})", value.name),
-        _ => String::new(),
+        self.stack.iter().rev().any(|id|
+            self.regions.get(id).map(|r|
+                matches!(r.kind, RegionKind::Arena { .. } | RegionKind::Manual)
+            ).unwrap_or(false)
+        )
     }
 }
