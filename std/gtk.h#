@@ -1,0 +1,28 @@
+;; H# Standard Library — std -> gtk
+;; GTK4 GUI bindings dla HackerOS
+
+struct App is
+    pub title:  string
+    pub width:  int
+    pub height: int
+end
+
+pub fn new_app(title: string, w: int, h: int) -> App is
+    return App { title: title, width: w, height: h }
+end
+
+pub fn label(text: string) is write("[gtk::label] " + text) end
+pub fn button(label: string, callback: string) is write("[gtk::button] " + label) end
+pub fn entry(placeholder: string) -> string is
+    return ""
+end
+pub fn vbox() is end
+pub fn hbox() is end
+pub fn grid() is end
+pub fn run() is write("[gtk::run] event loop") end
+pub fn dialog_info(title: string, msg: string) is write("[gtk::dialog] " + title + ": " + msg) end
+pub fn dialog_error(title: string, msg: string) is write("[gtk::error] " + title + ": " + msg) end
+pub fn is_dark_theme() -> bool is
+    return false
+end
+pub fn apply_css(css: string) is end
