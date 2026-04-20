@@ -1,0 +1,22 @@
+;; H# Standard Library — std -> net -> tcp
+
+struct TcpStream is
+    pub host: string
+    pub port: int
+end
+
+pub fn connect(host: string, port: int) -> TcpStream is
+    return TcpStream { host: host, port: port }
+end
+
+pub fn send(stream: TcpStream, data: string) is end
+pub fn recv(stream: TcpStream, size: int) -> string is
+    return ""
+end
+pub fn close(stream: TcpStream) is end
+pub fn scan_port(host: string, port: int, timeout_ms: int) -> bool is
+    return false
+end
+pub fn listen(host: string, port: int) -> TcpStream is
+    return TcpStream { host: host, port: port }
+end
