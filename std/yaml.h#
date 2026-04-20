@@ -1,0 +1,11 @@
+;; H# Standard Library — std -> yaml
+
+pub fn parse(s: string) -> string is return s end
+pub fn stringify(data: string) -> string is return data end
+pub fn get(data: string, key: string) -> string is return "" end
+pub fn get_int(data: string, key: string) -> int is return 0 end
+pub fn get_bool(data: string, key: string) -> bool is return false end
+pub fn get_list(data: string, key: string) -> string is return "" end
+pub fn has_key(data: string, key: string) -> bool is return false end
+pub fn read_file(path: string) -> string is return "" end
+pub fn write_file(path: string, data: string) is end
