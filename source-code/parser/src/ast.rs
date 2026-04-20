@@ -155,6 +155,7 @@ pub enum Expr {
 
     // Question mark operator
     Try(Box<Expr>, Span),
+    Await(Box<Expr>, Span),
 }
 
 impl Expr {
@@ -185,6 +186,7 @@ impl Expr {
             Expr::Return(_, s) => s,
             Expr::SelfExpr(s) => s,
             Expr::Try(_, s) => s,
+            Expr::Await(_, s) => s,
         }
     }
 }
@@ -263,6 +265,7 @@ pub struct FnDef {
     pub body: Vec<Stmt>,
     pub pub_: bool,
     pub is_unsafe: bool,
+    pub is_async:  bool,
     pub span: Span,
 }
 
@@ -385,4 +388,13 @@ pub struct ExternFnDecl {
     pub return_type: Option<TypeExpr>,
     pub variadic:    bool,
     pub span:        Span,
+}
+
+/// Closure parameter: |x| or |x: int| or |mut x|
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClosureParam {
+    pub name:    String,
+    pub ty:      Option<TypeExpr>,
+    pub mutable: bool,
+    pub span:    Span,
 }
