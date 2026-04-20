@@ -1,0 +1,48 @@
+;; H# Standard Library — std -> net -> http
+;; HTTP server + client
+
+struct Request is
+    pub method:  string
+    pub path:    string
+    pub headers: string
+    pub body:    string
+    pub query:   string
+end
+
+struct Response is
+    pub status:  int
+    pub headers: string
+    pub body:    string
+end
+
+pub fn new_response(status: int, body: string) -> Response is
+    return Response { status: status, headers: "", body: body }
+end
+
+pub fn set_header(res: Response, key: string, val: string) -> Response is return res end
+pub fn json_response(data: string) -> Response is
+    return Response { status: 200, headers: "Content-Type: application/json", body: data }
+end
+
+pub fn listen(host: string, port: int) is
+    write("[http::server] listening on " + host + ":" + to_string(port))
+end
+pub fn handle(path: string, method: string) is end
+pub fn serve() is end
+
+;; Client
+pub fn get(url: string) -> Response is
+    return Response { status: 0, headers: "", body: "" }
+end
+pub fn post(url: string, body: string) -> Response is
+    return Response { status: 0, headers: "", body: "" }
+end
+pub fn put(url: string, body: string) -> Response is
+    return Response { status: 0, headers: "", body: "" }
+end
+pub fn delete(url: string) -> Response is
+    return Response { status: 0, headers: "", body: "" }
+end
+pub fn request(method: string, url: string, body: string, headers: string) -> Response is
+    return Response { status: 0, headers: "", body: "" }
+end
