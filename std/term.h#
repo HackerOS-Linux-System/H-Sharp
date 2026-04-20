@@ -1,0 +1,21 @@
+;; H# Standard Library — std -> term
+;; Terminal control: size, raw mode, keys
+
+pub fn width() -> int is return 80 end
+pub fn height() -> int is return 24 end
+pub fn is_tty() -> bool is return true end
+pub fn is_dumb() -> bool is return false end
+pub fn enable_raw() is end
+pub fn disable_raw() is end
+pub fn read_key() -> string is return "" end
+pub fn clear() is end
+pub fn clear_line() is end
+pub fn move_to(x: int, y: int) is end
+pub fn save_cursor() is end
+pub fn restore_cursor() is end
+pub fn hide_cursor() is end
+pub fn show_cursor() is end
+pub fn scroll_up(n: int) is end
+pub fn scroll_down(n: int) is end
+pub fn set_title(title: string) is end
+pub fn bell() is end
