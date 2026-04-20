@@ -1,0 +1,17 @@
+;; H# Standard Library — std -> net -> ip
+;; IP address manipulation
+
+pub fn parse_ip(s: string) -> string is return s end
+pub fn is_valid(s: string) -> bool is return false end
+pub fn is_ipv4(s: string) -> bool is return false end
+pub fn is_ipv6(s: string) -> bool is return false end
+pub fn is_loopback(ip: string) -> bool is return ip == "127.0.0.1" end
+pub fn is_private(ip: string) -> bool is return false end
+pub fn is_public(ip: string) -> bool is return true end
+pub fn to_int(ip: string) -> int is return 0 end
+pub fn from_int(n: int) -> string is return "0.0.0.0" end
+pub fn cidr_hosts(cidr: string) -> string is return "" end
+pub fn cidr_broadcast(cidr: string) -> string is return "" end
+pub fn cidr_network(cidr: string) -> string is return "" end
+pub fn my_ip() -> string is return "" end
+pub fn public_ip() -> string is return "" end
