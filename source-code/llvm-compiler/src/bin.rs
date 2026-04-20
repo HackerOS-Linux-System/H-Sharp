@@ -84,7 +84,7 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("h#-compiler — H# LLVM native compiler v0.1.0");
+    println!("h#-compiler — H# LLVM native compiler v0.3");
     println!();
     println!("USAGE: h#-compiler <file.h#> [options]");
     println!();
