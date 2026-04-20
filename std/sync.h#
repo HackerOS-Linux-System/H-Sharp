@@ -1,0 +1,27 @@
+;; H# Standard Library — std -> sync
+;; Synchronizacja: Mutex, Channel, Atomic
+
+struct Mutex is
+    pub locked: bool
+end
+
+pub fn new_mutex() -> Mutex is return Mutex { locked: false } end
+pub fn lock(m: Mutex) -> Mutex is return Mutex { locked: true } end
+pub fn unlock(m: Mutex) -> Mutex is return Mutex { locked: false } end
+pub fn try_lock(m: Mutex) -> bool is return true end
+
+struct Channel is
+    pub name: string
+end
+
+pub fn new_channel(name: string) -> Channel is return Channel { name: name } end
+pub fn send(ch: Channel, data: string) is end
+pub fn recv(ch: Channel) -> string is return "" end
+pub fn try_recv(ch: Channel) -> string is return "" end
+pub fn close_channel(ch: Channel) is end
+
+pub fn atomic_add(ptr: int, val: int) -> int is return 0 end
+pub fn atomic_sub(ptr: int, val: int) -> int is return 0 end
+pub fn atomic_load(ptr: int) -> int is return 0 end
+pub fn atomic_store(ptr: int, val: int) is end
+pub fn atomic_swap(ptr: int, val: int) -> int is return 0 end
