@@ -101,7 +101,7 @@ impl CraneliftCodegen {
                             name: format!("{}_{}", imp.type_name, method.name),
                             params: method.params.clone(), return_type: method.return_type.clone(),
                             body: method.body.clone(), pub_: method.pub_,
-                            is_unsafe: method.is_unsafe, span: method.span.clone(),
+                            is_async: false, is_unsafe: method.is_unsafe, span: method.span.clone(),
                         }, cc)?;
                     }
                 }
@@ -144,7 +144,7 @@ impl CraneliftCodegen {
                             name: format!("{}_{}", imp.type_name, method.name),
                             params: method.params.clone(), return_type: method.return_type.clone(),
                             body: method.body.clone(), pub_: method.pub_,
-                            is_unsafe: method.is_unsafe, span: method.span.clone(),
+                            is_async: false, is_unsafe: method.is_unsafe, span: method.span.clone(),
                         });
                     }
                 }
@@ -246,6 +246,7 @@ pub fn emit_module(cg: CraneliftCodegen, output: &str) -> R<()> {
     let out_bin = format!("{}{}", output, suffix);
     let mut cmd = std::process::Command::new(cc);
     cmd.arg(&mo).arg(&ro).arg("-o").arg(&out_bin);
+    cmd.arg("-lm"); // math: sin, cos, sqrt, log, log2, etc.
     if cg.opts.static_link { cmd.arg("-static"); }
     if cg.opts.debug_info  { cmd.arg("-g"); }
     if cg.opts.optimize    { cmd.arg("-O2"); }
@@ -704,9 +705,27 @@ fn compile_expr(
         Expr::FieldAccess(obj, _, _) => Ok(e!(obj, hint)),
         Expr::Range(start, _, _, _)  => Ok(e!(start, hint)),
         Expr::SelfExpr(_)            => vars.get("self").map(|v| b.use_var(v)).ok_or(CodegenError::UndefinedVar("self".into())),
-        Expr::Try(inner, _)          => Ok(e!(inner, hint)),
+        // ? operator: evaluate expr; if zero/nil, return 0 from function early
+        Expr::Await(inner, _) => Ok(e!(inner, hint)),
+
+            Expr::Try(inner, _) => {
+            let val = e!(inner, hint);
+            let zero_v = zero(b, types::I64);
+            let is_err = b.ins().icmp(IntCC::Equal, val, zero_v);
+            let then_blk  = b.create_block();
+            let merge_blk = b.create_block();
+            b.ins().brif(is_err, then_blk, &[], merge_blk, &[]);
+            b.switch_to_block(then_blk);
+            b.seal_block(then_blk);
+            b.ins().return_(&[zero_v]);
+            b.switch_to_block(merge_blk);
+            b.seal_block(merge_blk);
+            Ok(val)
+        }
         Expr::Do { body, .. }        => { compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?; Ok(zero(b, types::I64)) }
-        _                            => Ok(zero(b, types::I64)),
+        // Closure: return a placeholder i64 (full impl in v0.3.1)
+        Expr::Closure { .. } => Ok(zero(b, types::I64)),
+        _                    => Ok(zero(b, types::I64)),
     }
 }
 
@@ -802,7 +821,140 @@ fn call_fn(
             Ok(zero(b, types::I64))
         }
         "parse_int" => Ok(zero(b, types::I64)),
-        _ => {
+        
+            // v0.3 stdlib builtins
+            "trim" | "str_trim" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_trim, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "to_upper" | "upper" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_to_upper, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "to_lower" | "lower" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_to_lower, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "contains" => {
+                let a = str_arg!(0); let b2 = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_contains, b.func);
+                let call = b.ins().call(r, &[a, b2]); Ok(b.inst_results(call)[0])
+            }
+            "replace" | "str_replace" => {
+                let a = str_arg!(0); let from = str_arg!(1); let to_s = str_arg!(2);
+                let r = module.declare_func_in_func(builtins.hsh_str_replace, b.func);
+                let call = b.ins().call(r, &[a, from, to_s]); Ok(b.inst_results(call)[0])
+            }
+            "now_unix" | "time_unix" => {
+                let r = module.declare_func_in_func(builtins.hsh_now_unix, b.func);
+                let call = b.ins().call(r, &[]); Ok(b.inst_results(call)[0])
+            }
+            "now_ms" | "time_ms" => {
+                let r = module.declare_func_in_func(builtins.hsh_now_ms, b.func);
+                let call = b.ins().call(r, &[]); Ok(b.inst_results(call)[0])
+            }
+            "sleep_ms" => {
+                let ms = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &args[0], None)?;
+                let r = module.declare_func_in_func(builtins.hsh_sleep_ms, b.func);
+                b.ins().call(r, &[ms]); Ok(zero(b, types::I64))
+            }
+            "shell" | "cmd" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_shell, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "getpid" | "pid" => {
+                let r = module.declare_func_in_func(builtins.hsh_getpid, b.func);
+                let call = b.ins().call(r, &[]); Ok(b.inst_results(call)[0])
+            }
+            "random_hex" => {
+                let n = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &args[0], None)?;
+                let r = module.declare_func_in_func(builtins.hsh_random_hex, b.func);
+                let call = b.ins().call(r, &[n]); Ok(b.inst_results(call)[0])
+            }
+            "random_int" => {
+                let mn = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &args[0], None)?;
+                let mx = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &args[1], None)?;
+                let r = module.declare_func_in_func(builtins.hsh_random_int, b.func);
+                let call = b.ins().call(r, &[mn, mx]); Ok(b.inst_results(call)[0])
+            }
+            "hostname" => {
+                let r = module.declare_func_in_func(builtins.hsh_hostname, b.func);
+                let call = b.ins().call(r, &[]); Ok(b.inst_results(call)[0])
+            }
+
+            "starts_with" | "str_starts_with" => {
+                let a = str_arg!(0); let b2 = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_starts_with, b.func);
+                let call = b.ins().call(r, &[a, b2]); Ok(b.inst_results(call)[0])
+            }
+            "ends_with" | "str_ends_with" => {
+                let a = str_arg!(0); let b2 = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_ends_with, b.func);
+                let call = b.ins().call(r, &[a, b2]); Ok(b.inst_results(call)[0])
+            }
+            "random_string" => {
+                let n = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &args[0], None)?;
+                let r = module.declare_func_in_func(builtins.hsh_random_hex, b.func);
+                let call = b.ins().call(r, &[n]); Ok(b.inst_results(call)[0])
+            }
+            "new_uuid" => {
+                let n = b.ins().iconst(types::I64, 16);
+                let r = module.declare_func_in_func(builtins.hsh_random_hex, b.func);
+                let call = b.ins().call(r, &[n]); Ok(b.inst_results(call)[0])
+            }
+            "fs_read" | "read_file" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_read_file, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "fs_write" | "write_file" => {
+                let p = str_arg!(0); let c = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_write_file, b.func);
+                let call = b.ins().call(r, &[p, c]); Ok(b.inst_results(call)[0])
+            }
+            "fs_exists" | "file_exists" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_file_exists, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "fs_mkdir_all" | "mkdir_all" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_mkdir_all, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "file_size_bytes" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_file_size, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "is_dir" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_is_dir, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "new_uuid" => {
+                let r = module.declare_func_in_func(builtins.hsh_uuid_v4, b.func);
+                let call = b.ins().call(r, &[]); Ok(b.inst_results(call)[0])
+            }
+            "random_string" => {
+                let n = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &args[0], None)?;
+                let r = module.declare_func_in_func(builtins.hsh_random_string, b.func);
+                let call = b.ins().call(r, &[n]); Ok(b.inst_results(call)[0])
+            }
+            "fs_mkdir_all" | "mkdir_all" | "file_size_bytes" | "is_dir" |
+            "file_stem" | "file_ext" | "file_parent" | "dns_resolve" |
+            "tcp_connect" | "tcp_recv" | "tcp_close" | "scan_port_net" |
+            "sha256" | "md5" | "xor_hex" | "bold" | "green_text" | "red_text" |
+            "yellow_text" | "dim_text" | "http_get" | "json_parse" |
+            "json_get_str" | "re_find" | "re_find_all" | "new_cli_parser" | "str_count" => {
+                // Stub for Cranelift — produces empty string/zero
+                Ok(zero(b, types::I64))
+            }
+                        _ => {
             // User-defined function
             if let Some(&fid) = fids.get(name) {
                 let sig = &fsigs[name];
