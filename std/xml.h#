@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> xml
+
+pub fn parse(s: string) -> string is return s end
+pub fn get_attr(node: string, attr: string) -> string is return "" end
+pub fn get_text(node: string) -> string is return "" end
+pub fn get_child(node: string, tag: string) -> string is return "" end
+pub fn get_children(node: string, tag: string) -> string is return "" end
+pub fn to_string_xml(node: string) -> string is return node end
+pub fn create_element(tag: string, attrs: string, content: string) -> string is
+    return "<" + tag + ">" + content + "</" + tag + ">"
+end
+pub fn has_attr(node: string, attr: string) -> bool is return false end
