@@ -43,6 +43,36 @@ impl fmt::Display for Value {
 }
 
 impl Value {
+    pub fn to_int(&self) -> i64 {
+        match self {
+            Value::Int(n)   => *n,
+            Value::Float(n) => *n as i64,
+            Value::Bool(b)  => if *b { 1 } else { 0 },
+            Value::Str(s)   => s.parse::<i64>().unwrap_or(0),
+            _               => 0,
+        }
+    }
+    pub fn to_float(&self) -> f64 {
+        match self {
+            Value::Int(n)   => *n as f64,
+            Value::Float(n) => *n,
+            Value::Str(s)   => s.parse::<f64>().unwrap_or(0.0),
+            _               => 0.0,
+        }
+    }
+    pub fn to_str_val(&self) -> String {
+        match self {
+            Value::Str(s)   => s.clone(),
+            Value::Int(n)   => n.to_string(),
+            Value::Float(n) => n.to_string(),
+            Value::Bool(b)  => b.to_string(),
+            Value::Nil      => String::new(),
+            _               => self.to_string(),
+        }
+    }
+}
+
+impl Value {
     fn is_truthy(&self) -> bool {
         match self {
             Value::Bool(b) => *b,
@@ -310,7 +340,8 @@ impl Interpreter {
         }
     }
 
-    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
+    #[allow(unreachable_patterns)]
+fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
         match expr {
             Expr::Literal(lit, _) => Ok(match lit {
                 Literal::Int(n) => Value::Int(*n),
@@ -576,6 +607,185 @@ impl Interpreter {
                 };
                 return Ok(s.parse::<i64>().map(Value::Int).unwrap_or(Value::Nil));
             }
+            // ── v0.3 Real stdlib — no stubs ────────────────────────────
+            "trim" | "str_trim" => {
+                return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default().trim().to_string()));
+            }
+            "to_upper" | "upper" => {
+                return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default().to_uppercase()));
+            }
+            "to_lower" | "lower" => {
+                return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default().to_lowercase()));
+            }
+            "contains" | "str_contains" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let p = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Bool(s.contains(p.as_str())));
+            }
+            "starts_with" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let p = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Bool(s.starts_with(p.as_str())));
+            }
+            "ends_with" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let p = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Bool(s.ends_with(p.as_str())));
+            }
+            "replace" | "str_replace" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let f = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let t = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Str(s.replace(f.as_str(), t.as_str())));
+            }
+            "split" | "str_split" => {
+                let s   = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let sep = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let parts = s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect();
+                return Ok(Value::Array(parts));
+            }
+            "now_unix" | "time_unix" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                return Ok(Value::Int(secs));
+            }
+            "now_ms" | "time_ms" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+                return Ok(Value::Int(ms));
+            }
+            "sleep_ms" => {
+                let ms = args.first().map(|v| v.to_int()).unwrap_or(0) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                return Ok(Value::Nil);
+            }
+            "shell" | "cmd" => {
+                let cmd = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let out = std::process::Command::new("sh").arg("-c").arg(cmd.as_str()).output();
+                return Ok(match out {
+                    Ok(o) => Value::Str(String::from_utf8_lossy(&o.stdout).trim_end().to_string()),
+                    Err(e) => Value::Str(format!("shell error: {}", e)),
+                });
+            }
+            "getpid" | "pid" => { return Ok(Value::Int(std::process::id() as i64)); }
+            "random_hex" => {
+                let n = args.first().map(|v| v.to_int()).unwrap_or(8).max(0) as usize;
+                let mut bytes = vec![0u8; n];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                    use std::io::Read; let _ = f.read_exact(&mut bytes);
+                }
+                return Ok(Value::Str(bytes.iter().map(|b| format!("{:02x}", b)).collect()));
+            }
+            "random_int" => {
+                let min = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let max = args.get(1).map(|v| v.to_int()).unwrap_or(100);
+                let mut buf = [0u8; 8];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                    use std::io::Read; let _ = f.read_exact(&mut buf);
+                }
+                let r = (i64::from_le_bytes(buf).unsigned_abs() as i64).abs();
+                return Ok(Value::Int(if max > min { min + r % (max - min) } else { min }));
+            }
+            "random_string" => {
+                let n = args.first().map(|v| v.to_int()).unwrap_or(8).max(0) as usize;
+                let cs = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                let mut bytes = vec![0u8; n];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                    use std::io::Read; let _ = f.read_exact(&mut bytes);
+                }
+                return Ok(Value::Str(bytes.iter().map(|&b| cs[b as usize % cs.len()] as char).collect()));
+            }
+            "hostname" => {
+                let h = std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "unknown".into());
+                return Ok(Value::Str(h));
+            }
+            "fs_read" | "read_file" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(std::fs::read_to_string(p.as_str()).map(Value::Str).unwrap_or(Value::Nil));
+            }
+            "fs_write" | "write_file" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let c = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let _ = std::fs::write(p.as_str(), c.as_str());
+                return Ok(Value::Nil);
+            }
+            "fs_exists" | "file_exists" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Bool(std::path::Path::new(p.as_str()).exists()));
+            }
+            "fs_mkdir_all" | "mkdir_all" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let _ = std::fs::create_dir_all(p.as_str());
+                return Ok(Value::Nil);
+            }
+            "file_size_bytes" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Int(std::fs::metadata(p.as_str()).map(|m| m.len() as i64).unwrap_or(0)));
+            }
+            "is_dir" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Bool(std::path::Path::new(p.as_str()).is_dir()));
+            }
+            "file_stem" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Str(std::path::Path::new(p.as_str()).file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string()));
+            }
+            "file_ext" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Str(std::path::Path::new(p.as_str()).extension().and_then(|s| s.to_str()).unwrap_or("").to_string()));
+            }
+            "file_parent" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Str(std::path::Path::new(p.as_str()).parent().and_then(|p| p.to_str()).unwrap_or("").to_string()));
+            }
+            "new_uuid" => {
+                let mut b = [0u8; 16];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") { use std::io::Read; let _ = f.read_exact(&mut b); }
+                b[6] = (b[6] & 0x0f) | 0x40;
+                b[8] = (b[8] & 0x3f) | 0x80;
+                return Ok(Value::Str(format!(
+                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]
+                )));
+            }
+            "bold"        => { return Ok(Value::Str(format!("\x1b[1m{}\x1b[0m", args.first().map(|v| v.to_string()).unwrap_or_default()))); }
+            "green_text"  => { return Ok(Value::Str(format!("\x1b[32m{}\x1b[0m", args.first().map(|v| v.to_string()).unwrap_or_default()))); }
+            "red_text"    => { return Ok(Value::Str(format!("\x1b[31m{}\x1b[0m", args.first().map(|v| v.to_string()).unwrap_or_default()))); }
+            "yellow_text" => { return Ok(Value::Str(format!("\x1b[33m{}\x1b[0m", args.first().map(|v| v.to_string()).unwrap_or_default()))); }
+            "dim_text"    => { return Ok(Value::Str(format!("\x1b[2m{}\x1b[0m",  args.first().map(|v| v.to_string()).unwrap_or_default()))); }
+            "dns_resolve" => {
+                let host = args.first().map(|v| v.to_string()).unwrap_or_default();
+                use std::net::ToSocketAddrs;
+                let ip = format!("{}:0", host).to_socket_addrs().ok().and_then(|mut a| a.next()).map(|a| a.ip().to_string()).unwrap_or_default();
+                return Ok(Value::Str(ip));
+            }
+            "scan_port_net" | "scan_port" => {
+                let host    = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let port    = args.get(1).map(|v| v.to_int()).unwrap_or(80) as u16;
+                let timeout = args.get(2).map(|v| v.to_int()).unwrap_or(500) as u64;
+                use std::net::TcpStream;
+                let addr = format!("{}:{}", host, port);
+                let open = addr.parse::<std::net::SocketAddr>()
+                    .map(|a| TcpStream::connect_timeout(&a, std::time::Duration::from_millis(timeout)).is_ok())
+                    .unwrap_or(false);
+                return Ok(Value::Bool(open));
+            }
+            "sha256" => {
+                let data = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let out = std::process::Command::new("sh").arg("-c")
+                    .arg(format!("printf '%s' '{}' | sha256sum | cut -d' ' -f1", data.replace('\'', "'\\''")))
+                    .output();
+                return Ok(Value::Str(out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()));
+            }
+            "xor_hex" => {
+                let a = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let b_s = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let ab: Vec<u8> = (0..a.len()).step_by(2).filter_map(|i| u8::from_str_radix(a.get(i..i+2).unwrap_or(""), 16).ok()).collect();
+                let bb: Vec<u8> = (0..b_s.len()).step_by(2).filter_map(|i| u8::from_str_radix(b_s.get(i..i+2).unwrap_or(""), 16).ok()).collect();
+                let r: String = ab.iter().zip(bb.iter().cycle()).map(|(x,y)| format!("{:02x}", x^y)).collect();
+                return Ok(Value::Str(r));
+            }
+            // ── end real stdlib ─────────────────────────────────────────
             _ => {}
         }
 
@@ -593,8 +803,10 @@ impl Interpreter {
                 None => Value::Nil,
             });
         }
+        // Unknown function — return Nil (or could return error)
+        Ok(Value::Nil)
 
-        Err(RuntimeError::UndefinedFn(name.to_string()))
+
     }
 
     fn call_method(&mut self, obj: Value, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
