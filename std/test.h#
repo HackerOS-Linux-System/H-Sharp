@@ -1,0 +1,46 @@
+;; H# Standard Library — std -> test
+;; Unit testing framework
+
+struct TestSuite is
+    pub name:   string
+    pub passed: int
+    pub failed: int
+end
+
+pub fn new_suite(name: string) -> TestSuite is
+    return TestSuite { name: name, passed: 0, failed: 0 }
+end
+
+pub fn assert_eq(a: string, b: string) -> bool is
+    if a == b is return true end
+    write("[FAIL] expected: " + b + " got: " + a)
+    return false
+end
+
+pub fn assert_eq_int(a: int, b: int) -> bool is
+    if a == b is return true end
+    write("[FAIL] expected: " + to_string(b) + " got: " + to_string(a))
+    return false
+end
+
+pub fn assert_true(cond: bool, msg: string) -> bool is
+    if cond is return true end
+    write("[FAIL] " + msg)
+    return false
+end
+
+pub fn assert_false(cond: bool, msg: string) -> bool is
+    if cond is
+        write("[FAIL] expected false — " + msg)
+        return false
+    end
+    return true
+end
+
+pub fn assert_contains(s: string, sub: string) -> bool is return false end
+pub fn assert_not_empty(s: string) -> bool is return s != "" end
+pub fn assert_nil(s: string) -> bool is return s == "" end
+
+pub fn report(suite: TestSuite) is
+    write("[TEST] " + suite.name + " — passed: " + to_string(suite.passed) + " failed: " + to_string(suite.failed))
+end
