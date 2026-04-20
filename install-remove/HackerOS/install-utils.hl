@@ -1,1 +1,13 @@
 // curl
+
+! Bytes
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.3/bytes -o /usr/bin/bytes
+> sudo chmod a+x /usr/bin/bytes
+
+! HackerOS H# Compiler
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.3/hhc -o /usr/bin/hhc
+> sudo chmod a+x /usr/bin/hhc
+
+! vira
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.3/vira -o /usr/bin/vira
+> sudo chmod a+x /usr/bin/vira
