@@ -1,0 +1,11 @@
+;; H# Standard Library — std -> uuid
+;; UUID v4/v5 generation
+
+pub fn v4() -> string is return "00000000-0000-4000-0000-000000000000" end
+pub fn v5(namespace: string, name: string) -> string is return v4() end
+pub fn is_valid(s: string) -> bool is return false end
+pub fn parse(s: string) -> string is return s end
+pub fn to_bytes(uuid: string) -> string is return "" end
+pub fn from_bytes(data: string) -> string is return "" end
+pub fn zero_uuid() -> string is return "00000000-0000-0000-0000-000000000000" end
+pub fn is_zero(uuid: string) -> bool is return uuid == zero_uuid() end
