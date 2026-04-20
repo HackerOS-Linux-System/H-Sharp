@@ -1,0 +1,20 @@
+;; H# Standard Library — std -> net -> ssh
+;; SSH client dla HackerOS tools
+
+struct SshConn is
+    pub host: string
+    pub user: string
+    pub port: int
+end
+
+pub fn connect(host: string, user: string, password: string) -> SshConn is
+    return SshConn { host: host, user: user, port: 22 }
+end
+pub fn connect_key(host: string, user: string, key_path: string) -> SshConn is
+    return SshConn { host: host, user: user, port: 22 }
+end
+pub fn exec_ssh(conn: SshConn, cmd: string) -> string is return "" end
+pub fn upload(conn: SshConn, local: string, remote: string) is end
+pub fn download(conn: SshConn, remote: string, local: string) is end
+pub fn close_ssh(conn: SshConn) is end
+pub fn is_connected(conn: SshConn) -> bool is return false end
