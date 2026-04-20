@@ -1,0 +1,15 @@
+;; H# Standard Library — std -> net -> udp
+
+struct UdpSocket is
+    pub host: string
+    pub port: int
+end
+
+pub fn bind(host: string, port: int) -> UdpSocket is
+    return UdpSocket { host: host, port: port }
+end
+pub fn send_to(sock: UdpSocket, data: string, host: string, port: int) is end
+pub fn recv_from(sock: UdpSocket, size: int) -> string is return "" end
+pub fn close(sock: UdpSocket) is end
+pub fn set_timeout(sock: UdpSocket, ms: int) is end
+pub fn broadcast(sock: UdpSocket, data: string, port: int) is end
