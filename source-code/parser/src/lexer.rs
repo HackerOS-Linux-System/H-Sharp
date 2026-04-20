@@ -44,6 +44,8 @@ pub enum TokenKind {
     Continue,
     Unsafe,
     Extern,
+    Async,
+    Await,
     Arena,
     Manual,       // unsafe manual — manual memory management mode
     Write,        // write() builtin (replaces println)
@@ -85,8 +87,8 @@ pub enum TokenKind {
     Colon,      // :
     Semicolon,  // ;
     Comma,      // ,
-    Pipe,       // |
-    Question,   // ?
+    Pipe,         // |
+    Question,      // ?  (error propagation / optional)
     At,         // @
 
     // Delimiters
@@ -325,6 +327,8 @@ impl Lexer {
             "arena"    => TokenKind::Arena,
             "manual"   => TokenKind::Manual,
             "extern"   => TokenKind::Extern,
+                    "async"    => TokenKind::Async,
+                    "await"    => TokenKind::Await,
             "write"    => TokenKind::Write,
             "true"     => TokenKind::Bool(true),
             "false"    => TokenKind::Bool(false),
