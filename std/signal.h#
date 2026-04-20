@@ -1,0 +1,16 @@
+;; H# Standard Library — std -> signal
+
+pub fn on_sigint(handler: string) is end
+pub fn on_sigterm(handler: string) is end
+pub fn on_sigpipe(handler: string) is end
+pub fn ignore_sigpipe() is end
+pub fn send_signal(pid: int, sig: int) is end
+pub fn raise_signal(sig: int) is end
+
+;; Signal constants
+pub fn SIGINT()  -> int is return 2 end
+pub fn SIGTERM() -> int is return 15 end
+pub fn SIGKILL() -> int is return 9 end
+pub fn SIGHUP()  -> int is return 1 end
+pub fn SIGUSR1() -> int is return 10 end
+pub fn SIGUSR2() -> int is return 12 end
