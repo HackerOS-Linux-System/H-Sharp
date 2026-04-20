@@ -5,6 +5,8 @@ use std::collections::HashMap;
 pub enum TypeError {
     #[error("undefined variable `{0}`")]
     UndefinedVar(String),
+    #[error("std library not found: {0}")]
+    StdNotFound(String),
     #[error("type mismatch: expected `{expected}`, found `{found}`")]
     TypeMismatch { expected: String, found: String },
     #[error("undefined function `{0}`")]
@@ -207,6 +209,19 @@ impl TypeChecker {
     }
 
     pub fn check_module(&mut self, module: &Module) -> Result<(), TypeError> {
+        // Check std imports exist on disk
+        for (import_kind, _alias, _span) in &module.imports {
+            if let hsharp_parser::ast::ImportKind::Std { path, .. } = import_kind {
+                let lib = path.last().cloned().unwrap_or_default();
+                let std_path = format!("/usr/lib/HackerOS/H#/std/{}.h#", lib);
+                if !std::path::Path::new(&std_path).exists() {
+                    return Err(TypeError::StdNotFound(format!(
+                        "std -> {}\n  Expected: {}\n  Install: hacker unpack h# (or: sudo cp std-h#/*.h# /usr/lib/HackerOS/H#/std/)",
+                        path.join(" -> "), std_path
+                    )));
+                }
+            }
+        }
         // First pass: collect fn signatures
         for item in &module.items {
             self.collect_signatures(item);
