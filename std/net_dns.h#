@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> net -> dns
+
+pub fn resolve(hostname: string) -> string is return "" end
+pub fn resolve_all(hostname: string) -> string is return "" end
+pub fn reverse_lookup(ip: string) -> string is return "" end
+pub fn lookup_mx(domain: string) -> string is return "" end
+pub fn lookup_txt(domain: string) -> string is return "" end
+pub fn lookup_ns(domain: string) -> string is return "" end
+pub fn is_valid_ip(ip: string) -> bool is return false end
+pub fn is_valid_domain(domain: string) -> bool is return false end
+pub fn is_ipv6(ip: string) -> bool is return false end
+pub fn cidr_contains(cidr: string, ip: string) -> bool is return false end
