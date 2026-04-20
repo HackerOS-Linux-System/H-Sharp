@@ -4,7 +4,7 @@ use crate::installer::Installer;
 use crate::registry::{Registry, print_search_results};
 use crate::settings::{ViraSettings, run_settings_tui};
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.3";
 
 pub fn run() -> anyhow::Result<()> {
     let mut parser = lexopt::Parser::from_env();
