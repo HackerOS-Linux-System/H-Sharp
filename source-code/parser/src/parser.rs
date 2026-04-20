@@ -220,6 +220,12 @@ impl Parser {
             TokenKind::Trait => self.parse_trait(pub_).map(Item::TraitDef),
             TokenKind::Impl => self.parse_impl().map(Item::ImplBlock),
             TokenKind::Type => self.parse_type_alias(pub_).map(|ta| ta),
+            TokenKind::Async => {
+                // async fn — consume async, then parse as regular fn with is_async=true
+                self.advance();
+                let fn_def = self.parse_fn(pub_)?;
+                Ok(Item::FnDef(FnDef { is_async: true, ..fn_def }))
+            }
             TokenKind::Extern => self.parse_extern_block_inline(),
             _ => Err(self.error(
                 format!("unexpected token `{}` at top level", self.current().text),
@@ -231,6 +237,10 @@ impl Parser {
     fn parse_fn(&mut self, pub_: bool) -> Result<FnDef, ParseError> {
         let start = self.current().span.clone();
         self.advance(); // 'fn'
+
+        let is_async = if matches!(self.current().kind, TokenKind::Async) {
+            self.advance(); true
+        } else { false };
 
         let is_unsafe = if matches!(self.current().kind, TokenKind::Unsafe) {
             self.advance(); true
@@ -250,7 +260,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.merge(&self.current().span);
 
-        Ok(FnDef { name, params, return_type, body, pub_, is_unsafe, span })
+        Ok(FnDef { name, params, return_type, body, pub_, is_async: false, is_unsafe, span })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
@@ -290,7 +300,7 @@ impl Parser {
     }
 
     fn parse_extern_block_inline(&mut self) -> Result<Item, ParseError> {
-        use crate::ast::{ExternBlock, ExternLang, ExternLinkKind, ExternFnDecl};
+        // Extern types are imported via ast::* glob
         let span = self.current().span.clone();
         self.advance(); // consume 'extern'
 
@@ -813,6 +823,13 @@ impl Parser {
                 continue;
             }
 
+            // Error propagation: expr?
+            if matches!(op_tok.kind, TokenKind::Question) {
+                let s = lhs.span().merge(&op_tok.span);
+                lhs = Expr::Try(Box::new(lhs), s);
+                continue;
+            }
+
             // Binary operators
             if let Some(bin_op) = token_to_binop(&op_tok.kind) {
                 let rhs = self.parse_expr(r_bp)?;
@@ -824,8 +841,63 @@ impl Parser {
         Ok(lhs)
     }
 
+    fn parse_closure_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current().span.clone();
+        self.advance(); // consume first |
+
+        // Parse params as regular Params (reuse existing type)
+        let mut params = Vec::new();
+        while !matches!(self.current().kind, TokenKind::Pipe | TokenKind::EOF) {
+            let p_span = self.current().span.clone();
+            let mutable = if matches!(self.current().kind, TokenKind::Mut) {
+                self.advance(); true
+            } else { false };
+            let (name, _) = self.expect_ident()?;
+            let ty = if matches!(self.current().kind, TokenKind::Colon) {
+                self.advance();
+                self.parse_type()?
+            } else { TypeExpr::Named("int".into()) }; // default type
+            params.push(Param { name, ty, mutable, span: p_span });
+            if matches!(self.current().kind, TokenKind::Comma) { self.advance(); }
+        }
+        if matches!(self.current().kind, TokenKind::Pipe) { self.advance(); } // closing |
+
+        // Optional return type: -> T
+        let return_type = if matches!(self.current().kind, TokenKind::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else { None };
+
+        // Body: `is ... end` block OR single expression
+        // parse_block() handles `is ... end` internally
+        let body = if matches!(self.current().kind, TokenKind::Is) {
+            self.parse_block()?
+        } else {
+            // Single-expression body: |x| x + 1
+            let e = self.parse_expr(0)?;
+            let s = e.span().clone();
+            vec![Stmt::Return(Some(e), s)]
+        };
+
+        let end_sp = self.current().span.clone();
+        Ok(Expr::Closure { params, return_type, body, span: span.merge(&end_sp) })
+    }
+
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
         let start = self.current().span.clone();
+        // await expr
+        if matches!(self.current().kind, TokenKind::Await) {
+            let span = self.current().span.clone();
+            self.advance();
+            let inner = self.parse_expr(0)?;
+            let s = span.merge(inner.span());
+            return Ok(Expr::Await(Box::new(inner), s));
+        }
+
+        // Closure: |params| body
+        if matches!(self.current().kind, TokenKind::Pipe) {
+            return self.parse_closure_expr();
+        }
         match &self.current().kind.clone() {
             TokenKind::Integer(v) => {
                 let v = *v;
@@ -1203,11 +1275,13 @@ impl Parser {
 
 fn infix_bp(kind: &TokenKind) -> Option<(u8, u8)> {
     match kind {
+        TokenKind::Question => Some((100, 101)),  // ? operator — high postfix precedence
         TokenKind::Assign | TokenKind::PlusAssign | TokenKind::MinusAssign |
         TokenKind::StarAssign | TokenKind::SlashAssign => Some((2, 1)),
         TokenKind::Or => Some((4, 5)),
         TokenKind::And => Some((6, 7)),
-        TokenKind::BitOr => Some((8, 9)),
+        // TokenKind::Pipe (single |) is used only for closures, not as binary operator
+        // Use bitor() builtin for bitwise OR
         TokenKind::BitXor => Some((10, 11)),
         TokenKind::BitAnd => Some((12, 13)),
         TokenKind::Eq | TokenKind::NotEq => Some((14, 15)),
@@ -1239,7 +1313,7 @@ fn token_to_binop(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::And => Some(BinOp::And),
         TokenKind::Or => Some(BinOp::Or),
         TokenKind::BitAnd => Some(BinOp::BitAnd),
-        TokenKind::BitOr => Some(BinOp::BitOr),
+        // Pipe no longer maps to BitOr (use bitor() builtin)
         TokenKind::BitXor => Some(BinOp::BitXor),
         TokenKind::Shl => Some(BinOp::Shl),
         TokenKind::Shr => Some(BinOp::Shr),
