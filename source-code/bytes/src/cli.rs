@@ -5,7 +5,7 @@ use crate::registry::Registry;
 use crate::python_interop::{resolve_python_import, setup_python_deps};
 use crate::progress::{BytesBar, BarTheme};
 
-const VERSION: &str = "0.3";
+const VERSION: &str = "0.5";
 
 pub fn run() -> anyhow::Result<()> {
     let mut args_raw: Vec<String> = std::env::args().skip(1).collect();
