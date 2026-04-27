@@ -1,0 +1,7 @@
+;; H# Standard Library — std -> audio
+pub fn load(path: string) -> string is return "" end
+pub fn play(audio: string) is end
+pub fn stop(audio: string) is end
+pub fn duration_ms(audio: string) -> int is return 0 end
+pub fn to_wav(audio: string, path: string) is end
+pub fn to_mp3(audio: string, path: string) is end
