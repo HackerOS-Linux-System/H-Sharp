@@ -1,0 +1,18 @@
+;; H# Standard Library — std -> container
+;; Podman/Docker API dla HackerOS
+
+pub fn pull(image: string) is write("[container] pulling " + image) end
+pub fn run(image: string, cmd: string) -> string is return "" end
+pub fn run_detached(image: string, cmd: string) -> string is return "" end
+pub fn stop(id: string) is end
+pub fn remove(id: string) is end
+pub fn list() -> string is return "[]" end
+pub fn exec_container(id: string, cmd: string) -> string is return "" end
+pub fn logs(id: string) -> string is return "" end
+pub fn inspect(id: string) -> string is return "{}" end
+pub fn build(dockerfile: string, tag: string) is end
+pub fn push(image: string) is end
+pub fn pull_image(image: string) is end
+pub fn image_list() -> string is return "[]" end
+pub fn network_create(name: string) is end
+pub fn volume_create(name: string) is end
