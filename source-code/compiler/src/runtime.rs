@@ -42,6 +42,13 @@ pub struct Builtins {
     pub hsh_ends_with:    cranelift_module::FuncId,
     pub hsh_uuid_v4:      cranelift_module::FuncId,
     pub hsh_random_string:cranelift_module::FuncId,
+    // ANSI formatting
+    pub hsh_bold:        cranelift_module::FuncId,
+    pub hsh_green_text:  cranelift_module::FuncId,
+    pub hsh_red_text:    cranelift_module::FuncId,
+    pub hsh_yellow_text: cranelift_module::FuncId,
+    pub hsh_dim_text:    cranelift_module::FuncId,
+    pub hsh_cyan_text:   cranelift_module::FuncId,
 }
 
 impl Builtins {
@@ -216,6 +223,13 @@ impl Builtins {
         let hsh_uuid_v4       = { let mut s = Signature::new(call_conv); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_uuid_v4",       Linkage::Import, &s).unwrap() };
         let hsh_random_string = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_random_string", Linkage::Import, &s).unwrap() };
 
+        let hsh_bold        = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_bold",        Linkage::Import, &s).unwrap() };
+        let hsh_green_text  = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_green_text",  Linkage::Import, &s).unwrap() };
+        let hsh_red_text    = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_red_text",    Linkage::Import, &s).unwrap() };
+        let hsh_yellow_text = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_yellow_text", Linkage::Import, &s).unwrap() };
+        let hsh_dim_text    = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_dim_text",    Linkage::Import, &s).unwrap() };
+        let hsh_cyan_text   = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_cyan_text",   Linkage::Import, &s).unwrap() };
+
         Self {
             println, print, panic_fn, exit_fn,
             hsh_int_to_string, hsh_strlen, hsh_strcat,
@@ -225,6 +239,7 @@ impl Builtins {
             hsh_random_hex, hsh_random_int, hsh_sin, hsh_cos, hsh_sqrt, hsh_hostname,
             hsh_file_exists, hsh_read_file, hsh_write_file, hsh_mkdir_all, hsh_file_size,
             hsh_is_dir, hsh_starts_with, hsh_ends_with, hsh_uuid_v4, hsh_random_string,
+            hsh_bold, hsh_green_text, hsh_red_text, hsh_yellow_text, hsh_dim_text, hsh_cyan_text,
         }
     }
 }
@@ -237,6 +252,13 @@ pub fn runtime_c_source() -> &'static str {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/stat.h>
 
 /* H# core types */
 typedef const char* hsh_string;
@@ -479,7 +501,7 @@ static int64_t hsh_env_get(hsh_string key, hsh_string *out) {
     return v ? 1 : 0;
 }
 
-#include <unistd.h>
+
 hsh_string hsh_hostname(void) {
     static char buf[256];
     gethostname(buf, sizeof(buf));
@@ -487,7 +509,7 @@ hsh_string hsh_hostname(void) {
 }
 
 /* ── Time ─────────────────────────────────────────────────────────────────── */
-#include <time.h>
+
 
 int64_t hsh_now_unix(void) {
     return (int64_t)time(NULL);
@@ -570,7 +592,7 @@ int64_t hsh_random_int(int64_t min, int64_t max) {
 
 
 /* ── Filesystem ──────────────────────────────────────────────────────────── */
-#include <sys/stat.h>
+
 #include <dirent.h>
 
 int64_t hsh_file_exists(hsh_string path) {
@@ -665,6 +687,86 @@ hsh_string hsh_random_string(int64_t n) {
     free(tmp);
     out[n] = '\0';
     return out;
+}
+
+/* ── ANSI Terminal formatting ─────────────────────────────────────────────── */
+
+hsh_string hsh_bold(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 10);
+    sprintf(out, "\x1b[1m%s\x1b[0m", s);
+    return out;
+}
+hsh_string hsh_green_text(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 14);
+    sprintf(out, "\x1b[32m%s\x1b[0m", s);
+    return out;
+}
+hsh_string hsh_red_text(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 14);
+    sprintf(out, "\x1b[31m%s\x1b[0m", s);
+    return out;
+}
+hsh_string hsh_yellow_text(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 14);
+    sprintf(out, "\x1b[33m%s\x1b[0m", s);
+    return out;
+}
+hsh_string hsh_dim_text(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 10);
+    sprintf(out, "\x1b[2m%s\x1b[0m", s);
+    return out;
+}
+hsh_string hsh_underline(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 10);
+    sprintf(out, "\x1b[4m%s\x1b[0m", s);
+    return out;
+}
+hsh_string hsh_cyan_text(hsh_string s) {
+    char *out = (char*)malloc(strlen(s) + 14);
+    sprintf(out, "\x1b[36m%s\x1b[0m", s);
+    return out;
+}
+
+/* ── Network ─────────────────────────────────────────────────────────────── */
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+int64_t hsh_scan_port_net(hsh_string host, int64_t port, int64_t timeout_ms) {
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%lld", (long long)port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return 0;
+    int fd = socket(res->ai_family, SOCK_STREAM, 0);
+    if (fd < 0) { freeaddrinfo(res); return 0; }
+    // Set non-blocking for timeout
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int ok = (connect(fd, res->ai_addr, res->ai_addrlen) == 0) ? 1 : 0;
+    close(fd);
+    freeaddrinfo(res);
+    return ok;
+}
+
+hsh_string hsh_dns_resolve(hsh_string host) {
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0) return "";
+    static char ip[INET6_ADDRSTRLEN];
+    if (res->ai_family == AF_INET) {
+        inet_ntop(AF_INET, &((struct sockaddr_in*)res->ai_addr)->sin_addr, ip, sizeof(ip));
+    } else {
+        inet_ntop(AF_INET6, &((struct sockaddr_in6*)res->ai_addr)->sin6_addr, ip, sizeof(ip));
+    }
+    freeaddrinfo(res);
+    return ip;
 }
 "#
 }
