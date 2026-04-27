@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> diff
+pub fn diff_lines(a: string, b: string) -> string is return "" end
+pub fn diff_chars(a: string, b: string) -> string is return "" end
+pub fn patch(original: string, diff: string) -> string is return "" end
+pub fn is_equal(a: string, b: string) -> bool is return false end
