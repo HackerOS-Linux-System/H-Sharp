@@ -44,6 +44,7 @@ pub enum TokenKind {
     Continue,
     Unsafe,
     Extern,
+    Mod,
     Async,
     Await,
     Arena,
@@ -89,6 +90,9 @@ pub enum TokenKind {
     Comma,      // ,
     Pipe,         // |
     Question,      // ?  (error propagation / optional)
+    Hash,          // #  (attributes)
+    InterpStart,   // "...${  (start of interpolated string)
+    InterpEnd,     // }..."    (end of interpolated section)
     At,         // @
 
     // Delimiters
@@ -327,6 +331,7 @@ impl Lexer {
             "arena"    => TokenKind::Arena,
             "manual"   => TokenKind::Manual,
             "extern"   => TokenKind::Extern,
+                    "mod"      => TokenKind::Mod,
                     "async"    => TokenKind::Async,
                     "await"    => TokenKind::Await,
             "write"    => TokenKind::Write,
@@ -384,24 +389,22 @@ impl Lexer {
                 Some('/') if self.peek(1) == Some('/') => {
                     self.advance(); self.advance(); // consume //
                     tokens.push(Token::new(TokenKind::BlockCommentStart, Span::new(start.clone(), self.position(), self.file.clone()), "//"));
-                    // skip until \ on its own line
+                    // Block comment ends with \\\\ anywhere in line
                     loop {
-                        while let Some(c) = self.current() {
-                            if c == '\n' { self.advance(); break; }
-                            self.advance();
+                        match self.current() {
+                            None => break,
+                            Some('\\')
+                            if self.peek(1).map(|c| c == '\\').unwrap_or(false) => {
+                                self.advance(); self.advance();
+                                tokens.push(Token::new(TokenKind::BlockCommentEnd,
+                                    Span::new(start, self.position(), self.file.clone()), "\\\\"));
+                                break;
+                            }
+                            Some(c) => {
+                                if c == '\n' { self.line += 1; self.col = 1; }
+                                self.advance();
+                            }
                         }
-                        // check if next line starts with \ (block comment end)
-                        let _saved_pos = self.pos;
-                        let _saved_line = self.line;
-                        let _saved_col = self.col;
-                        self.skip_whitespace_no_newline();
-                        if self.current() == Some('\\') && self.peek(1).map(|c| c == '\\').unwrap_or(false) {
-                            self.advance(); self.advance();
-                            tokens.push(Token::new(TokenKind::BlockCommentEnd, Span::new(start, self.position(), self.file.clone()), "\\\\"));
-                            break;
-                        }
-                        if matches!(self.current(), None) { break; }
-                        // not end, continue skipping
                     }
                 }
                 Some(';') if self.peek(1) == Some(';') => {
@@ -411,18 +414,19 @@ impl Lexer {
                         self.advance();
                     }
                 }
-                // Legacy # comment (keep for compatibility during transition)
                 Some('#') => {
-                    while let Some(c) = self.current() {
-                        if c == '\n' { break; }
-                        self.advance();
+                    // #[ → attribute token; bare # → skip (legacy comment)
+                    if self.current() == Some('[') {
+                        tokens.push(Token::new(TokenKind::Hash, Span::new(start, self.position(), self.file.clone()), "#"));
+                    } else {
+                        while let Some(c) = self.current() { if c == '\n' { break; } self.advance(); }
                     }
+                    self.advance();
                 }
                 Some('\n') => {
                     self.advance();
-                    tokens.push(Token::new(TokenKind::Newline, Span::new(start, self.position(), self.file.clone()), "\n"));
+                    tokens.push(Token::new(TokenKind::Newline, Span::new(start.clone(), self.position(), self.file.clone()), "\n"));
                 }
-                Some('\r') => { self.advance(); }
                 Some('"') => {
                     self.advance();
                     match self.read_string(start) {
