@@ -1,0 +1,4 @@
+;; H# Standard Library — std -> rate_limit
+pub fn new(max: int, window_ms: int) -> string is return "" end
+pub fn check(limiter: string, key: string) -> bool is return true end
+pub fn remaining(limiter: string, key: string) -> int is return 0 end
