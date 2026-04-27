@@ -1,0 +1,14 @@
+;; H# Standard Library — std -> hk
+;; .hk config format (HackerOS format)
+;; Full docs: https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+
+pub fn parse(content: string) -> string is return "" end
+pub fn load(path: string) -> string is return "" end
+pub fn get(config: string, section: string, key: string) -> string is return "" end
+pub fn get_int(config: string, section: string, key: string) -> int is return 0 end
+pub fn get_bool(config: string, section: string, key: string) -> bool is return false end
+pub fn get_array(config: string, section: string, key: string) -> string is return "" end
+pub fn set(config: string, section: string, key: string, val: string) -> string is return "" end
+pub fn save(config: string, path: string) is end
+pub fn new_config() -> string is return "" end
+pub fn add_section(config: string, section: string) -> string is return "" end
