@@ -1,0 +1,8 @@
+;; H# Standard Library — std -> cache
+pub fn new_lru(capacity: int) -> string is return "" end
+pub fn set(cache: string, key: string, val: string) is end
+pub fn get(cache: string, key: string) -> string is return "" end
+pub fn has(cache: string, key: string) -> bool is return false end
+pub fn remove(cache: string, key: string) is end
+pub fn clear(cache: string) is end
+pub fn size(cache: string) -> int is return 0 end
