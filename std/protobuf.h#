@@ -1,0 +1,3 @@
+;; H# Standard Library — std -> protobuf
+pub fn encode(schema: string, data: string) -> string is return "" end
+pub fn decode(schema: string, data: string) -> string is return "" end
