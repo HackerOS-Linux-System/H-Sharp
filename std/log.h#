@@ -1,0 +1,17 @@
+;; H# Standard Library — std -> log
+;; Logging z poziomami
+
+pub fn debug(msg: string) is write("[DEBUG] " + msg) end
+pub fn info(msg: string)  is write("[INFO]  " + msg) end
+pub fn warn(msg: string)  is write("[WARN]  " + msg) end
+pub fn error(msg: string) is write("[ERROR] " + msg) end
+pub fn fatal(msg: string) is
+    write("[FATAL] " + msg)
+end
+
+pub fn set_level(level: string) is end
+pub fn set_output(path: string) is end
+pub fn set_format(fmt: string) is end
+
+pub fn info_fmt(msg: string, args: string) is write("[INFO]  " + msg + args) end
+pub fn debug_fmt(msg: string, args: string) is write("[DEBUG] " + msg + args) end
