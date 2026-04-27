@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> money
+pub fn format_usd(cents: int) -> string is return "" end
+pub fn format_eur(cents: int) -> string is return "" end
+pub fn parse_amount(s: string) -> int is return 0 end
+pub fn convert(amount: int, from_curr: string, to_curr: string, rate: f64) -> int is return 0 end
