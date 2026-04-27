@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> redis
+pub fn connect(host: string, port: int) -> string is return "" end
+pub fn set(r: string, key: string, val: string) is end
+pub fn get(r: string, key: string) -> string is return "" end
+pub fn del(r: string, key: string) is end
+pub fn exists(r: string, key: string) -> bool is return false end
+pub fn incr(r: string, key: string) -> int is return 0 end
+pub fn expire(r: string, key: string, secs: int) is end
+pub fn hset(r: string, hash: string, field: string, val: string) is end
+pub fn hget(r: string, hash: string, field: string) -> string is return "" end
+pub fn lpush(r: string, list: string, val: string) is end
+pub fn rpop(r: string, list: string) -> string is return "" end
