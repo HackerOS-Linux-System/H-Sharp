@@ -1,0 +1,7 @@
+;; H# Standard Library — std -> websocket
+pub fn connect(url: string) -> string is return "" end
+pub fn send(ws: string, msg: string) is end
+pub fn recv(ws: string) -> string is return "" end
+pub fn close(ws: string) is end
+pub fn on_message(ws: string, callback: string) is end
+pub fn is_open(ws: string) -> bool is return false end
