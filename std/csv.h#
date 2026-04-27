@@ -1,0 +1,11 @@
+;; H# Standard Library — std -> csv
+
+pub fn parse(data: string) -> string is return data end
+pub fn parse_header(data: string) -> string is return "" end
+pub fn get_row(parsed: string, i: int) -> string is return "" end
+pub fn get_col(row: string, col: string) -> string is return "" end
+pub fn row_count(parsed: string) -> int is return 0 end
+pub fn to_string_csv(data: string) -> string is return data end
+pub fn write_csv(path: string, data: string) is end
+pub fn read_csv(path: string) -> string is return "" end
+pub fn filter_rows(data: string, col: string, val: string) -> string is return "" end
