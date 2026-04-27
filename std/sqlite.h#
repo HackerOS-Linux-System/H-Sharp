@@ -1,0 +1,13 @@
+;; H# Standard Library — std -> sqlite
+pub fn open(path: string) -> string is return "" end
+pub fn exec(db: string, sql: string) is end
+pub fn query(db: string, sql: string) -> string is return "" end
+pub fn close(db: string) is end
+pub fn begin(db: string) is end
+pub fn commit(db: string) is end
+pub fn rollback(db: string) is end
+pub fn prepare(db: string, sql: string) -> string is return "" end
+pub fn bind(stmt: string, idx: int, val: string) is end
+pub fn step(stmt: string) -> bool is return false end
+pub fn column_str(stmt: string, idx: int) -> string is return "" end
+pub fn column_int(stmt: string, idx: int) -> int is return 0 end
