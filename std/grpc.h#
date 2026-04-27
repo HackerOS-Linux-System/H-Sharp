@@ -1,0 +1,6 @@
+;; H# Standard Library — std -> grpc
+pub fn new_client(addr: string) -> string is return "" end
+pub fn call(client: string, method: string, req: string) -> string is return "" end
+pub fn new_server(addr: string) -> string is return "" end
+pub fn register(server: string, service: string) is end
+pub fn serve(server: string) is end
