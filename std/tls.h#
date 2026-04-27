@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> tls
+pub fn connect(host: string, port: int) -> string is return "" end
+pub fn read(stream: string, n: int) -> string is return "" end
+pub fn write_tls(stream: string, data: string) -> int is return 0 end
+pub fn close(stream: string) is end
