@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> crypto_aes
+pub fn encrypt(key: string, plaintext: string) -> string is return "" end
+pub fn decrypt(key: string, ciphertext: string) -> string is return "" end
+pub fn encrypt_cbc(key: string, iv: string, plaintext: string) -> string is return "" end
+pub fn decrypt_cbc(key: string, iv: string, ciphertext: string) -> string is return "" end
