@@ -1,0 +1,6 @@
+;; H# Standard Library — std -> pubsub
+pub fn new_broker() -> string is return "" end
+pub fn subscribe(broker: string, topic: string) -> string is return "" end
+pub fn publish(broker: string, topic: string, msg: string) is end
+pub fn recv(sub: string) -> string is return "" end
+pub fn unsubscribe(sub: string) is end
