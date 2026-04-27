@@ -1,0 +1,7 @@
+;; H# Standard Library — std -> zip_gen
+pub fn create(path: string) -> string is return "" end
+pub fn add_file(zip: string, file_path: string, in_zip_path: string) is end
+pub fn add_bytes(zip: string, data: string, name: string) is end
+pub fn finish(zip: string) is end
+pub fn extract(zip_path: string, dest: string) is end
+pub fn list_files(zip_path: string) -> string is return "" end
