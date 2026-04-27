@@ -1,0 +1,21 @@
+;; H# Standard Library — std -> conv
+;; Konwersje typów
+
+pub fn int_to_str(n: int) -> string is return to_string(n) end
+pub fn float_to_str(f: f64) -> string is return to_string(f) end
+pub fn bool_to_str(b: bool) -> string is
+    if b is return "true" end
+    return "false"
+end
+pub fn str_to_int(s: string) -> int is return 0 end
+pub fn str_to_float(s: string) -> f64 is return 0.0 end
+pub fn str_to_bool(s: string) -> bool is return false end
+pub fn int_to_float(n: int) -> f64 is return 0.0 end
+pub fn float_to_int(f: f64) -> int is return 0 end
+pub fn int_to_hex(n: int) -> string is return "" end
+pub fn int_to_bin(n: int) -> string is return "" end
+pub fn int_to_oct(n: int) -> string is return "" end
+pub fn hex_to_int(s: string) -> int is return 0 end
+pub fn bin_to_int(s: string) -> int is return 0 end
+pub fn char_to_int(c: string) -> int is return 0 end
+pub fn int_to_char(n: int) -> string is return "" end
