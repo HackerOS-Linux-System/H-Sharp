@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> async
+;; Async/await runtime (placeholder dla v0.3)
+
+struct Future is
+    pub id: int
+end
+
+pub fn spawn(task: string) -> Future is return Future { id: 0 } end
+pub fn await_(f: Future) -> string is return "" end
+pub fn sleep_async(ms: int) -> Future is return Future { id: 0 } end
+pub fn join_all(tasks: string) -> string is return "" end
+pub fn timeout(f: Future, ms: int) -> bool is return false end
