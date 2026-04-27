@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> date
+pub fn today() -> string is return "" end
+pub fn now_str() -> string is return "" end
+pub fn parse(s: string) -> int is return 0 end
+pub fn format(ts: int, fmt: string) -> string is return "" end
+pub fn add_days(ts: int, days: int) -> int is return 0 end
+pub fn add_hours(ts: int, hours: int) -> int is return 0 end
+pub fn diff_days(a: int, b: int) -> int is return 0 end
+pub fn year(ts: int) -> int is return 0 end
+pub fn month(ts: int) -> int is return 0 end
+pub fn day(ts: int) -> int is return 0 end
+pub fn weekday(ts: int) -> string is return "" end
