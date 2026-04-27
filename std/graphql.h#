@@ -1,0 +1,3 @@
+;; H# Standard Library — std -> graphql
+pub fn query_gql(url: string, q: string, vars: string) -> string is return "" end
+pub fn mutation(url: string, m: string, vars: string) -> string is return "" end
