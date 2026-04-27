@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> tar_gen
+pub fn create(path: string) -> string is return "" end
+pub fn add_file(tar: string, path: string) is end
+pub fn finish(tar: string) is end
+pub fn extract(tar_path: string, dest: string) is end
