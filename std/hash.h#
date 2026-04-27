@@ -1,0 +1,12 @@
+;; H# Standard Library — std -> hash
+;; Non-crypto hash functions
+
+pub fn fnv1a(s: string) -> int is return 0 end
+pub fn fnv1a_64(s: string) -> int is return 0 end
+pub fn djb2(s: string) -> int is return 0 end
+pub fn sdbm(s: string) -> int is return 0 end
+pub fn murmur3(s: string, seed: int) -> int is return 0 end
+pub fn crc32(s: string) -> int is return 0 end
+pub fn xxhash(s: string) -> int is return 0 end
+pub fn adler32(s: string) -> int is return 0 end
+pub fn is_equal(a: string, b: string) -> bool is return a == b end
