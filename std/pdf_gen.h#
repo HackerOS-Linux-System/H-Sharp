@@ -1,0 +1,6 @@
+;; H# Standard Library — std -> pdf_gen
+pub fn new_doc() -> string is return "" end
+pub fn add_page(doc: string) -> string is return "" end
+pub fn add_text(page: string, text: string, x: int, y: int) is end
+pub fn add_image(page: string, path: string, x: int, y: int, w: int, h: int) is end
+pub fn save(doc: string, path: string) is end
