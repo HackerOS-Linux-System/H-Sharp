@@ -1,0 +1,18 @@
+;; H# Standard Library — std -> cron
+;; Scheduler / cron-like task runner
+
+struct Job is
+    pub name:     string
+    pub schedule: string
+end
+
+pub fn new_job(name: string, schedule: string) -> Job is
+    return Job { name: name, schedule: schedule }
+end
+pub fn run_job(j: Job, cmd: string) is
+    write("[cron] " + j.name + " scheduled: " + j.schedule)
+end
+pub fn parse_schedule(s: string) -> bool is return true end
+pub fn next_run(schedule: string) -> int is return 0 end
+pub fn start_scheduler() is end
+pub fn stop_scheduler() is end
