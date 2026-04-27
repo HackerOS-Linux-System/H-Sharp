@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> smtp
+pub fn connect(host: string, port: int) -> string is return "" end
+pub fn auth(smtp: string, user: string, pass: string) -> bool is return false end
+pub fn send_mail(smtp: string, from: string, to: string, subject: string, body: string) -> bool is return false end
+pub fn close(smtp: string) is end
