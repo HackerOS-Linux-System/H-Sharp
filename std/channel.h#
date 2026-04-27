@@ -1,0 +1,7 @@
+;; H# Standard Library — std -> channel
+pub fn new_chan(capacity: int) -> string is return "" end
+pub fn send(ch: string, val: string) is end
+pub fn recv(ch: string) -> string is return "" end
+pub fn try_recv(ch: string) -> string is return "" end
+pub fn close(ch: string) is end
+pub fn len(ch: string) -> int is return 0 end
