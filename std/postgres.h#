@@ -1,0 +1,7 @@
+;; H# Standard Library — std -> postgres
+pub fn connect(dsn: string) -> string is return "" end
+pub fn exec(conn: string, sql: string) is end
+pub fn query(conn: string, sql: string) -> string is return "" end
+pub fn close(conn: string) is end
+pub fn begin(conn: string) is end
+pub fn commit(conn: string) is end
