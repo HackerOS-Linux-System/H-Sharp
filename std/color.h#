@@ -1,0 +1,7 @@
+;; H# Standard Library — std -> color
+pub fn rgb(r: int, g: int, b: int) -> string is return "" end
+pub fn hex_to_rgb(hex: string) -> string is return "" end
+pub fn rgb_to_hex(r: int, g: int, b: int) -> string is return "" end
+pub fn blend(a: string, b: string, t: f64) -> string is return "" end
+pub fn darken(c: string, pct: f64) -> string is return "" end
+pub fn lighten(c: string, pct: f64) -> string is return "" end
