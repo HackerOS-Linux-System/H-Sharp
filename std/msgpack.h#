@@ -1,0 +1,3 @@
+;; H# Standard Library — std -> msgpack
+pub fn encode(data: string) -> string is return "" end
+pub fn decode(data: string) -> string is return "" end
