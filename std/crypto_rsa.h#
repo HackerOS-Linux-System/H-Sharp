@@ -1,0 +1,8 @@
+;; H# Standard Library — std -> crypto_rsa
+pub fn generate_keypair(bits: int) -> string is return "" end
+pub fn get_public(keypair: string) -> string is return "" end
+pub fn get_private(keypair: string) -> string is return "" end
+pub fn encrypt_pub(pubkey: string, data: string) -> string is return "" end
+pub fn decrypt_priv(privkey: string, data: string) -> string is return "" end
+pub fn sign(privkey: string, data: string) -> string is return "" end
+pub fn verify_sig(pubkey: string, data: string, sig: string) -> bool is return false end
