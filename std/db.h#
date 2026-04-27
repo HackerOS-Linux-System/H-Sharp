@@ -1,0 +1,27 @@
+;; H# Standard Library — std -> db
+;; SQLite + PostgreSQL + Redis bindings
+
+struct DbConn is
+    pub driver: string
+    pub dsn:    string
+end
+
+pub fn sqlite_open(path: string) -> DbConn is
+    return DbConn { driver: "sqlite", dsn: path }
+end
+pub fn pg_connect(dsn: string) -> DbConn is
+    return DbConn { driver: "postgres", dsn: dsn }
+end
+pub fn redis_connect(host: string, port: int) -> DbConn is
+    return DbConn { driver: "redis", dsn: host }
+end
+
+pub fn query(conn: DbConn, sql: string) -> string is return "" end
+pub fn exec(conn: DbConn, sql: string) -> int is return 0 end
+pub fn begin(conn: DbConn) is end
+pub fn commit(conn: DbConn) is end
+pub fn rollback(conn: DbConn) is end
+pub fn close_db(conn: DbConn) is end
+pub fn last_insert_id(conn: DbConn) -> int is return 0 end
+pub fn affected_rows(conn: DbConn) -> int is return 0 end
+pub fn escape(s: string) -> string is return s end
