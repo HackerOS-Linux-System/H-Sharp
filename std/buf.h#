@@ -1,0 +1,21 @@
+;; H# Standard Library — std -> buf
+;; Dynamiczny bufor bajtów / string builder
+
+struct Buffer is
+    pub data: string
+    pub len:  int
+end
+
+pub fn new_buf() -> Buffer is return Buffer { data: "", len: 0 } end
+pub fn write_buf(b: Buffer, data: string) -> Buffer is
+    return Buffer { data: b.data + data, len: b.len + len(data) }
+end
+pub fn write_byte(b: Buffer, byte: int) -> Buffer is return b end
+pub fn write_int(b: Buffer, n: int) -> Buffer is
+    return Buffer { data: b.data + to_string(n), len: b.len + 8 }
+end
+pub fn to_string_buf(b: Buffer) -> string is return b.data end
+pub fn to_bytes_buf(b: Buffer) -> string is return b.data end
+pub fn reset_buf(b: Buffer) -> Buffer is return new_buf() end
+pub fn capacity(b: Buffer) -> int is return b.len end
+pub fn is_empty_buf(b: Buffer) -> bool is return b.len == 0 end
