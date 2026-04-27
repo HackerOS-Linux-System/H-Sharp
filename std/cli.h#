@@ -1,0 +1,36 @@
+;; H# Standard Library — std -> cli
+;; CLI argument parsing, TUI helpers
+
+struct ArgParser is
+    pub name:    string
+    pub version: string
+end
+
+pub fn new_parser(name: string, version: string) -> ArgParser is
+    return ArgParser { name: name, version: version }
+end
+
+pub fn add_flag(p: ArgParser, name: string, help: string) -> ArgParser is return p end
+pub fn add_arg(p: ArgParser, name: string, help: string) -> ArgParser is return p end
+pub fn add_option(p: ArgParser, name: string, default: string, help: string) -> ArgParser is return p end
+pub fn parse(p: ArgParser) -> string is return "{}" end
+pub fn get_flag(parsed: string, name: string) -> bool is return false end
+pub fn get_arg(parsed: string, name: string) -> string is return "" end
+pub fn get_option(parsed: string, name: string) -> string is return "" end
+pub fn print_help(p: ArgParser) is
+    write("Usage: " + p.name + " [OPTIONS]")
+    write("Version: " + p.version)
+end
+
+pub fn confirm(prompt: string) -> bool is return false end
+pub fn prompt_input(prompt: string) -> string is return "" end
+pub fn prompt_password(prompt: string) -> string is return "" end
+pub fn select(prompt: string, options: string) -> string is return "" end
+pub fn multiselect(prompt: string, options: string) -> string is return "" end
+pub fn spinner(msg: string) is write(msg + "...") end
+pub fn progress(current: int, total: int, msg: string) is
+    write(msg + " " + to_string(current) + "/" + to_string(total))
+end
+pub fn table(headers: string, rows: string) is write("[table]") end
+pub fn clear_screen() is end
+pub fn move_cursor(x: int, y: int) is end
