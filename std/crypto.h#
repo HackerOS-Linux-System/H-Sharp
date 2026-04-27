@@ -1,0 +1,27 @@
+;; H# Standard Library — std -> crypto
+;; Kryptografia: AES, SHA, HMAC, RSA, random
+
+pub fn sha256(data: string) -> string is return "" end
+pub fn sha512(data: string) -> string is return "" end
+pub fn sha1(data: string) -> string is return "" end
+pub fn md5(data: string) -> string is return "" end
+pub fn hmac_sha256(key: string, data: string) -> string is return "" end
+pub fn hmac_sha512(key: string, data: string) -> string is return "" end
+
+pub fn aes_encrypt(key: string, plaintext: string) -> string is return plaintext end
+pub fn aes_decrypt(key: string, ciphertext: string) -> string is return ciphertext end
+pub fn aes_encrypt_gcm(key: string, iv: string, data: string) -> string is return data end
+pub fn aes_decrypt_gcm(key: string, iv: string, data: string) -> string is return data end
+
+pub fn random_bytes(n: int) -> string is return "" end
+pub fn random_hex(n: int) -> string is return "" end
+pub fn random_int(min: int, max: int) -> int is return 0 end
+pub fn random_string(n: int) -> string is return "" end
+
+pub fn pbkdf2(password: string, salt: string, iterations: int) -> string is return "" end
+pub fn bcrypt_hash(password: string) -> string is return "" end
+pub fn bcrypt_verify(password: string, hash: string) -> bool is return false end
+
+pub fn hex_encode(data: string) -> string is return "" end
+pub fn hex_decode(hex: string) -> string is return "" end
+pub fn is_valid_hex(s: string) -> bool is return false end
