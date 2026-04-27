@@ -1,0 +1,21 @@
+;; H# Standard Library — std -> config
+;; Zarządzanie konfiguracją aplikacji (env + file)
+
+struct Config is
+    pub path: string
+end
+
+pub fn load(path: string) -> Config is
+    return Config { path: path }
+end
+pub fn load_env() -> Config is
+    return Config { path: "" }
+end
+pub fn get(c: Config, key: string) -> string is return "" end
+pub fn get_int(c: Config, key: string) -> int is return 0 end
+pub fn get_bool(c: Config, key: string) -> bool is return false end
+pub fn get_or(c: Config, key: string, default: string) -> string is return default end
+pub fn set(c: Config, key: string, val: string) -> Config is return c end
+pub fn save(c: Config) is end
+pub fn has(c: Config, key: string) -> bool is return false end
+pub fn all_keys(c: Config) -> string is return "" end
