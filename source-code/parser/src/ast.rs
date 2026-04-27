@@ -30,34 +30,51 @@ pub enum TypeExpr {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ImportKind {
     /// use "std -> module -> sub" from "alias"
+    /// File lives at /usr/lib/HackerOS/H#/std/<module>.h#
     Std { path: Vec<String>, alias: Option<String> },
+    /// use "core -> runtime" from "alias"
+    /// Built-in — always available, no file on disk needed
+    Core { path: Vec<String>, alias: Option<String> },
     /// use "vira -> pkgname" or "vira -> pkgname/1.2" from "alias"
+    /// Package declared in vira.hk [dependencies]
     Vira { name: String, version: Option<String>, alias: Option<String> },
-    /// use "file -> path/to/lib.h#" from "alias"
-    File { path: String, alias: Option<String> },
-    /// use "lib:static -> file.a" from "alias"
-    LibStatic { path: String, alias: Option<String> },
-    /// use "lib:dynamic -> file.so" from "alias"
-    LibDynamic { path: String, alias: Option<String> },
-    /// use "github.com/user/repo" from "alias"  (Vira Go-style)
-    GitRepo { url: String, alias: Option<String> },
-    /// use "python -> numpy" from "np"  — Python package interop via bytes
+    /// use "github -> libname" from "alias"
+    /// Library details (URL, version) declared in vira.hk or bytes.hk [github] section
+    Github { name: String, alias: Option<String> },
+    /// use "python -> numpy" from "np"
+    /// Python package — installed via pip, bridged through bytes JIT
     Python { name: String, version: Option<String>, alias: Option<String> },
-    /// use "bytes -> pkgname" from "alias"  — Bytes Repository (Bytes-Repository/repository)
+    /// use "bytes -> pkgname" from "alias"
+    /// Package from Bytes-Repository, declared in bytes.hk
     BytesRepo { name: String, version: Option<String>, alias: Option<String> },
+    /// use "mod -> name" from "alias" — explicit module file import (use mod instead)
+    /// Deprecated: use `mod name` syntax instead
+    #[deprecated]
+    ModFile { path: String, alias: Option<String> },
 }
 
 // ─── Literals ─────────────────────────────────────────────────────────────────
+
+/// Part of an interpolated string literal
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InterpPart {
+    Text(String),
+    Expr(Box<Expr>),
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
     Int(i64),
     Float(f64),
-    String(String),
-    Bytes(Vec<u8>),
     Bool(bool),
+    String(String),
+    /// Interpolated string: "Hello ${name}!" 
+    Interpolated(Vec<InterpPart>),
     Nil,
+    Bytes(Vec<u8>),
 }
+
 
 // ─── Patterns ─────────────────────────────────────────────────────────────────
 
@@ -213,15 +230,44 @@ pub struct MatchArm {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ArenaKind {
+    /// Default general-purpose arena (like std::heap.GeneralPurposeAllocator in Zig)
+    General,
+    /// Stack-based fixed buffer — no heap, size known at compile time
+    Fixed,
+    /// Pool allocator — all objects same size, very fast free
+    Pool,
+    /// OS page-granular allocator (mmap/VirtualAlloc)
+    Page,
+    /// Ring/circular buffer allocator — stream processing
+    Ring,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ManualKind {
+    /// Modern manual: typed Box/Arc semantics, drop on scope exit
+    Modern,
+    /// Classic C-like: malloc/free, no automatic cleanup
+    Classic,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnsafeMode {
-    Arena(Option<usize>),   // unsafe arena / unsafe arena(N)
-    Manual,                  // unsafe manual — raw malloc/free
-    Raw,                     // unsafe — no allocator wrapper
+    /// unsafe arena is...end               — GeneralPurposeAllocator (default)
+    /// unsafe arena(fixed) is...end        — FixedBufferAllocator
+    /// unsafe arena(pool) is...end         — MemoryPoolAllocator
+    /// unsafe arena(page) is...end         — PageAllocator
+    /// unsafe arena(ring) is...end         — RingBufferAllocator
+    Arena { kind: ArenaKind, size: Option<usize> },
+    /// unsafe manual is...end              — modern RAII manual
+    /// unsafe manual(classic) is...end     — C-like malloc/free
+    Manual(ManualKind),
+    /// unsafe is...end                     — raw, no allocator overhead
+    Raw,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArenaConfig {
-    pub size: Option<usize>,
     pub mode: UnsafeMode,
 }
 
@@ -255,11 +301,46 @@ pub enum Item {
     ImplBlock(ImplBlock),
     TypeAlias { name: String, ty: TypeExpr, pub_: bool, span: Span },
     Extern(ExternBlock),
+    /// mod name — include file or directory module
+    ModDecl {
+        name:   String,   // module name (= filename without .h#)
+        pub_:   bool,
+        inline: Option<Vec<Item>>,  // Some(items) = inline mod { }, None = external file
+        span:   Span,
+    },
+}
+
+
+/// Attribute — #[name] or #[name(args)] applied to items/exprs
+
+/// Generic type parameter: T, T: Trait, T: Trait + OtherTrait
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeParam {
+    pub name:   String,
+    pub bounds: Vec<String>,  // trait bounds
+    pub span:   Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attribute {
+    pub name: String,
+    pub args: Vec<AttrArg>,
+    pub span: Span,
+}
+
+/// Attribute argument: #[name(key = "value", flag, expr)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AttrArg {
+    Ident(String),                         // #[inline]
+    KeyValue(String, String),              // #[cfg(target = "linux")]
+    Lit(String),                           // #[doc("text")]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FnDef {
-    pub name: String,
+    pub attrs:       Vec<Attribute>,
+    pub type_params: Vec<TypeParam>,
+    pub name:        String,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
     pub body: Vec<Stmt>,
@@ -279,9 +360,10 @@ pub struct Param {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructDef {
-    pub name: String,
+    pub attrs:       Vec<Attribute>,
+    pub type_params: Vec<TypeParam>,
+    pub name:        String,
     pub fields: Vec<StructField>,
-    pub generics: Vec<String>,
     pub pub_: bool,
     pub span: Span,
 }
@@ -296,9 +378,10 @@ pub struct StructField {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnumDef {
-    pub name: String,
+    pub attrs:       Vec<Attribute>,
+    pub type_params: Vec<TypeParam>,
+    pub name:        String,
     pub variants: Vec<EnumVariant>,
-    pub generics: Vec<String>,
     pub pub_: bool,
     pub span: Span,
 }
@@ -319,7 +402,9 @@ pub enum EnumVariantFields {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TraitDef {
-    pub name: String,
+    pub attrs:       Vec<Attribute>,
+    pub type_params: Vec<TypeParam>,
+    pub name:        String,
     pub methods: Vec<TraitMethod>,
     pub pub_: bool,
     pub span: Span,
