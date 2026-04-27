@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> template
+pub fn render(tmpl: string, vars: string) -> string is return "" end
+pub fn load_file(path: string) -> string is return "" end
+pub fn register(name: string, tmpl: string) is end
+pub fn render_named(name: string, vars: string) -> string is return "" end
