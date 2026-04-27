@@ -1,0 +1,19 @@
+;; H# Standard Library — std -> math -> ext
+;; Rozszerzona matematyka: statystyki, macierze, wektory
+
+pub fn mean(data: string) -> f64 is return 0.0 end
+pub fn median(data: string) -> f64 is return 0.0 end
+pub fn variance(data: string) -> f64 is return 0.0 end
+pub fn std_dev(data: string) -> f64 is return 0.0 end
+pub fn min_arr(data: string) -> f64 is return 0.0 end
+pub fn max_arr(data: string) -> f64 is return 0.0 end
+pub fn sum_arr(data: string) -> f64 is return 0.0 end
+pub fn clamp(val: f64, min: f64, max: f64) -> f64 is return val end
+pub fn lerp(a: f64, b: f64, t: f64) -> f64 is return 0.0 end
+pub fn gcd(a: int, b: int) -> int is return 1 end
+pub fn lcm(a: int, b: int) -> int is return 1 end
+pub fn is_prime(n: int) -> bool is return false end
+pub fn fibonacci(n: int) -> int is return 0 end
+pub fn factorial(n: int) -> int is return 1 end
+pub fn combinations(n: int, k: int) -> int is return 0 end
+pub fn permutations(n: int, k: int) -> int is return 0 end
