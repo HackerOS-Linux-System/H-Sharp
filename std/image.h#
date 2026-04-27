@@ -1,0 +1,10 @@
+;; H# Standard Library — std -> image
+pub fn load(path: string) -> string is return "" end
+pub fn save(img: string, path: string) is end
+pub fn width(img: string) -> int is return 0 end
+pub fn height(img: string) -> int is return 0 end
+pub fn resize(img: string, w: int, h: int) -> string is return "" end
+pub fn crop(img: string, x: int, y: int, w: int, h: int) -> string is return "" end
+pub fn to_grayscale(img: string) -> string is return "" end
+pub fn to_base64(img: string) -> string is return "" end
+pub fn from_base64(data: string) -> string is return "" end
