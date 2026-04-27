@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> jwt
+pub fn encode(payload: string, secret: string) -> string is return "" end
+pub fn decode(token: string, secret: string) -> string is return "" end
+pub fn verify(token: string, secret: string) -> bool is return false end
+pub fn get_payload(token: string) -> string is return "" end
