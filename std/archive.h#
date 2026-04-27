@@ -1,0 +1,15 @@
+;; H# Standard Library — std -> archive
+;; Kompresja i archiwa: tar, zip, gzip
+
+pub fn tar_create(output: string, files: string) is end
+pub fn tar_extract(archive: string, dest: string) is end
+pub fn tar_list(archive: string) -> string is return "" end
+
+pub fn zip_create(output: string, dir: string) is end
+pub fn zip_extract(archive: string, dest: string) is end
+pub fn zip_list(archive: string) -> string is return "" end
+
+pub fn gzip_compress(data: string) -> string is return data end
+pub fn gzip_decompress(data: string) -> string is return data end
+pub fn zstd_compress(data: string, level: int) -> string is return data end
+pub fn zstd_decompress(data: string) -> string is return data end
