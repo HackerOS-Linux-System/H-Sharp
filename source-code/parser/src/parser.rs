@@ -207,8 +207,45 @@ impl Parser {
 
     // ── Items ─────────────────────────────────────────────────────────────────
 
+
+    /// Parse zero or more #[attribute] before an item
+    fn parse_attributes(&mut self) -> Vec<Attribute> {
+        let mut attrs = Vec::new();
+        while matches!(self.current().kind, TokenKind::Hash) {
+            let span = self.current().span.clone();
+            self.advance(); // #
+            if !matches!(self.current().kind, TokenKind::LBracket) { break; }
+            self.advance(); // [
+            let (name, _) = self.expect_ident().unwrap_or_else(|_| (String::new(), self.current().span.clone()));
+            let mut args = Vec::new();
+            if matches!(self.current().kind, TokenKind::LParen) {
+                self.advance(); // (
+                while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                    let (k, _) = self.expect_ident().unwrap_or_else(|_| (String::new(), self.current().span.clone()));
+                    if matches!(self.current().kind, TokenKind::Assign) {
+                        self.advance();
+                        let v = if let TokenKind::StringLit(s) = &self.current().kind.clone() {
+                            let s = s.clone(); self.advance(); s
+                        } else { String::new() };
+                        args.push(AttrArg::KeyValue(k, v));
+                    } else {
+                        args.push(AttrArg::Ident(k));
+                    }
+                    if matches!(self.current().kind, TokenKind::Comma) { self.advance(); }
+                }
+                if matches!(self.current().kind, TokenKind::RParen) { self.advance(); }
+            }
+            if matches!(self.current().kind, TokenKind::RBracket) { self.advance(); }
+            let end_span = self.current().span.clone();
+            attrs.push(Attribute { name, args, span: span.merge(&end_span) });
+            self.skip_newlines();
+        }
+        attrs
+    }
+
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         self.skip_newlines();
+        let attrs = self.parse_attributes();
         let pub_ = if matches!(self.current().kind, TokenKind::Pub) {
             self.advance(); true
         } else { false };
@@ -226,6 +263,7 @@ impl Parser {
                 let fn_def = self.parse_fn(pub_)?;
                 Ok(Item::FnDef(FnDef { is_async: true, ..fn_def }))
             }
+            TokenKind::Mod => self.parse_mod_decl(pub_),
             TokenKind::Extern => self.parse_extern_block_inline(),
             _ => Err(self.error(
                 format!("unexpected token `{}` at top level", self.current().text),
@@ -234,7 +272,39 @@ impl Parser {
         }
     }
 
-    fn parse_fn(&mut self, pub_: bool) -> Result<FnDef, ParseError> {
+
+    fn parse_mod_decl(&mut self, pub_: bool) -> Result<Item, ParseError> {
+        let span = self.current().span.clone();
+        self.advance(); // consume 'mod'
+        let (name, _) = self.expect_ident()?;
+
+        // mod name { items... } — inline module
+        // mod name              — external file module
+        if matches!(self.current().kind, TokenKind::Is) {
+            self.advance(); // consume 'is'
+            self.skip_newlines();
+            let mut items = Vec::new();
+            while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
+                self.skip_newlines();
+                if matches!(self.current().kind, TokenKind::End | TokenKind::EOF) { break; }
+                match self.parse_item() {
+                    Ok(item) => items.push(item),
+                    Err(e)   => { self.errors.report(e); self.recover(); }
+                }
+                self.skip_newlines();
+            }
+            self.expect(&TokenKind::End)?;
+            let end_span = self.current().span.clone();
+            Ok(Item::ModDecl { name, pub_, inline: Some(items), span: span.merge(&end_span) })
+        } else {
+            // External file: mod name resolves to name.h# or name/mod.h#
+            let end_span = self.current().span.clone();
+            Ok(Item::ModDecl { name, pub_, inline: None, span: span.merge(&end_span) })
+        }
+    }
+
+    fn parse_fn(&mut self, pub_: bool) -> Result<FnDef, ParseError> { self.parse_fn_with_attrs(pub_, vec![]) }
+    fn parse_fn_with_attrs(&mut self, pub_: bool, attrs: Vec<Attribute>) -> Result<FnDef, ParseError> {
         let start = self.current().span.clone();
         self.advance(); // 'fn'
 
@@ -247,6 +317,8 @@ impl Parser {
         } else { false };
 
         let (name, _) = self.expect_ident()?;
+        // Generic type parameters: fn name<T, U: Trait>
+        let type_params = self.parse_generics_decl()?;
         self.expect(&TokenKind::LParen)?;
         let params = self.parse_params()?;
         self.expect(&TokenKind::RParen)?;
@@ -260,7 +332,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = start.merge(&self.current().span);
 
-        Ok(FnDef { name, params, return_type, body, pub_, is_async: false, is_unsafe, span })
+        Ok(FnDef { attrs, type_params, name, params, return_type, body, pub_, is_async: false, is_unsafe, span })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
@@ -417,7 +489,7 @@ impl Parser {
         let start = self.current().span.clone();
         self.advance(); // 'struct'
         let (name, _) = self.expect_ident()?;
-        let generics = self.parse_generics_decl()?;
+        let type_params = self.parse_generics_decl()?;
         self.skip_newlines();
 
         let mut fields = Vec::new();
@@ -442,14 +514,14 @@ impl Parser {
         }
 
         let span = start.merge(&self.current().span);
-        Ok(StructDef { name, fields, generics, pub_, span })
+        Ok(StructDef { attrs: vec![], type_params, name, fields, pub_, span })
     }
 
     fn parse_enum(&mut self, pub_: bool) -> Result<EnumDef, ParseError> {
         let start = self.current().span.clone();
         self.advance(); // 'enum'
         let (name, _) = self.expect_ident()?;
-        let generics = self.parse_generics_decl()?;
+        let type_params = self.parse_generics_decl()?;
         self.skip_newlines();
 
         let mut variants = Vec::new();
@@ -481,7 +553,7 @@ impl Parser {
         }
 
         let span = start.merge(&self.current().span);
-        Ok(EnumDef { name, variants, generics, pub_, span })
+        Ok(EnumDef { attrs: vec![], type_params, name, variants, pub_, span })
     }
 
     fn parse_trait(&mut self, pub_: bool) -> Result<TraitDef, ParseError> {
@@ -529,7 +601,7 @@ impl Parser {
         }
 
         let span = start.merge(&self.current().span);
-        Ok(TraitDef { name, methods, pub_, span })
+        Ok(TraitDef { attrs: vec![], type_params: vec![], name, methods, pub_, span })
     }
 
     fn parse_impl(&mut self) -> Result<ImplBlock, ParseError> {
@@ -583,18 +655,39 @@ impl Parser {
         Ok(Item::TypeAlias { name, ty, pub_, span })
     }
 
-    fn parse_generics_decl(&mut self) -> Result<Vec<String>, ParseError> {
-        let mut generics = Vec::new();
+    /// Parse generic type parameters: <T>, <T: Trait>, <T: Trait + OtherTrait, U>
+    fn parse_generics_decl(&mut self) -> Result<Vec<TypeParam>, ParseError> {
+        let mut params = Vec::new();
         if matches!(self.current().kind, TokenKind::Lt) {
             self.advance();
             while !matches!(self.current().kind, TokenKind::Gt | TokenKind::EOF) {
-                let (g, _) = self.expect_ident()?;
-                generics.push(g);
+                let span = self.current().span.clone();
+                let (name, _) = self.expect_ident()?;
+                let mut bounds = Vec::new();
+                // Optional trait bounds: T: Trait + OtherTrait
+                if matches!(self.current().kind, TokenKind::Colon) {
+                    self.advance();
+                    loop {
+                        let (bound, _) = self.expect_ident()?;
+                        bounds.push(bound);
+                        if matches!(self.current().kind, TokenKind::Plus) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                params.push(TypeParam { name, bounds, span });
                 if matches!(self.current().kind, TokenKind::Comma) { self.advance(); }
             }
             self.expect(&TokenKind::Gt)?;
         }
-        Ok(generics)
+        Ok(params)
+    }
+
+    /// Legacy: parse generics as simple name list (for backward compat)
+    fn parse_generics_simple(&mut self) -> Result<Vec<String>, ParseError> {
+        Ok(self.parse_generics_decl()?.into_iter().map(|p| p.name).collect())
     }
 
     // ── Types ─────────────────────────────────────────────────────────────────
@@ -841,6 +934,55 @@ impl Parser {
         Ok(lhs)
     }
 
+
+    fn parse_interpolated_string(&self, raw: String, span: Span) -> Expr {
+        // Parse "Hello ${name}, you are ${age} years old!" into InterpParts
+        // Parts: [Text("Hello "), Expr(name), Text(", you are "), Expr(age), Text(" years old!")]
+        let mut parts: Vec<InterpPart> = Vec::new();
+        let mut rest = raw.as_str();
+        
+        while let Some(start_idx) = rest.find("${") {
+            // Text before ${
+            let text = &rest[..start_idx];
+            if !text.is_empty() {
+                parts.push(InterpPart::Text(text.to_string()));
+            }
+            // Find closing }
+            rest = &rest[start_idx + 2..];  // skip ${
+            if let Some(end_idx) = rest.find('}') {
+                let expr_src = rest[..end_idx].trim();
+                // Parse the expression inside ${}
+                // Simple: treat as identifier or simple call
+                let expr = if expr_src.contains('(') {
+                    // function call — too complex for inline, emit as string concat
+                    Expr::Literal(Literal::String(format!("${{{}}}", expr_src)), span.clone())
+                } else {
+                    // Variable reference
+                    Expr::Ident(expr_src.to_string(), span.clone())
+                };
+                parts.push(InterpPart::Expr(Box::new(expr)));
+                rest = &rest[end_idx + 1..];  // skip }
+            } else {
+                // Unterminated ${ — treat as literal
+                parts.push(InterpPart::Text(format!("${{{}", rest)));
+                rest = "";
+                break;
+            }
+        }
+        
+        // Remaining text
+        if !rest.is_empty() {
+            parts.push(InterpPart::Text(rest.to_string()));
+        }
+        
+        if parts.len() == 1 {
+            if let InterpPart::Text(t) = &parts[0] {
+                return Expr::Literal(Literal::String(t.clone()), span);
+            }
+        }
+        Expr::Literal(Literal::Interpolated(parts), span)
+    }
+
     fn parse_closure_expr(&mut self) -> Result<Expr, ParseError> {
         let span = self.current().span.clone();
         self.advance(); // consume first |
@@ -915,7 +1057,12 @@ impl Parser {
                 let s = s.clone();
                 let span = self.current().span.clone();
                 self.advance();
-                Ok(Expr::Literal(Literal::String(s), span))
+                // Check for ${...} string interpolation
+                if s.contains("${") {
+                    Ok(self.parse_interpolated_string(s, span))
+                } else {
+                    Ok(Expr::Literal(Literal::String(s), span))
+                }
             }
             TokenKind::Bool(b) => {
                 let b = *b;
@@ -1042,23 +1189,48 @@ impl Parser {
                 Ok(Expr::Do { body, span: s })
             }
             TokenKind::Unsafe => {
-                self.advance();
-                let arena = if matches!(self.current().kind, TokenKind::Arena) {
-                    self.advance();
-                    let size = if matches!(self.current().kind, TokenKind::LParen) {
-                        self.advance();
-                        if let TokenKind::Integer(n) = &self.current().kind.clone() {
-                            let n = *n as usize;
+                self.advance();  // consume 'unsafe'
+                let arena: Option<ArenaConfig> = if matches!(self.current().kind, TokenKind::Arena) {
+                    self.advance();  // consume 'arena'
+                    // Parse optional arena type: (fixed), (pool), (page), (ring), or (N)
+                    let kind = if matches!(self.current().kind, TokenKind::LParen) {
+                        self.advance();  // consume '('
+                        let k = match &self.current().kind.clone() {
+                            TokenKind::Ident(s) if s == "fixed"   => { self.advance(); ArenaKind::Fixed   }
+                            TokenKind::Ident(s) if s == "pool"    => { self.advance(); ArenaKind::Pool    }
+                            TokenKind::Ident(s) if s == "page"    => { self.advance(); ArenaKind::Page    }
+                            TokenKind::Ident(s) if s == "ring"    => { self.advance(); ArenaKind::Ring    }
+                            TokenKind::Integer(_)                  => ArenaKind::General,  // size follows
+                            _                                      => ArenaKind::General,
+                        };
+                        // Optional size (integer)
+                        let size = if let TokenKind::Integer(n) = self.current().kind.clone() {
                             self.advance();
-                            self.expect(&TokenKind::RParen)?;
-                            Some(n)
-                        } else {
-                            self.expect(&TokenKind::RParen)?;
-                            None
-                        }
-                    } else { None };
-                    Some(ArenaConfig { size, mode: crate::ast::UnsafeMode::Arena(size) })
-                } else { None };
+                            Some(n as usize)
+                        } else { None };
+                        self.expect(&TokenKind::RParen)?;
+                        (k, size)
+                    } else {
+                        (ArenaKind::General, None)
+                    };
+                    Some(ArenaConfig { mode: UnsafeMode::Arena { kind: kind.0, size: kind.1 } })
+                } else if matches!(self.current().kind, TokenKind::Manual) {
+                    self.advance();  // consume 'manual'
+                    // Parse optional manual style: (classic) or nothing = modern
+                    let manual_kind = if matches!(self.current().kind, TokenKind::LParen) {
+                        self.advance();
+                        let k = match &self.current().kind.clone() {
+                            TokenKind::Ident(s) if s == "classic" => { self.advance(); ManualKind::Classic }
+                            _ => ManualKind::Modern,
+                        };
+                        self.expect(&TokenKind::RParen)?;
+                        k
+                    } else { ManualKind::Modern };
+                    Some(ArenaConfig { mode: UnsafeMode::Manual(manual_kind) })
+                } else {
+                    // plain 'unsafe is...end' — raw mode
+                    Some(ArenaConfig { mode: UnsafeMode::Raw })
+                };
                 let body = self.parse_block()?;
                 let s = start.merge(&self.current().span);
                 Ok(Expr::Unsafe(body, arena, s))
@@ -1399,6 +1571,16 @@ fn parse_use_path(path: &str, alias: Option<String>) -> Option<ImportKind> {
             return Some(ImportKind::Std { path: parts, alias });
         }
     }
+    // use "core -> runtime" — built-in modules (memory, runtime, types, etc.)
+    if path.starts_with("core") && path.contains(arrow) {
+        let parts: Vec<String> = path.split(arrow)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "core")
+            .collect();
+        if !parts.is_empty() {
+            return Some(ImportKind::Core { path: parts, alias });
+        }
+    }
     if path.starts_with("vira") && path.contains(arrow) {
         let rest = path.splitn(2, arrow).nth(1)?.trim();
         let (name, ver) = if let Some(idx) = rest.rfind('/') {
@@ -1410,21 +1592,22 @@ fn parse_use_path(path: &str, alias: Option<String>) -> Option<ImportKind> {
         } else { (rest.to_string(), None) };
         return Some(ImportKind::Vira { name, version: ver, alias });
     }
-    if path.starts_with("file") && path.contains(arrow) {
-        let p = path.splitn(2, arrow).nth(1)?.trim().to_string();
-        return Some(ImportKind::File { path: p, alias });
+    // file -> removed: use `mod name` syntax instead
+    // lib:static -> removed (use extern blocks for native libs)
+    // lib:dynamic -> removed (use extern blocks for native libs)
+    // use "github -> libname" from "alias"
+    // Library details in vira.hk or bytes.hk [github] section
+    if path.starts_with("github") && path.contains(arrow) {
+        let name = path.split(arrow).nth(1)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        return Some(ImportKind::Github { name, alias });
     }
-    if path.starts_with("lib:static") && path.contains(arrow) {
-        let p = path.splitn(2, arrow).nth(1)?.trim().to_string();
-        return Some(ImportKind::LibStatic { path: p, alias });
-    }
-    if path.starts_with("lib:dynamic") && path.contains(arrow) {
-        let p = path.splitn(2, arrow).nth(1)?.trim().to_string();
-        return Some(ImportKind::LibDynamic { path: p, alias });
-    }
+
+    // Legacy: github.com/user/repo style (deprecated, redirects to Github)
     // Go-style git repo: github.com/user/repo or gitlab.com/user/repo
     if path.starts_with("github.com/") || path.starts_with("gitlab.com/") || path.starts_with("git.sr.ht/") {
-        return Some(ImportKind::GitRepo { url: path.to_string(), alias });
+        return Some(ImportKind::Github { name: path.to_string(), alias });
     }
     // Backward-compat with old std: syntax
     if let Some(rest) = path.strip_prefix("std:") {
