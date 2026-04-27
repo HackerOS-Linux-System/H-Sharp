@@ -1,0 +1,4 @@
+;; H# Standard Library — std -> crypto -> hex
+pub fn encode(data: string) -> string is return "" end
+pub fn decode(hex: string) -> string is return "" end
+pub fn xor(a: string, b: string) -> string is return a end
