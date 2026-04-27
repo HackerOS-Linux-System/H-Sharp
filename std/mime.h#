@@ -1,0 +1,5 @@
+;; H# Standard Library — std -> mime
+pub fn from_ext(ext: string) -> string is return "" end
+pub fn from_path(path: string) -> string is return "" end
+pub fn is_text(mime: string) -> bool is return false end
+pub fn is_binary(mime: string) -> bool is return false end
