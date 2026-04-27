@@ -122,13 +122,14 @@ impl LlvmCodegen {
                 Item::ImplBlock(imp) => {
                     for method in &imp.methods {
                         fns.push(FnDef {
+                            attrs: vec![], type_params: vec![],
                             name: format!("{}_{}", imp.type_name, method.name),
                                  params: method.params.clone(),
                                  return_type: method.return_type.clone(),
                                  body: method.body.clone(),
                                  pub_: method.pub_,
+                                 is_async: false,
                                  is_unsafe: method.is_unsafe,
-                                 is_async: method.is_async,   // FIXED: added missing field
                                  span: method.span.clone(),
                         });
                     }
@@ -664,41 +665,119 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
 
                        // Closure: placeholder (full implementation v0.3.1)
                        Expr::Closure { .. } => Ok(self.ctx.i64_type().const_zero().into()),
+
+                       // ── Unsafe arena / manual blocks ─────────────────────────────────
+                       Expr::Unsafe(body, arena_cfg, _) => {
+                           use hsharp_parser::ast::{UnsafeMode, ArenaKind, ManualKind};
+                           let i64t = self.ctx.i64_type();
+                           let _ptr = self.ctx.ptr_type(inkwell::AddressSpace::default());
+
+                           match arena_cfg.as_ref().map(|c| &c.mode) {
+                               // General, Pool, Page, Ring: malloc-backed bump arena
+                               Some(UnsafeMode::Arena { kind, size }) => {
+                                   let arena_size = *size.as_ref().unwrap_or(&match kind {
+                                       ArenaKind::Fixed   =>    65_536,
+                                       ArenaKind::Pool    =>     4_096,
+                                       ArenaKind::Page    =>     4_096,
+                                       ArenaKind::Ring    => 1_048_576,
+                                       ArenaKind::General => 1_048_576,
+                                   }) as u64;
+                                   // Allocate arena backing store
+                                   let sz_val = i64t.const_int(arena_size, false);
+                                   let alloc = self.builder.build_call(
+                                       self.builtins.malloc, &[sz_val.into()], "arena_ptr"
+                                   ).unwrap();
+                                   let arena_ptr = self.unwrap_call(alloc);
+                                   // Compile body
+                                   for s in body { self.stmt(s)?; }
+                                   // Free arena (O(1) bulk free)
+                                   self.builder.build_call(
+                                       self.builtins.free, &[arena_ptr.into()], ""
+                                   ).unwrap();
+                                   Ok(i64t.const_zero().into())
+                               }
+                               // Modern RAII manual: track allocs, free on scope exit
+                               Some(UnsafeMode::Manual(ManualKind::Modern)) => {
+                                   let list_sz = i64t.const_int(8 * 1024, false);
+                                   let alloc = self.builder.build_call(
+                                       self.builtins.malloc, &[list_sz.into()], "raii_list"
+                                   ).unwrap();
+                                   let list_ptr = self.unwrap_call(alloc);
+                                   for s in body { self.stmt(s)?; }
+                                   self.builder.build_call(
+                                       self.builtins.free, &[list_ptr.into()], ""
+                                   ).unwrap();
+                                   Ok(i64t.const_zero().into())
+                               }
+                               // Classic C-like: programmer calls malloc/free explicitly
+                               Some(UnsafeMode::Manual(ManualKind::Classic)) | Some(UnsafeMode::Raw) | None => {
+                                   for s in body { self.stmt(s)?; }
+                                   Ok(i64t.const_zero().into())
+                               }
+                           }
+                       }
+
                        _ => Ok(self.ctx.i64_type().const_zero().into()),
                    }
                }
 
-               fn literal(&mut self, lit: &Literal,  hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
-                   Ok(match lit {
+               fn literal(&mut self, lit: &Literal, hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+                   match lit {
                        Literal::Int(n) => {
                            let t = match hint {
                                Some(BasicTypeEnum::IntType(t)) => t,
-                      _ => self.ctx.i64_type(),
+                               _ => self.ctx.i64_type(),
                            };
-                           t.const_int(*n as u64, true).into()
+                           Ok(t.const_int(*n as u64, true).into())
                        }
                        Literal::Float(f) => {
                            let t = match hint {
                                Some(BasicTypeEnum::FloatType(t)) => t,
-                      _ => self.ctx.f64_type(),
+                               _ => self.ctx.f64_type(),
                            };
-                           t.const_float(*f).into()
+                           Ok(t.const_float(*f).into())
                        }
-                       Literal::Bool(b)  => self.ctx.i8_type().const_int(if *b { 1 } else { 0 }, false).into(),
-                      Literal::Nil      => self.ctx.i64_type().const_zero().into(),
-                      Literal::String(s) => {
-                          let ptr = if let Some(&g) = self.str_globals.get(s.as_str()) {
-                              g
-                          } else {
-                              let gs = self.builder.build_global_string_ptr(s, ".str").unwrap();
-                              let p = gs.as_pointer_value();
-                              self.str_globals.insert(s.clone(), p);
-                              p
-                          };
-                          ptr.into()
-                      }
-                      Literal::Bytes(_) => self.ctx.i64_type().const_zero().into(),
-                   })
+                       Literal::Bool(b)  => Ok(self.ctx.i8_type().const_int(if *b { 1 } else { 0 }, false).into()),
+                       Literal::Nil      => Ok(self.ctx.i64_type().const_zero().into()),
+                       Literal::Interpolated(parts) => {
+                           // LLVM: concat interpolated string parts using hsh_strcat
+                           let mut acc: BasicValueEnum = self.builder
+                           .build_global_string_ptr("", ".istart").unwrap()
+                           .as_pointer_value().into();
+                           for part in parts {
+                               let pv: BasicValueEnum = match part {
+                                   hsharp_parser::ast::InterpPart::Text(t) => {
+                                       self.builder.build_global_string_ptr(t.as_str(), ".itext").unwrap()
+                                       .as_pointer_value().into()
+                                   }
+                                   hsharp_parser::ast::InterpPart::Expr(e) => {
+                                       let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                                       let r = self.builder.build_call(
+                                           self.builtins.hsh_int_to_string, &[v.into()], "its"
+                                       ).unwrap();
+                                       self.unwrap_call(r).into()
+                                   }
+                               };
+                               let r = self.builder.build_call(
+                                   self.builtins.hsh_strcat, &[acc.into(), pv.into()], "cat"
+                               ).unwrap();
+                               acc = self.unwrap_call(r).into();
+                           }
+                           Ok(acc)
+                       }
+                       Literal::String(s) => {
+                           let ptr = if let Some(&g) = self.str_globals.get(s.as_str()) {
+                               g
+                           } else {
+                               let gs = self.builder.build_global_string_ptr(s, ".str").unwrap();
+                               let p = gs.as_pointer_value();
+                               self.str_globals.insert(s.clone(), p);
+                               p
+                           };
+                           Ok(ptr.into())
+                       }
+                       Literal::Bytes(_) => Ok(self.ctx.i64_type().const_zero().into()),
+                   }
                }
 
                fn call_fn(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
@@ -753,6 +832,170 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            self.builder.build_unreachable().unwrap();
                            Ok(self.ctx.i64_type().const_zero().into())
                        }
+
+                       // ── String stdlib ───────────────────────────────────────────────
+                       "trim" | "str_trim" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_trim, &[a.into()], "trim").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "to_upper" | "upper" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_to_upper, &[a.into()], "upper").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "to_lower" | "lower" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_to_lower, &[a.into()], "lower").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "contains" | "str_contains" => {
+                           let a = str_arg!(0); let b2 = str_arg!(1);
+                           let r = self.builder.build_call(self.builtins.hsh_str_contains, &[a.into(), b2.into()], "contains").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "starts_with" => {
+                           let a = str_arg!(0); let b2 = str_arg!(1);
+                           let r = self.builder.build_call(self.builtins.hsh_starts_with, &[a.into(), b2.into()], "sw").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "ends_with" => {
+                           let a = str_arg!(0); let b2 = str_arg!(1);
+                           let r = self.builder.build_call(self.builtins.hsh_ends_with, &[a.into(), b2.into()], "ew").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "replace" | "str_replace" => {
+                           let a = str_arg!(0); let f2 = str_arg!(1); let t2 = str_arg!(2);
+                           let r = self.builder.build_call(self.builtins.hsh_str_replace, &[a.into(), f2.into(), t2.into()], "repl").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       // ── Time ────────────────────────────────────────────────────────
+                       "now_unix" | "time_unix" => {
+                           let r = self.builder.build_call(self.builtins.hsh_now_unix, &[], "now_unix").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "now_ms" | "time_ms" => {
+                           let r = self.builder.build_call(self.builtins.hsh_now_ms, &[], "now_ms").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "sleep_ms" => {
+                           let ms = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                           self.builder.build_call(self.builtins.hsh_sleep_ms, &[ms.into()], "").unwrap();
+                           Ok(self.ctx.i64_type().const_zero().into())
+                       }
+                       // ── System ──────────────────────────────────────────────────────
+                       "shell" | "cmd" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_shell, &[a.into()], "shell").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "getpid" | "pid" => {
+                           let r = self.builder.build_call(self.builtins.hsh_getpid, &[], "pid").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "hostname" => {
+                           let r = self.builder.build_call(self.builtins.hsh_hostname, &[], "host").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       // ── Random / Crypto ─────────────────────────────────────────────
+                       "random_hex" => {
+                           let n = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                           let r = self.builder.build_call(self.builtins.hsh_random_hex, &[n.into()], "rhex").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "random_int" => {
+                           let mn = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                           let mx = self.expr(&args[1], Some(self.ctx.i64_type().into()))?;
+                           let r  = self.builder.build_call(self.builtins.hsh_random_int, &[mn.into(), mx.into()], "rint").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "random_string" => {
+                           let n = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                           let r = self.builder.build_call(self.builtins.hsh_random_string, &[n.into()], "rstr").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "new_uuid" => {
+                           let r = self.builder.build_call(self.builtins.hsh_uuid_v4, &[], "uuid").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       // ── Filesystem ──────────────────────────────────────────────────
+                       "fs_read" | "read_file" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_read_file, &[a.into()], "fread").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "fs_write" | "write_file" => {
+                           let p = str_arg!(0); let c2 = str_arg!(1);
+                           let r = self.builder.build_call(self.builtins.hsh_write_file, &[p.into(), c2.into()], "fwrite").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "fs_exists" | "file_exists" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_file_exists, &[a.into()], "fex").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "fs_mkdir_all" | "mkdir_all" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_mkdir_all, &[a.into()], "mkdir").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "file_size_bytes" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_file_size, &[a.into()], "fsz").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "is_dir" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_is_dir, &[a.into()], "isdir").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       // ── ANSI / Terminal ─────────────────────────────────────────────
+                       "bold" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_bold, &[a.into()], "bold").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "green_text" | "green" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_green_text, &[a.into()], "green").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "red_text" | "red" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_red_text, &[a.into()], "red").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "yellow_text" | "yellow" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_yellow_text, &[a.into()], "yel").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "dim_text" | "dim" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_dim_text, &[a.into()], "dim").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "cyan_text" | "cyan" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_cyan_text, &[a.into()], "cyan").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       // ── Network ──────────────────────────────────────────────────────
+                       "scan_port" | "scan_port_net" => {
+                           let host = str_arg!(0);
+                           let port = self.expr(&args[1], Some(self.ctx.i64_type().into()))?;
+                           let tout = if args.len() > 2 {
+                               self.expr(&args[2], Some(self.ctx.i64_type().into()))?
+                           } else { self.ctx.i64_type().const_int(500, false).into() };
+                           let r = self.builder.build_call(self.builtins.hsh_scan_port, &[host.into(), port.into(), tout.into()], "sport").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+                       "dns_resolve" => {
+                           let a = str_arg!(0);
+                           let r = self.builder.build_call(self.builtins.hsh_dns_resolve, &[a.into()], "dns").unwrap();
+                           Ok(self.unwrap_call(r))
+                       }
+
                        _ => {
                            // User function
                            if let Some(&fv) = self.func_vals.get(name) {
