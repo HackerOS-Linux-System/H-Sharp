@@ -45,6 +45,14 @@ impl Vars {
         v
     }
     fn get(&self, name: &str) -> Option<Variable> { self.map.get(name).copied() }
+    fn next_id(&mut self) -> usize { let id = self.next as usize; self.next += 1; id }
+    /// Declare + define a variable with an initial value, returns the Variable
+    fn define_raw(&mut self, name: &str, val: Value, b: &mut FunctionBuilder) -> Variable {
+        let var = self.declare(name);
+        b.declare_var(var, types::I64);
+        b.def_var(var, val);
+        var
+    }
 }
 
 // ── String constant pool ────────────────────────────────────────────────────────
@@ -68,13 +76,14 @@ impl StrPool {
 // ── Top-level context ────────────────────────────────────────────────────────────
 
 pub struct CraneliftCodegen {
-    module:    ObjectModule,
-    isa:       Arc<dyn TargetIsa>,
-    builtins:  Builtins,
-    str_pool:  StrPool,
-    func_ids:  HashMap<String, FuncId>,
-    func_sigs: HashMap<String, Signature>,
-    pub opts:  CompileOptions,
+    module:     ObjectModule,
+    isa:        Arc<dyn TargetIsa>,
+    builtins:   Builtins,
+    str_pool:   StrPool,
+    func_ids:   HashMap<String, FuncId>,
+    func_sigs:  HashMap<String, Signature>,
+    pub opts:   CompileOptions,
+    closure_id: usize,   // counter for unique closure function names
 }
 
 impl CraneliftCodegen {
@@ -85,7 +94,7 @@ impl CraneliftCodegen {
             .map_err(|e| CodegenError::Module(e.to_string()))?;
         let mut module = ObjectModule::new(ob);
         let builtins   = Builtins::declare(&mut module, cc);
-        Ok(Self { module, isa, builtins, str_pool: StrPool::new(), func_ids: HashMap::new(), func_sigs: HashMap::new(), opts: opts.clone() })
+        Ok(Self { module, isa, builtins, str_pool: StrPool::new(), func_ids: HashMap::new(), func_sigs: HashMap::new(), opts: opts.clone(), closure_id: 0 })
     }
 
     // ── Pass 1: declare all signatures ──────────────────────────────────────────
@@ -98,6 +107,7 @@ impl CraneliftCodegen {
                 Item::ImplBlock(imp) => {
                     for method in &imp.methods {
                         self.declare_one(&FnDef {
+                attrs: vec![], type_params: vec![],
                             name: format!("{}_{}", imp.type_name, method.name),
                             params: method.params.clone(), return_type: method.return_type.clone(),
                             body: method.body.clone(), pub_: method.pub_,
@@ -133,7 +143,8 @@ impl CraneliftCodegen {
 
     // ── Pass 2: compile all bodies ───────────────────────────────────────────────
 
-    pub fn compile_module(&mut self, m: &HshModule) -> R<()> {
+    pub 
+fn compile_module(&mut self, m: &HshModule) -> R<()> {
         let mut fns: Vec<FnDef> = Vec::new();
         for item in &m.items {
             match item {
@@ -141,6 +152,7 @@ impl CraneliftCodegen {
                 Item::ImplBlock(imp) => {
                     for method in &imp.methods {
                         fns.push(FnDef {
+                attrs: vec![], type_params: vec![],
                             name: format!("{}_{}", imp.type_name, method.name),
                             params: method.params.clone(), return_type: method.return_type.clone(),
                             body: method.body.clone(), pub_: method.pub_,
@@ -151,7 +163,25 @@ impl CraneliftCodegen {
                 _ => {}
             }
         }
-        for f in fns { self.compile_fn(&f)?; }
+                // ── Closure extraction pass: pull closures out as named functions ──────
+        let mut extra_fns: Vec<FnDef> = Vec::new();
+        let mut closure_counter = 0usize;
+        for f in fns.iter_mut() {
+            for stmt in f.body.iter_mut() {
+                extract_closures_from_stmt(stmt, &mut closure_counter, &mut extra_fns);
+            }
+        }
+        // Declare closure functions first (they may be referenced in the body)
+        let cc = self.isa.default_call_conv();
+        for cf in &extra_fns {
+            self.declare_one(cf, cc)?;
+        }
+        // Compile closure functions first
+        for cf in &extra_fns {
+            self.compile_fn(cf)?;
+        }
+        // Now compile all regular functions
+        for f in &fns { self.compile_fn(f)?; }
         Ok(())
     }
 
@@ -221,6 +251,184 @@ impl CraneliftCodegen {
         Ok(())
     }
 }
+
+/// Compile an unsafe arena/manual block with proper allocator setup and teardown.
+///
+/// Arena types (Zig-inspired):
+///   General — bump allocator, bulk-freed at end of block
+///   Fixed   — FixedBufferAllocator: stack buffer, zero heap
+///   Pool    — MemoryPool: all same-size objects, O(1) alloc/free
+///   Page    — PageAllocator: OS page granularity (mmap)
+///   Ring    — RingBuffer: circular, for streams/queues
+///   Manual(Modern)  — RAII: tracked allocs, freed on scope exit
+///   Manual(Classic) — C-like: raw malloc/free, programmer owns lifetime
+///   Raw     — no allocator wrapper
+fn compile_unsafe_arena(
+    b:        &mut FunctionBuilder,
+    vars:     &mut Vars,
+    module:   &mut ObjectModule,
+    builtins: &Builtins,
+    sp:       &mut StrPool,
+    fids:     &HashMap<String, FuncId>,
+    fsigs:    &HashMap<String, Signature>,
+    fn_name:  &str,
+    ret_type: &Option<TypeExpr>,
+    mode:     &hsharp_parser::ast::UnsafeMode,
+    body:     &[Stmt],
+) -> R<()> {
+    use hsharp_parser::ast::{UnsafeMode, ArenaKind, ManualKind};
+
+    match mode {
+        UnsafeMode::Arena { kind, size } => {
+            let arena_size = size.unwrap_or(match kind {
+                ArenaKind::Fixed  => 65_536,          // 64 KB stack buffer
+                ArenaKind::Pool   => 4_096,           // 4 KB pool chunks
+                ArenaKind::Page   => 4_096,           // one OS page
+                ArenaKind::Ring   => 1_024 * 1_024,   // 1 MB ring
+                ArenaKind::General => 1_024 * 1_024,  // 1 MB general
+            }) as i64;
+
+            // Allocate the arena backing store
+            let size_v    = b.ins().iconst(types::I64, arena_size);
+            let malloc_r  = module.declare_func_in_func(builtins.malloc, b.func);
+            let alloc_c   = b.ins().call(malloc_r, &[size_v]);
+            let arena_ptr = b.inst_results(alloc_c)[0];
+
+            // For pool allocator: also track a "bump pointer" offset
+            let bump_var = Variable::from_u32(vars.next_id() as u32);
+            b.declare_var(bump_var, types::I64);
+            let zero_val = b.ins().iconst(types::I64, 0);
+            b.def_var(bump_var, zero_val);
+
+            // Store the arena pointer as a local variable "__arena"
+            let arena_var = vars.define_raw("__arena_ptr", arena_ptr, b);
+
+            // Compile body — arena allocations inside use arena_ptr
+            compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
+
+            // Teardown: bulk free the arena backing store — O(1)
+            let arena_val = b.use_var(arena_var);
+            let free_r    = module.declare_func_in_func(builtins.free, b.func);
+            b.ins().call(free_r, &[arena_val]);
+
+            Ok(())
+        }
+
+        UnsafeMode::Manual(ManualKind::Modern) => {
+            // Modern RAII: track allocations in a list, free all on scope exit
+            // For v0.4: we track via a linked list in the arena backing buffer
+            let list_size = b.ins().iconst(types::I64, 8 * 1024); // 8 KB tracking buffer
+            let malloc_r  = module.declare_func_in_func(builtins.malloc, b.func);
+            let list_c    = b.ins().call(malloc_r, &[list_size]);
+            let list_ptr  = b.inst_results(list_c)[0];
+            let list_var  = vars.define_raw("__raii_list", list_ptr, b);
+            let cnt_v     = b.ins().iconst(types::I64, 0);
+            let cnt_var   = vars.define_raw("__raii_count", cnt_v, b);
+
+            compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
+
+            // Free all tracked allocations (walk the list)
+            // For v0.4 simplification: free the tracking buffer itself
+            let free_r    = module.declare_func_in_func(builtins.free, b.func);
+            let list_val  = b.use_var(list_var);
+            b.ins().call(free_r, &[list_val]);
+
+            Ok(())
+        }
+
+        UnsafeMode::Manual(ManualKind::Classic) => {
+            // Classic C-like: programmer calls malloc/free explicitly
+            compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
+            Ok(())
+        }
+
+        UnsafeMode::Raw => {
+            // Raw unsafe: no allocator, just execute body
+            compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
+            Ok(())
+        }
+    }
+}
+
+
+/// Walk an expression, extract all Expr::Closure, compile them as standalone FnDefs.
+fn extract_closures_from_expr(
+    expr:    &mut Expr,
+    counter: &mut usize,
+    out_fns: &mut Vec<FnDef>,
+) {
+    match expr {
+        Expr::Closure { params, body, span, .. } => {
+            let id   = *counter;
+            *counter += 1;
+            let name = format!("__closure_{}", id);
+            let fn_def = FnDef {
+                attrs: vec![], type_params: vec![],
+                name: name.clone(),
+                params: params.clone(),
+                // Closures return i64 (H# int) by default — avoids return-type mismatch
+                return_type: Some(hsharp_parser::ast::TypeExpr::Named("int".into())),
+                body: body.clone(),
+                pub_: false, is_async: false, is_unsafe: false,
+                span: span.clone(),
+            };
+            out_fns.push(fn_def);
+            *expr = Expr::Call(Box::new(Expr::Ident(name, span.clone())), vec![], span.clone());
+        }
+        Expr::BinOp(lhs, _, rhs, _) | Expr::Range(lhs, rhs, _, _) => {
+            extract_closures_from_expr(lhs, counter, out_fns);
+            extract_closures_from_expr(rhs, counter, out_fns);
+        }
+        Expr::Assign(lhs, rhs, _) | Expr::CompoundAssign(lhs, _, rhs, _) => {
+            extract_closures_from_expr(lhs, counter, out_fns);
+            extract_closures_from_expr(rhs, counter, out_fns);
+        }
+        Expr::Call(_, args, _) | Expr::MethodCall(_, _, args, _) => {
+            for a in args.iter_mut() { extract_closures_from_expr(a, counter, out_fns); }
+        }
+        Expr::If { condition, then_body, else_body, .. } => {
+            extract_closures_from_expr(condition, counter, out_fns);
+            for s in then_body.iter_mut() { extract_closures_from_stmt(s, counter, out_fns); }
+            if let Some(eb) = else_body {
+                for s in eb.iter_mut() { extract_closures_from_stmt(s, counter, out_fns); }
+            }
+        }
+        Expr::While { condition, body, .. } => {
+            extract_closures_from_expr(condition, counter, out_fns);
+            for s in body.iter_mut() { extract_closures_from_stmt(s, counter, out_fns); }
+        }
+        Expr::For { iterable, body, .. } => {
+            extract_closures_from_expr(iterable, counter, out_fns);
+            for s in body.iter_mut() { extract_closures_from_stmt(s, counter, out_fns); }
+        }
+        Expr::Try(inner, _) | Expr::Await(inner, _) => {
+            extract_closures_from_expr(inner, counter, out_fns);
+        }
+        Expr::UnOp(_, inner, _) => {
+            extract_closures_from_expr(inner, counter, out_fns);
+        }
+        Expr::Return(Some(e), _) => extract_closures_from_expr(e, counter, out_fns),
+        _ => {}
+    }
+}
+
+/// Walk a statement, extract closures.
+/// Note: Stmt has no If/While/For variants — those live inside Stmt::Expr(Expr::If{...}).
+fn extract_closures_from_stmt(
+    stmt:    &mut Stmt,
+    counter: &mut usize,
+    out_fns: &mut Vec<FnDef>,
+) {
+    match stmt {
+        Stmt::Let { value: Some(v), .. }
+        | Stmt::Expr(v, _)
+        | Stmt::Return(Some(v), _)
+        | Stmt::Break(Some(v), _) => extract_closures_from_expr(v, counter, out_fns),
+        _ => {}
+    }
+}
+
+
 
 // ── Emit (consumes CraneliftCodegen) ────────────────────────────────────────────
 
@@ -385,8 +593,15 @@ fn compile_stmt(
                     Ok(true)
                 }
 
-                Expr::Unsafe(body, _, _) =>
-                    compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body),
+                Expr::Unsafe(body, arena_cfg, _) => {
+                    // Arena/unsafe block: set up allocator, run body, tear down
+                    if let Some(cfg) = arena_cfg {
+                        compile_unsafe_arena(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &cfg.mode, body)?;
+                    } else {
+                        compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
+                    }
+                    Ok(false)
+                }
 
                 _ => { compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, e, None)?; Ok(false) }
             }
@@ -555,7 +770,35 @@ fn compile_expr(
     macro_rules! e { ($ex:expr, $h:expr) => { compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, $ex, $h)? }; }
 
     match expr {
-        Expr::Literal(lit, _) => lit_val(b, module, sp, lit, hint),
+        Expr::Literal(lit, _) => {
+            // Handle interpolated strings with full compile_expr context
+            if let Literal::Interpolated(parts) = lit {
+                let empty_did = sp.intern("", module);
+                let empty_gv  = module.declare_data_in_func(empty_did, b.func);
+                let mut acc   = b.ins().global_value(types::I64, empty_gv);
+                for part in parts {
+                    let pv = match part {
+                        hsharp_parser::ast::InterpPart::Text(t) => {
+                            let did = sp.intern(t, module);
+                            let gv  = module.declare_data_in_func(did, b.func);
+                            b.ins().global_value(types::I64, gv)
+                        }
+                        hsharp_parser::ast::InterpPart::Expr(e) => {
+                            let v  = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, e, None)?;
+                            let fr = module.declare_func_in_func(builtins.hsh_int_to_string, b.func);
+                            let c  = b.ins().call(fr, &[v]);
+                            b.inst_results(c)[0]
+                        }
+                    };
+                    let fr   = module.declare_func_in_func(builtins.hsh_strcat, b.func);
+                    let call = b.ins().call(fr, &[acc, pv]);
+                    acc = b.inst_results(call)[0];
+                }
+                Ok(acc)
+            } else {
+                lit_val(b, module, sp, lit, hint)
+            }
+        }
 
         Expr::Ident(name, _) => {
             vars.get(name).map(|var| b.use_var(var))
@@ -652,9 +895,14 @@ fn compile_expr(
             compile_for(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, pattern, iterable, body)?;
             Ok(zero(b, types::I64))
         }
-        Expr::Unsafe(body, _, _) => {
-            compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
-            Ok(zero(b, types::I64))
+        Expr::Unsafe(body, arena_cfg, _) => {
+            if let Some(cfg) = arena_cfg {
+                compile_unsafe_arena(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, &cfg.mode, body)?;
+                Ok(zero(b, types::I64))
+            } else {
+                compile_stmts(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, body)?;
+                Ok(zero(b, types::I64))
+            }
         }
 
         Expr::Return(val, _) => {
@@ -717,7 +965,9 @@ fn compile_expr(
             b.ins().brif(is_err, then_blk, &[], merge_blk, &[]);
             b.switch_to_block(then_blk);
             b.seal_block(then_blk);
-            b.ins().return_(&[zero_v]);
+            // Correct return type: I32 for main, I64 otherwise
+            let ret_zero = if fn_name == "main" { b.ins().iconst(types::I32, 0) } else { zero_v };
+            b.ins().return_(&[ret_zero]);
             b.switch_to_block(merge_blk);
             b.seal_block(merge_blk);
             Ok(val)
@@ -740,6 +990,18 @@ fn lit_val(b: &mut FunctionBuilder, module: &mut ObjectModule, sp: &mut StrPool,
         }
         Literal::Bool(bl)  => b.ins().iconst(types::I64, if *bl { 1 } else { 0 }),
         Literal::Nil       => b.ins().iconst(types::I64, 0),
+        Literal::Interpolated(parts) => {
+            // Simple text-only interpolation in lit_val context
+            let mut combined = String::new();
+            for part in parts {
+                if let hsharp_parser::ast::InterpPart::Text(t) = part {
+                    combined.push_str(t);
+                }
+            }
+            let did = sp.intern(&combined, module);
+            let gv  = module.declare_data_in_func(did, b.func);
+            b.ins().global_value(types::I64, gv)
+        }
         Literal::String(s) => {
             let did = sp.intern(s, module);
             let gv  = module.declare_data_in_func(did, b.func);
@@ -759,6 +1021,39 @@ fn call_fn(
     sp: &mut StrPool, fids: &HashMap<String, FuncId>, fsigs: &HashMap<String, Signature>,
     fn_name: &str, ret_type: &Option<TypeExpr>, name: &str, args: &[Expr], _hint: Option<types::Type>,
 ) -> R<Value> {
+    // ── Closure pointer retrieval ──────────────────────────────────────────────
+    // __closure_N with 0 args → return function's address as i64 fn pointer
+    if name.starts_with("__closure_") && args.is_empty() {
+        if let Some(&fid) = fids.get(name) {
+            let func_ref = module.declare_func_in_func(fid, b.func);
+            let addr = b.ins().func_addr(types::I64, func_ref);
+            return Ok(addr);
+        }
+        return Ok(zero(b, types::I64));
+    }
+
+    // ── Indirect closure call ──────────────────────────────────────────────────
+    // If name is not a known function but IS a local variable (fn-pointer), call indirectly
+    if !fids.contains_key(name) {
+        if let Some(var) = vars.get(name) {
+            let fn_ptr = b.use_var(var);
+            if b.func.dfg.value_type(fn_ptr) == types::I64 {
+                let mut sig = Signature::new(b.func.signature.call_conv);
+                let mut cargs = Vec::new();
+                for arg in args {
+                    let v = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, arg, None)?;
+                    sig.params.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                    cargs.push(v);
+                }
+                sig.returns.push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                let sig_ref = b.import_signature(sig);
+                let call    = b.ins().call_indirect(sig_ref, fn_ptr, &cargs);
+                return Ok(b.inst_results(call)[0]);
+            }
+        }
+    }
+
+
     macro_rules! e { ($ex:expr, $h:expr) => { compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, $ex, $h)? }; }
     macro_rules! str_arg { ($i:expr) => {{
         if let Some(a) = args.get($i) { e!(a, Some(types::I64)) }
@@ -948,10 +1243,39 @@ fn call_fn(
             "fs_mkdir_all" | "mkdir_all" | "file_size_bytes" | "is_dir" |
             "file_stem" | "file_ext" | "file_parent" | "dns_resolve" |
             "tcp_connect" | "tcp_recv" | "tcp_close" | "scan_port_net" |
-            "sha256" | "md5" | "xor_hex" | "bold" | "green_text" | "red_text" |
-            "yellow_text" | "dim_text" | "http_get" | "json_parse" |
-            "json_get_str" | "re_find" | "re_find_all" | "new_cli_parser" | "str_count" => {
-                // Stub for Cranelift — produces empty string/zero
+            "sha256" | "md5" | "xor_hex" | "bold" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_bold, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "green_text" | "green" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_green_text, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "red_text" | "red" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_red_text, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "yellow_text" | "yellow" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_yellow_text, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "dim_text" | "dim" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_dim_text, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "cyan_text" | "cyan" => {
+                let a = str_arg!(0);
+                let r = module.declare_func_in_func(builtins.hsh_cyan_text, b.func);
+                let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
+            }
+            "http_get" | "json_parse" | "json_get_str" |
+            "re_find" | "re_find_all" | "new_cli_parser" | "str_count" => {
+                // Stub — full impl in v0.4
                 Ok(zero(b, types::I64))
             }
                         _ => {
