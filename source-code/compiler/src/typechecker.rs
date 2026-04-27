@@ -211,15 +211,21 @@ impl TypeChecker {
     pub fn check_module(&mut self, module: &Module) -> Result<(), TypeError> {
         // Check std imports exist on disk
         for (import_kind, _alias, _span) in &module.imports {
-            if let hsharp_parser::ast::ImportKind::Std { path, .. } = import_kind {
-                let lib = path.last().cloned().unwrap_or_default();
-                let std_path = format!("/usr/lib/HackerOS/H#/std/{}.h#", lib);
-                if !std::path::Path::new(&std_path).exists() {
-                    return Err(TypeError::StdNotFound(format!(
-                        "std -> {}\n  Expected: {}\n  Install: hacker unpack h# (or: sudo cp std-h#/*.h# /usr/lib/HackerOS/H#/std/)",
-                        path.join(" -> "), std_path
-                    )));
+            match import_kind {
+                hsharp_parser::ast::ImportKind::Std { path, .. } => {
+                    let lib = path.last().cloned().unwrap_or_default();
+                    let std_path = format!("/usr/lib/HackerOS/H#/std/{}.h#", lib);
+                    if !std::path::Path::new(&std_path).exists() {
+                        return Err(TypeError::StdNotFound(format!(
+                            "std -> {}\n  Expected: {}\n  Install: hacker unpack h# (or: sudo cp std-h#/*.h# /usr/lib/HackerOS/H#/std/)",
+                            path.join(" -> "), std_path
+                        )));
+                    }
                 }
+                hsharp_parser::ast::ImportKind::Core { .. } => {
+                    // core -> * is always available — built into the compiler
+                }
+                _ => {}
             }
         }
         // First pass: collect fn signatures
@@ -318,6 +324,10 @@ impl TypeChecker {
                 Literal::Bool(_) => HType::Bool,
                 Literal::Nil => HType::Optional(Box::new(HType::Any)),
                 Literal::Bytes(_) => HType::Bytes,
+                Literal::Interpolated(parts) => {
+                    let _ = parts;
+                    HType::Str
+                }
             },
             Expr::Ident(name, _) => {
                 if let Some(v) = self.lookup(name) {
