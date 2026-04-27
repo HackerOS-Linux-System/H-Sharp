@@ -13,10 +13,21 @@ pub enum Value {
     Array(Vec<Value>),
     Tuple(Vec<Value>),
     Struct { name: String, fields: HashMap<String, Value> },
-    Fn { name: String, params: Vec<Param>, body: Vec<Stmt>, env: Env },
+    Fn { name: String, params: Vec<Param>, body: Vec<Stmt>, env: Env, is_async: bool },
     Return(Box<Value>),
     Break,
     Continue,
+    /// Async task — result of calling an async fn
+    /// Contains the resolved value (computed eagerly in v0.4)
+    /// Real coroutine scheduling in v0.5
+    AsyncTask(Box<AsyncTaskState>),
+}
+
+/// State of an async task
+#[derive(Debug, Clone)]
+pub enum AsyncTaskState {
+    Ready(Value),
+    Pending { fn_name: String, args: Vec<Value> },
 }
 
 impl fmt::Display for Value {
@@ -27,6 +38,10 @@ impl fmt::Display for Value {
             Value::Bool(b)   => write!(f, "{}", b),
             Value::Str(s)    => write!(f, "{}", s),
             Value::Nil       => write!(f, "nil"),
+            Value::AsyncTask(t) => match t.as_ref() {
+                AsyncTaskState::Ready(v) => write!(f, "{}", v),
+                AsyncTaskState::Pending { fn_name, .. } => write!(f, "<async:{}>", fn_name),
+            },
             Value::Array(a)  => write!(f, "[{}]", a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")),
             Value::Tuple(t)  => write!(f, "({})", t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")),
             Value::Bytes(b)  => write!(f, "<bytes len={}>", b.len()),
@@ -74,6 +89,9 @@ impl Value {
 
 impl Value {
     fn is_truthy(&self) -> bool {
+        if let Value::AsyncTask(t) = self {
+            if let AsyncTaskState::Ready(v) = t.as_ref() { return v.is_truthy(); }
+        }
         match self {
             Value::Bool(b) => *b,
             Value::Nil => false,
@@ -320,11 +338,35 @@ impl Interpreter {
                         self.assign_lhs(lhs, result)?;
                         Ok(None)
                     }
-                    Expr::Unsafe(body, _, _) => {
+                    Expr::Unsafe(body, arena_cfg, _) => {
+                        use hsharp_parser::ast::{UnsafeMode, ArenaKind, ManualKind};
+                        // Describe arena type in scope (for debug/tooling)
+                        let arena_name = match arena_cfg.as_ref().map(|c| &c.mode) {
+                            Some(UnsafeMode::Arena { kind, size }) => {
+                                let k = match kind {
+                                    ArenaKind::General => "general",
+                                    ArenaKind::Fixed   => "fixed",
+                                    ArenaKind::Pool    => "pool",
+                                    ArenaKind::Page    => "page",
+                                    ArenaKind::Ring    => "ring",
+                                };
+                                format!("arena({})", k)
+                            }
+                            Some(UnsafeMode::Manual(ManualKind::Modern))  => "manual".to_string(),
+                            Some(UnsafeMode::Manual(ManualKind::Classic)) => "manual(classic)".to_string(),
+                            Some(UnsafeMode::Raw) | None                  => "raw".to_string(),
+                        };
                         self.env.push();
+                        // Expose __arena_kind in scope for introspection
+                        self.env.define(&format!("__unsafe_{}", arena_name), Value::Str(arena_name.clone()), false);
                         let r = self.exec_block(body)?;
                         self.env.pop();
-                        Ok(r)
+                        // Only propagate explicit returns, not block values
+                        // (otherwise outer block exits early after arena block)
+                        match r {
+                            Some(Value::Return(_)) => Ok(r),
+                            _ => Ok(None),
+                        }
                     }
                     _ => {
                         self.eval_expr(expr)?;
@@ -343,12 +385,36 @@ impl Interpreter {
     #[allow(unreachable_patterns)]
 fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
         match expr {
+            // String interpolation: evaluate ALL parts (text + expressions)
+            Expr::Literal(Literal::Interpolated(parts), _) => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        hsharp_parser::ast::InterpPart::Text(t) => result.push_str(t),
+                        hsharp_parser::ast::InterpPart::Expr(e) => {
+                            let v = self.eval_expr(e)?;
+                            result.push_str(&v.to_string());
+                        }
+                    }
+                }
+                return Ok(Value::Str(result));
+            }
             Expr::Literal(lit, _) => Ok(match lit {
                 Literal::Int(n) => Value::Int(*n),
                 Literal::Float(f) => Value::Float(*f),
                 Literal::String(s) => Value::Str(s.clone()),
                 Literal::Bool(b) => Value::Bool(*b),
                 Literal::Nil => Value::Nil,
+                Literal::Interpolated(parts) => {
+                    let mut r = String::new();
+                    for p in parts {
+                        match p {
+                            hsharp_parser::ast::InterpPart::Text(t) => r.push_str(t),
+                            hsharp_parser::ast::InterpPart::Expr(_) => {},
+                        }
+                    }
+                    Value::Str(r)
+                }
                 Literal::Bytes(b) => Value::Bytes(b.clone()),
             }),
             Expr::Ident(name, _) => {
@@ -361,6 +427,7 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                         params: f.params.clone(),
                         body: f.body.clone(),
                         env: self.env.clone(),
+                        is_async: f.is_async,
                     })
                 } else {
                     Err(RuntimeError::UndefinedVar(name.clone()))
@@ -543,7 +610,31 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 self.env.get("self").cloned()
                     .ok_or_else(|| RuntimeError::UndefinedVar("self".into()))
             }
-            _ => Ok(Value::Nil),
+            Expr::Unsafe(body, arena_cfg, _) => {
+                use hsharp_parser::ast::{UnsafeMode, ArenaKind, ManualKind};
+                self.env.push();
+                let r = self.exec_block(body)?;
+                self.env.pop();
+                Ok(match r {
+                    Some(Value::Return(v)) => *v,
+                    Some(v) => v,
+                    None => Value::Nil,
+                })
+            }
+            // await expr — resolve AsyncTask
+            Expr::Await(inner, _) => {
+                let task_val = self.eval_expr(inner)?;
+                match task_val {
+                    Value::AsyncTask(t) => match *t {
+                        AsyncTaskState::Ready(v) => Ok(v),
+                        AsyncTaskState::Pending { fn_name, ref args } => {
+                            self.call_fn(&fn_name, args.clone())
+                        }
+                    },
+                    other => Ok(other),
+                }
+            }
+                        _ => Ok(Value::Nil),
         }
     }
 
@@ -797,11 +888,16 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
             }
             let result = self.exec_block(&f.body)?;
             self.env.pop();
-            return Ok(match result {
+            let resolved = match result {
                 Some(Value::Return(v)) => *v,
                 Some(v) => v,
                 None => Value::Nil,
-            });
+            };
+            // If function is async, wrap in AsyncTask::Ready
+            if f.is_async {
+                return Ok(Value::AsyncTask(Box::new(AsyncTaskState::Ready(resolved))));
+            }
+            return Ok(resolved);
         }
         // Unknown function — return Nil (or could return error)
         Ok(Value::Nil)
