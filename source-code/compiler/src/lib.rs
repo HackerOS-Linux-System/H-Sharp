@@ -1,3 +1,6 @@
+pub mod modules;
+pub mod traits;
+pub mod mono;
 pub mod cranelift_codegen;
 pub mod runtime;
 pub mod target;
@@ -74,7 +77,28 @@ fn compile_cranelift(module: &Module, opts: &CompileOptions) -> Result<(), Compi
         .map_err(CompileError::Cranelift)?;
 
     cg.declare_functions(module).map_err(CompileError::Cranelift)?;
-    cg.compile_module(module).map_err(CompileError::Cranelift)?;
+    // Pass 1: trait registration
+    let mut trait_registry = crate::traits::TraitRegistry::new();
+    for item in &module.items {
+        match item {
+            hsharp_parser::ast::Item::TraitDef(t) => trait_registry.register_trait(t),
+            hsharp_parser::ast::Item::ImplBlock(b) => trait_registry.register_impl(b),
+            _ => {}
+        }
+    }
+    // Collect all trait impl functions and add them to module for codegen
+    let mut expanded_items = module.items.clone();
+    for fn_def in trait_registry.emit_fns() {
+        expanded_items.push(hsharp_parser::ast::Item::FnDef(fn_def.clone()));
+    }
+    let expanded_module = hsharp_parser::ast::Module {
+        file:       module.file.clone(),
+        directives: module.directives.clone(),
+        imports:    module.imports.clone(),
+        items:      expanded_items,
+    };
+
+    cg.compile_module(&expanded_module).map_err(CompileError::Cranelift)?;
     cranelift_codegen::emit_module(cg, &opts.output).map_err(CompileError::Cranelift)?;
     Ok(())
 }
