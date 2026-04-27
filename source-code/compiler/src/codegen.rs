@@ -266,7 +266,10 @@ static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
                     }
                     Expr::Unsafe(body, arena, _) => {
                         if let Some(arena_cfg) = arena {
-                            let size = arena_cfg.size.unwrap_or(1024 * 1024);
+                            let size = match &arena_cfg.mode {
+                        hsharp_parser::ast::UnsafeMode::Arena { size, .. } => size.unwrap_or(1024 * 1024),
+                        _ => 1024 * 1024,
+                    };
                             writeln!(self.body, "{}{{ HshArena* __arena = hsh_arena_new({});", indent, size).ok();
                             for s in body { self.emit_stmt(s, depth + 1)?; }
                             writeln!(self.body, "{}    hsh_arena_free(__arena); }}", indent).ok();
@@ -392,16 +395,18 @@ static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
             Pattern::Literal(lit, _) => match lit {
                 Literal::Int(n) => format!("{} == {}", subject, n),
                 Literal::Bool(b) => format!("{} == {}", subject, if *b { "true" } else { "false" }),
-                Literal::String(s) => format!("strcmp({}, \"{}\") == 0", subject, s.replace('"', "\\\"")),
-                Literal::Nil => format!("{} == NULL", subject),
+                Literal::String(s) => {
+                    let escaped = s.replace("\\", "\\\\").replace("\"", "\\\"");
+                    format!("strcmp({}, \"{}\") == 0", subject, escaped)
+                }
+                Literal::Nil => format!("{} == 0", subject),
+                Literal::Interpolated(_) => "1".to_string(),
                 _ => "1".to_string(),
             },
-            Pattern::Or(pats, _) => pats.iter()
-                .map(|p| format!("({})", self.pattern_condition(subject, p)))
-                .collect::<Vec<_>>().join(" || "),
             _ => "1".to_string(),
         }
     }
+
 
     fn emit_pattern_bindings(&mut self, subject: &str, pat: &Pattern, depth: usize) {
         let indent = "    ".repeat(depth);
@@ -419,6 +424,12 @@ static hsh_string hsh_any_to_string(hsh_int n) { return hsh_int_to_string(n); }
                 Literal::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
                 Literal::Nil => "NULL".to_string(),
                 Literal::Bytes(_) => "NULL /* bytes */".to_string(),
+                Literal::Interpolated(parts) => {
+                    let t: String = parts.iter().filter_map(|p| {
+                        if let hsharp_parser::ast::InterpPart::Text(s) = p { Some(s.as_str()) } else { None }
+                    }).collect();
+                    format!("\"{}\"", t)
+                }
             },
             Expr::Ident(name, _) => name.clone(),
             Expr::SelfExpr(_) => "self".to_string(),
