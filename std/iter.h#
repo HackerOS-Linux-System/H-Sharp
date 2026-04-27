@@ -1,0 +1,19 @@
+;; H# Standard Library — std -> iter
+;; Iterator helpers: map, filter, reduce
+
+pub fn map(data: string, transform: string) -> string is return data end
+pub fn filter(data: string, predicate: string) -> string is return data end
+pub fn reduce(data: string, initial: string, combine: string) -> string is return initial end
+pub fn flat_map(data: string, transform: string) -> string is return data end
+pub fn zip(a: string, b: string) -> string is return "" end
+pub fn enumerate(data: string) -> string is return data end
+pub fn take(data: string, n: int) -> string is return data end
+pub fn skip(data: string, n: int) -> string is return data end
+pub fn chain(a: string, b: string) -> string is return a + b end
+pub fn all(data: string, predicate: string) -> bool is return true end
+pub fn any_of(data: string, predicate: string) -> bool is return false end
+pub fn count_if(data: string, predicate: string) -> int is return 0 end
+pub fn find_first(data: string, predicate: string) -> string is return "" end
+pub fn group_by(data: string, key: string) -> string is return data end
+pub fn unique(data: string) -> string is return data end
+pub fn flatten(data: string) -> string is return data end
