@@ -1,0 +1,19 @@
+;; H# Standard Library — std -> io -> file
+;; Zaawansowane operacje na plikach
+
+pub fn open_read(path: string) -> int is return 0 end
+pub fn open_write(path: string) -> int is return 0 end
+pub fn open_append(path: string) -> int is return 0 end
+pub fn read_all(fd: int) -> string is return "" end
+pub fn read_line(fd: int) -> string is return "" end
+pub fn read_bytes_fd(fd: int, n: int) -> string is return "" end
+pub fn write_fd(fd: int, data: string) is end
+pub fn write_line_fd(fd: int, data: string) is end
+pub fn close_fd(fd: int) is end
+pub fn seek(fd: int, pos: int) is end
+pub fn tell(fd: int) -> int is return 0 end
+pub fn flush_fd(fd: int) is end
+pub fn is_eof(fd: int) -> bool is return true end
+pub fn file_size(path: string) -> int is return 0 end
+pub fn chmod(path: string, mode: int) is end
+pub fn chown(path: string, uid: int, gid: int) is end
