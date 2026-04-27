@@ -1,0 +1,23 @@
+;; H# Standard Library — std -> fmt
+;; Formatowanie stringów
+
+pub fn format(template: string, args: string) -> string is return template end
+pub fn sprintf(fmt: string, val: int) -> string is return to_string(val) end
+pub fn sprintf_f(fmt: string, val: f64) -> string is return to_string(val) end
+pub fn pad_left(s: string, width: int) -> string is return s end
+pub fn pad_right(s: string, width: int) -> string is return s end
+pub fn center(s: string, width: int) -> string is return s end
+pub fn truncate(s: string, max: int) -> string is return s end
+pub fn repeat(s: string, n: int) -> string is return s end
+pub fn wrap(s: string, width: int) -> string is return s end
+pub fn indent(s: string, spaces: int) -> string is return s end
+pub fn strip_ansi(s: string) -> string is return s end
+
+;; ANSI colors
+pub fn red(s: string)    -> string is return "[red]" + s + "[/]" end
+pub fn green(s: string)  -> string is return "[green]" + s + "[/]" end
+pub fn yellow(s: string) -> string is return "[yellow]" + s + "[/]" end
+pub fn blue(s: string)   -> string is return "[blue]" + s + "[/]" end
+pub fn bold(s: string)   -> string is return "[bold]" + s + "[/]" end
+pub fn dim(s: string)    -> string is return "[dim]" + s + "[/]" end
+pub fn underline(s: string) -> string is return "[underline]" + s + "[/]" end
