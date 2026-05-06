@@ -262,4 +262,4 @@ examples/
 
 ## Licencja
 
-BSD-3 — HackerOS Team  
+Apache 2.0 — HackerOS Team  
