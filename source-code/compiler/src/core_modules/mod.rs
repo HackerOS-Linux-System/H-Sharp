@@ -1,10 +1,3 @@
-//! H# Core Modules — built into the compiler, always available.
-//! use "core -> runtime" from "rt"
-//! use "core -> mem"     from "mem"
-//! use "core -> types"   from "types"
-//! use "core -> io"      from "io"
-//! use "core -> panic"   from "panic"
-
 pub mod runtime;
 pub mod mem;
 pub mod types;
