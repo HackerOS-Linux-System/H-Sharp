@@ -75,7 +75,7 @@ fn main() {
 }
 
 fn print_banner() {
-    println!("{}", "  h# v0.5  —  HackerOS-first compiled language".cyan().bold());
+    println!("{}", "  h# v0.4.0  —  HackerOS-first compiled language".cyan().bold());
     println!();
 }
 
