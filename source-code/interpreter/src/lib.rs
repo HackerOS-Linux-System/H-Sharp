@@ -30,6 +30,40 @@ pub enum AsyncTaskState {
     Pending { fn_name: String, args: Vec<Value> },
 }
 
+/// Inline monomorphization for generic functions at interpreter call sites
+fn mono_fn_inline(f: &hsharp_parser::ast::FnDef, subst: &std::collections::HashMap<String, hsharp_parser::ast::TypeExpr>) -> hsharp_parser::ast::FnDef {
+    if subst.is_empty() { return f.clone(); }
+    hsharp_parser::ast::FnDef {
+        attrs:       f.attrs.clone(),
+        type_params: vec![],  // monomorphized
+        name:        {
+            let mut parts: Vec<String> = subst.values().map(|t| match t {
+                hsharp_parser::ast::TypeExpr::Named(n) => n.clone(),
+                _ => "t".to_string(),
+            }).collect();
+            parts.sort();
+            format!("{}__{}", f.name, parts.join("__"))
+        },
+        params:      f.params.iter().map(|p| hsharp_parser::ast::Param {
+            name: p.name.clone(),
+            ty: subst_type_inline(&p.ty, subst),
+            mutable: p.mutable,
+            span: p.span.clone(),
+        }).collect(),
+        return_type: f.return_type.as_ref().map(|t| subst_type_inline(t, subst)),
+        body:        f.body.clone(),
+        pub_: f.pub_, is_async: f.is_async, is_unsafe: f.is_unsafe, span: f.span.clone(),
+    }
+}
+
+fn subst_type_inline(ty: &hsharp_parser::ast::TypeExpr, subst: &std::collections::HashMap<String, hsharp_parser::ast::TypeExpr>) -> hsharp_parser::ast::TypeExpr {
+    match ty {
+        hsharp_parser::ast::TypeExpr::Named(n) => subst.get(n).cloned().unwrap_or(ty.clone()),
+        other => other.clone(),
+    }
+}
+
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -146,6 +180,15 @@ impl Env {
             }
         }
         false
+    }
+
+    /// Flatten all scopes into one for closure capture.
+    pub fn flatten_for_capture(&self) -> Self {
+        let mut flat = std::collections::HashMap::new();
+        for scope in self.scopes.iter() {
+            for (k, v) in scope { flat.insert(k.clone(), v.clone()); }
+        }
+        Self { scopes: vec![flat] }
     }
 }
 
@@ -634,11 +677,50 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                     other => Ok(other),
                 }
             }
-                        _ => Ok(Value::Nil),
+                        // Closure with environment capture
+            Expr::Closure { params, body, .. } => {
+                // Capture lexical scope — flatten all scopes so captured vars
+                // are always accessible regardless of scope nesting
+                Ok(Value::Fn {
+                    name:     "<closure>".to_string(),
+                    params:   params.clone(),
+                    body:     body.clone(),
+                    env:      self.env.flatten_for_capture(),
+                    is_async: false,
+                })
+            }
+            _ => Ok(Value::Nil),
         }
     }
 
     fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        // Check if name is a closure/fn stored in environment (e.g. let triple = |n| n*3)
+        if let Some(val) = self.env.get(name).cloned() {
+            match val {
+                Value::Fn { params, body, env: captured_env, is_async, .. } => {
+                    let saved = self.env.clone();
+                    self.env = captured_env;
+                    self.env.push();
+                    for (param, val) in params.iter().zip(args.iter()) {
+                        self.env.define(&param.name, val.clone(), param.mutable);
+                    }
+                    let result = self.exec_block(&body)?;
+                    self.env.pop();
+                    self.env = saved;
+                    let resolved = match result {
+                        Some(Value::Return(v)) => *v,
+                        Some(v) => v,
+                        None => Value::Nil,
+                    };
+                    if is_async {
+                        return Ok(Value::AsyncTask(Box::new(AsyncTaskState::Ready(resolved))));
+                    }
+                    return Ok(resolved);
+                }
+                _ => {}
+            }
+        }
+
         // Builtins
         match name {
             "print" => {
@@ -882,6 +964,25 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
 
         // User-defined functions
         if let Some(f) = self.fns.get(name).cloned() {
+            // Monomorphize generic functions at call site
+            let f = if !f.type_params.is_empty() {
+                // Build type substitution from actual argument types
+                let mut subst = std::collections::HashMap::new();
+                for (tp, val) in f.type_params.iter().zip(args.iter()) {
+                    let concrete_ty = match val {
+                        Value::Int(_)   => hsharp_parser::ast::TypeExpr::Named("int".into()),
+                        Value::Float(_) => hsharp_parser::ast::TypeExpr::Named("float".into()),
+                        Value::Str(_)   => hsharp_parser::ast::TypeExpr::Named("string".into()),
+                        Value::Bool(_)  => hsharp_parser::ast::TypeExpr::Named("bool".into()),
+                        Value::Array(_) => hsharp_parser::ast::TypeExpr::Array(Box::new(hsharp_parser::ast::TypeExpr::Named("any".into()))),
+                        _               => hsharp_parser::ast::TypeExpr::Named("any".into()),
+                    };
+                    subst.insert(tp.name.clone(), concrete_ty);
+                }
+                mono_fn_inline(&f, &subst)
+            } else {
+                f
+            };
             self.env.push();
             for (param, val) in f.params.iter().zip(args) {
                 self.env.define(&param.name, val, param.mutable);
