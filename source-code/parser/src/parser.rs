@@ -935,54 +935,84 @@ impl Parser {
     }
 
 
-    fn parse_interpolated_string(&self, raw: String, span: Span) -> Expr {
-        // Parse "Hello ${name}, you are ${age} years old!" into InterpParts
-        // Parts: [Text("Hello "), Expr(name), Text(", you are "), Expr(age), Text(" years old!")]
+    fn parse_interpolated_string(&mut self, raw: String, span: Span) -> Expr {
         let mut parts: Vec<InterpPart> = Vec::new();
-        let mut rest = raw.as_str();
-        
-        while let Some(start_idx) = rest.find("${") {
-            // Text before ${
-            let text = &rest[..start_idx];
-            if !text.is_empty() {
-                parts.push(InterpPart::Text(text.to_string()));
-            }
-            // Find closing }
-            rest = &rest[start_idx + 2..];  // skip ${
-            if let Some(end_idx) = rest.find('}') {
-                let expr_src = rest[..end_idx].trim();
-                // Parse the expression inside ${}
-                // Simple: treat as identifier or simple call
-                let expr = if expr_src.contains('(') {
-                    // function call — too complex for inline, emit as string concat
-                    Expr::Literal(Literal::String(format!("${{{}}}", expr_src)), span.clone())
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        let mut text_start = 0;
+
+        while i < bytes.len() {
+            if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i+1] == b'{' {
+                // Flush text before ${
+                let text = &raw[text_start..i];
+                if !text.is_empty() {
+                    parts.push(InterpPart::Text(text.to_string()));
+                }
+                i += 2; // skip ${
+
+                // Find matching }  (handle nested {} for complex exprs)
+                let expr_start = i;
+                let mut depth = 1usize;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'{' => { depth += 1; i += 1; }
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                            i += 1;
+                        }
+                        _ => { i += 1; }
+                    }
+                }
+                let expr_src = raw[expr_start..i].trim();
+                i += 1; // skip }
+                text_start = i;
+
+                // Parse the expression inside ${...} using the full parser
+                let expr = if expr_src.is_empty() {
+                    Expr::Literal(Literal::String(String::new()), span.clone())
                 } else {
-                    // Variable reference
-                    Expr::Ident(expr_src.to_string(), span.clone())
+                    // Parse interpolated expression using crate::parse()
+                    let sub_src = format!("fn __interp__() is\n    return {}\nend", expr_src);
+                    let result = crate::parse(&sub_src, "<interp>");
+                    if !result.has_errors() {
+                        result.module.items.into_iter().find_map(|item| {
+                            if let Item::FnDef(f) = item {
+                                f.body.into_iter().find_map(|s| {
+                                    if let Stmt::Return(Some(e), _) = s { Some(e) } else { None }
+                                })
+                            } else { None }
+                        }).unwrap_or_else(|| Expr::Ident(expr_src.to_string(), span.clone()))
+                    } else if expr_src.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        Expr::Ident(expr_src.to_string(), span.clone())
+                    } else {
+                        Expr::Literal(Literal::String(format!("${{{}}}", expr_src)), span.clone())
+                    }
                 };
                 parts.push(InterpPart::Expr(Box::new(expr)));
-                rest = &rest[end_idx + 1..];  // skip }
             } else {
-                // Unterminated ${ — treat as literal
-                parts.push(InterpPart::Text(format!("${{{}", rest)));
-                rest = "";
-                break;
+                i += 1;
             }
         }
-        
+
         // Remaining text
-        if !rest.is_empty() {
-            parts.push(InterpPart::Text(rest.to_string()));
+        let tail = &raw[text_start..];
+        if !tail.is_empty() {
+            parts.push(InterpPart::Text(tail.to_string()));
         }
-        
+
         if parts.len() == 1 {
             if let InterpPart::Text(t) = &parts[0] {
                 return Expr::Literal(Literal::String(t.clone()), span);
             }
         }
+        if parts.is_empty() {
+            return Expr::Literal(Literal::String(String::new()), span);
+        }
         Expr::Literal(Literal::Interpolated(parts), span)
     }
 
+    
     fn parse_closure_expr(&mut self) -> Result<Expr, ParseError> {
         let span = self.current().span.clone();
         self.advance(); // consume first |
