@@ -148,6 +148,7 @@ struct FnSig {
 }
 
 pub struct TypeChecker {
+    pub derived_impls: std::collections::HashMap<String, (String, String)>,
     scopes: Vec<HashMap<String, VarInfo>>,
     fns: HashMap<String, FnSig>,
     structs: HashMap<String, Vec<(String, HType)>>,
@@ -163,6 +164,7 @@ impl TypeChecker {
             structs: HashMap::new(),
             current_fn_return: None,
             errors: Vec::new(),
+            derived_impls: HashMap::new(),
         };
         tc.register_builtins();
         tc
