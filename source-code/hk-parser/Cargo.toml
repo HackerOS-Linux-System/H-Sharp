@@ -1,5 +1,5 @@
 [package]
 name = "hk-parser"
-version = "0.4.0"
+version = "0.1.0"
 edition = "2021"
 description = "HackerOS .hk config format parser"
