@@ -76,7 +76,7 @@ impl<'ctx> LlvmBuiltins<'ctx> {
         let ip  = |name: &str| decl(name, ptr.fn_type(&[i64t.into()], false));        // i64→ptr
         let pi  = |name: &str| decl(name, i64t.fn_type(&[ptr.into()], false));        // ptr→i64
         let ppi = |name: &str| decl(name, i64t.fn_type(&[ptr.into(), ptr.into()], false)); // ptr,ptr→i64
-        let vp  = |name: &str| decl(name, void.fn_type(&[ptr.into()], false));        // ptr→void
+        let _vp = |name: &str| decl(name, void.fn_type(&[ptr.into()], false));        // ptr→void
         let ni  = |name: &str| decl(name, i64t.fn_type(&[], false));                  // →i64
         let np  = |name: &str| decl(name, ptr.fn_type(&[], false));                   // →ptr
         let vi  = |name: &str| decl(name, void.fn_type(&[i64t.into()], false));       // i64→void
