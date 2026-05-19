@@ -76,10 +76,10 @@ impl LlvmCodegen {
 
         // Create target machine for optimization
         Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Llvm(e))?;
+            .map_err(|e| CodegenError::Llvm(e))?;
         let triple  = TargetMachine::get_default_triple();
         let target  = Target::from_triple(&triple)
-        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
         let opt_lvl = if self.opts.optimize { OptimizationLevel::Aggressive } else { OptimizationLevel::Default };
 
         // Use native CPU with all extensions for maximum performance
@@ -122,15 +122,15 @@ impl LlvmCodegen {
                 Item::ImplBlock(imp) => {
                     for method in &imp.methods {
                         fns.push(FnDef {
-                            attrs: vec![], type_params: vec![],
+                attrs: vec![], type_params: vec![],
                             name: format!("{}_{}", imp.type_name, method.name),
-                                 params: method.params.clone(),
-                                 return_type: method.return_type.clone(),
-                                 body: method.body.clone(),
-                                 pub_: method.pub_,
-                                 is_async: false,
-                                 is_unsafe: method.is_unsafe,
-                                 span: method.span.clone(),
+                            params: method.params.clone(),
+                            return_type: method.return_type.clone(),
+                            body: method.body.clone(),
+                            pub_: method.pub_,
+                            is_async: false,
+                            is_unsafe: method.is_unsafe,
+                            span: method.span.clone(),
                         });
                     }
                 }
@@ -206,7 +206,7 @@ impl LlvmCodegen {
                 builder.build_return(None).unwrap();
             } else {
                 let ct = f.return_type.as_ref().and_then(|t| htype_to_llvm(ctx, t))
-                .unwrap_or(ctx.i64_type().into());
+                    .unwrap_or(ctx.i64_type().into());
                 let zero = self.zero_val(ctx, ct);
                 builder.build_return(Some(&zero)).unwrap();
             }
@@ -236,15 +236,15 @@ impl LlvmCodegen {
         std::fs::write(&rt_c, hsharp_compiler::runtime::runtime_c_source())?;
         let rt_opt = if self.opts.optimize { "-O3" } else { "-O1" };
         let ok = std::process::Command::new("cc")
-        .args([rt_opt, "-ffunction-sections", "-fdata-sections",
-              "-fPIC", "-c", &rt_c, "-o", &rt_o])
-        .status()?.success();
+            .args([rt_opt, "-ffunction-sections", "-fdata-sections",
+                   "-fPIC", "-c", &rt_c, "-o", &rt_o])
+            .status()?.success();
         if !ok { return Err(CodegenError::Link("runtime compile failed".into())); }
 
         // Emit LLVM-optimized object file
         let obj_path = format!("{}_main.o", self.opts.output);
         machine.write_to_file(module, FileType::Object, Path::new(&obj_path))
-        .map_err(|e| CodegenError::Llvm(e.to_string()))?;
+            .map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
         // Link with aggressive size + performance flags
         let suffix = self.opts.target.exe_suffix();
@@ -260,7 +260,7 @@ impl LlvmCodegen {
                 "-Wl,--gc-sections",    // remove unused code sections
                 "-Wl,--as-needed",      // skip unused library linkage
                 "-Wl,--strip-all",      // strip all symbols (smallest binary)
-            "-flto",                // link-time optimization
+                "-flto",                // link-time optimization
             ]);
         } else {
             cmd.arg("-O1");
@@ -286,8 +286,8 @@ impl LlvmCodegen {
         // Post-link strip for maximum binary size reduction
         if self.opts.optimize {
             let _ = std::process::Command::new("strip")
-            .args(["--strip-all", "--strip-unneeded", &out])
-            .status();
+                .args(["--strip-all", "--strip-unneeded", &out])
+                .status();
         }
 
         let _ = std::fs::remove_file(&obj_path);
@@ -348,8 +348,8 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         match s {
             Stmt::Let { name, ty, mutable: _, value, .. } => {
                 let llvm_ty = ty.as_ref()
-                .and_then(|t| htype_to_llvm(self.ctx, t))
-                .unwrap_or(self.ctx.i64_type().into());
+                    .and_then(|t| htype_to_llvm(self.ctx, t))
+                    .unwrap_or(self.ctx.i64_type().into());
                 let ptr = self.builder.build_alloca(llvm_ty, name).unwrap();
                 if let Some(e) = value {
                     let v = self.expr(e, Some(llvm_ty))?;
@@ -380,13 +380,13 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
             Stmt::Expr(e, _) => {
                 match e {
                     Expr::If { condition, then_body, elsif_branches, else_body, .. } =>
-                    self.if_stmt(condition, then_body, elsif_branches, else_body),
+                        self.if_stmt(condition, then_body, elsif_branches, else_body),
 
                     Expr::While { condition, body, .. } =>
-                    self.while_stmt(condition, body),
+                        self.while_stmt(condition, body),
 
                     Expr::For { pattern, iterable, body, .. } =>
-                    self.for_stmt(pattern, iterable, body),
+                        self.for_stmt(pattern, iterable, body),
 
                     Expr::Assign(lhs, rhs, _) => {
                         if let Expr::Ident(name, _) = lhs.as_ref() {
@@ -402,9 +402,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     Expr::CompoundAssign(lhs, op, rhs, _) => {
                         if let Expr::Ident(name, _) = lhs.as_ref() {
                             if let Some(&ptr) = self.vars.get(name.as_str()) {
-                                let lv = self.builder.build_load(
+                                                let lv = self.builder.build_load(
                                     self.ctx.i64_type(),
-                                                                 ptr, "lv"
+                                    ptr, "lv"
                                 ).unwrap();
                                 let rv = self.expr(rhs, None)?;
                                 let res = self.binop(op, lv, rv)?;
@@ -443,683 +443,684 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     // ── Control flow ──────────────────────────────────────────────────────────
 
     fn if_stmt(&mut self, cond: &Expr, then_b: &[Stmt],
-               elsifs: &[(Expr, Vec<Stmt>)], else_b: &Option<Vec<Stmt>>) -> R<bool> {
-                   let parent = self.builder.get_insert_block().unwrap()
-                   .get_parent().unwrap();
-                   let cv = self.as_bool(cond)?;
+                elsifs: &[(Expr, Vec<Stmt>)], else_b: &Option<Vec<Stmt>>) -> R<bool> {
+        let parent = self.builder.get_insert_block().unwrap()
+            .get_parent().unwrap();
+        let cv = self.as_bool(cond)?;
 
-                   let then_blk  = self.ctx.append_basic_block(parent, "then");
-                   let else_blk  = self.ctx.append_basic_block(parent, "else");
-                   let merge_blk = self.ctx.append_basic_block(parent, "merge");
+        let then_blk  = self.ctx.append_basic_block(parent, "then");
+        let else_blk  = self.ctx.append_basic_block(parent, "else");
+        let merge_blk = self.ctx.append_basic_block(parent, "merge");
 
-                   self.builder.build_conditional_branch(cv, then_blk, else_blk).unwrap();
+        self.builder.build_conditional_branch(cv, then_blk, else_blk).unwrap();
 
-                   self.builder.position_at_end(then_blk);
-                   let t1 = self.stmts(then_b)?;
-                   if !t1 { self.builder.build_unconditional_branch(merge_blk).unwrap(); }
+        self.builder.position_at_end(then_blk);
+        let t1 = self.stmts(then_b)?;
+        if !t1 { self.builder.build_unconditional_branch(merge_blk).unwrap(); }
 
-                   self.builder.position_at_end(else_blk);
-                   if !elsifs.is_empty() {
-                       let (ec, eb) = &elsifs[0];
-                       self.if_stmt(ec, eb, &elsifs[1..], else_b)?;
-                       if self.builder.get_insert_block().map(|b| b.get_terminator().is_none()).unwrap_or(false) {
-                           self.builder.build_unconditional_branch(merge_blk).unwrap();
-                       }
-                   } else if let Some(eb) = else_b {
-                       let t2 = self.stmts(eb)?;
-                       if !t2 { self.builder.build_unconditional_branch(merge_blk).unwrap(); }
-                   } else {
-                       self.builder.build_unconditional_branch(merge_blk).unwrap();
-                   }
+        self.builder.position_at_end(else_blk);
+        if !elsifs.is_empty() {
+            let (ec, eb) = &elsifs[0];
+            self.if_stmt(ec, eb, &elsifs[1..], else_b)?;
+            if self.builder.get_insert_block().map(|b| b.get_terminator().is_none()).unwrap_or(false) {
+                self.builder.build_unconditional_branch(merge_blk).unwrap();
+            }
+        } else if let Some(eb) = else_b {
+            let t2 = self.stmts(eb)?;
+            if !t2 { self.builder.build_unconditional_branch(merge_blk).unwrap(); }
+        } else {
+            self.builder.build_unconditional_branch(merge_blk).unwrap();
+        }
 
-                   self.builder.position_at_end(merge_blk);
-                   Ok(false)
-               }
+        self.builder.position_at_end(merge_blk);
+        Ok(false)
+    }
 
-               fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> R<bool> {
-                   let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                   let header = self.ctx.append_basic_block(parent, "while_hdr");
-                   let body_b = self.ctx.append_basic_block(parent, "while_body");
-                   let exit   = self.ctx.append_basic_block(parent, "while_exit");
+    fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> R<bool> {
+        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let header = self.ctx.append_basic_block(parent, "while_hdr");
+        let body_b = self.ctx.append_basic_block(parent, "while_body");
+        let exit   = self.ctx.append_basic_block(parent, "while_exit");
 
-                   self.builder.build_unconditional_branch(header).unwrap();
-                   self.builder.position_at_end(header);
-                   let cv = self.as_bool(cond)?;
-                   self.builder.build_conditional_branch(cv, body_b, exit).unwrap();
+        self.builder.build_unconditional_branch(header).unwrap();
+        self.builder.position_at_end(header);
+        let cv = self.as_bool(cond)?;
+        self.builder.build_conditional_branch(cv, body_b, exit).unwrap();
 
-                   self.builder.position_at_end(body_b);
-                   let t = self.stmts(body)?;
-                   if !t { self.builder.build_unconditional_branch(header).unwrap(); }
+        self.builder.position_at_end(body_b);
+        let t = self.stmts(body)?;
+        if !t { self.builder.build_unconditional_branch(header).unwrap(); }
 
-                   self.builder.position_at_end(exit);
-                   Ok(false)
-               }
+        self.builder.position_at_end(exit);
+        Ok(false)
+    }
 
-               fn for_stmt(&mut self, pat: &Pattern, iter: &Expr, body: &[Stmt]) -> R<bool> {
-                   if let Expr::Range(start, end_e, inclusive, _) = iter {
-                       let vname = match pat { Pattern::Ident(n, _) => n.as_str(), _ => "__i" };
-                       let i64t  = self.ctx.i64_type();
+    fn for_stmt(&mut self, pat: &Pattern, iter: &Expr, body: &[Stmt]) -> R<bool> {
+        if let Expr::Range(start, end_e, inclusive, _) = iter {
+            let vname = match pat { Pattern::Ident(n, _) => n.as_str(), _ => "__i" };
+            let i64t  = self.ctx.i64_type();
 
-                       let sv = self.expr(start, Some(i64t.into()))?;
-                       let ev = self.expr(end_e,  Some(i64t.into()))?;
+            let sv = self.expr(start, Some(i64t.into()))?;
+            let ev = self.expr(end_e,  Some(i64t.into()))?;
 
-                       let loop_ptr = self.builder.build_alloca(i64t, vname).unwrap();
-                       self.builder.build_store(loop_ptr, sv).unwrap();
-                       self.vars.insert(vname.to_string(), loop_ptr);
+            let loop_ptr = self.builder.build_alloca(i64t, vname).unwrap();
+            self.builder.build_store(loop_ptr, sv).unwrap();
+            self.vars.insert(vname.to_string(), loop_ptr);
 
-                       let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                       let header = self.ctx.append_basic_block(parent, "for_hdr");
-                       let body_b = self.ctx.append_basic_block(parent, "for_body");
-                       let exit   = self.ctx.append_basic_block(parent, "for_exit");
+            let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let header = self.ctx.append_basic_block(parent, "for_hdr");
+            let body_b = self.ctx.append_basic_block(parent, "for_body");
+            let exit   = self.ctx.append_basic_block(parent, "for_exit");
 
-                       self.builder.build_unconditional_branch(header).unwrap();
-                       self.builder.position_at_end(header);
+            self.builder.build_unconditional_branch(header).unwrap();
+            self.builder.position_at_end(header);
 
-                       let cur = self.builder.build_load(i64t, loop_ptr, "cur").unwrap();
-                       let cond = if *inclusive {
-                           self.builder.build_int_compare(
-                               inkwell::IntPredicate::SLE, cur.into_int_value(), ev.into_int_value(), "cmp"
-                           ).unwrap()
-                       } else {
-                           self.builder.build_int_compare(
-                               inkwell::IntPredicate::SLT, cur.into_int_value(), ev.into_int_value(), "cmp"
-                           ).unwrap()
-                       };
-                       self.builder.build_conditional_branch(cond, body_b, exit).unwrap();
+            let cur = self.builder.build_load(i64t, loop_ptr, "cur").unwrap();
+            let cond = if *inclusive {
+                self.builder.build_int_compare(
+                    inkwell::IntPredicate::SLE, cur.into_int_value(), ev.into_int_value(), "cmp"
+                ).unwrap()
+            } else {
+                self.builder.build_int_compare(
+                    inkwell::IntPredicate::SLT, cur.into_int_value(), ev.into_int_value(), "cmp"
+                ).unwrap()
+            };
+            self.builder.build_conditional_branch(cond, body_b, exit).unwrap();
 
-                       self.builder.position_at_end(body_b);
-                       let t = self.stmts(body)?;
-                       if !t {
-                           let c2  = self.builder.build_load(i64t, loop_ptr, "c2").unwrap().into_int_value();
-                           let one = i64t.const_int(1, false);
-                           let nxt = self.builder.build_int_add(c2, one, "nxt").unwrap();
-                           self.builder.build_store(loop_ptr, nxt).unwrap();
-                           self.builder.build_unconditional_branch(header).unwrap();
-                       }
+            self.builder.position_at_end(body_b);
+            let t = self.stmts(body)?;
+            if !t {
+                let c2  = self.builder.build_load(i64t, loop_ptr, "c2").unwrap().into_int_value();
+                let one = i64t.const_int(1, false);
+                let nxt = self.builder.build_int_add(c2, one, "nxt").unwrap();
+                self.builder.build_store(loop_ptr, nxt).unwrap();
+                self.builder.build_unconditional_branch(header).unwrap();
+            }
 
-                       self.builder.position_at_end(exit);
-                   } else {
-                       self.expr(iter, None)?;
-                   }
-                   Ok(false)
-               }
+            self.builder.position_at_end(exit);
+        } else {
+            self.expr(iter, None)?;
+        }
+        Ok(false)
+    }
 
-               // ── Expressions ───────────────────────────────────────────────────────────
+    // ── Expressions ───────────────────────────────────────────────────────────
 
-               fn expr(&mut self, e: &Expr,  hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
-                   match e {
-                       Expr::Literal(lit, _) => self.literal(lit, hint),
+    fn expr(&mut self, e: &Expr,  hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+        match e {
+            Expr::Literal(lit, _) => self.literal(lit, hint),
 
-                       Expr::Ident(name, _) => {
-                           let ptr = self.vars.get(name.as_str())
-                           .copied()
-                           .ok_or_else(|| CodegenError::UndefinedVar(name.clone()))?;
-                           Ok(self.builder.build_load(self.ctx.i64_type(), ptr, name).unwrap())
-                       }
+            Expr::Ident(name, _) => {
+                let ptr = self.vars.get(name.as_str())
+                    .copied()
+                    .ok_or_else(|| CodegenError::UndefinedVar(name.clone()))?;
+                Ok(self.builder.build_load(self.ctx.i64_type(), ptr, name).unwrap())
+            }
 
-                       Expr::BinOp(l, op, r, _) => {
-                           let lv = self.expr(l, hint)?;
-                           let rv = self.expr(r, hint)?;
-                           self.binop(op, lv, rv)
-                       }
+            Expr::BinOp(l, op, r, _) => {
+                let lv = self.expr(l, hint)?;
+                let rv = self.expr(r, hint)?;
+                self.binop(op, lv, rv)
+            }
 
-                       Expr::UnOp(op, inner, _) => {
-                           let v = self.expr(inner, hint)?;
-                           match op {
-                               UnOp::Neg => match v {
-                                   BasicValueEnum::IntValue(i)   => Ok(self.builder.build_int_neg(i, "neg").unwrap().into()),
-                                   BasicValueEnum::FloatValue(f) => Ok(self.builder.build_float_neg(f, "fneg").unwrap().into()),
-                                   _ => Ok(v),
-                               },
-                               UnOp::Not => {
-                                   let i = v.into_int_value();
-                                   let zero = i.get_type().const_zero();
-                                   Ok(self.builder.build_int_compare(inkwell::IntPredicate::EQ, i, zero, "not").unwrap().into())
-                               }
-                               _ => Ok(v),
-                           }
-                       }
+            Expr::UnOp(op, inner, _) => {
+                let v = self.expr(inner, hint)?;
+                match op {
+                    UnOp::Neg => match v {
+                        BasicValueEnum::IntValue(i)   => Ok(self.builder.build_int_neg(i, "neg").unwrap().into()),
+                        BasicValueEnum::FloatValue(f) => Ok(self.builder.build_float_neg(f, "fneg").unwrap().into()),
+                        _ => Ok(v),
+                    },
+                    UnOp::Not => {
+                        let i = v.into_int_value();
+                        let zero = i.get_type().const_zero();
+                        Ok(self.builder.build_int_compare(inkwell::IntPredicate::EQ, i, zero, "not").unwrap().into())
+                    }
+                    _ => Ok(v),
+                }
+            }
 
-                       Expr::Call(callee, args, _) => {
-                           if let Expr::Ident(name, _) = callee.as_ref() {
-                               self.call_fn(name, args, hint)
-                           } else {
-                               Ok(self.ctx.i64_type().const_zero().into())
-                           }
-                       }
+            Expr::Call(callee, args, _) => {
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    self.call_fn(name, args, hint)
+                } else {
+                    Ok(self.ctx.i64_type().const_zero().into())
+                }
+            }
 
-                       Expr::Assign(lhs, rhs, _) => {
-                           if let Expr::Ident(name, _) = lhs.as_ref() {
-                               if let Some(&ptr) = self.vars.get(name.as_str()) {
-                                   let v = self.expr(rhs, None)?;
-                                   self.builder.build_store(ptr, v).unwrap();
-                               }
-                           }
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
+            Expr::Assign(lhs, rhs, _) => {
+                if let Expr::Ident(name, _) = lhs.as_ref() {
+                    if let Some(&ptr) = self.vars.get(name.as_str()) {
+                            let v = self.expr(rhs, None)?;
+                        self.builder.build_store(ptr, v).unwrap();
+                    }
+                }
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
 
-                       Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
-                           self.if_stmt(condition, then_body, elsif_branches, else_body)?;
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
+            Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+                self.if_stmt(condition, then_body, elsif_branches, else_body)?;
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
 
-                       Expr::While { condition, body, .. } => {
-                           self.while_stmt(condition, body)?;
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
+            Expr::While { condition, body, .. } => {
+                self.while_stmt(condition, body)?;
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
 
-                       Expr::For { pattern, iterable, body, .. } => {
-                           self.for_stmt(pattern, iterable, body)?;
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
+            Expr::For { pattern, iterable, body, .. } => {
+                self.for_stmt(pattern, iterable, body)?;
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
 
-                       Expr::Cast(inner, ty, _) => {
-                           let v   = self.expr(inner, None)?;
-                           let dst = htype_to_llvm(self.ctx, ty).unwrap_or(self.ctx.i64_type().into());
-                           self.cast(v, dst)
-                       }
+            Expr::Cast(inner, ty, _) => {
+                let v   = self.expr(inner, None)?;
+                let dst = htype_to_llvm(self.ctx, ty).unwrap_or(self.ctx.i64_type().into());
+                self.cast(v, dst)
+            }
 
-                       Expr::Return(val, _) => {
-                           if let Some(expr) = val {
-                               let v = self.expr(expr, None)?;
-                               let v = self.coerce_ret(v);
-                               self.builder.build_return(Some(&v)).unwrap();
-                           } else if self.fn_name == "main" {
-                               let z = self.ctx.i32_type().const_int(0, false);
-                               self.builder.build_return(Some(&z)).unwrap();
-                           } else {
-                               self.builder.build_return(None).unwrap();
-                           }
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
+            Expr::Return(val, _) => {
+                if let Some(expr) = val {
+                    let v = self.expr(expr, None)?;
+                    let v = self.coerce_ret(v);
+                    self.builder.build_return(Some(&v)).unwrap();
+                } else if self.fn_name == "main" {
+                    let z = self.ctx.i32_type().const_int(0, false);
+                    self.builder.build_return(Some(&z)).unwrap();
+                } else {
+                    self.builder.build_return(None).unwrap();
+                }
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
 
-                       Expr::Range(start, _, _, _) => self.expr(start, hint),
+            Expr::Range(start, _, _, _) => self.expr(start, hint),
 
-                       // ? operator: evaluate inner; if i64==0 (error/nil), return 0 early
-                       Expr::Await(inner, _) => self.expr(inner, hint),
+            // ? operator: evaluate inner; if i64==0 (error/nil), return 0 early
+            Expr::Await(inner, _) => self.expr(inner, hint),
 
-                       Expr::Try(inner, _) => {
-                           let val = self.expr(inner, hint)?;
-                           let fn_val = self.builder.get_insert_block()
-                           .and_then(|b| b.get_parent())
-                           .expect("no parent function");
-                           let then_bb  = self.ctx.append_basic_block(fn_val, "try_err");
-                           let merge_bb = self.ctx.append_basic_block(fn_val, "try_ok");
-                           let zero = self.ctx.i64_type().const_zero();
-                           // Compare to zero
-                           let is_err = if let BasicValueEnum::IntValue(iv) = val {
-                               self.builder.build_int_compare(
-                                   inkwell::IntPredicate::EQ, iv, zero, "is_err"
-                               ).unwrap()
-                           } else {
-                               self.ctx.bool_type().const_zero()
-                           };
-                           self.builder.build_conditional_branch(is_err, then_bb, merge_bb).unwrap();
-                           // Early-return path
-                           self.builder.position_at_end(then_bb);
-                           self.builder.build_return(Some(&BasicValueEnum::IntValue(zero))).unwrap();
-                           // Normal path
-                           self.builder.position_at_end(merge_bb);
-                           Ok(val)
-                       }
+            Expr::Try(inner, _) => {
+                let val = self.expr(inner, hint)?;
+                let fn_val = self.builder.get_insert_block()
+                    .and_then(|b| b.get_parent())
+                    .expect("no parent function");
+                let then_bb  = self.ctx.append_basic_block(fn_val, "try_err");
+                let merge_bb = self.ctx.append_basic_block(fn_val, "try_ok");
+                let zero = self.ctx.i64_type().const_zero();
+                // Compare to zero
+                let is_err = if let BasicValueEnum::IntValue(iv) = val {
+                    self.builder.build_int_compare(
+                        inkwell::IntPredicate::EQ, iv, zero, "is_err"
+                    ).unwrap()
+                } else {
+                    self.ctx.bool_type().const_zero()
+                };
+                self.builder.build_conditional_branch(is_err, then_bb, merge_bb).unwrap();
+                // Early-return path
+                self.builder.position_at_end(then_bb);
+                self.builder.build_return(Some(&BasicValueEnum::IntValue(zero))).unwrap();
+                // Normal path
+                self.builder.position_at_end(merge_bb);
+                Ok(val)
+            }
 
-                       // Closure: placeholder (full implementation v0.3.1)
-                       Expr::Closure { .. } => Ok(self.ctx.i64_type().const_zero().into()),
+            // Closure: placeholder (full implementation v0.3.1)
+            Expr::Closure { .. } => Ok(self.ctx.i64_type().const_zero().into()),
 
-                       // ── Unsafe arena / manual blocks ─────────────────────────────────
-                       Expr::Unsafe(body, arena_cfg, _) => {
-                           use hsharp_parser::ast::{UnsafeMode, ArenaKind, ManualKind};
-                           let i64t = self.ctx.i64_type();
-                           let _ptr = self.ctx.ptr_type(inkwell::AddressSpace::default());
+            // ── Unsafe arena / manual blocks ─────────────────────────────────
+            Expr::Unsafe(body, arena_cfg, _) => {
+                use hsharp_parser::ast::{UnsafeMode, ArenaKind, ManualKind};
+                let i64t = self.ctx.i64_type();
+                let _ptr = self.ctx.ptr_type(inkwell::AddressSpace::default());
 
-                           match arena_cfg.as_ref().map(|c| &c.mode) {
-                               // General, Pool, Page, Ring: malloc-backed bump arena
-                               Some(UnsafeMode::Arena { kind, size }) => {
-                                   let arena_size = *size.as_ref().unwrap_or(&match kind {
-                                       ArenaKind::Fixed   =>    65_536,
-                                       ArenaKind::Pool    =>     4_096,
-                                       ArenaKind::Page    =>     4_096,
-                                       ArenaKind::Ring    => 1_048_576,
-                                       ArenaKind::General => 1_048_576,
-                                   }) as u64;
-                                   // Allocate arena backing store
-                                   let sz_val = i64t.const_int(arena_size, false);
-                                   let alloc = self.builder.build_call(
-                                       self.builtins.malloc, &[sz_val.into()], "arena_ptr"
-                                   ).unwrap();
-                                   let arena_ptr = self.unwrap_call(alloc);
-                                   // Compile body
-                                   for s in body { self.stmt(s)?; }
-                                   // Free arena (O(1) bulk free)
-                                   self.builder.build_call(
-                                       self.builtins.free, &[arena_ptr.into()], ""
-                                   ).unwrap();
-                                   Ok(i64t.const_zero().into())
-                               }
-                               // Modern RAII manual: track allocs, free on scope exit
-                               Some(UnsafeMode::Manual(ManualKind::Modern)) => {
-                                   let list_sz = i64t.const_int(8 * 1024, false);
-                                   let alloc = self.builder.build_call(
-                                       self.builtins.malloc, &[list_sz.into()], "raii_list"
-                                   ).unwrap();
-                                   let list_ptr = self.unwrap_call(alloc);
-                                   for s in body { self.stmt(s)?; }
-                                   self.builder.build_call(
-                                       self.builtins.free, &[list_ptr.into()], ""
-                                   ).unwrap();
-                                   Ok(i64t.const_zero().into())
-                               }
-                               // Classic C-like: programmer calls malloc/free explicitly
-                               Some(UnsafeMode::Manual(ManualKind::Classic)) | Some(UnsafeMode::Raw) | None => {
-                                   for s in body { self.stmt(s)?; }
-                                   Ok(i64t.const_zero().into())
-                               }
-                           }
-                       }
+                match arena_cfg.as_ref().map(|c| &c.mode) {
+                    // General, Pool, Page, Ring: malloc-backed bump arena
+                    Some(UnsafeMode::Arena { kind, size }) => {
+                        let arena_size = *size.as_ref().unwrap_or(&match kind {
+                            ArenaKind::Fixed   =>    65_536,
+                            ArenaKind::Pool    =>     4_096,
+                            ArenaKind::Page    =>     4_096,
+                            ArenaKind::Ring    => 1_048_576,
+                            ArenaKind::General => 1_048_576,
+                        }) as u64;
+                        // Allocate arena backing store
+                        let sz_val = i64t.const_int(arena_size, false);
+                        let alloc = self.builder.build_call(
+                            self.builtins.malloc, &[sz_val.into()], "arena_ptr"
+                        ).unwrap();
+                        let arena_ptr = self.unwrap_call(alloc);
+                        // Compile body
+                        for s in body { self.stmt(s)?; }
+                        // Free arena (O(1) bulk free)
+                        self.builder.build_call(
+                            self.builtins.free, &[arena_ptr.into()], ""
+                        ).unwrap();
+                        Ok(i64t.const_zero().into())
+                    }
+                    // Modern RAII manual: track allocs, free on scope exit
+                    Some(UnsafeMode::Manual(ManualKind::Modern)) => {
+                        let list_sz = i64t.const_int(8 * 1024, false);
+                        let alloc = self.builder.build_call(
+                            self.builtins.malloc, &[list_sz.into()], "raii_list"
+                        ).unwrap();
+                        let list_ptr = self.unwrap_call(alloc);
+                        for s in body { self.stmt(s)?; }
+                        self.builder.build_call(
+                            self.builtins.free, &[list_ptr.into()], ""
+                        ).unwrap();
+                        Ok(i64t.const_zero().into())
+                    }
+                    // Classic C-like: programmer calls malloc/free explicitly
+                    Some(UnsafeMode::Manual(ManualKind::Classic)) | Some(UnsafeMode::Raw) | None => {
+                        for s in body { self.stmt(s)?; }
+                        Ok(i64t.const_zero().into())
+                    }
+                }
+            }
 
-                       _ => Ok(self.ctx.i64_type().const_zero().into()),
-                   }
-               }
+            _ => Ok(self.ctx.i64_type().const_zero().into()),
+        }
+    }
 
-               fn literal(&mut self, lit: &Literal, hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
-                   match lit {
-                       Literal::Int(n) => {
-                           let t = match hint {
-                               Some(BasicTypeEnum::IntType(t)) => t,
-                               _ => self.ctx.i64_type(),
-                           };
-                           Ok(t.const_int(*n as u64, true).into())
-                       }
-                       Literal::Float(f) => {
-                           let t = match hint {
-                               Some(BasicTypeEnum::FloatType(t)) => t,
-                               _ => self.ctx.f64_type(),
-                           };
-                           Ok(t.const_float(*f).into())
-                       }
-                       Literal::Bool(b)  => Ok(self.ctx.i8_type().const_int(if *b { 1 } else { 0 }, false).into()),
-                       Literal::Nil      => Ok(self.ctx.i64_type().const_zero().into()),
-                       Literal::Interpolated(parts) => {
-                           // LLVM: concat interpolated string parts using hsh_strcat
-                           let mut acc: BasicValueEnum = self.builder
-                           .build_global_string_ptr("", ".istart").unwrap()
-                           .as_pointer_value().into();
-                           for part in parts {
-                               let pv: BasicValueEnum = match part {
-                                   hsharp_parser::ast::InterpPart::Text(t) => {
-                                       self.builder.build_global_string_ptr(t.as_str(), ".itext").unwrap()
-                                       .as_pointer_value().into()
-                                   }
-                                   hsharp_parser::ast::InterpPart::Expr(e) => {
-                                       let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
-                                       let r = self.builder.build_call(
-                                           self.builtins.hsh_int_to_string, &[v.into()], "its"
-                                       ).unwrap();
-                                       self.unwrap_call(r).into()
-                                   }
-                               };
-                               let r = self.builder.build_call(
-                                   self.builtins.hsh_strcat, &[acc.into(), pv.into()], "cat"
-                               ).unwrap();
-                               acc = self.unwrap_call(r).into();
-                           }
-                           Ok(acc)
-                       }
-                       Literal::String(s) => {
-                           let ptr = if let Some(&g) = self.str_globals.get(s.as_str()) {
-                               g
-                           } else {
-                               let gs = self.builder.build_global_string_ptr(s, ".str").unwrap();
-                               let p = gs.as_pointer_value();
-                               self.str_globals.insert(s.clone(), p);
-                               p
-                           };
-                           Ok(ptr.into())
-                       }
-                       Literal::Bytes(_) => Ok(self.ctx.i64_type().const_zero().into()),
-                   }
-               }
+    fn literal(&mut self, lit: &Literal,  hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+        Ok(match lit {
+            Literal::Int(n) => {
+                let t = match hint {
+                    Some(BasicTypeEnum::IntType(t)) => t,
+                    _ => self.ctx.i64_type(),
+                };
+                t.const_int(*n as u64, true).into()
+            }
+            Literal::Float(f) => {
+                let t = match hint {
+                    Some(BasicTypeEnum::FloatType(t)) => t,
+                    _ => self.ctx.f64_type(),
+                };
+                t.const_float(*f).into()
+            }
+            Literal::Bool(b)  => self.ctx.i8_type().const_int(if *b { 1 } else { 0 }, false).into(),
+            Literal::Nil      => self.ctx.i64_type().const_zero().into(),
+            Literal::Interpolated(parts) => {
+                // LLVM: concat interpolated string parts using hsh_strcat
+                let i8ptr = self.ctx.ptr_type(inkwell::AddressSpace::default());
+                let mut acc: BasicValueEnum = self.builder
+                    .build_global_string_ptr("", ".istart").unwrap()
+                    .as_pointer_value().into();
+                for part in parts {
+                    let pv: BasicValueEnum = match part {
+                        hsharp_parser::ast::InterpPart::Text(t) => {
+                            self.builder.build_global_string_ptr(t.as_str(), ".itext").unwrap()
+                                .as_pointer_value().into()
+                        }
+                        hsharp_parser::ast::InterpPart::Expr(e) => {
+                            let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                            let r = self.builder.build_call(
+                                self.builtins.hsh_int_to_string, &[v.into()], "its"
+                            ).unwrap();
+                            self.unwrap_call(r).into()
+                        }
+                    };
+                    let r = self.builder.build_call(
+                        self.builtins.hsh_strcat, &[acc.into(), pv.into()], "cat"
+                    ).unwrap();
+                    acc = self.unwrap_call(r).into();
+                }
+                acc
+            }
+        Literal::String(s) => {
+                let ptr = if let Some(&g) = self.str_globals.get(s.as_str()) {
+                    g
+                } else {
+                    let gs = self.builder.build_global_string_ptr(s, ".str").unwrap();
+                    let p = gs.as_pointer_value();
+                    self.str_globals.insert(s.clone(), p);
+                    p
+                };
+                ptr.into()
+            }
+            Literal::Bytes(_) => self.ctx.i64_type().const_zero().into(),
+        })
+    }
 
-               fn call_fn(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
-                   let i8ptr = self.ctx.ptr_type(AddressSpace::default());
+    fn call_fn(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
+        let i8ptr = self.ctx.ptr_type(AddressSpace::default());
 
-                   macro_rules! str_arg {
-                       ($i:expr) => {
-                           if let Some(a) = args.get($i) {
-                               self.expr(a, Some(i8ptr.into()))?
-                           } else {
-                               let g = self.builder.build_global_string_ptr("", ".empty").unwrap();
-                               g.as_pointer_value().into()
-                           }
-                       }
-                   }
+        macro_rules! str_arg {
+            ($i:expr) => {
+                if let Some(a) = args.get($i) {
+                    self.expr(a, Some(i8ptr.into()))?
+                } else {
+                    let g = self.builder.build_global_string_ptr("", ".empty").unwrap();
+                    g.as_pointer_value().into()
+                }
+            }
+        }
 
-                   match name {
-                       "println" | "write" | "writeln" => {
-                           let a = str_arg!(0);
-                           self.builder.build_call(self.builtins.hsh_println, &[a.into()], "").unwrap();
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
-                       "print" => {
-                           let a = str_arg!(0);
-                           self.builder.build_call(self.builtins.hsh_print, &[a.into()], "").unwrap();
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
-                       "to_string" => {
-                           let a = if let Some(e) = args.first() {
-                               self.expr(e, Some(self.ctx.i64_type().into()))?
-                           } else { self.ctx.i64_type().const_zero().into() };
-                           let r = self.builder.build_call(self.builtins.hsh_int_to_string, &[a.into()], "ts").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "len" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_strlen, &[a.into()], "len").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "panic" => {
-                           let a = str_arg!(0);
-                           self.builder.build_call(self.builtins.hsh_panic, &[a.into()], "").unwrap();
-                           self.builder.build_unreachable().unwrap();
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
-                       "exit" => {
-                           let code = if let Some(e) = args.first() {
-                               let v = self.expr(e, Some(self.ctx.i32_type().into()))?;
-                               match v { BasicValueEnum::IntValue(i) => i.into(), _ => self.ctx.i32_type().const_zero().into() }
-                           } else { self.ctx.i32_type().const_zero().into() };
-                           self.builder.build_call(self.builtins.exit_fn, &[code], "").unwrap();
-                           self.builder.build_unreachable().unwrap();
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
+        match name {
+            "println" | "write" | "writeln" => {
+                let a = str_arg!(0);
+                self.builder.build_call(self.builtins.hsh_println, &[a.into()], "").unwrap();
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
+            "print" => {
+                let a = str_arg!(0);
+                self.builder.build_call(self.builtins.hsh_print, &[a.into()], "").unwrap();
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
+            "to_string" => {
+                let a = if let Some(e) = args.first() {
+                    self.expr(e, Some(self.ctx.i64_type().into()))?
+                } else { self.ctx.i64_type().const_zero().into() };
+                let r = self.builder.build_call(self.builtins.hsh_int_to_string, &[a.into()], "ts").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "len" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_strlen, &[a.into()], "len").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "panic" => {
+                let a = str_arg!(0);
+                self.builder.build_call(self.builtins.hsh_panic, &[a.into()], "").unwrap();
+                self.builder.build_unreachable().unwrap();
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
+            "exit" => {
+                let code = if let Some(e) = args.first() {
+                    let v = self.expr(e, Some(self.ctx.i32_type().into()))?;
+                    match v { BasicValueEnum::IntValue(i) => i.into(), _ => self.ctx.i32_type().const_zero().into() }
+                } else { self.ctx.i32_type().const_zero().into() };
+                self.builder.build_call(self.builtins.exit_fn, &[code], "").unwrap();
+                self.builder.build_unreachable().unwrap();
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
 
-                       // ── String stdlib ───────────────────────────────────────────────
-                       "trim" | "str_trim" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_trim, &[a.into()], "trim").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "to_upper" | "upper" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_to_upper, &[a.into()], "upper").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "to_lower" | "lower" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_to_lower, &[a.into()], "lower").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "contains" | "str_contains" => {
-                           let a = str_arg!(0); let b2 = str_arg!(1);
-                           let r = self.builder.build_call(self.builtins.hsh_str_contains, &[a.into(), b2.into()], "contains").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "starts_with" => {
-                           let a = str_arg!(0); let b2 = str_arg!(1);
-                           let r = self.builder.build_call(self.builtins.hsh_starts_with, &[a.into(), b2.into()], "sw").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "ends_with" => {
-                           let a = str_arg!(0); let b2 = str_arg!(1);
-                           let r = self.builder.build_call(self.builtins.hsh_ends_with, &[a.into(), b2.into()], "ew").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "replace" | "str_replace" => {
-                           let a = str_arg!(0); let f2 = str_arg!(1); let t2 = str_arg!(2);
-                           let r = self.builder.build_call(self.builtins.hsh_str_replace, &[a.into(), f2.into(), t2.into()], "repl").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       // ── Time ────────────────────────────────────────────────────────
-                       "now_unix" | "time_unix" => {
-                           let r = self.builder.build_call(self.builtins.hsh_now_unix, &[], "now_unix").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "now_ms" | "time_ms" => {
-                           let r = self.builder.build_call(self.builtins.hsh_now_ms, &[], "now_ms").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "sleep_ms" => {
-                           let ms = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
-                           self.builder.build_call(self.builtins.hsh_sleep_ms, &[ms.into()], "").unwrap();
-                           Ok(self.ctx.i64_type().const_zero().into())
-                       }
-                       // ── System ──────────────────────────────────────────────────────
-                       "shell" | "cmd" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_shell, &[a.into()], "shell").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "getpid" | "pid" => {
-                           let r = self.builder.build_call(self.builtins.hsh_getpid, &[], "pid").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "hostname" => {
-                           let r = self.builder.build_call(self.builtins.hsh_hostname, &[], "host").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       // ── Random / Crypto ─────────────────────────────────────────────
-                       "random_hex" => {
-                           let n = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
-                           let r = self.builder.build_call(self.builtins.hsh_random_hex, &[n.into()], "rhex").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "random_int" => {
-                           let mn = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
-                           let mx = self.expr(&args[1], Some(self.ctx.i64_type().into()))?;
-                           let r  = self.builder.build_call(self.builtins.hsh_random_int, &[mn.into(), mx.into()], "rint").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "random_string" => {
-                           let n = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
-                           let r = self.builder.build_call(self.builtins.hsh_random_string, &[n.into()], "rstr").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "new_uuid" => {
-                           let r = self.builder.build_call(self.builtins.hsh_uuid_v4, &[], "uuid").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       // ── Filesystem ──────────────────────────────────────────────────
-                       "fs_read" | "read_file" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_read_file, &[a.into()], "fread").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "fs_write" | "write_file" => {
-                           let p = str_arg!(0); let c2 = str_arg!(1);
-                           let r = self.builder.build_call(self.builtins.hsh_write_file, &[p.into(), c2.into()], "fwrite").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "fs_exists" | "file_exists" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_file_exists, &[a.into()], "fex").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "fs_mkdir_all" | "mkdir_all" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_mkdir_all, &[a.into()], "mkdir").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "file_size_bytes" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_file_size, &[a.into()], "fsz").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "is_dir" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_is_dir, &[a.into()], "isdir").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       // ── ANSI / Terminal ─────────────────────────────────────────────
-                       "bold" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_bold, &[a.into()], "bold").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "green_text" | "green" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_green_text, &[a.into()], "green").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "red_text" | "red" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_red_text, &[a.into()], "red").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "yellow_text" | "yellow" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_yellow_text, &[a.into()], "yel").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "dim_text" | "dim" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_dim_text, &[a.into()], "dim").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "cyan_text" | "cyan" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_cyan_text, &[a.into()], "cyan").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       // ── Network ──────────────────────────────────────────────────────
-                       "scan_port" | "scan_port_net" => {
-                           let host = str_arg!(0);
-                           let port = self.expr(&args[1], Some(self.ctx.i64_type().into()))?;
-                           let tout = if args.len() > 2 {
-                               self.expr(&args[2], Some(self.ctx.i64_type().into()))?
-                           } else { self.ctx.i64_type().const_int(500, false).into() };
-                           let r = self.builder.build_call(self.builtins.hsh_scan_port, &[host.into(), port.into(), tout.into()], "sport").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
-                       "dns_resolve" => {
-                           let a = str_arg!(0);
-                           let r = self.builder.build_call(self.builtins.hsh_dns_resolve, &[a.into()], "dns").unwrap();
-                           Ok(self.unwrap_call(r))
-                       }
+            // ── String stdlib ───────────────────────────────────────────────
+            "trim" | "str_trim" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_trim, &[a.into()], "trim").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "to_upper" | "upper" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_to_upper, &[a.into()], "upper").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "to_lower" | "lower" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_to_lower, &[a.into()], "lower").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "contains" | "str_contains" => {
+                let a = str_arg!(0); let b2 = str_arg!(1);
+                let r = self.builder.build_call(self.builtins.hsh_str_contains, &[a.into(), b2.into()], "contains").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "starts_with" => {
+                let a = str_arg!(0); let b2 = str_arg!(1);
+                let r = self.builder.build_call(self.builtins.hsh_starts_with, &[a.into(), b2.into()], "sw").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "ends_with" => {
+                let a = str_arg!(0); let b2 = str_arg!(1);
+                let r = self.builder.build_call(self.builtins.hsh_ends_with, &[a.into(), b2.into()], "ew").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "replace" | "str_replace" => {
+                let a = str_arg!(0); let f2 = str_arg!(1); let t2 = str_arg!(2);
+                let r = self.builder.build_call(self.builtins.hsh_str_replace, &[a.into(), f2.into(), t2.into()], "repl").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            // ── Time ────────────────────────────────────────────────────────
+            "now_unix" | "time_unix" => {
+                let r = self.builder.build_call(self.builtins.hsh_now_unix, &[], "now_unix").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "now_ms" | "time_ms" => {
+                let r = self.builder.build_call(self.builtins.hsh_now_ms, &[], "now_ms").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "sleep_ms" => {
+                let ms = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                self.builder.build_call(self.builtins.hsh_sleep_ms, &[ms.into()], "").unwrap();
+                Ok(self.ctx.i64_type().const_zero().into())
+            }
+            // ── System ──────────────────────────────────────────────────────
+            "shell" | "cmd" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_shell, &[a.into()], "shell").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "getpid" | "pid" => {
+                let r = self.builder.build_call(self.builtins.hsh_getpid, &[], "pid").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "hostname" => {
+                let r = self.builder.build_call(self.builtins.hsh_hostname, &[], "host").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            // ── Random / Crypto ─────────────────────────────────────────────
+            "random_hex" => {
+                let n = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                let r = self.builder.build_call(self.builtins.hsh_random_hex, &[n.into()], "rhex").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "random_int" => {
+                let mn = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                let mx = self.expr(&args[1], Some(self.ctx.i64_type().into()))?;
+                let r  = self.builder.build_call(self.builtins.hsh_random_int, &[mn.into(), mx.into()], "rint").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "random_string" => {
+                let n = self.expr(&args[0], Some(self.ctx.i64_type().into()))?;
+                let r = self.builder.build_call(self.builtins.hsh_random_string, &[n.into()], "rstr").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "new_uuid" => {
+                let r = self.builder.build_call(self.builtins.hsh_uuid_v4, &[], "uuid").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            // ── Filesystem ──────────────────────────────────────────────────
+            "fs_read" | "read_file" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_read_file, &[a.into()], "fread").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "fs_write" | "write_file" => {
+                let p = str_arg!(0); let c2 = str_arg!(1);
+                let r = self.builder.build_call(self.builtins.hsh_write_file, &[p.into(), c2.into()], "fwrite").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "fs_exists" | "file_exists" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_file_exists, &[a.into()], "fex").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "fs_mkdir_all" | "mkdir_all" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_mkdir_all, &[a.into()], "mkdir").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "file_size_bytes" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_file_size, &[a.into()], "fsz").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "is_dir" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_is_dir, &[a.into()], "isdir").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            // ── ANSI / Terminal ─────────────────────────────────────────────
+            "bold" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_bold, &[a.into()], "bold").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "green_text" | "green" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_green_text, &[a.into()], "green").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "red_text" | "red" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_red_text, &[a.into()], "red").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "yellow_text" | "yellow" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_yellow_text, &[a.into()], "yel").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "dim_text" | "dim" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_dim_text, &[a.into()], "dim").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "cyan_text" | "cyan" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_cyan_text, &[a.into()], "cyan").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            // ── Network ──────────────────────────────────────────────────────
+            "scan_port" | "scan_port_net" => {
+                let host = str_arg!(0);
+                let port = self.expr(&args[1], Some(self.ctx.i64_type().into()))?;
+                let tout = if args.len() > 2 {
+                    self.expr(&args[2], Some(self.ctx.i64_type().into()))?
+                } else { self.ctx.i64_type().const_int(500, false).into() };
+                let r = self.builder.build_call(self.builtins.hsh_scan_port, &[host.into(), port.into(), tout.into()], "sport").unwrap();
+                Ok(self.unwrap_call(r))
+            }
+            "dns_resolve" => {
+                let a = str_arg!(0);
+                let r = self.builder.build_call(self.builtins.hsh_dns_resolve, &[a.into()], "dns").unwrap();
+                Ok(self.unwrap_call(r))
+            }
 
-                       _ => {
-                           // User function
-                           if let Some(&fv) = self.func_vals.get(name) {
-                               let _sig = fv.get_type();
-                               let mut call_args = Vec::new();
-                               for (_i, a) in args.iter().enumerate() {
+            _ => {
+                // User function
+                if let Some(&fv) = self.func_vals.get(name) {
+                    let _sig = fv.get_type();
+                    let mut call_args = Vec::new();
+                    for (_i, a) in args.iter().enumerate() {
 
-                                   let v = self.expr(a, None)?;
-                                   call_args.push(v.into());
-                               }
-                               let r = self.builder.build_call(fv, &call_args, "call").unwrap();
-                               Ok(self.unwrap_call(r))
-                           } else {
-                               Ok(self.ctx.i64_type().const_zero().into())
-                           }
-                       }
-                   }
-               }
+                        let v = self.expr(a, None)?;
+                        call_args.push(v.into());
+                    }
+                    let r = self.builder.build_call(fv, &call_args, "call").unwrap();
+                    Ok(self.unwrap_call(r))
+                } else {
+                    Ok(self.ctx.i64_type().const_zero().into())
+                }
+            }
+        }
+    }
 
-               fn binop(&mut self, op: &BinOp, lv: BasicValueEnum<'ctx>, rv: BasicValueEnum<'ctx>) -> R<BasicValueEnum<'ctx>> {
-                   // String concatenation for Add on pointer types
-                   if matches!(op, BinOp::Add) {
-                       if let (BasicValueEnum::PointerValue(_), BasicValueEnum::PointerValue(_)) = (&lv, &rv) {
-                           let r = self.builder.build_call(
-                               self.builtins.hsh_strcat, &[lv.into(), rv.into()], "cat"
-                           ).unwrap();
-                           return Ok(self.unwrap_call(r));
-                       }
-                   }
+    fn binop(&mut self, op: &BinOp, lv: BasicValueEnum<'ctx>, rv: BasicValueEnum<'ctx>) -> R<BasicValueEnum<'ctx>> {
+        // String concatenation for Add on pointer types
+        if matches!(op, BinOp::Add) {
+            if let (BasicValueEnum::PointerValue(_), BasicValueEnum::PointerValue(_)) = (&lv, &rv) {
+                let r = self.builder.build_call(
+                    self.builtins.hsh_strcat, &[lv.into(), rv.into()], "cat"
+                ).unwrap();
+                return Ok(self.unwrap_call(r));
+            }
+        }
 
-                   Ok(match (lv, rv) {
-                       (BasicValueEnum::IntValue(l), BasicValueEnum::IntValue(r)) => {
-                           match op {
-                               BinOp::Add    => self.builder.build_int_add(l, r, "add").unwrap().into(),
-                      BinOp::Sub    => self.builder.build_int_sub(l, r, "sub").unwrap().into(),
-                      BinOp::Mul    => self.builder.build_int_mul(l, r, "mul").unwrap().into(),
-                      BinOp::Div    => self.builder.build_int_signed_div(l, r, "div").unwrap().into(),
-                      BinOp::Mod    => self.builder.build_int_signed_rem(l, r, "rem").unwrap().into(),
-                      BinOp::BitAnd => self.builder.build_and(l, r, "and").unwrap().into(),
-                      BinOp::BitOr  => self.builder.build_or(l, r, "or").unwrap().into(),
-                      BinOp::BitXor => self.builder.build_xor(l, r, "xor").unwrap().into(),
-                      BinOp::Shl    => self.builder.build_left_shift(l, r, "shl").unwrap().into(),
-                      BinOp::Shr    => self.builder.build_right_shift(l, r, true, "shr").unwrap().into(),
-                      BinOp::Eq    => self.builder.build_int_compare(inkwell::IntPredicate::EQ,  l, r, "eq").unwrap().into(),
-                      BinOp::NotEq  => self.builder.build_int_compare(inkwell::IntPredicate::NE,  l, r, "ne").unwrap().into(),
-                      BinOp::Lt    => self.builder.build_int_compare(inkwell::IntPredicate::SLT, l, r, "lt").unwrap().into(),
-                      BinOp::Gt    => self.builder.build_int_compare(inkwell::IntPredicate::SGT, l, r, "gt").unwrap().into(),
-                      BinOp::LtEq  => self.builder.build_int_compare(inkwell::IntPredicate::SLE, l, r, "le").unwrap().into(),
-                      BinOp::GtEq  => self.builder.build_int_compare(inkwell::IntPredicate::SGE, l, r, "ge").unwrap().into(),
-                      BinOp::And   => self.builder.build_and(l, r, "land").unwrap().into(),
-                      BinOp::Or    => self.builder.build_or(l, r, "lor").unwrap().into(),
-                           }
-                       }
-                       (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) => {
-                           match op {
-                               BinOp::Add  => self.builder.build_float_add(l, r, "fadd").unwrap().into(),
-                      BinOp::Sub  => self.builder.build_float_sub(l, r, "fsub").unwrap().into(),
-                      BinOp::Mul  => self.builder.build_float_mul(l, r, "fmul").unwrap().into(),
-                      BinOp::Div  => self.builder.build_float_div(l, r, "fdiv").unwrap().into(),
-                      BinOp::Eq   => self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, l, r, "feq").unwrap().into(),
-                      BinOp::Lt   => self.builder.build_float_compare(inkwell::FloatPredicate::OLT, l, r, "flt").unwrap().into(),
-                      BinOp::Gt   => self.builder.build_float_compare(inkwell::FloatPredicate::OGT, l, r, "fgt").unwrap().into(),
-                      _ => self.ctx.f64_type().const_zero().into(),
-                           }
-                       }
-                       _ => self.ctx.i64_type().const_zero().into(),
-                   })
-               }
+        Ok(match (lv, rv) {
+            (BasicValueEnum::IntValue(l), BasicValueEnum::IntValue(r)) => {
+                match op {
+                    BinOp::Add    => self.builder.build_int_add(l, r, "add").unwrap().into(),
+                    BinOp::Sub    => self.builder.build_int_sub(l, r, "sub").unwrap().into(),
+                    BinOp::Mul    => self.builder.build_int_mul(l, r, "mul").unwrap().into(),
+                    BinOp::Div    => self.builder.build_int_signed_div(l, r, "div").unwrap().into(),
+                    BinOp::Mod    => self.builder.build_int_signed_rem(l, r, "rem").unwrap().into(),
+                    BinOp::BitAnd => self.builder.build_and(l, r, "and").unwrap().into(),
+                    BinOp::BitOr  => self.builder.build_or(l, r, "or").unwrap().into(),
+                    BinOp::BitXor => self.builder.build_xor(l, r, "xor").unwrap().into(),
+                    BinOp::Shl    => self.builder.build_left_shift(l, r, "shl").unwrap().into(),
+                    BinOp::Shr    => self.builder.build_right_shift(l, r, true, "shr").unwrap().into(),
+                    BinOp::Eq    => self.builder.build_int_compare(inkwell::IntPredicate::EQ,  l, r, "eq").unwrap().into(),
+                    BinOp::NotEq  => self.builder.build_int_compare(inkwell::IntPredicate::NE,  l, r, "ne").unwrap().into(),
+                    BinOp::Lt    => self.builder.build_int_compare(inkwell::IntPredicate::SLT, l, r, "lt").unwrap().into(),
+                    BinOp::Gt    => self.builder.build_int_compare(inkwell::IntPredicate::SGT, l, r, "gt").unwrap().into(),
+                    BinOp::LtEq  => self.builder.build_int_compare(inkwell::IntPredicate::SLE, l, r, "le").unwrap().into(),
+                    BinOp::GtEq  => self.builder.build_int_compare(inkwell::IntPredicate::SGE, l, r, "ge").unwrap().into(),
+                    BinOp::And   => self.builder.build_and(l, r, "land").unwrap().into(),
+                    BinOp::Or    => self.builder.build_or(l, r, "lor").unwrap().into(),
+                }
+            }
+            (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) => {
+                match op {
+                    BinOp::Add  => self.builder.build_float_add(l, r, "fadd").unwrap().into(),
+                    BinOp::Sub  => self.builder.build_float_sub(l, r, "fsub").unwrap().into(),
+                    BinOp::Mul  => self.builder.build_float_mul(l, r, "fmul").unwrap().into(),
+                    BinOp::Div  => self.builder.build_float_div(l, r, "fdiv").unwrap().into(),
+                    BinOp::Eq   => self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, l, r, "feq").unwrap().into(),
+                    BinOp::Lt   => self.builder.build_float_compare(inkwell::FloatPredicate::OLT, l, r, "flt").unwrap().into(),
+                    BinOp::Gt   => self.builder.build_float_compare(inkwell::FloatPredicate::OGT, l, r, "fgt").unwrap().into(),
+                    _ => self.ctx.f64_type().const_zero().into(),
+                }
+            }
+            _ => self.ctx.i64_type().const_zero().into(),
+        })
+    }
 
-               fn cast(&mut self, v: BasicValueEnum<'ctx>, dst: BasicTypeEnum<'ctx>) -> R<BasicValueEnum<'ctx>> {
-                   Ok(match (v, dst) {
-                       (BasicValueEnum::IntValue(i), BasicTypeEnum::IntType(t)) => {
-                           if i.get_type().get_bit_width() > t.get_bit_width() {
-                               self.builder.build_int_truncate(i, t, "trunc").unwrap().into()
-                           } else {
-                               self.builder.build_int_s_extend(i, t, "sext").unwrap().into()
-                           }
-                       }
-                       (BasicValueEnum::IntValue(i), BasicTypeEnum::FloatType(t)) =>
-                       self.builder.build_signed_int_to_float(i, t, "i2f").unwrap().into(),
-                      (BasicValueEnum::FloatValue(f), BasicTypeEnum::IntType(t)) =>
-                      self.builder.build_float_to_signed_int(f, t, "f2i").unwrap().into(),
-                      (BasicValueEnum::FloatValue(f), BasicTypeEnum::FloatType(t)) =>
-                      if f.get_type() == self.ctx.f64_type() && t != self.ctx.f64_type() {
-                          self.builder.build_float_trunc(f, t, "ftrunc").unwrap().into()
-                      } else if f.get_type() != self.ctx.f64_type() && t == self.ctx.f64_type() {
-                          self.builder.build_float_ext(f, t, "fext").unwrap().into()
-                      } else { f.into() },
-                          _ => v,
-                   })
-               }
+    fn cast(&mut self, v: BasicValueEnum<'ctx>, dst: BasicTypeEnum<'ctx>) -> R<BasicValueEnum<'ctx>> {
+        Ok(match (v, dst) {
+            (BasicValueEnum::IntValue(i), BasicTypeEnum::IntType(t)) => {
+                if i.get_type().get_bit_width() > t.get_bit_width() {
+                    self.builder.build_int_truncate(i, t, "trunc").unwrap().into()
+                } else {
+                    self.builder.build_int_s_extend(i, t, "sext").unwrap().into()
+                }
+            }
+            (BasicValueEnum::IntValue(i), BasicTypeEnum::FloatType(t)) =>
+                self.builder.build_signed_int_to_float(i, t, "i2f").unwrap().into(),
+            (BasicValueEnum::FloatValue(f), BasicTypeEnum::IntType(t)) =>
+                self.builder.build_float_to_signed_int(f, t, "f2i").unwrap().into(),
+            (BasicValueEnum::FloatValue(f), BasicTypeEnum::FloatType(t)) =>
+                if f.get_type() == self.ctx.f64_type() && t != self.ctx.f64_type() {
+                    self.builder.build_float_trunc(f, t, "ftrunc").unwrap().into()
+                } else if f.get_type() != self.ctx.f64_type() && t == self.ctx.f64_type() {
+                    self.builder.build_float_ext(f, t, "fext").unwrap().into()
+                } else { f.into() },
+            _ => v,
+        })
+    }
 
-               fn as_bool(&mut self, e: &Expr) -> R<inkwell::values::IntValue<'ctx>> {
-                   let v = self.expr(e, Some(self.ctx.i8_type().into()))?;
-                   match v {
-                       BasicValueEnum::IntValue(i) => {
-                           let z = i.get_type().const_zero();
-                           Ok(self.builder.build_int_compare(inkwell::IntPredicate::NE, i, z, "bool").unwrap())
-                       }
-                       BasicValueEnum::FloatValue(f) => {
-                           let z = f.get_type().const_float(0.0);
-                           Ok(self.builder.build_float_compare(inkwell::FloatPredicate::ONE, f, z, "fbool").unwrap())
-                       }
-                       _ => Ok(self.ctx.i8_type().const_int(1, false)),
-                   }
-               }
+    fn as_bool(&mut self, e: &Expr) -> R<inkwell::values::IntValue<'ctx>> {
+        let v = self.expr(e, Some(self.ctx.i8_type().into()))?;
+        match v {
+            BasicValueEnum::IntValue(i) => {
+                let z = i.get_type().const_zero();
+                Ok(self.builder.build_int_compare(inkwell::IntPredicate::NE, i, z, "bool").unwrap())
+            }
+            BasicValueEnum::FloatValue(f) => {
+                let z = f.get_type().const_float(0.0);
+                Ok(self.builder.build_float_compare(inkwell::FloatPredicate::ONE, f, z, "fbool").unwrap())
+            }
+            _ => Ok(self.ctx.i8_type().const_int(1, false)),
+        }
+    }
 
-               fn coerce_ret(&mut self, v: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
-                   if self.fn_name != "main" { return v; }
-                   let i32t = self.ctx.i32_type();
-                   match v {
-                       BasicValueEnum::IntValue(i) if i.get_type() != i32t => {
-                           self.builder.build_int_cast(i, i32t, "ret_cast").unwrap().into()
-                       }
-                       _ => v,
-                   }
-               }
+    fn coerce_ret(&mut self, v: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        if self.fn_name != "main" { return v; }
+        let i32t = self.ctx.i32_type();
+        match v {
+            BasicValueEnum::IntValue(i) if i.get_type() != i32t => {
+                self.builder.build_int_cast(i, i32t, "ret_cast").unwrap().into()
+            }
+            _ => v,
+        }
+    }
 
-               fn zero(&self, ty: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
-                   match ty {
-                       BasicTypeEnum::IntType(t)     => t.const_zero().into(),
-                       BasicTypeEnum::FloatType(t)   => t.const_zero().into(),
-                       BasicTypeEnum::PointerType(t) => t.const_null().into(),
-                       _ => self.ctx.i64_type().const_zero().into(),
-                   }
-               }
+    fn zero(&self, ty: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        match ty {
+            BasicTypeEnum::IntType(t)     => t.const_zero().into(),
+            BasicTypeEnum::FloatType(t)   => t.const_zero().into(),
+            BasicTypeEnum::PointerType(t) => t.const_null().into(),
+            _ => self.ctx.i64_type().const_zero().into(),
+        }
+    }
 }
