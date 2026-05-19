@@ -1,6 +1,6 @@
 [package]
 name = "hsharp-compiler"
-version = "0.4.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -25,4 +25,3 @@ cranelift-native   = "=0.100.0"
 # Object file writing
 object = "=0.32.2"
 target-lexicon = "0.12"
-
