@@ -42,6 +42,24 @@ pub struct Builtins {
     pub hsh_ends_with:    cranelift_module::FuncId,
     pub hsh_uuid_v4:      cranelift_module::FuncId,
     pub hsh_random_string:cranelift_module::FuncId,
+    // Closure environment (heap closures)
+    pub hsh_closure_create: cranelift_module::FuncId,
+    pub hsh_closure_call1:  cranelift_module::FuncId,
+    pub hsh_closure_call2:  cranelift_module::FuncId,
+    // HTTP
+    pub hsh_http_get:      cranelift_module::FuncId,
+    pub hsh_http_post:     cranelift_module::FuncId,
+    pub hsh_json_get:      cranelift_module::FuncId,
+    // Regex (native POSIX)
+    pub hsh_regex_match:   cranelift_module::FuncId,
+    pub hsh_regex_find:    cranelift_module::FuncId,
+    pub hsh_regex_replace: cranelift_module::FuncId,
+    // SQLite
+    pub hsh_sqlite_open:   cranelift_module::FuncId,
+    pub hsh_sqlite_exec:   cranelift_module::FuncId,
+    pub hsh_sqlite_query:  cranelift_module::FuncId,
+    pub hsh_sqlite_close:  cranelift_module::FuncId,
+    pub hsh_val_to_str:  cranelift_module::FuncId,
     // ANSI formatting
     pub hsh_bold:        cranelift_module::FuncId,
     pub hsh_green_text:  cranelift_module::FuncId,
@@ -229,6 +247,24 @@ impl Builtins {
         let hsh_yellow_text = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_yellow_text", Linkage::Import, &s).unwrap() };
         let hsh_dim_text    = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_dim_text",    Linkage::Import, &s).unwrap() };
         let hsh_cyan_text   = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_cyan_text",   Linkage::Import, &s).unwrap() };
+        // Smart type-to-string (passes strings through, converts ints)
+        let hsh_val_to_str   = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_val_to_str",    Linkage::Import, &s).unwrap() };
+        // HTTP
+        let hsh_http_get     = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_http_get",      Linkage::Import, &s).unwrap() };
+        let hsh_http_post    = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_http_post",     Linkage::Import, &s).unwrap() };
+        let hsh_json_get     = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_json_get",      Linkage::Import, &s).unwrap() };
+        // Regex (POSIX)
+        let hsh_regex_match  = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_regex_match",   Linkage::Import, &s).unwrap() };
+        let hsh_regex_find   = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_regex_find",    Linkage::Import, &s).unwrap() };
+        let hsh_regex_replace = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_regex_replace",  Linkage::Import, &s).unwrap() };
+        // SQLite
+        let hsh_sqlite_open  = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_sqlite_open",   Linkage::Import, &s).unwrap() };
+        let hsh_sqlite_exec  = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_sqlite_exec",   Linkage::Import, &s).unwrap() };
+        let hsh_sqlite_query = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_sqlite_query",  Linkage::Import, &s).unwrap() };
+        let hsh_sqlite_close = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); module.declare_function("hsh_sqlite_close",  Linkage::Import, &s).unwrap() };
+        let hsh_closure_create = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_closure_create", Linkage::Import, &s).unwrap() };
+        let hsh_closure_call1  = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_closure_call1",  Linkage::Import, &s).unwrap() };
+        let hsh_closure_call2  = { let mut s = Signature::new(call_conv); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.params.push(AbiParam::new(types::I64)); s.returns.push(AbiParam::new(types::I64)); module.declare_function("hsh_closure_call2",  Linkage::Import, &s).unwrap() };
 
         Self {
             println, print, panic_fn, exit_fn,
@@ -240,6 +276,11 @@ impl Builtins {
             hsh_file_exists, hsh_read_file, hsh_write_file, hsh_mkdir_all, hsh_file_size,
             hsh_is_dir, hsh_starts_with, hsh_ends_with, hsh_uuid_v4, hsh_random_string,
             hsh_bold, hsh_green_text, hsh_red_text, hsh_yellow_text, hsh_dim_text, hsh_cyan_text,
+            hsh_val_to_str,
+            hsh_regex_match, hsh_regex_find, hsh_regex_replace,
+            hsh_closure_create, hsh_closure_call1, hsh_closure_call2,
+            hsh_sqlite_open, hsh_sqlite_exec, hsh_sqlite_query, hsh_sqlite_close,
+            hsh_http_get, hsh_http_post, hsh_json_get,
         }
     }
 }
@@ -767,6 +808,262 @@ hsh_string hsh_dns_resolve(hsh_string host) {
     }
     freeaddrinfo(res);
     return ip;
+}
+
+/* ── Native Regex (POSIX ERE — no grep dependency) ─────────────────────────── */
+#include <regex.h>
+
+/* Normalize pattern: convert PCRE shortcuts to POSIX ERE */
+static void hsh_normalize_pattern(const char *in, char *out, size_t out_sz) {
+    size_t i = 0, j = 0;
+    while (in[i] && j + 4 < out_sz) {
+        if (in[i] == '\\' && in[i+1]) {
+            switch (in[i+1]) {
+                case 'd': memcpy(out+j, "[0-9]", 5); j += 5; i += 2; break;
+                case 'D': memcpy(out+j, "[^0-9]", 6); j += 6; i += 2; break;
+                case 'w': memcpy(out+j, "[A-Za-z0-9_]", 12); j += 12; i += 2; break;
+                case 'W': memcpy(out+j, "[^A-Za-z0-9_]", 13); j += 13; i += 2; break;
+                case 's': memcpy(out+j, "[ \\t\\n\\r]", 9); j += 9; i += 2; break;
+                default:  out[j++] = in[i++]; out[j++] = in[i++]; break;
+            }
+        } else {
+            out[j++] = in[i++];
+        }
+    }
+    out[j] = '\0';
+}
+
+int64_t hsh_regex_match(hsh_string pattern, hsh_string text) {
+    if (!pattern || !text) return 0;
+    char norm[4096]; hsh_normalize_pattern(pattern, norm, sizeof(norm));
+    regex_t re;
+    if (regcomp(&re, norm, REG_EXTENDED | REG_NOSUB) != 0) return 0;
+    int ok = (regexec(&re, text, 0, NULL, 0) == 0) ? 1 : 0;
+    regfree(&re);
+    return ok;
+}
+
+hsh_string hsh_regex_find(hsh_string pattern, hsh_string text) {
+    if (!pattern || !text) return "";
+    char norm[4096]; hsh_normalize_pattern(pattern, norm, sizeof(norm));
+    regex_t re;
+    if (regcomp(&re, norm, REG_EXTENDED) != 0) return "";
+    regmatch_t m;
+    if (regexec(&re, text, 1, &m, 0) == 0) {
+        int len = m.rm_eo - m.rm_so;
+        char *result = (char*)malloc(len + 1);
+        strncpy(result, text + m.rm_so, len);
+        result[len] = '\0';
+        regfree(&re);
+        return result;
+    }
+    regfree(&re);
+    return "";
+}
+
+hsh_string hsh_regex_replace(hsh_string pattern, hsh_string replacement, hsh_string text) {
+    if (!pattern || !text || !replacement) return text ? text : "";
+    char norm[4096]; hsh_normalize_pattern(pattern, norm, sizeof(norm));
+    regex_t re;
+    if (regcomp(&re, norm, REG_EXTENDED) != 0) return text;
+    regmatch_t m;
+    size_t text_len = strlen(text);
+    size_t repl_len = strlen(replacement);
+    char *out = (char*)malloc(text_len * 2 + repl_len + 1);
+    if (!out) { regfree(&re); return text; }
+    size_t out_pos = 0;
+    const char *cursor = text;
+    while (regexec(&re, cursor, 1, &m, 0) == 0) {
+        // Copy text before match
+        size_t pre = m.rm_so;
+        memcpy(out + out_pos, cursor, pre);
+        out_pos += pre;
+        // Copy replacement
+        memcpy(out + out_pos, replacement, repl_len);
+        out_pos += repl_len;
+        cursor += m.rm_eo;
+        if (m.rm_eo == 0) { out[out_pos++] = *cursor++; } // advance past zero-length match
+    }
+    // Copy remaining text
+    size_t tail = strlen(cursor);
+    memcpy(out + out_pos, cursor, tail);
+    out_pos += tail;
+    out[out_pos] = '\0';
+    regfree(&re);
+    return out;
+}
+
+/* ── Native SQLite3 (libsqlite3) ─────────────────────────────────────────────── */
+/* Requires: apt install libsqlite3-dev  OR  pacman -S sqlite */
+#ifdef __has_include
+  #if __has_include(<sqlite3.h>)
+    #define HSH_HAVE_SQLITE3 1
+    #include <sqlite3.h>
+  #endif
+#endif
+
+#ifndef HSH_HAVE_SQLITE3
+/* Stub: no sqlite3 header available at compile time — use CLI fallback */
+hsh_string hsh_sqlite_open(hsh_string path) { return path; }
+hsh_string hsh_sqlite_exec(hsh_string db_path, hsh_string sql) {
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "sqlite3 '%s' '%s' 2>&1", db_path, sql);
+    return hsh_shell(cmd);
+}
+hsh_string hsh_sqlite_query(hsh_string db_path, hsh_string sql) {
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "sqlite3 -separator ',' '%s' '%s' 2>&1", db_path, sql);
+    return hsh_shell(cmd);
+}
+void hsh_sqlite_close(hsh_string db_path) { (void)db_path; }
+#else
+/* Real libsqlite3 implementation */
+/* db handle is stored as a pointer packed into a string representation */
+/* We use a simple global map indexed by path for portability */
+#include <stdlib.h>
+
+hsh_string hsh_sqlite_open(hsh_string path) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) {
+        return sqlite3_errmsg(db);
+    }
+    /* Store pointer as hex string */
+    char *handle = (char*)malloc(32);
+    snprintf(handle, 32, "db:%p", (void*)db);
+    return handle;
+}
+
+static sqlite3 *hsh_sqlite_get(hsh_string handle) {
+    if (!handle || strncmp(handle, "db:", 3) != 0) return NULL;
+    void *ptr = NULL;
+    sscanf(handle + 3, "%p", &ptr);
+    return (sqlite3*)ptr;
+}
+
+static char hsh_sqlite_result[65536];
+
+static int hsh_sqlite_cb(void *buf, int cols, char **vals, char **names) {
+    char *out = (char*)buf;
+    size_t pos = strlen(out);
+    for (int i = 0; i < cols; i++) {
+        if (i > 0) { out[pos++] = ','; }
+        const char *v = vals[i] ? vals[i] : "";
+        size_t vl = strlen(v);
+        memcpy(out + pos, v, vl);
+        pos += vl;
+    }
+    out[pos++] = '\n';
+    out[pos]   = '\0';
+    return 0;
+}
+
+hsh_string hsh_sqlite_exec(hsh_string handle, hsh_string sql) {
+    sqlite3 *db = hsh_sqlite_get(handle);
+    if (!db) return "error: invalid db handle";
+    char *errmsg = NULL;
+    hsh_sqlite_result[0] = '\0';
+    sqlite3_exec(db, sql, hsh_sqlite_cb, hsh_sqlite_result, &errmsg);
+    if (errmsg) {
+        char *e = strdup(errmsg);
+        sqlite3_free(errmsg);
+        return e;
+    }
+    return hsh_sqlite_result[0] ? strdup(hsh_sqlite_result) : "";
+}
+
+hsh_string hsh_sqlite_query(hsh_string handle, hsh_string sql) {
+    return hsh_sqlite_exec(handle, sql);
+}
+
+void hsh_sqlite_close(hsh_string handle) {
+    sqlite3 *db = hsh_sqlite_get(handle);
+    if (db) sqlite3_close(db);
+}
+#endif /* HSH_HAVE_SQLITE3 */
+
+/* ── Closure environment (heap-allocated capture struct) ─────────────────────── */
+#include <stdarg.h>
+typedef struct { int64_t fn_ptr; int64_t n_caps; int64_t caps[8]; } HshClosure;
+
+/* Create closure with up to 8 captures passed as individual args */
+HshClosure* hsh_closure_create(int64_t fn_ptr, int64_t n_caps,
+    int64_t c0, int64_t c1, int64_t c2, int64_t c3,
+    int64_t c4, int64_t c5, int64_t c6, int64_t c7) {
+    HshClosure *c = (HshClosure*)malloc(sizeof(HshClosure));
+    c->fn_ptr  = fn_ptr;
+    c->n_caps  = n_caps;
+    int64_t caps_in[8] = {c0, c1, c2, c3, c4, c5, c6, c7};
+    for (int64_t i = 0; i < n_caps && i < 8; i++) {
+        c->caps[i] = caps_in[i];
+    }
+    return c;
+}
+
+/* Call a closure with 1 explicit arg + up to 8 captured args */
+int64_t hsh_closure_call1(HshClosure *c, int64_t arg0) {
+    typedef int64_t (*Fn0)(void);
+    typedef int64_t (*Fn1)(int64_t);
+    typedef int64_t (*Fn2)(int64_t, int64_t);
+    typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
+    switch (c->n_caps) {
+        case 0: return ((Fn1)(void*)c->fn_ptr)(arg0);
+        case 1: return ((Fn2)(void*)c->fn_ptr)(arg0, c->caps[0]);
+        case 2: return ((Fn3)(void*)c->fn_ptr)(arg0, c->caps[0], c->caps[1]);
+        default: return ((Fn1)(void*)c->fn_ptr)(arg0);
+    }
+}
+
+/* Call with 2 explicit args */
+int64_t hsh_closure_call2(HshClosure *c, int64_t arg0, int64_t arg1) {
+    typedef int64_t (*Fn2)(int64_t, int64_t);
+    typedef int64_t (*Fn3)(int64_t, int64_t, int64_t);
+    typedef int64_t (*Fn4)(int64_t, int64_t, int64_t, int64_t);
+    switch (c->n_caps) {
+        case 0: return ((Fn2)(void*)c->fn_ptr)(arg0, arg1);
+        case 1: return ((Fn3)(void*)c->fn_ptr)(arg0, arg1, c->caps[0]);
+        case 2: return ((Fn4)(void*)c->fn_ptr)(arg0, arg1, c->caps[0], c->caps[1]);
+        default: return ((Fn2)(void*)c->fn_ptr)(arg0, arg1);
+    }
+}
+
+/* ── Smart value-to-string conversion ──────────────────────────────────────── */
+hsh_string hsh_val_to_str(int64_t v) {
+    if (v == 0) return "0";
+    if ((uintptr_t)v > 65536 && (uintptr_t)v < (uintptr_t)0x7fffffffffff) {
+        const char *p = (const char *)v;
+        unsigned char first = (unsigned char)p[0];
+        if (first == 0 || (first >= 0x20 && first < 0x80) ||
+            (first >= 0xC0 && first < 0xF8)) {
+            return (hsh_string)v;
+        }
+    }
+    return hsh_int_to_string(v);
+}
+
+/* ── HTTP (curl-based) ──────────────────────────────────────────────────────── */
+hsh_string hsh_http_get(hsh_string url) {
+    if (!url) return "";
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "curl -s -L --max-time 10 -A 'H#/0.6' '%s' 2>/dev/null", url);
+    return hsh_shell(cmd);
+}
+
+hsh_string hsh_http_post(hsh_string url, hsh_string body) {
+    if (!url) return "";
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -L -X POST --max-time 10 -H 'Content-Type: application/json' -d '%s' '%s' 2>/dev/null",
+        body ? body : "", url);
+    return hsh_shell(cmd);
+}
+
+hsh_string hsh_json_get(hsh_string json_str, hsh_string key) {
+    if (!json_str || !key || !*key) return json_str ? json_str : "";
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "echo '%s' | jq -r '.%s' 2>/dev/null | tr -d '\\n'", json_str, key);
+    hsh_string result = hsh_shell(cmd);
+    if (result && *result && strcmp(result, "null") != 0) return result;
+    return "";
 }
 "#
 }
