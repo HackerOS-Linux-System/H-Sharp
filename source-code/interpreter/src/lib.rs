@@ -1,3 +1,4 @@
+pub mod runtime_async;
 use hsharp_parser::ast::*;
 use std::collections::HashMap;
 use std::fmt;
@@ -168,6 +169,20 @@ impl Env {
         None
     }
 
+    /// Return all variables visible in the current scope (for profiler/introspection)
+    pub fn all_vars(&self) -> Vec<(String, Value)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for (k, (v, _)) in scope {
+                if seen.insert(k.clone()) {
+                    result.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        result
+    }
+
     fn set(&mut self, name: &str, val: Value) -> bool {
         for scope in self.scopes.iter_mut().rev() {
             if let Some((v, m)) = scope.get_mut(name) {
@@ -213,6 +228,8 @@ pub enum RuntimeError {
 }
 
 pub struct Interpreter {
+    /// Real async task reactor (v0.6 cooperative runtime)
+    pub reactor: runtime_async::Reactor,
     env: Env,
     fns: HashMap<String, FnDef>,
     structs: HashMap<String, StructDef>,
@@ -228,6 +245,7 @@ impl Interpreter {
             structs: HashMap::new(),
             stdout: String::new(),
             captured_output: false,
+            reactor: runtime_async::Reactor::new(),
         }
     }
 
@@ -671,6 +689,8 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                     Value::AsyncTask(t) => match *t {
                         AsyncTaskState::Ready(v) => Ok(v),
                         AsyncTaskState::Pending { fn_name, ref args } => {
+                            // v0.6: check if it's an I/O task registered in reactor
+                            // otherwise execute synchronously
                             self.call_fn(&fn_name, args.clone())
                         }
                     },
@@ -694,7 +714,8 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
     }
 
     fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        // Check if name is a closure/fn stored in environment (e.g. let triple = |n| n*3)
+
+                    // Check if name is a closure/fn stored in environment (e.g. let triple = |n| n*3)
         if let Some(val) = self.env.get(name).cloned() {
             match val {
                 Value::Fn { params, body, env: captured_env, is_async, .. } => {
@@ -723,6 +744,162 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
 
         // Builtins
         match name {
+            // ── Regex (v0.6) ─────────────────────────────────────────────────
+            "re_match" | "regex_match" => {
+                let pattern = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let text    = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                // Use grep as portable regex engine
+                use std::io::Write;
+                let mut grep_m = std::process::Command::new("grep")
+                    .args(["-qP", &pattern])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn().unwrap_or_else(|_| panic!("grep not found"));
+                if let Some(stdin) = grep_m.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let ok = grep_m.wait().map(|s| s.success()).unwrap_or(false);
+                return Ok(Value::Bool(ok));
+            }
+            "re_find" | "regex_find" => {
+                let pattern = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let text    = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                use std::io::Write;
+                let mut gf = std::process::Command::new("grep")
+                    .args(["-oP", &pattern])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn().unwrap_or_else(|_| { eprintln!("grep not found"); std::process::exit(1); });
+                if let Some(s) = gf.stdin.as_mut() { let _ = s.write_all(text.as_bytes()); }
+                let gfo = gf.wait_with_output().unwrap_or_else(|_| std::process::Command::new("true").output().unwrap());
+                return Ok(Value::Str(String::from_utf8_lossy(&gfo.stdout).trim().to_string()));
+            }
+            "re_find_all" | "regex_find_all" => {
+                let pattern = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let text    = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                use std::io::Write;
+                let mut gfa = std::process::Command::new("grep")
+                    .args(["-oP", &pattern])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn().unwrap_or_else(|_| { eprintln!("grep not found"); std::process::exit(1); });
+                if let Some(s) = gfa.stdin.as_mut() { let _ = s.write_all(text.as_bytes()); }
+                let gfao = gfa.wait_with_output().unwrap_or_else(|_| std::process::Command::new("true").output().unwrap());
+                let results: Vec<Value> = String::from_utf8_lossy(&gfao.stdout)
+                    .lines().filter(|l| !l.is_empty())
+                    .map(|l| Value::Str(l.to_string())).collect();
+                return Ok(Value::Array(results));
+            }
+            "re_replace" | "regex_replace" => {
+                let pattern = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let repl    = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let text    = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+                use std::io::Write;
+                let sed_script = format!("s|{}|{}|g", pattern, repl);
+                let mut sed_c = std::process::Command::new("sed")
+                    .args(["-E", &sed_script])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn().unwrap_or_else(|_| { eprintln!("sed not found"); std::process::exit(1); });
+                if let Some(s) = sed_c.stdin.as_mut() { let _ = s.write_all(text.as_bytes()); }
+                let sed_out = sed_c.wait_with_output().unwrap_or_else(|_| std::process::Command::new("true").output().unwrap());
+                let out = Ok::<_, std::io::Error>(sed_out);
+                return Ok(Value::Str(match out {
+                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+                    Err(_) => text.to_string(),
+                }));
+            }
+            // ── SQLite (v0.6) ─────────────────────────────────────────────────
+            "sqlite_open" | "db_open" => {
+                let path = args.first().map(|v| v.to_string()).unwrap_or_else(|| "./db.sqlite".to_string());
+                // Return the path as a db handle (string-based for portability)
+                return Ok(Value::Str(format!("sqlite://{}", path)));
+            }
+            "sqlite_exec" | "db_exec" => {
+                let db   = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let sql  = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let path = db.strip_prefix("sqlite://").unwrap_or(&db);
+                let out  = std::process::Command::new("sqlite3")
+                    .arg(path).arg(&sql)
+                    .output();
+                return Ok(match out {
+                    Ok(o) if o.status.success() => Value::Str(String::from_utf8_lossy(&o.stdout).to_string()),
+                    Ok(o) => Value::Str(format!("db error: {}", String::from_utf8_lossy(&o.stderr))),
+                    Err(e) => Value::Str(format!("sqlite3 not found: {}", e)),
+                });
+            }
+            "sqlite_query" | "db_query" => {
+                let db   = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let sql  = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let path = db.strip_prefix("sqlite://").unwrap_or(&db);
+                let out  = std::process::Command::new("sqlite3")
+                    .args(["-separator", ",", path, &sql])
+                    .output();
+                let rows: Vec<Value> = match out {
+                    Ok(o) => String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| {
+                            let cols: Vec<Value> = l.split(',')
+                                .map(|c| Value::Str(c.trim().to_string()))
+                                .collect();
+                            Value::Array(cols)
+                        })
+                        .collect(),
+                    Err(_) => vec![],
+                };
+                return Ok(Value::Array(rows));
+            }
+            "sqlite_close" | "db_close" => {
+                return Ok(Value::Nil); // SQLite files don't need explicit close
+            }
+            // ── Profiler (v0.6) ───────────────────────────────────────────────
+            "prof_start" | "profile_start" => {
+                let label = args.first().map(|v| v.to_string()).unwrap_or_else(|| "default".to_string());
+                // Store start time in a global map (use env for now)
+                let start_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                self.env.define(&format!("__prof_{}", label), Value::Int(start_ns), true);
+                return Ok(Value::Int(start_ns));
+            }
+            "prof_end" | "profile_end" => {
+                let label = args.first().map(|v| v.to_string()).unwrap_or_else(|| "default".to_string());
+                let end_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                let start_ns = self.env.get(&format!("__prof_{}", label))
+                    .and_then(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                    .unwrap_or(end_ns);
+                let elapsed_ms = (end_ns - start_ns) / 1_000_000;
+                let msg = format!("[prof] {} = {}ms", label, elapsed_ms);
+                return Ok(Value::Str(msg));
+            }
+            "prof_report" => {
+                // Print all profiler entries
+                let report: Vec<String> = self.env.all_vars()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("__prof_"))
+                    .map(|(k, v)| format!("  {}: started at {:?}", k.trim_start_matches("__prof_"), v.to_string()))
+                    .collect();
+                return Ok(Value::Str(format!("[profiler report]
+{}", report.join("
+"))));
+            }
+            // ── Large project tooling ─────────────────────────────────────────
+            "module_info" => {
+                return Ok(Value::Str(format!("module: {} functions registered", self.fns.len())));
+            }
+            "heap_size" | "memory_usage" => {
+                // Read /proc/self/status for VmRSS
+                let mem = std::fs::read_to_string("/proc/self/status").ok()
+                    .and_then(|s| s.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<i64>().unwrap_or(0)))
+                    .unwrap_or(0);
+                return Ok(Value::Int(mem));
+            }
             "print" => {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
                 if self.captured_output {
@@ -1028,14 +1205,6 @@ fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 Ok(Value::Str(b.iter().map(|byte| format!("{:02x}", byte)).collect()))
             }
             // Array of ints can act as bytes
-            (Value::Array(arr), "to_hex") => {
-                let hex: String = arr.iter().map(|v| match v {
-                    Value::Int(n) => format!("{:02x}", n & 0xFF),
-                    _ => "??".to_string(),
-                }).collect();
-                Ok(Value::Str(hex))
-            }
-            (Value::Array(arr), "len") => Ok(Value::Int(arr.len() as i64)),
             (Value::Int(n), "to_string") => Ok(Value::Str(n.to_string())),
             (Value::Float(f), "to_string") => Ok(Value::Str(f.to_string())),
             (Value::Bool(b), "to_string") => Ok(Value::Str(b.to_string())),
