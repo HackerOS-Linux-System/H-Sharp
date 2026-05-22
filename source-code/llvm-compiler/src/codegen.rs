@@ -247,11 +247,25 @@ impl LlvmCodegen {
             .map_err(|e| CodegenError::Llvm(e.to_string()))?;
 
         // Link with aggressive size + performance flags
+        // Detect if this is a library file (no main fn) → compile as .o
+        let has_main = module.get_function("main").is_some();
+        if !has_main {
+            // Auto-detect: no main → object file only
+            let obj_out = format!("{}.o", self.opts.output);
+            std::fs::copy(&obj_path, &obj_out).ok();
+            eprintln!("  note: no `main` fn found — compiled as object file: {}", obj_out);
+            std::fs::remove_file(&obj_path).ok();
+            std::fs::remove_file(&rt_c).ok();
+            std::fs::remove_file(&rt_o).ok();
+            return Ok(());
+        }
         let suffix = self.opts.target.exe_suffix();
         let out    = format!("{}{}", self.opts.output, suffix);
         let mut cmd = std::process::Command::new("cc");
         cmd.arg(&obj_path).arg(&rt_o).arg("-o").arg(&out);
         cmd.arg("-no-pie");
+        // Always link math, pthread, dl (needed by H# runtime)
+        cmd.args(["-lm", "-lpthread", "-ldl"]);
 
         if self.opts.optimize {
             // Dead code elimination at link time + strip all symbols
@@ -272,7 +286,7 @@ impl LlvmCodegen {
         if !result.status.success() {
             // Retry without advanced flags (some linkers don't support all)
             let mut cmd2 = std::process::Command::new("cc");
-            cmd2.args([&obj_path, &rt_o, "-o", &out, "-no-pie"]);
+            cmd2.args([&obj_path, &rt_o, "-o", &out, "-no-pie", "-lm", "-lpthread", "-ldl"]);
             if self.opts.optimize { cmd2.arg("-O2"); cmd2.arg("-Wl,--gc-sections"); }
             if self.opts.static_link { cmd2.arg("-static"); }
             let r2 = cmd2.output()?;
@@ -741,7 +755,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
             Literal::Nil      => self.ctx.i64_type().const_zero().into(),
             Literal::Interpolated(parts) => {
                 // LLVM: concat interpolated string parts using hsh_strcat
-                let i8ptr = self.ctx.ptr_type(inkwell::AddressSpace::default());
+                let _i8ptr = self.ctx.ptr_type(inkwell::AddressSpace::default());
                 let mut acc: BasicValueEnum = self.builder
                     .build_global_string_ptr("", ".istart").unwrap()
                     .as_pointer_value().into();
