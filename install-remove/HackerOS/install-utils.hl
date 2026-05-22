@@ -1,9 +1,9 @@
 // curl
 
 ! Bytes
-> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.5/bytes -o /usr/bin/bytes
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.6/bytes -o /usr/bin/bytes
 > sudo chmod a+x /usr/bin/bytes
 
 ! HackerOS H# Compiler
-> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.5/hhc -o /usr/bin/hhc
+> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.6/hhc -o /usr/bin/hhc
 > sudo chmod a+x /usr/bin/hhc
