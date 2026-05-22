@@ -8,6 +8,24 @@ use cranelift_codegen::{
     Context,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+
+use std::cell::RefCell;
+thread_local! {
+    /// Maps let-binding-name → "__bind:fn_name:cap0:cap1:..." 
+    static CLOSURE_BINDINGS: RefCell<std::collections::HashMap<String, String>> = RefCell::new(std::collections::HashMap::new());
+}
+
+fn set_closure_binding(var: &str, bind_str: &str) {
+    CLOSURE_BINDINGS.with(|m| m.borrow_mut().insert(var.to_string(), bind_str.to_string()));
+}
+
+fn get_closure_binding(var: &str) -> Option<String> {
+    CLOSURE_BINDINGS.with(|m| m.borrow().get(var).cloned())
+}
+
+fn clear_closure_bindings() {
+    CLOSURE_BINDINGS.with(|m| m.borrow_mut().clear());
+}
 use cranelift_module::{DataDescription, FuncId, Linkage, Module as CraneliftModule};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
@@ -352,6 +370,52 @@ fn compile_unsafe_arena(
 
 
 /// Walk an expression, extract all Expr::Closure, compile them as standalone FnDefs.
+/// Collect variables referenced in stmts that are NOT in param_names (i.e. free variables to capture)
+fn collect_free_vars_in_stmts(stmts: &[Stmt], params: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut free = std::collections::HashSet::new();
+    let mut bound = params.clone();
+    for s in stmts { collect_free_in_stmt(s, &mut bound, &mut free); }
+    let mut v: Vec<String> = free.into_iter().collect();
+    v.sort();
+    v
+}
+
+fn collect_free_in_stmt(stmt: &Stmt, bound: &mut std::collections::HashSet<String>, free: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Stmt::Let { name, value, .. } => {
+            if let Some(e) = value { collect_free_in_expr(e, bound, free); }
+            bound.insert(name.clone());
+        }
+        Stmt::Expr(e, _) | Stmt::Return(Some(e), _) => collect_free_in_expr(e, bound, free),
+        _ => {}
+    }
+}
+
+fn collect_free_in_expr(expr: &Expr, bound: &std::collections::HashSet<String>, free: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Ident(name, _) => {
+            if !bound.contains(name) { free.insert(name.clone()); }
+        }
+        Expr::BinOp(l, _, r, _) => { collect_free_in_expr(l, bound, free); collect_free_in_expr(r, bound, free); }
+        Expr::UnOp(_, e, _) | Expr::Try(e, _) | Expr::Await(e, _) => collect_free_in_expr(e, bound, free),
+        Expr::Call(callee, args, _) => {
+            collect_free_in_expr(callee, bound, free);
+            for a in args { collect_free_in_expr(a, bound, free); }
+        }
+        Expr::If { condition, then_body, else_body, .. } => {
+            collect_free_in_expr(condition, bound, free);
+            let mut b2 = bound.clone();
+            for s in then_body { collect_free_in_stmt(s, &mut b2, free); }
+            if let Some(eb) = else_body {
+                let mut b3 = bound.clone();
+                for s in eb { collect_free_in_stmt(s, &mut b3, free); }
+            }
+        }
+        _ => {}
+    }
+}
+
+
 fn extract_closures_from_expr(
     expr:    &mut Expr,
     counter: &mut usize,
@@ -362,18 +426,48 @@ fn extract_closures_from_expr(
             let id   = *counter;
             *counter += 1;
             let name = format!("__closure_{}", id);
+
+            // Detect free variables — capture by value as extra fn params
+            let param_names: std::collections::HashSet<_> = params.iter().map(|p| p.name.clone()).collect();
+            let free_vars: Vec<String> = collect_free_vars_in_stmts(body, &param_names);
+
+            // All params = explicit params + captured vars (passed as extra args)
+            let mut all_params = params.clone();
+            for fv in &free_vars {
+                all_params.push(hsharp_parser::ast::Param {
+                    name: fv.clone(),
+                    ty:   hsharp_parser::ast::TypeExpr::Named("int".into()),
+                    mutable: false,
+                    span:  span.clone(),
+                });
+            }
+
             let fn_def = FnDef {
                 attrs: vec![], type_params: vec![],
                 name: name.clone(),
-                params: params.clone(),
-                // Closures return i64 (H# int) by default — avoids return-type mismatch
+                params: all_params,
                 return_type: Some(hsharp_parser::ast::TypeExpr::Named("int".into())),
                 body: body.clone(),
                 pub_: false, is_async: false, is_unsafe: false,
                 span: span.clone(),
             };
             out_fns.push(fn_def);
-            *expr = Expr::Call(Box::new(Expr::Ident(name, span.clone())), vec![], span.clone());
+
+            // Replace |x, y| body with:
+            //   hsh_closure_create(__closure_0_ptr, n_caps, cap0, cap1, ...)
+            // where __closure_0_ptr is the function address.
+            // The closure object is then called via hsh_closure_call1/2.
+            //
+            // For now: store as Ident(__closure_N) + attach metadata via naming convention
+            // The n_caps and captures are encoded in the name for lookup at call sites.
+            if !free_vars.is_empty() {
+                // Encode as: Call(Ident("__bind:__closure_0:cap0:cap1"), [])
+                // At call sites, this is recognized and caps are appended automatically
+                let bind_name = format!("__bind:{}:{}", name, free_vars.join(":"));
+                *expr = Expr::Ident(bind_name, span.clone());
+            } else {
+                *expr = Expr::Ident(name, span.clone());
+            }
         }
         Expr::BinOp(lhs, _, rhs, _) | Expr::Range(lhs, rhs, _, _) => {
             extract_closures_from_expr(lhs, counter, out_fns);
@@ -454,7 +548,7 @@ pub fn emit_module(cg: CraneliftCodegen, output: &str) -> R<()> {
     let out_bin = format!("{}{}", output, suffix);
     let mut cmd = std::process::Command::new(cc);
     cmd.arg(&mo).arg(&ro).arg("-o").arg(&out_bin);
-    cmd.arg("-lm"); // math: sin, cos, sqrt, log, log2, etc.
+    cmd.args(["-lm", "-lpthread", "-ldl"]); // math + pthreads + dynamic linking
     if cg.opts.static_link { cmd.arg("-static"); }
     if cg.opts.debug_info  { cmd.arg("-g"); }
     if cg.opts.optimize    { cmd.arg("-O2"); }
@@ -511,6 +605,23 @@ fn compile_stmt(
 
     match stmt {
         Stmt::Let { name, ty, mutable: _, value, .. } => {
+            // Check if binding a closure: Ident("__bind:fn_name:cap0:cap1...")
+            if let Some(hsharp_parser::ast::Expr::Ident(bind_str, _)) = value.as_ref() {
+                if bind_str.starts_with("__bind:") {
+                    set_closure_binding(name, bind_str);
+                    let var = vars.declare(name);
+                    b.declare_var(var, types::I64);
+                    // Get fn_ptr of underlying closure fn
+                    let parts: Vec<&str> = bind_str.strip_prefix("__bind:").unwrap_or("").splitn(2, ':').collect();
+                    let ufn = parts.first().copied().unwrap_or("");
+                    let v = if let Some(&fid) = fids.get(ufn) {
+                        let fr = module.declare_func_in_func(fid, b.func);
+                        b.ins().func_addr(types::I64, fr)
+                    } else { zero(b, types::I64) };
+                    b.def_var(var, v);
+                    return Ok(false);
+                }
+            }
             let ct  = ty.as_ref().and_then(|t| htype_to_cl(t)).unwrap_or(types::I64);
             let var = vars.declare(name);
             b.declare_var(var, ct);
@@ -785,7 +896,7 @@ fn compile_expr(
                         }
                         hsharp_parser::ast::InterpPart::Expr(e) => {
                             let v  = compile_expr(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, e, None)?;
-                            let fr = module.declare_func_in_func(builtins.hsh_int_to_string, b.func);
+                            let fr = module.declare_func_in_func(builtins.hsh_val_to_str, b.func);
                             let c  = b.ins().call(fr, &[v]);
                             b.inst_results(c)[0]
                         }
@@ -833,6 +944,34 @@ fn compile_expr(
 
         Expr::Call(callee, args, _) => {
             if let Expr::Ident(name, _) = callee.as_ref() {
+                // Check CLOSURE_BINDINGS: "scale" → "__bind:__closure_0:factor"
+                if let Some(bind_str) = get_closure_binding(name) {
+                    let rest = bind_str.strip_prefix("__bind:").unwrap_or(&bind_str);
+                    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let fn_name_str   = parts[0];
+                        let capture_vars: Vec<String> = parts[1].split(':').map(|s| s.to_string()).collect();
+                        let mut augmented: Vec<Expr> = args.to_vec();
+                        let dummy_span    = callee.span().clone();
+                        for cv in &capture_vars {
+                            augmented.push(Expr::Ident(cv.clone(), dummy_span.clone()));
+                        }
+                        return call_fn(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, fn_name_str, &augmented, hint);
+                    }
+                }
+                // Handle __bind: directly in callee name
+                if let Some(rest) = name.strip_prefix("__bind:") {
+                    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        let fn_name_str  = parts[0];
+                        let capture_vars: Vec<String> = parts[1].split(':').map(|s| s.to_string()).collect();
+                        let mut augmented: Vec<Expr> = args.to_vec();
+                        for cv in &capture_vars {
+                            augmented.push(Expr::Ident(cv.clone(), callee.span().clone()));
+                        }
+                        return call_fn(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, fn_name_str, &augmented, hint);
+                    }
+                }
                 call_fn(b, vars, module, builtins, sp, fids, fsigs, fn_name, ret_type, name, args, hint)
             } else {
                 e!(callee, None);
@@ -1061,6 +1200,26 @@ fn call_fn(
     }}}
 
     match name {
+            // ── Closure runtime ───────────────────────────────────────────────
+            "__closure_create_internal" => {
+                // Build a heap closure: {fn_ptr, n_caps, cap0, cap1, ...}
+                // args[0] = __fn_ptr_NAME ident, args[1] = n_caps int literal, args[2..] = captures
+                if args.len() < 2 { return Ok(zero(b, types::I64)); }
+                // Get fn pointer from named function
+                let fn_ptr = if let Expr::Ident(ref fname, _) = args[0] {
+                    let real_name = fname.strip_prefix("__fn_ptr_").unwrap_or(fname);
+                    if let Some(&fid) = fids.get(real_name) {
+                        let fr = module.declare_func_in_func(fid, b.func);
+                        b.ins().func_addr(types::I64, fr)
+                    } else { zero(b, types::I64) }
+                } else { zero(b, types::I64) };
+                let n_caps_v = e!(&args[1], Some(types::I64));
+                let create_ref = module.declare_func_in_func(builtins.hsh_closure_create, b.func);
+                let mut cargs = vec![fn_ptr, n_caps_v];
+                for a in args.iter().skip(2) { cargs.push(e!(a, Some(types::I64))); }
+                let call = b.ins().call(create_ref, &cargs);
+                Ok(b.inst_results(call)[0])
+            }
         // write() and writeln() are H# 0.1 syntax — map to hsh_println
         "write" | "println" | "writeln" => {
             let a = str_arg!(0);
@@ -1274,8 +1433,29 @@ fn call_fn(
                 let call = b.ins().call(r, &[a]); Ok(b.inst_results(call)[0])
             }
             "http_get" | "json_parse" | "json_get_str" |
-            "re_find" | "re_find_all" | "new_cli_parser" | "str_count" => {
-                // Stub — full impl in v0.4
+            // ── Regex (native POSIX — no grep dependency) ─────────────────────
+            "re_match" | "regex_match" => {
+                let pat = str_arg!(0); let txt = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_regex_match, b.func);
+                let c = b.ins().call(r, &[pat, txt]); Ok(b.inst_results(c)[0])
+            }
+            "re_find" | "regex_find" => {
+                let pat = str_arg!(0); let txt = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_regex_find, b.func);
+                let c = b.ins().call(r, &[pat, txt]); Ok(b.inst_results(c)[0])
+            }
+            "re_find_all" | "regex_find_all" => {
+                // Returns first match as string (array support needs runtime array type)
+                let pat = str_arg!(0); let txt = str_arg!(1);
+                let r = module.declare_func_in_func(builtins.hsh_regex_find, b.func);
+                let c = b.ins().call(r, &[pat, txt]); Ok(b.inst_results(c)[0])
+            }
+            "re_replace" | "regex_replace" => {
+                let pat = str_arg!(0); let rep = str_arg!(1); let txt = str_arg!(2);
+                let r = module.declare_func_in_func(builtins.hsh_regex_replace, b.func);
+                let c = b.ins().call(r, &[pat, rep, txt]); Ok(b.inst_results(c)[0])
+            }
+            "new_cli_parser" | "str_count" => {
                 Ok(zero(b, types::I64))
             }
                         _ => {
