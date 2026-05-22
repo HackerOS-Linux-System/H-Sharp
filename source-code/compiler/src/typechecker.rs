@@ -332,6 +332,10 @@ impl TypeChecker {
                 }
             },
             Expr::Ident(name, _) => {
+                // Skip __bind: closure idents (they're internal compiler names)
+                if name.starts_with("__bind:") || name.starts_with("__closure_") || name.starts_with("__fn_ptr_") {
+                    return HType::Any;
+                }
                 if let Some(v) = self.lookup(name) {
                     v.ty.clone()
                 } else {
