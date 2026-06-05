@@ -2,19 +2,34 @@ use colored::*;
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum BarTheme { Default, Arrow, Cargo }
+pub enum BarTheme {
+    Default,
+    Arrow,
+    Cargo,
+}
 
-impl Default for BarTheme { fn default() -> Self { Self::Default } }
+impl Default for BarTheme {
+    fn default() -> Self { Self::Default }
+}
 
 impl std::fmt::Display for BarTheme {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self { Self::Default => write!(f, "default"), Self::Arrow => write!(f, "arrow"), Self::Cargo => write!(f, "cargo") }
+        match self {
+            Self::Default => write!(f, "default"),
+            Self::Arrow   => write!(f, "arrow"),
+            Self::Cargo   => write!(f, "cargo"),
+        }
     }
 }
+
 impl std::str::FromStr for BarTheme {
     type Err = ();
-    fn from_str(s: &str) -> Result<Self,()> {
-        match s { "arrow" => Ok(Self::Arrow), "cargo" => Ok(Self::Cargo), _ => Ok(Self::Default) }
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "arrow" => Ok(Self::Arrow),
+            "cargo" => Ok(Self::Cargo),
+            _       => Ok(Self::Default),
+        }
     }
 }
 
@@ -31,7 +46,9 @@ impl BytesBar {
         Self { total, current: 0, width: 20, theme, status: String::new() }
     }
 
-    pub fn set_status(&mut self, s: impl Into<String>) { self.status = s.into(); }
+    pub fn set_status(&mut self, s: impl Into<String>) {
+        self.status = s.into();
+    }
 
     pub fn inc(&mut self, n: u64) {
         self.current = (self.current + n).min(self.total);
@@ -46,28 +63,33 @@ impl BytesBar {
     }
 
     fn render(&self) {
-        let pct = if self.total == 0 { 100.0 } else { self.current as f64 / self.total as f64 * 100.0 };
+        let pct    = if self.total == 0 { 100.0 } else { self.current as f64 / self.total as f64 * 100.0 };
         let filled = ((pct / 100.0) * self.width as f64) as usize;
         let empty  = self.width.saturating_sub(filled);
 
-        // Bar rendering per theme
-        // Default: [#------]   (filled=# empty=-)
-        // Arrow:   [>-------]  (leading > then -)
-        // Cargo:   [===>    ]  (filled== then > then spaces)
         let bar = match &self.theme {
             BarTheme::Default => {
-                let f: String = "#".repeat(filled);
-                let e: String = "-".repeat(empty);
-                format!("{}{}{}{}", "[".cyan(), f.cyan().bold(), e.dimmed(), "]".cyan())
+                format!(
+                    "{}{}{}{}",
+                    "[".cyan(),
+                        "#".repeat(filled).cyan().bold(),
+                        "-".repeat(empty).dimmed(),
+                        "]".cyan()
+                )
             }
             BarTheme::Arrow => {
                 if filled == 0 {
                     format!("{}{}{}", "[".cyan(), "-".repeat(self.width).dimmed(), "]".cyan())
                 } else {
-                    let lead = ">".repeat(1);
-                    let dashes: String = "-".repeat(empty);
                     let fill_part = if filled > 1 { "#".repeat(filled - 1) } else { String::new() };
-                    format!("{}{}{}{}{}", "[".cyan(), fill_part.cyan().bold(), lead.cyan().bold(), dashes.dimmed(), "]".cyan())
+                    format!(
+                        "{}{}{}{}{}",
+                        "[".cyan(),
+                            fill_part.cyan().bold(),
+                            ">".cyan().bold(),
+                            "-".repeat(empty).dimmed(),
+                            "]".cyan()
+                    )
                 }
             }
             BarTheme::Cargo => {
@@ -75,23 +97,37 @@ impl BytesBar {
                     format!("{}{}{}", "[".cyan(), " ".repeat(self.width), "]".cyan())
                 } else {
                     let eq_part: String = "=".repeat(filled.saturating_sub(1));
-                    let spaces: String  = " ".repeat(empty);
-                    format!("{}{}{}{}{}", "[".cyan(), eq_part.cyan().bold(), ">".cyan().bold(), spaces, "]".cyan())
+                    format!(
+                        "{}{}{}{}{}",
+                        "[".cyan(),
+                            eq_part.cyan().bold(),
+                            ">".cyan().bold(),
+                            " ".repeat(empty),
+                            "]".cyan()
+                    )
                 }
             }
         };
 
-        // ETA: rough estimate
         let pct_str = format!("{:.0}%", pct);
         let eta_str = if pct > 0.0 && pct < 100.0 {
             let remaining = self.total.saturating_sub(self.current);
-            let rate = self.current.max(1);
+            let rate      = self.current.max(1);
             format!(" ~{}s", remaining / rate)
-        } else { String::new() };
+        } else {
+            String::new()
+        };
 
-        let status = if self.status.len() > 32 { &self.status[..32] } else { &self.status };
+        let status = if self.status.len() > 36 { &self.status[..36] } else { &self.status };
 
-        print!("\r{} {} {}{}  {}", bar, pct_str.yellow().bold(), eta_str.dimmed(), " ".repeat(10), status.cyan());
+        print!(
+            "\r{} {} {}{}  {}",
+            bar,
+            pct_str.yellow().bold(),
+               eta_str.dimmed(),
+               " ".repeat(10),
+               status.cyan()
+        );
         std::io::stdout().flush().ok();
     }
 }
@@ -100,19 +136,22 @@ impl BytesBar {
 pub fn print_queue(items: &[String], current_idx: usize) {
     let shown: Vec<_> = items.iter().skip(current_idx).take(5).collect();
     if shown.is_empty() { return; }
-    println!(); // newline after bar
+    println!();
     for (i, item) in shown.iter().enumerate() {
-        let prefix = if i == 0 { "  →".cyan().bold().to_string() } else { "  ·".dimmed().to_string() };
+        let prefix = if i == 0 {
+            "  →".cyan().bold().to_string()
+        } else {
+            "  ·".dimmed().to_string()
+        };
         println!("{} {}", prefix, item.dimmed());
     }
-    // Move cursor back up
     print!("\x1b[{}A", shown.len() + 1);
     std::io::stdout().flush().ok();
 }
 
-/// Settings TUI for bytes (same style as vira settings)
+/// TUI settings for bytes
 pub fn bytes_settings_tui(theme: &mut BarTheme) -> anyhow::Result<()> {
-    use std::io::{BufRead};
+    use std::io::BufRead;
 
     loop {
         print!("\x1b[2J\x1b[H");
