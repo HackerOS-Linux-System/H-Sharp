@@ -1,6 +1,6 @@
 [package]
-name = "hsharp-parser"
-version = "0.2.0"
+name    = "hsharp-parser"
+version = "0.7.0"
 edition = "2021"
 
 [lib]
@@ -8,9 +8,10 @@ name = "hsharp_parser"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "=1.0.79"
-thiserror = "=1.0.56"
-serde = { version = "=1.0.195", features = ["derive"] }
+anyhow     = "=1.0.79"
+thiserror  = "=1.0.56"
+serde      = { version = "=1.0.195", features = ["derive"] }
 serde_json = "=1.0.108"
-colored = "=2.0.4"
-indexmap = "=2.0.2"
+colored    = "=2.0.4"
+# Must be >= 2.1.0 to satisfy hk-parser 0.3.0 transitive requirement
+indexmap   = "2.1"
