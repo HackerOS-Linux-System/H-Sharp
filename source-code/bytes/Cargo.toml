@@ -3,7 +3,7 @@ name    = "bytes"
 version = "0.7.0"
 edition = "2021"
 authors = ["HackerOS Team"]
-description = "H# RAM-JIT Package Manager & Multi-language Workspace Builder"
+description = "H# Package Manager & Multi-language Workspace Builder"
 
 [[bin]]
 name = "bytes"
