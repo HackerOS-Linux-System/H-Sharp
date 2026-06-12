@@ -1,12 +1,12 @@
+#![allow(dead_code)]
 use colored::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::BytesProject;
 use crate::lockfile::LockFile;
 use crate::progress::{BytesBar, BarTheme};
 use crate::registry::{download_package, Registry};
 
-/// High-level installer — installs all deps for a project
 pub struct Installer {
     pub project:   BytesProject,
     pub cache_dir: PathBuf,
@@ -21,12 +21,8 @@ impl Installer {
 
     pub fn install_all(&self) -> anyhow::Result<()> {
         if self.project.dependencies.is_empty() && self.project.python.is_none() {
-            if self.verbose {
-                println!("  {}", "Nothing to install.".dimmed());
-            }
             return Ok(());
         }
-
         self.install_hsharp_deps()?;
         self.install_python_deps()?;
         Ok(())
@@ -38,23 +34,19 @@ impl Installer {
         let pkg_cache = self.cache_dir.join("packages");
         std::fs::create_dir_all(&pkg_cache)?;
 
-        let total = self.project.dependencies.len() as u64;
-        let mut bar = BytesBar::new(total, BarTheme::Default);
+        let total    = self.project.dependencies.len() as u64;
+        let mut bar  = BytesBar::new(total, BarTheme::Default);
         let registry = Registry::fetch();
         let mut lock = LockFile::read();
 
         for (pkg, ver) in &self.project.dependencies {
             bar.set_status(format!("fetching {}", pkg));
 
-            // Check lockfile for cached version
             if let Some(locked) = lock.get(pkg) {
-                if locked.version == *ver {
-                    let cached = pkg_cache.join(pkg);
-                    if cached.exists() {
-                        bar.set_status(format!("{} (cached)", pkg));
-                        bar.inc(1);
-                        continue;
-                    }
+                if locked.version == *ver && pkg_cache.join(pkg).exists() {
+                    bar.set_status(format!("{} (cached)", pkg));
+                    bar.inc(1);
+                    continue;
                 }
             }
 
@@ -65,7 +57,6 @@ impl Installer {
                     lock.lock(pkg, ver, entry.git.clone(), None);
                 }
             } else {
-                // Write stub for unknown packages
                 std::fs::write(
                     pkg_cache.join(format!("{}.h#", pkg)),
                                format!(";; bytes stub: {} v{}\n", pkg, ver),
@@ -75,10 +66,7 @@ impl Installer {
             bar.inc(1);
         }
         lock.write();
-        bar.finish(&format!(
-            "{} H# package(s) ready",
-                            self.project.dependencies.len()
-        ));
+        bar.finish(&format!("{} H# package(s) ready", self.project.dependencies.len()));
         Ok(())
     }
 
