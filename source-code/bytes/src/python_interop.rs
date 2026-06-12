@@ -1,6 +1,6 @@
+#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 use crate::config::PythonConfig;
-use colored::*;
 
 pub struct PythonEnv {
     pub version:  String,
@@ -8,16 +8,13 @@ pub struct PythonEnv {
 }
 
 impl PythonEnv {
-    /// Set up or locate an existing venv
     pub fn setup(version: &str, cache: &Path) -> anyhow::Result<Self> {
         let venv_dir = cache.join("venv");
         if !venv_dir.exists() {
             let python = find_python(version)?;
             let ok = std::process::Command::new(&python)
             .args(["-m", "venv", &venv_dir.display().to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .status().map(|s| s.success()).unwrap_or(false);
             if !ok {
                 anyhow::bail!("failed to create venv at {}", venv_dir.display());
             }
@@ -26,21 +23,16 @@ impl PythonEnv {
     }
 
     pub fn install_package(&self, pkg: &str, ver: Option<&str>) -> anyhow::Result<()> {
-        let pip = self.venv_dir.join("bin/pip");
+        let pip  = self.venv_dir.join("bin/pip");
         let spec = if let Some(v) = ver {
             if v == "latest" { pkg.to_string() } else { format!("{}=={}", pkg, v) }
-        } else {
-            pkg.to_string()
-        };
+        } else { pkg.to_string() };
 
         let ok = std::process::Command::new(&pip)
         .args(["install", "-q", &spec])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .status().map(|s| s.success()).unwrap_or(false);
 
         if !ok {
-            // Fallback: system pip with --user
             let _ = std::process::Command::new("pip3")
             .args(["install", "-q", "--user", &spec])
             .status();
@@ -49,44 +41,13 @@ impl PythonEnv {
     }
 }
 
-/// Install all Python deps from PythonConfig into a venv
 pub fn setup_python_deps(config: &PythonConfig, cache: &Path) -> anyhow::Result<()> {
     if config.packages.is_empty() { return Ok(()); }
-
     let env = PythonEnv::setup(&config.version, cache)?;
-    for pkg in &config.packages {
-        env.install_package(pkg, None)?;
-    }
+    for pkg in &config.packages { env.install_package(pkg, None)?; }
     Ok(())
 }
 
-fn find_python(version: &str) -> anyhow::Result<String> {
-    // Try version-specific first
-    let candidates = vec![
-        format!("python{}", version),
-            format!("python{}", &version[..1]),  // major only: python3
-                "python3".to_string(),
-                "python".to_string(),
-    ];
-
-    for py in &candidates {
-        if let Ok(o) = std::process::Command::new("which").arg(py).output() {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !s.is_empty() { return Ok(s); }
-            }
-        }
-    }
-    // Common absolute paths
-    for p in &["/usr/bin/python3", "/usr/local/bin/python3"] {
-        if std::path::Path::new(p).exists() {
-            return Ok(p.to_string());
-        }
-    }
-    Err(anyhow::anyhow!("Python {} not found", version))
-}
-
-/// Resolve a Python import to its installed path
 pub fn resolve_python_import(pkg: &str, venv_dir: &Path) -> Option<PathBuf> {
     let site_packages = venv_dir.join("lib");
     if let Ok(entries) = std::fs::read_dir(&site_packages) {
@@ -96,4 +57,25 @@ pub fn resolve_python_import(pkg: &str, venv_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_python(version: &str) -> anyhow::Result<String> {
+    let candidates = vec![
+        format!("python{}", version),
+            format!("python{}", &version[..1]),
+                "python3".to_string(),
+                "python".to_string(),
+    ];
+    for py in &candidates {
+        if let Ok(o) = std::process::Command::new("which").arg(py).output() {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !s.is_empty() { return Ok(s); }
+            }
+        }
+    }
+    for p in &["/usr/bin/python3", "/usr/local/bin/python3"] {
+        if std::path::Path::new(p).exists() { return Ok(p.to_string()); }
+    }
+    Err(anyhow::anyhow!("Python {} not found", version))
 }
