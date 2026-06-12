@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use colored::*;
 use std::path::{Path, PathBuf};
 
@@ -14,11 +15,11 @@ pub fn hackeros_cache_base() -> PathBuf {
 }
 
 pub fn create_session_dir() -> anyhow::Result<PathBuf> {
-    let base       = hackeros_libs_base();
-    let session_id = format!("session-{}", std::process::id());
+    let base        = hackeros_libs_base();
+    let session_id  = format!("session-{}", std::process::id());
     let session_dir = base.join(&session_id);
     std::fs::create_dir_all(&session_dir)?;
-
+    // Try tmpfs mount; fall back silently
     let mounted = try_mount_tmpfs(&session_dir);
     if !mounted {
         let marker = session_dir.join(".bytes-session");
@@ -27,39 +28,44 @@ pub fn create_session_dir() -> anyhow::Result<PathBuf> {
     Ok(session_dir)
 }
 
+/// Mount tmpfs using CLI tools only — no `nix` crate needed.
 fn try_mount_tmpfs(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
-        use nix::mount::{mount, MsFlags};
-        if mount(
-            Some("tmpfs"),
-                 path,
-                 Some("tmpfs"),
-                 MsFlags::empty(),
-                 Some("size=512m,mode=0700"),
-        ).is_ok() {
-            return true;
-        }
+        // Direct mount (needs root)
+        if std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=512m,mode=0700",
+                  "tmpfs", &path.display().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false)
+            { return true; }
 
-        // Try via unshare
-        return std::process::Command::new("unshare")
-        .args(["--user", "--mount", "mount", "-t", "tmpfs",
-              "-o", "size=512m", "tmpfs", &path.display().to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+            // Unprivileged via unshare
+            if std::process::Command::new("unshare")
+                .args(["--user", "--mount", "mount", "-t", "tmpfs",
+                      "-o", "size=512m", "tmpfs", &path.display().to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status().map(|s| s.success()).unwrap_or(false)
+                { return true; }
     }
-    #[allow(unreachable_code)]
     false
 }
 
 fn cleanup_session(dir: &Path) {
     #[cfg(target_os = "linux")]
     {
-        let _ = nix::mount::umount(dir);
+        let _ = std::process::Command::new("umount")
+        .arg(&dir.display().to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── IsolatedEnv ───────────────────────────────────────────────────────────────
 
 pub struct IsolatedEnv {
     pub session_dir:  PathBuf,
@@ -90,16 +96,13 @@ impl IsolatedEnv {
     pub fn install_sys_dep(&self, deb_name: &str) -> anyhow::Result<()> {
         let extract_dir = self.sys_deps_dir.join(deb_name);
         std::fs::create_dir_all(&extract_dir)?;
+        eprintln!("  {} system dep {} -> isolated env", "fetching".cyan(), deb_name.yellow());
 
-        eprintln!("  {} system dep {} → isolated env", "fetching".cyan(), deb_name.yellow());
-
-        let deb_tmp = tempfile::NamedTempFile::new()?;
+        let deb_tmp    = tempfile::NamedTempFile::new()?;
         let downloaded = std::process::Command::new("apt-get")
         .args(["download", deb_name])
         .current_dir(deb_tmp.path().parent().unwrap_or(Path::new("/tmp")))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .status().map(|s| s.success()).unwrap_or(false);
 
         if !downloaded {
             eprintln!("  {} could not download {}, skipping", "warn:".yellow(), deb_name);
@@ -117,12 +120,11 @@ impl IsolatedEnv {
 
         for deb in &deb_files {
             let ok = std::process::Command::new("dpkg-deb")
-            .args(["--extract", &deb.path().display().to_string(), &extract_dir.display().to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .args(["--extract", &deb.path().display().to_string(),
+                  &extract_dir.display().to_string()])
+            .status().map(|s| s.success()).unwrap_or(false);
             if ok {
-                eprintln!("  {} {} extracted to isolated env", "✓".green(), deb_name.cyan());
+                eprintln!("  {} {} extracted", "checkmark".green(), deb_name.cyan());
             }
         }
         Ok(())
@@ -132,7 +134,10 @@ impl IsolatedEnv {
         let mut paths = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.sys_deps_dir) {
             for pkg in entries.flatten() {
-                for lib_dir in &["usr/lib", "usr/lib/x86_64-linux-gnu", "lib", "lib/x86_64-linux-gnu"] {
+                for lib_dir in &[
+                    "usr/lib", "usr/lib/x86_64-linux-gnu",
+                    "lib",     "lib/x86_64-linux-gnu",
+                ] {
                     let p = pkg.path().join(lib_dir);
                     if p.exists() { paths.push(p.display().to_string()); }
                 }
@@ -141,13 +146,8 @@ impl IsolatedEnv {
         paths.join(":")
     }
 
-    pub fn size(&self) -> u64 {
-        dir_size(&self.session_dir)
-    }
-
-    pub fn cleanup(&self) {
-        cleanup_session(&self.session_dir);
-    }
+    pub fn size(&self)    -> u64 { dir_size(&self.session_dir) }
+    pub fn cleanup(&self)        { cleanup_session(&self.session_dir); }
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -162,10 +162,9 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
-/// Vira persistent cache
-pub struct ViraCache {
-    pub base: PathBuf,
-}
+// ── ViraCache ─────────────────────────────────────────────────────────────────
+
+pub struct ViraCache { pub base: PathBuf }
 
 impl ViraCache {
     pub fn open() -> Self {
@@ -198,7 +197,7 @@ impl ViraCache {
         if !pkg_dir.exists() { return vec![]; }
         std::fs::read_dir(&pkg_dir).into_iter().flatten().flatten()
         .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
+            let name  = e.file_name().to_string_lossy().to_string();
             let parts: Vec<&str> = name.rsplitn(2, '-').collect();
             if parts.len() == 2 {
                 Some((parts[1].to_string(), parts[0].to_string()))
