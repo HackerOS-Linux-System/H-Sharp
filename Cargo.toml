@@ -1,20 +1,18 @@
 [workspace]
 members = [
     "source-code/parser",
-    "source-code/compiler",
+    "source-code/compiler", # Requires: llvm-21-dev libpolly-21-dev (apt.llvm.org/unstable)
     "source-code/cli",
     "source-code/bytes",
     "source-code/interpreter",
-    "source-code/vira",
-    "source-code/llvm-compiler",  # Requires: llvm-21-dev libpolly-21-dev (apt.llvm.org/unstable)
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
-license = "BSD-3"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # Shared deps
