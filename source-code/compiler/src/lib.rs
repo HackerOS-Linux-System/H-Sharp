@@ -1,85 +1,87 @@
+pub mod derive_codegen;
 pub mod lifetimes;
 pub mod modules;
 pub mod traits;
-pub mod mono;
-pub mod cranelift_codegen;
+pub mod regions;
+pub mod ffi;
+pub mod ffi_linker;
 pub mod runtime;
 pub mod target;
 pub mod typechecker;
-pub mod types;
+pub mod optimize_ast;
+pub mod builtins_registry;
+pub mod features;
+pub mod monomorphize;
 
-// Keep old C codegen as fallback
+// LLVM codegen + its support modules (merged from the former
+// `hsharp-llvm-compiler` crate).
 pub mod codegen;
+pub mod builtins;
+pub mod llvm_types;
+pub mod llvm_optimize;
 
 use hsharp_parser::ast::Module;
-
 pub use target::TargetTriple;
-pub use typechecker::TypeError;
+pub use typechecker::{Diagnostic, Severity, print_diagnostics};
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
-    pub target: TargetTriple,
-    pub optimize: bool,
+    pub target:      TargetTriple,
+    pub optimize:    bool,
     pub static_link: bool,
-    pub debug_info: bool,
-    pub output: String,
-    /// Use Cranelift native backend (true) or C transpilation fallback (false)
-    pub use_cranelift: bool,
+    pub debug_info:  bool,
+    pub output:      String,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
-            target: TargetTriple::host(),
-            optimize: true,
+            target:      TargetTriple::host(),
+            optimize:    true,
             static_link: true,
-            debug_info: false,
-            output: "output".to_string(),
-            use_cranelift: true,
+            debug_info:  false,
+            output:      "output".to_string(),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum CompileError {
-    Type(TypeError),
-    Codegen(String),
-    Cranelift(cranelift_codegen::CodegenError),
+    /// Type-checking / feature-capability errors. Already printed by the
+    /// time this is returned via `print_diagnostics`.
+    Diagnostics(Vec<Diagnostic>),
+    Codegen(codegen::CodegenError),
     Io(std::io::Error),
-    Linker(String),
 }
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompileError::Type(e)      => write!(f, "type error: {}", e),
-            CompileError::Codegen(s)   => write!(f, "codegen error: {}", s),
-            CompileError::Cranelift(e) => write!(f, "cranelift error: {}", e),
-            CompileError::Io(e)        => write!(f, "io error: {}", e),
-            CompileError::Linker(s)    => write!(f, "linker error: {}", s),
+            CompileError::Diagnostics(d) => write!(f, "{} error(s)", d.iter().filter(|x| x.severity == Severity::Error).count()),
+            CompileError::Codegen(e)     => write!(f, "codegen: {}", e),
+            CompileError::Io(e)          => write!(f, "io: {}", e),
         }
     }
 }
 
-pub fn compile(module: &Module, opts: &CompileOptions) -> Result<(), CompileError> {
-    // Type check always
-    let mut tc = typechecker::TypeChecker::new();
-    tc.check_module(module).map_err(CompileError::Type)?;
+impl std::error::Error for CompileError {}
+impl From<std::io::Error>          for CompileError { fn from(e: std::io::Error)          -> Self { CompileError::Io(e) } }
+impl From<codegen::CodegenError>   for CompileError { fn from(e: codegen::CodegenError)   -> Self { CompileError::Codegen(e) } }
 
-    if opts.use_cranelift {
-        compile_cranelift(module, opts)
-    } else {
-        compile_c_fallback(module, opts)
-    }
-}
-
-fn compile_cranelift(module: &Module, opts: &CompileOptions) -> Result<(), CompileError> {
-    let mut cg = cranelift_codegen::CraneliftCodegen::new(opts)
-        .map_err(CompileError::Cranelift)?;
-
-    cg.declare_functions(module).map_err(CompileError::Cranelift)?;
-    // Pass 1: trait registration
-    let mut trait_registry = crate::traits::TraitRegistry::new();
+/// Compile an H# module to a native binary via LLVM.
+///
+/// `source` is the original source text (required for diagnostic spans).
+///
+/// Pipeline:
+///   0. trait registration + #[derive] expansion
+///   1. typecheck → Vec<Diagnostic>
+///   2. feature/backend capability → Vec<Diagnostic>
+///   3. monomorphize generics
+///   4. AST-level optimisations (constant folding, string concat, DCE, #[inline])
+///   5. LLVM codegen → object → link → binary
+pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(), CompileError> {
+    // ── Pass 0: trait registration + #[derive] expansion ──────────────────
+    let mut trait_registry = traits::TraitRegistry::new();
     for item in &module.items {
         match item {
             hsharp_parser::ast::Item::TraitDef(t) => trait_registry.register_trait(t),
@@ -87,31 +89,42 @@ fn compile_cranelift(module: &Module, opts: &CompileOptions) -> Result<(), Compi
             _ => {}
         }
     }
-    // Collect all trait impl functions and add them to module for codegen
-    let mut expanded_items = module.items.clone();
+    let derive_items = derive_codegen::expand_derives(module);
+
+    let mut items = module.items.clone();
+    items.extend(derive_items);
     for fn_def in trait_registry.emit_fns() {
-        expanded_items.push(hsharp_parser::ast::Item::FnDef(fn_def.clone()));
+        items.push(hsharp_parser::ast::Item::FnDef(fn_def.clone()));
     }
-    let expanded_module = hsharp_parser::ast::Module {
+
+    let mut module = hsharp_parser::ast::Module {
         file:       module.file.clone(),
+        edition:    module.edition.clone(),
         directives: module.directives.clone(),
         imports:    module.imports.clone(),
-        items:      expanded_items,
+        items,
     };
 
-    cg.compile_module(&expanded_module).map_err(CompileError::Cranelift)?;
-    cranelift_codegen::emit_module(cg, &opts.output).map_err(CompileError::Cranelift)?;
-    Ok(())
-}
+    // ── Pass 1+2: typecheck + feature/capability check ─────────────────────
+    let mut tc = typechecker::TypeChecker::new();
+    let mut diags = tc.check_module(&module);
+    diags.extend(features::check_module_features(&module, builtins_registry::Backend::Llvm));
 
-fn compile_c_fallback(module: &Module, opts: &CompileOptions) -> Result<(), CompileError> {
-    let mut cg = codegen::Codegen::new(&module.file, opts);
-    cg.compile_module(module)
-        .map_err(|e| CompileError::Codegen(e.to_string()))?;
-    cg.emit_object(&opts.output)
-        .map_err(|e| CompileError::Codegen(e.to_string()))?;
+    if !diags.is_empty() {
+        print_diagnostics(&diags, source, &module.file);
+    }
+    if diags.iter().any(|d| d.severity == Severity::Error) {
+        return Err(CompileError::Diagnostics(diags));
+    }
+
+    // ── Pass 3: monomorphize generics ──────────────────────────────────────
+    let _mono_stats = monomorphize::monomorphize(&mut module, &mut tc);
+
+    // ── Pass 4: AST-level optimisations ────────────────────────────────────
+    let (module, _opt_stats) = optimize_ast::OptimizeContext::new().run(module);
+
+    // ── Pass 5: LLVM codegen → object → binary ─────────────────────────────
+    let cg = codegen::LlvmCodegen::new(opts)?;
+    cg.compile_full(&module)?;
     Ok(())
 }
-pub mod regions;
-pub mod ffi;
-pub mod ffi_linker;
