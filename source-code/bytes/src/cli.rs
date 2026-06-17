@@ -231,20 +231,104 @@ fn cmd_build(extra: &[String], release: bool, verbose: bool) -> anyhow::Result<(
     std::fs::create_dir_all(&cache)?;
     std::fs::create_dir_all("build")?;
 
-    let mode = if release { "release (JIT -> native)" } else { "dev (JIT)" };
-    println!("  {} {} [{}]", "Building:".cyan().bold(), entry.dimmed(), mode);
-
     if !project.dependencies.is_empty() { cmd_install(verbose, release)?; }
 
-    let out = format!("build/{}", project.package.name.trim_start_matches('/'));
-    let mut args = vec!["hsharp".to_string(), "build".to_string(), entry.clone(),
-    "-o".to_string(), out.clone()];
-    if release { args.push("--release".to_string()); }
+    // Defense-in-depth: even if config parsing somehow yields an empty
+    // name, never produce "build/" as the output path — that's a
+    // directory, and `ld -o build/` fails with
+    // "cannot open output file build/: Jest katalogiem".
+    let pkg_name = {
+        let n = project.package.name.trim().trim_start_matches('/');
+        if n.is_empty() {
+            std::path::Path::new(".").canonicalize().ok()
+            .and_then(|d| d.file_name().map(|s| s.to_string_lossy().to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "out".to_string())
+        } else {
+            n.to_string()
+        }
+    };
+    let out = format!("build/{}", pkg_name);
 
-    let status = std::process::Command::new(&args[0]).args(&args[1..]).status();
-    match status {
-        Ok(s) if s.success() => println!("  {} binary: {}", "checkmark".green().bold(), out.cyan()),
-        _ => { eprintln!("  {} build failed", "error".red().bold()); std::process::exit(1); }
+    // Decide which compiler to use. v0.8: Cranelift has been removed —
+    // `h#` (LLVM, statically linked, merged from the former hhc/
+    // hsharp-llvm-compiler crate) is the only AOT compiled backend.
+    // `[release] -> backend` still accepts the legacy name "hhc" as an
+    // alias for "h#" so existing bytes.hk files keep working.
+    //
+    // `hsharp build`'s internal typechecker prints a terse one-line
+    // "✗ type check failed" with no further detail, whereas `h#` prints
+    // full, line-numbered TYPE ERROR/SYNTAX ERROR diagnostics (§1) — so
+    // `h#` is preferred for `--release` whenever available.
+    let release_backend = project.release.as_ref()
+    .and_then(|r| r.backend.as_deref())
+    .unwrap_or("h#");
+
+    let use_hsharp_compiler = release && matches!(release_backend, "h#" | "hhc" | "llvm");
+
+    let (program, args): (&str, Vec<String>) = if use_hsharp_compiler {
+        // h# compile <file> -o <out> [--release] [--verbose]
+        // NOTE: the subcommand is 'compile', not a bare positional arg (v0.8)
+        let mut a = vec!["compile".to_string(), entry.clone(), "-o".to_string(), out.clone()];
+        if release { a.push("--release".to_string()); }
+        if verbose { a.push("--verbose".to_string()); }
+        ("/usr/bin/h#", a)
+    } else {
+        let mut a = vec!["build".to_string(), entry.clone(), "-o".to_string(), out.clone()];
+        if release { a.push("--release".to_string()); }
+        ("hsharp", a)
+    };
+
+    let mode = if release {
+        format!("release ({})", program)
+    } else {
+        "dev (JIT)".to_string()
+    };
+    println!("  {} {} [{}]", "Building:".cyan().bold(), entry.dimmed(), mode);
+    if verbose {
+        println!("  {} {} {}", "exec:".dimmed(), program, args.join(" "));
+    }
+    println!();
+
+    // CRITICAL: always inherit stdout/stderr (the default for Command::status)
+    // so the underlying compiler's full diagnostics — parse errors, type
+    // errors, link errors — are shown to the user, not swallowed.
+    let run = std::process::Command::new(program)
+    .args(&args)
+    .stdout(std::process::Stdio::inherit())
+    .stderr(std::process::Stdio::inherit())
+    .status();
+
+    match run {
+        Ok(s) if s.success() => {
+            println!();
+            println!("  {} binary: {}", "checkmark".green().bold(), out.cyan());
+        }
+        Ok(s) => {
+            println!();
+            eprintln!(
+                "  {} build failed (exit code {})",
+                      "error".red().bold(),
+                      s.code().unwrap_or(-1)
+            );
+            if !use_hsharp_compiler && release {
+                eprintln!(
+                    "  {} `hsharp build --release` gives terse errors. Try the LLVM backend for full diagnostics:",
+                    "hint:".yellow()
+                );
+                eprintln!("        {}", format!("/usr/bin/h# compile --release {} -o {}", entry, out).cyan());
+                eprintln!(
+                    "  {} or set {} in bytes.hk under [release] to make `bytes build --release` use it by default.",
+                    "hint:".yellow(), "backend => h#".cyan()
+                );
+            }
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("  {} could not run `{}`: {}", "error".red().bold(), program, e);
+            eprintln!("  {} is `{}` installed and on PATH?", "hint:".yellow(), program);
+            std::process::exit(1);
+        }
     }
     Ok(())
 }
@@ -289,7 +373,13 @@ fn cmd_add(pkg: &str, ver: &str, release: bool) -> anyhow::Result<()> {
     if let Some(entry) = registry.find(&pkg_name) {
         bar.set_status(format!("downloading {}", pkg));
         bar.inc(1);
-        download_package(entry, &cache)?;
+        let spec = crate::config::DepSpec::parse(ver);
+        let mode = BytesProject::find()
+        .and_then(|p| BytesProject::load(&p).ok())
+        .and_then(|p| p.registry)
+        .map(|r| r.mode)
+        .unwrap_or_else(|| "release".to_string());
+        download_package(entry, &cache, &spec, &mode)?;
         let mut lock = LockFile::read();
         lock.lock(&pkg_name, ver, entry.git.clone(), None);
         lock.write();
@@ -364,10 +454,12 @@ fn cmd_install(_verbose: bool, release: bool) -> anyhow::Result<()> {
         let pkg_cache = cache.join("packages");
         std::fs::create_dir_all(&pkg_cache)?;
         let mut lock = LockFile::read();
+        let registry_mode = project.registry.as_ref().map(|r| r.mode.clone()).unwrap_or_else(|| "release".to_string());
         for (pkg, ver) in &project.dependencies {
             bar.set_status(format!("fetching {}", pkg));
             if let Some(entry) = registry.find(pkg) {
-                download_package(entry, &pkg_cache).ok();
+                let spec = crate::config::DepSpec::parse(ver);
+                download_package(entry, &pkg_cache, &spec, &registry_mode).ok();
                 lock.lock(pkg, ver, entry.git.clone(), None);
             } else {
                 std::fs::write(pkg_cache.join(format!("{}.h#", pkg)),
@@ -636,13 +728,13 @@ fn walkdir_size(path: &std::path::Path) -> u64 {
 
 fn print_header() {
     println!();
-    println!("  {}  H# RAM-JIT Package Manager", "bytes".cyan().bold());
-    println!("  {}  libs: ~/.hackeros/H#/libs/ (tmpfs, RAM-backed)", format!("v{}", VERSION).dimmed());
+    println!("  {}  H# Package Manager", "bytes".cyan().bold());
+    println!("  {}  build • run • deps • workspaces", format!("v{}", VERSION).dimmed());
     println!();
 }
 
 fn print_version() {
-    println!("bytes {} (H# RAM-JIT PM + Workspace Builder)", VERSION);
+    println!("bytes {} — H# Package Manager", VERSION);
 }
 
 fn print_help() {
