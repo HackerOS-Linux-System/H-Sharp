@@ -1,0 +1,95 @@
+;; H# Core String Tests
+use "std -> test"    from "test"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+#[test]
+fn test_string_concat() is
+    let a = "Hello"
+    let b = ", World!"
+    assert_eq(a + b, "Hello, World!")
+end
+
+#[test]
+fn test_string_len() is
+    assert_eq("".len(), 0)
+    assert_eq("hello".len(), 5)
+    assert_eq("H#".len(), 2)
+end
+
+#[test]
+fn test_string_contains() is
+    assert_true("hello world".contains("world"))
+    assert_true(!"hello".contains("xyz"))
+end
+
+#[test]
+fn test_string_starts_ends() is
+    assert_true("HackerOS".starts_with("Hacker"))
+    assert_true("HackerOS".ends_with("OS"))
+    assert_true(!"HackerOS".starts_with("OS"))
+end
+
+#[test]
+fn test_str_trim() is
+    assert_eq(str::trim("  hello  "), "hello")
+    assert_eq(str::trim("  "), "")
+    assert_eq(str::trim("no-spaces"), "no-spaces")
+end
+
+#[test]
+fn test_str_split() is
+    let parts = str::split("a,b,c", ",")
+    assert_eq(parts.len(), 3)
+    assert_eq(parts[0], "a")
+    assert_eq(parts[1], "b")
+    assert_eq(parts[2], "c")
+end
+
+#[test]
+fn test_str_join() is
+    let parts = ["a", "b", "c"]
+    assert_eq(str::join(parts, ","), "a,b,c")
+    assert_eq(str::join(parts, ""), "abc")
+end
+
+#[test]
+fn test_str_replace() is
+    assert_eq(str::replace("hello world", "world", "H#"), "hello H#")
+    assert_eq(str::replace("aaa", "a", "b"), "bbb")
+end
+
+#[test]
+fn test_str_to_upper_lower() is
+    assert_eq(str::to_upper("hello"), "HELLO")
+    assert_eq(str::to_lower("HELLO"), "hello")
+end
+
+#[test]
+fn test_conv_str_to_int() is
+    assert_eq(conv::str_to_int("42"), 42)
+    assert_eq(conv::str_to_int("-7"), -7)
+    assert_eq(conv::str_to_int("0"), 0)
+end
+
+#[test]
+fn test_conv_int_to_str() is
+    assert_eq(to_string(42), "42")
+    assert_eq(to_string(-7), "-7")
+    assert_eq(to_string(0), "0")
+end
+
+#[test]
+fn test_conv_hex() is
+    assert_eq(conv::int_to_hex(255), "ff")
+    assert_eq(conv::int_to_hex(0), "0")
+    assert_eq(conv::int_to_hex(16), "10")
+end
+
+#[test]
+fn test_string_interpolation() is
+    let name = "H#"
+    let ver  = 6
+    let msg  = "Lang: {name} v0.{ver}"
+    assert_eq(msg, "Lang: H# v0.6")
+end
