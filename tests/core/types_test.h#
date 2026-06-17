@@ -1,0 +1,160 @@
+;; H# Type System Tests
+use "std -> test" from "test"
+
+;; ── Structs ──────────────────────────────────────────────────────────────────
+
+struct Point is
+    pub x: f64
+    pub y: f64
+end
+
+impl Point is
+    fn new(x: f64, y: f64) -> Point is
+        return Point { x: x, y: y }
+    end
+
+    fn distance_to(self, other: Point) -> f64 is
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        return (dx * dx + dy * dy)
+    end
+
+    fn to_str(self) -> string is
+        return "(" + to_string(self.x) + ", " + to_string(self.y) + ")"
+    end
+end
+
+#[test]
+fn test_struct_creation() is
+    let p = Point { x: 3.0, y: 4.0 }
+    assert_eq(p.x as int, 3)
+    assert_eq(p.y as int, 4)
+end
+
+#[test]
+fn test_struct_method() is
+    let p = Point::new(1.0, 2.0)
+    assert_eq(p.to_str(), "(1, 2)")
+end
+
+#[test]
+fn test_struct_mutation() is
+    let mut p = Point { x: 0.0, y: 0.0 }
+    p.x = 5.0
+    p.y = 10.0
+    assert_eq(p.x as int, 5)
+    assert_eq(p.y as int, 10)
+end
+
+;; ── Enums ────────────────────────────────────────────────────────────────────
+
+enum Color is
+    Red
+    Green
+    Blue
+    Custom(int, int, int)
+end
+
+fn color_name(c: Color) -> string is
+    match c is
+        Color::Red        => return "red"
+        Color::Green      => return "green"
+        Color::Blue       => return "blue"
+        Color::Custom(_, _, _) => return "custom"
+    end
+end
+
+#[test]
+fn test_enum_match() is
+    assert_eq(color_name(Color::Red),   "red")
+    assert_eq(color_name(Color::Green), "green")
+    assert_eq(color_name(Color::Blue),  "blue")
+end
+
+#[test]
+fn test_enum_tuple_variant() is
+    let c = Color::Custom(255, 128, 0)
+    assert_eq(color_name(c), "custom")
+end
+
+;; ── Optionals ────────────────────────────────────────────────────────────────
+
+fn find_positive(arr: [int]) -> int? is
+    for x in arr is
+        if x > 0 is
+            return x
+        end
+    end
+    return nil
+end
+
+#[test]
+fn test_optional_some() is
+    let result = find_positive([-1, -2, 3, 4])
+    assert_true(result != nil)
+    assert_eq(result, 3)
+end
+
+#[test]
+fn test_optional_nil() is
+    let result = find_positive([-1, -2, -3])
+    assert_true(result == nil)
+end
+
+;; ── Arrays ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_array_basic() is
+    let arr: [int] = [1, 2, 3, 4, 5]
+    assert_eq(arr.len(), 5)
+    assert_eq(arr[0], 1)
+    assert_eq(arr[4], 5)
+end
+
+#[test]
+fn test_array_mutation() is
+    let mut arr: [int] = [1, 2, 3]
+    arr[1] = 99
+    assert_eq(arr[1], 99)
+end
+
+#[test]
+fn test_array_push() is
+    let mut arr: [int] = []
+    arr.push(10)
+    arr.push(20)
+    arr.push(30)
+    assert_eq(arr.len(), 3)
+    assert_eq(arr[2], 30)
+end
+
+#[test]
+fn test_array_iteration() is
+    let arr = [2, 4, 6, 8]
+    let mut sum: int = 0
+    for x in arr is
+        sum += x
+    end
+    assert_eq(sum, 20)
+end
+
+;; ── Tuples ───────────────────────────────────────────────────────────────────
+
+fn divmod(a: int, b: int) -> (int, int) is
+    return (a / b, a % b)
+end
+
+#[test]
+fn test_tuple_return() is
+    let (q, r) = divmod(17, 5)
+    assert_eq(q, 3)
+    assert_eq(r, 2)
+end
+
+#[test]
+fn test_tuple_access() is
+    let t = (42, "hello", true)
+    assert_eq(t.0, 42)
+    assert_eq(t.1, "hello")
+    assert_true(t.2)
+end
