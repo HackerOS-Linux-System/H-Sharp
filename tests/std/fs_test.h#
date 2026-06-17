@@ -1,0 +1,92 @@
+;; H# std -> fs Tests
+use "std -> test" from "test"
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+use "std -> env"  from "env"
+
+fn tmp_path(name: string) -> string is
+    return path::join(env::temp_dir(), "hsharp_test_" + name)
+end
+
+#[test]
+fn test_write_and_read() is
+    let p = tmp_path("write_read.txt")
+    fs::write(p, "hello H#")
+    let content = fs::read(p)
+    assert_eq(content, "hello H#")
+    fs::remove(p)
+end
+
+#[test]
+fn test_exists() is
+    let p = tmp_path("exists.txt")
+    assert_true(!fs::exists(p))
+    fs::write(p, "data")
+    assert_true(fs::exists(p))
+    fs::remove(p)
+end
+
+#[test]
+fn test_append() is
+    let p = tmp_path("append.txt")
+    fs::write(p, "line1\n")
+    fs::append(p, "line2\n")
+    fs::append(p, "line3\n")
+    let content = fs::read(p)
+    assert_true(content.contains("line1"))
+    assert_true(content.contains("line2"))
+    assert_true(content.contains("line3"))
+    fs::remove(p)
+end
+
+#[test]
+fn test_mkdir_and_rmdir() is
+    let dir = tmp_path("testdir")
+    fs::mkdir(dir)
+    assert_true(fs::exists(dir))
+    assert_true(fs::is_dir(dir))
+    fs::rmdir(dir)
+    assert_true(!fs::exists(dir))
+end
+
+#[test]
+fn test_read_lines() is
+    let p = tmp_path("lines.txt")
+    fs::write(p, "a\nb\nc\n")
+    let lines = fs::read_lines(p)
+    assert_eq(lines.len(), 3)
+    assert_eq(lines[0], "a")
+    assert_eq(lines[2], "c")
+    fs::remove(p)
+end
+
+#[test]
+fn test_file_size() is
+    let p = tmp_path("size.txt")
+    fs::write(p, "12345")
+    assert_eq(fs::size(p), 5)
+    fs::remove(p)
+end
+
+#[test]
+fn test_path_join() is
+    let result = path::join("/tmp", "file.txt")
+    assert_eq(result, "/tmp/file.txt")
+end
+
+#[test]
+fn test_path_stem() is
+    assert_eq(path::stem("/tmp/file.txt"), "file")
+    assert_eq(path::stem("main.h#"), "main")
+end
+
+#[test]
+fn test_path_extension() is
+    assert_eq(path::extension("file.h#"), "h#")
+    assert_eq(path::extension("file.txt"), "txt")
+end
+
+#[test]
+fn test_path_parent() is
+    assert_eq(path::parent("/tmp/dir/file.txt"), "/tmp/dir")
+end
