@@ -1,0 +1,87 @@
+;; H# std -> collections Tests
+use "std -> test"        from "test"
+use "std -> collections" from "col"
+
+#[test]
+fn test_hashmap_basic() is
+    let mut map = col::HashMap::new()
+    map.insert("a", 1)
+    map.insert("b", 2)
+    map.insert("c", 3)
+    assert_eq(map.get("a"), 1)
+    assert_eq(map.get("b"), 2)
+    assert_eq(map.len(), 3)
+end
+
+#[test]
+fn test_hashmap_contains() is
+    let mut map = col::HashMap::new()
+    map.insert("key", 42)
+    assert_true(map.contains_key("key"))
+    assert_true(!map.contains_key("other"))
+end
+
+#[test]
+fn test_hashmap_remove() is
+    let mut map = col::HashMap::new()
+    map.insert("x", 10)
+    map.insert("y", 20)
+    map.remove("x")
+    assert_true(!map.contains_key("x"))
+    assert_eq(map.len(), 1)
+end
+
+#[test]
+fn test_hashmap_overwrite() is
+    let mut map = col::HashMap::new()
+    map.insert("key", 1)
+    map.insert("key", 99)
+    assert_eq(map.get("key"), 99)
+    assert_eq(map.len(), 1)
+end
+
+#[test]
+fn test_hashset_basic() is
+    let mut set = col::HashSet::new()
+    set.insert(1)
+    set.insert(2)
+    set.insert(3)
+    set.insert(2)   ;; duplicate
+    assert_eq(set.len(), 3)
+    assert_true(set.contains(1))
+    assert_true(!set.contains(99))
+end
+
+#[test]
+fn test_queue_fifo() is
+    let mut q = col::Queue::new()
+    q.push(10)
+    q.push(20)
+    q.push(30)
+    assert_eq(q.len(), 3)
+    assert_eq(q.pop(), 10)
+    assert_eq(q.pop(), 20)
+    assert_eq(q.len(), 1)
+end
+
+#[test]
+fn test_stack_lifo() is
+    let mut s = col::Stack::new()
+    s.push(1)
+    s.push(2)
+    s.push(3)
+    assert_eq(s.pop(), 3)
+    assert_eq(s.pop(), 2)
+    assert_eq(s.peek(), 1)
+    assert_eq(s.len(), 1)
+end
+
+#[test]
+fn test_queue_empty() is
+    let mut q = col::Queue::new()
+    assert_true(q.is_empty())
+    q.push(1)
+    assert_true(!q.is_empty())
+    q.pop()
+    assert_true(q.is_empty())
+end
