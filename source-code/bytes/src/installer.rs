@@ -51,7 +51,9 @@ impl Installer {
             }
 
             if let Some(entry) = registry.find(pkg) {
-                if let Err(e) = download_package(entry, &pkg_cache) {
+                let spec = crate::config::DepSpec::parse(ver);
+                let mode = self.project.registry.as_ref().map(|r| r.mode.clone()).unwrap_or_else(|| "release".to_string());
+                if let Err(e) = download_package(entry, &pkg_cache, &spec, &mode) {
                     eprintln!("  {} {}: {}", "warn:".yellow(), pkg, e);
                 } else {
                     lock.lock(pkg, ver, entry.git.clone(), None);
