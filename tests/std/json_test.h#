@@ -1,0 +1,92 @@
+;; H# std -> json Tests
+use "std -> test" from "test"
+use "std -> json" from "json"
+
+#[test]
+fn test_parse_object() is
+    let raw = "{\"name\":\"H#\",\"version\":\"0.6\",\"cool\":true}"
+    let obj = json::parse(raw)
+    assert_eq(json::get_str(obj, "name"), "H#")
+    assert_eq(json::get_str(obj, "version"), "0.6")
+    assert_true(json::get_bool(obj, "cool"))
+end
+
+#[test]
+fn test_parse_int() is
+    let raw = "{\"count\":42,\"score\":-7}"
+    let obj = json::parse(raw)
+    assert_eq(json::get_int(obj, "count"), 42)
+    assert_eq(json::get_int(obj, "score"), -7)
+end
+
+#[test]
+fn test_parse_array() is
+    let raw = "[1, 2, 3, 4, 5]"
+    let arr = json::parse_array(raw)
+    assert_eq(arr.len(), 5)
+    assert_eq(json::int_at(arr, 0), 1)
+    assert_eq(json::int_at(arr, 4), 5)
+end
+
+#[test]
+fn test_stringify() is
+    let obj = json::object([
+        ("lang",    "H#"),
+        ("version", "0.6")
+    ])
+    let s = json::stringify(obj)
+    assert_true(s.contains("lang"))
+    assert_true(s.contains("H#"))
+end
+
+#[test]
+fn test_stringify_roundtrip() is
+    let raw  = "{\"x\":1,\"y\":2}"
+    let obj  = json::parse(raw)
+    let back = json::stringify(obj)
+    let obj2 = json::parse(back)
+    assert_eq(json::get_int(obj2, "x"), 1)
+    assert_eq(json::get_int(obj2, "y"), 2)
+end
+
+#[test]
+fn test_nested_object() is
+    let raw = "{\"user\":{\"name\":\"Alice\",\"age\":30}}"
+    let obj = json::parse(raw)
+    let user = json::get_obj(obj, "user")
+    assert_eq(json::get_str(user, "name"), "Alice")
+    assert_eq(json::get_int(user, "age"), 30)
+end
+
+#[test]
+fn test_null_value() is
+    let raw = "{\"key\":null}"
+    let obj = json::parse(raw)
+    assert_true(json::is_null(obj, "key"))
+end
+
+#[test]
+fn test_missing_key() is
+    let raw = "{\"a\":1}"
+    let obj = json::parse(raw)
+    assert_true(json::has_key(obj, "a"))
+    assert_true(!json::has_key(obj, "b"))
+end
+
+#[test]
+fn test_array_of_objects() is
+    let raw = "[{\"id\":1},{\"id\":2},{\"id\":3}]"
+    let arr = json::parse_array(raw)
+    assert_eq(arr.len(), 3)
+    let first = json::obj_at(arr, 0)
+    assert_eq(json::get_int(first, "id"), 1)
+end
+
+#[test]
+fn test_json_set() is
+    let mut obj = json::empty_object()
+    json::set_str(obj, "name", "H#")
+    json::set_int(obj, "version", 6)
+    assert_eq(json::get_str(obj, "name"), "H#")
+    assert_eq(json::get_int(obj, "version"), 6)
+end
