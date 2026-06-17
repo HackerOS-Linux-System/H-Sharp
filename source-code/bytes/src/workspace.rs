@@ -34,6 +34,37 @@ pub fn build_workspace(
     );
     println!();
 
+    // §10: toolchain preflight. Without this, a missing `zig`/`crystal`/
+    // `nim`/etc. produces a generic "exec error: No such file or
+    // directory" PER MEMBER, with no guidance. Check every toolchain
+    // actually needed by `ws.languages` up front, print one consolidated
+    // report, and abort before wasting time on members whose toolchain is
+    // missing (unless --skip-missing).
+    let skip_missing = std::env::var("BYTES_SKIP_MISSING_TOOLCHAINS").is_ok();
+    let missing = preflight_toolchains(&members, verbose);
+    if !missing.is_empty() {
+        println!("  {}", "Workspace toolchain check:".bold());
+        for (lang, _tool, install_hint) in &missing {
+            println!("    {:<10} {} not found — install: {}", lang, "x".red().bold(), install_hint.cyan());
+        }
+        println!();
+        if !skip_missing {
+            eprintln!(
+                "  {} {} toolchain(s) missing. Set BYTES_SKIP_MISSING_TOOLCHAINS=1 to build the rest anyway.",
+                      "error:".red().bold(), missing.len()
+            );
+            anyhow::bail!("missing toolchains: {}", missing.iter().map(|(l, _, _)| l.as_str()).collect::<Vec<_>>().join(", "));
+        } else {
+            println!("  {} continuing without these members ({})", "warn:".yellow(), "BYTES_SKIP_MISSING_TOOLCHAINS=1".dimmed());
+            println!();
+        }
+    }
+
+    let missing_langs: std::collections::HashSet<&str> = missing.iter().map(|(l, _, _)| l.as_str()).collect();
+    let members: Vec<(String, String)> = members.into_iter()
+    .filter(|(_, lang)| !missing_langs.contains(lang.as_str()))
+    .collect();
+
     if parallel && members.len() > 1 {
         build_parallel(&members, release, verbose)
     } else {
@@ -299,6 +330,79 @@ fn build_dlang(dir: &Path, release: bool, verbose: bool) -> (bool, String) {
     if release { args.extend_from_slice(&["-O", "-release", "-inline"]); }
     args.push("src/main.d");
     run_cmd(&args, dir, verbose)
+}
+
+/// §10: workspace toolchain preflight.
+///
+/// For each distinct language in `members`, check that the required CLI
+/// tool is on PATH. Returns `(language, tool_name, install_hint)` for every
+/// language whose tool is MISSING — one entry per language, even if
+/// multiple members use it, so the report doesn't repeat itself.
+///
+/// This turns:
+///   `exec error: No such file or directory` (x N members, no context)
+/// into:
+///   ```
+///   Workspace toolchain check:
+///     zig        x not found — install: https://ziglang.org/download/
+///     crystal    x not found — install: sudo apt install crystal
+///   ```
+fn preflight_toolchains(members: &[(String, String)], verbose: bool) -> Vec<(String, String, String)> {
+    let tool_table: &[(&str, &str, &str)] = &[
+        ("h#",         "h#",       "part of this toolchain — check `/usr/bin/h#` (and `hsharp`) are on PATH"),
+        ("hsharp",     "hsharp",   "part of this toolchain — check `/usr/bin/h#` (and `hsharp`) are on PATH"),
+        ("rust",       "cargo",    "https://rustup.rs"),
+        ("c",          "cc",       "sudo apt install gcc"),
+        ("cpp",        "c++",      "sudo apt install g++"),
+        ("c++",        "c++",      "sudo apt install g++"),
+        ("zig",        "zig",      "https://ziglang.org/download/"),
+        ("odin",       "odin",     "https://odin-lang.org/docs/install/"),
+        ("crystal",    "crystal",  "sudo apt install crystal  (or https://crystal-lang.org/install/)"),
+        ("typescript", "tsc",      "npm install -g typescript  (or install deno: https://deno.com)"),
+        ("javascript", "node",     "https://nodejs.org  (or: sudo apt install nodejs)"),
+        ("golang",     "go",       "https://go.dev/dl/"),
+        ("go",         "go",       "https://go.dev/dl/"),
+        ("kotlin",     "kotlinc",  "sudo apt install kotlin  (or https://kotlinlang.org/docs/command-line.html)"),
+        ("lua",        "luac",     "sudo apt install lua5.4"),
+        ("dart",       "dart",     "https://dart.dev/get-dart"),
+        ("vala",       "valac",    "sudo apt install valac"),
+        ("python",     "python3",  "sudo apt install python3"),
+        ("nim",        "nim",      "https://nim-lang.org/install.html"),
+        ("d",          "dmd",      "https://dlang.org/download.html"),
+        ("swift",      "swift",    "https://www.swift.org/install/"),
+        ("julia",      "julia",    "https://julialang.org/downloads/"),
+        ("elixir",     "elixir",   "sudo apt install elixir"),
+    ];
+
+    let used_langs: std::collections::HashSet<&str> =
+    members.iter().map(|(_, l)| l.as_str()).collect();
+
+    let mut missing = Vec::new();
+    let mut report  = Vec::new();
+
+    for lang in &used_langs {
+        let Some((_, tool, hint)) = tool_table.iter().find(|(l, _, _)| l == lang) else {
+            continue; // unknown language key — let the per-member builder report it
+        };
+        let found = which(tool);
+        if verbose {
+            report.push((lang.to_string(), tool.to_string(), found));
+        }
+        if !found {
+            missing.push((lang.to_string(), tool.to_string(), hint.to_string()));
+        }
+    }
+
+    if verbose {
+        println!("  {}", "Workspace toolchain check:".bold());
+        for (lang, tool, found) in &report {
+            let mark = if *found { "ok".green().bold() } else { "x".red().bold() };
+            println!("    {:<10} {} ({})", lang, mark, tool.dimmed());
+        }
+        println!();
+    }
+
+    missing
 }
 
 fn which(cmd: &str) -> bool {
