@@ -1,0 +1,132 @@
+;; H# Control Flow Tests
+use "std -> test" from "test"
+
+#[test]
+fn test_if_basic() is
+    let x: int = 5
+    let mut result: string = ""
+    if x > 3 is
+        result = "big"
+    else is
+        result = "small"
+    end
+    assert_eq(result, "big")
+end
+
+#[test]
+fn test_if_elsif() is
+    let x: int = 5
+    let mut label: string = ""
+    if x > 10 is
+        label = "large"
+    elsif x > 3 is
+        label = "medium"
+    else is
+        label = "small"
+    end
+    assert_eq(label, "medium")
+end
+
+#[test]
+fn test_while_loop() is
+    let mut i: int = 0
+    let mut sum: int = 0
+    while i < 5 is
+        sum += i
+        i += 1
+    end
+    assert_eq(sum, 10)
+end
+
+#[test]
+fn test_for_range() is
+    let mut sum: int = 0
+    for i in 1..=5 is
+        sum += i
+    end
+    assert_eq(sum, 15)
+end
+
+#[test]
+fn test_for_exclusive_range() is
+    let mut count: int = 0
+    for _ in 0..5 is
+        count += 1
+    end
+    assert_eq(count, 5)
+end
+
+#[test]
+fn test_break() is
+    let mut i: int = 0
+    let mut found: int = -1
+    while i < 10 is
+        if i == 5 is
+            found = i
+            break
+        end
+        i += 1
+    end
+    assert_eq(found, 5)
+    assert_eq(i, 5)
+end
+
+#[test]
+fn test_continue() is
+    let mut sum: int = 0
+    for i in 1..=10 is
+        if i % 2 == 0 is
+            continue
+        end
+        sum += i
+    end
+    ;; odd numbers 1+3+5+7+9 = 25
+    assert_eq(sum, 25)
+end
+
+#[test]
+fn test_nested_loops() is
+    let mut count: int = 0
+    for i in 0..3 is
+        for _ in 0..3 is
+            count += 1
+        end
+    end
+    assert_eq(count, 9)
+end
+
+#[test]
+fn test_match_basic() is
+    let x: int = 2
+    let mut result: string = ""
+    match x is
+        1 => result = "one"
+        2 => result = "two"
+        3 => result = "three"
+        _ => result = "other"
+    end
+    assert_eq(result, "two")
+end
+
+#[test]
+fn test_match_wildcard() is
+    let x: int = 99
+    let mut result: string = ""
+    match x is
+        1 => result = "one"
+        _ => result = "unknown"
+    end
+    assert_eq(result, "unknown")
+end
+
+#[test]
+fn test_match_string() is
+    let cmd: string = "start"
+    let mut handled: bool = false
+    match cmd is
+        "start"  => handled = true
+        "stop"   => handled = false
+        _        => handled = false
+    end
+    assert_true(handled)
+end
