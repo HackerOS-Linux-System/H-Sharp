@@ -3,17 +3,18 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-mod build;
+mod compile;
 mod check;
 mod new;
 mod preview;
 
 #[derive(Parser)]
 #[command(
-    name = "/usr/bin/h#",
-    bin_name = "/usr/bin/h#",
-    version = env!("CARGO_PKG_VERSION"),
-    about = "h# — HackerOS-first compiled language",
+name = "h#",
+bin_name = "h#",
+version = env!("CARGO_PKG_VERSION"),
+          about = "h# — HackerOS-first compiled language",
+          long_about = None,
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -22,37 +23,68 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Build the project to a native binary
-    Build {
-        #[arg(help = "Source file(s) to build (omit to build all .h# in project)")]
-        files: Vec<std::path::PathBuf>,
+    /// Compile a H# source file to a native binary
+    ///
+    /// Examples:
+    ///   h# compile src/main.h#
+    ///   h# compile src/main.h# -o build/myapp --release
+    ///   h# compile src/main.h# --target linux-aarch64 --emit-ir
+    Compile {
+        #[arg(help = "Source file to compile (e.g. src/main.h#)")]
+        file: std::path::PathBuf,
+
+        /// Output binary path (default: build/<stem>)
         #[arg(short, long)]
         output: Option<String>,
-        /// Target (linux-x86_64, windows-x86_64, macos-aarch64, ...)
+
+        /// Cross-compilation target (linux-x86_64, windows-x86_64, macos-aarch64, …)
         #[arg(short, long)]
         target: Option<String>,
+
+        /// Enable LLVM O3 + native CPU codegen, LTO, strip
         #[arg(long)]
-        debug: bool,
+        release: bool,
+
+        /// Disable optimisations (O0, no LTO)
         #[arg(long = "no-opt")]
         no_opt: bool,
+
+        /// Keep DWARF debug info in the binary
+        #[arg(long)]
+        debug: bool,
+
+        /// Dynamically link output (default: static)
+        #[arg(long = "dynamic")]
+        dynamic: bool,
+
+        /// Dump optimised LLVM IR to stdout instead of emitting a binary
+        #[arg(long = "emit-ir")]
+        emit_ir: bool,
+
+        /// Print every compilation step
+        #[arg(short, long)]
+        verbose: bool,
     },
-    /// Preview / interpret without compiling
+
+    /// Preview / interpret a file without compiling
     Preview {
-        #[arg(required = true, help = "Source file to preview (e.g. main.h#)")]
+        #[arg(required = true)]
         file: std::path::PathBuf,
     },
-    /// Check syntax and types only (accepts multiple files)
+
+    /// Check syntax and types only (no binary emitted)
     Check {
-        #[arg(help = "File(s) to check (omit = check all .h# files)")]
         files: Vec<std::path::PathBuf>,
     },
-    /// Create a new H# project
+
+    /// Create a new H# project from a template
     New {
         name: String,
         #[arg(short, long, default_value = "app")]
         template: String,
     },
-    /// List cross-compilation targets
+
+    /// List available cross-compilation targets
     Targets,
 }
 
@@ -60,7 +92,8 @@ fn main() {
     print_banner();
     let cli = Cli::parse();
     match cli.command {
-        Command::Build { files, output, target, debug, no_opt } => build::run(files, output, target, debug, no_opt),
+        Command::Compile { file, output, target, release, no_opt, debug, dynamic, emit_ir, verbose } =>
+        compile::run(file, output, target, release, no_opt, debug, dynamic, emit_ir, verbose),
         Command::Preview { file }  => preview::run(Some(file)),
         Command::Check { files }   => check::run_multi(files),
         Command::New { name, template } => new::run(name, template),
@@ -69,13 +102,13 @@ fn main() {
             for (name, desc) in hsharp_compiler::TargetTriple::all_named() {
                 println!("  {}  {}", format!("{:<25}", name).cyan(), desc);
             }
-            println!("\n{}", "Usage: hsharp build --target linux-aarch64".dimmed());
+            println!("\n{}", "Usage: h# compile --target linux-aarch64 src/main.h#".dimmed());
         }
     }
 }
 
 fn print_banner() {
-    println!("{}", "  h# v0.4.0  —  HackerOS-first compiled language".cyan().bold());
+    println!("{}", "  h# v0.8  —  HackerOS-first compiled language  (LLVM backend)".cyan().bold());
     println!();
 }
 
@@ -83,9 +116,9 @@ pub fn make_bar(total: u64, prefix: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template(&format!("{{spinner:.cyan}} {} [{{bar:40.cyan/blue}}] {{pos}}/{{len}}  {{msg}}", prefix))
-            .unwrap()
-            .progress_chars("<#>-"),
+        .template(&format!("{{spinner:.cyan}} {} [{{bar:40.cyan/blue}}] {{pos}}/{{len}}  {{msg}}", prefix))
+        .unwrap()
+        .progress_chars("<#>-"),
     );
     pb.enable_steady_tick(Duration::from_millis(80));
     pb
