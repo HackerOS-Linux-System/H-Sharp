@@ -1,0 +1,66 @@
+;; H# std -> crypto Tests
+use "std -> test"   from "test"
+use "std -> crypto" from "crypto"
+use "std -> hex"    from "hex"
+
+#[test]
+fn test_sha256_known() is
+    ;; SHA-256 of empty string
+    let hash = crypto::sha256("")
+    assert_eq(hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+end
+
+#[test]
+fn test_sha256_hello() is
+    let hash = crypto::sha256("hello")
+    assert_eq(hash.len(), 64)
+    assert_true(hash.starts_with("2cf2"))
+end
+
+#[test]
+fn test_sha256_deterministic() is
+    let h1 = crypto::sha256("test string")
+    let h2 = crypto::sha256("test string")
+    assert_eq(h1, h2)
+end
+
+#[test]
+fn test_md5() is
+    let hash = crypto::md5("hello")
+    assert_eq(hash.len(), 32)
+    assert_eq(hash, "5d41402abc4b2a76b9719d911017c592")
+end
+
+#[test]
+fn test_random_bytes_len() is
+    let rb = crypto::random_bytes(16)
+    assert_eq(rb.len(), 16)
+end
+
+#[test]
+fn test_random_bytes_different() is
+    let r1 = crypto::random_bytes(8)
+    let r2 = crypto::random_bytes(8)
+    ;; extremely unlikely to be equal
+    assert_true(r1 != r2)
+end
+
+#[test]
+fn test_hmac_sha256() is
+    let key = "secret"
+    let msg = "message"
+    let mac = crypto::hmac_sha256(key, msg)
+    assert_eq(mac.len(), 64)
+    ;; Same inputs → same MAC
+    assert_eq(mac, crypto::hmac_sha256(key, msg))
+    ;; Different key → different MAC
+    assert_true(mac != crypto::hmac_sha256("other", msg))
+end
+
+#[test]
+fn test_hex_encode_decode() is
+    let data = "Hello"
+    let encoded = hex::encode(data)
+    let decoded = hex::decode(encoded)
+    assert_eq(decoded, data)
+end
