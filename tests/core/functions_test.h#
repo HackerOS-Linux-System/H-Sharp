@@ -1,0 +1,155 @@
+;; H# Functions Tests
+use "std -> test" from "test"
+
+;; ── Basic functions ──────────────────────────────────────────────────────────
+
+fn add(a: int, b: int) -> int = a + b
+
+fn factorial(n: int) -> int is
+    if n <= 1 is return 1 end
+    return n * factorial(n - 1)
+end
+
+fn fibonacci(n: int) -> int is
+    if n <= 1 is return n end
+    return fibonacci(n - 1) + fibonacci(n - 2)
+end
+
+fn is_prime(n: int) -> bool is
+    if n < 2 is return false end
+    let mut i: int = 2
+    while i * i <= n is
+        if n % i == 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+#[test]
+fn test_add() is
+    assert_eq(add(2, 3), 5)
+    assert_eq(add(-5, 5), 0)
+end
+
+#[test]
+fn test_factorial() is
+    assert_eq(factorial(0), 1)
+    assert_eq(factorial(1), 1)
+    assert_eq(factorial(5), 120)
+    assert_eq(factorial(10), 3628800)
+end
+
+#[test]
+fn test_fibonacci() is
+    assert_eq(fibonacci(0), 0)
+    assert_eq(fibonacci(1), 1)
+    assert_eq(fibonacci(5), 5)
+    assert_eq(fibonacci(10), 55)
+end
+
+#[test]
+fn test_is_prime() is
+    assert_true(!is_prime(0))
+    assert_true(!is_prime(1))
+    assert_true(is_prime(2))
+    assert_true(is_prime(3))
+    assert_true(!is_prime(4))
+    assert_true(is_prime(5))
+    assert_true(!is_prime(9))
+    assert_true(is_prime(17))
+    assert_true(is_prime(97))
+end
+
+;; ── Higher-order functions ───────────────────────────────────────────────────
+
+fn apply(x: int, f: fn(int) -> int) -> int is
+    return f(x)
+end
+
+fn compose_add(a: int) -> fn(int) -> int is
+    return |b: int| -> int is a + b end
+end
+
+#[test]
+fn test_higher_order() is
+    let double = |x: int| -> int is x * 2 end
+    assert_eq(apply(5, double), 10)
+    assert_eq(apply(3, double), 6)
+end
+
+#[test]
+fn test_closure_capture() is
+    let offset: int = 10
+    let add_offset = |x: int| -> int is x + offset end
+    assert_eq(add_offset(5), 15)
+    assert_eq(add_offset(0), 10)
+end
+
+#[test]
+fn test_closure_compose() is
+    let add5 = compose_add(5)
+    assert_eq(add5(3), 8)
+    assert_eq(add5(10), 15)
+end
+
+;; ── Generics ─────────────────────────────────────────────────────────────────
+
+fn max_val<T>(a: T, b: T) -> T is
+    if a > b is return a end
+    return b
+end
+
+fn swap<T>(a: T, b: T) -> (T, T) = (b, a)
+
+#[test]
+fn test_generic_max() is
+    assert_eq(max_val(3, 7), 7)
+    assert_eq(max_val(10, 2), 10)
+    assert_eq(max_val(-1, -5), -1)
+end
+
+#[test]
+fn test_generic_swap() is
+    let (b, a) = swap(1, 2)
+    assert_eq(a, 1)
+    assert_eq(b, 2)
+end
+
+;; ── Error handling with ? ────────────────────────────────────────────────────
+
+fn safe_div(a: int, b: int) -> int? is
+    if b == 0 is
+        return nil
+    end
+    return a / b
+end
+
+fn chain_div(a: int, b: int, c: int) -> int? is
+    let r1 = safe_div(a, b)?
+    let r2 = safe_div(r1, c)?
+    return r2
+end
+
+#[test]
+fn test_safe_div_ok() is
+    let r = safe_div(10, 2)
+    assert_eq(r, 5)
+end
+
+#[test]
+fn test_safe_div_nil() is
+    let r = safe_div(10, 0)
+    assert_true(r == nil)
+end
+
+#[test]
+fn test_question_operator_chain() is
+    let r = chain_div(60, 3, 4)
+    assert_eq(r, 5)
+end
+
+#[test]
+fn test_question_operator_short_circuit() is
+    let r = chain_div(10, 0, 5)
+    assert_true(r == nil)
+end
