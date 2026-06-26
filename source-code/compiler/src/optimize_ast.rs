@@ -601,7 +601,7 @@ fn expr_span_mut(expr: &mut Expr) -> &mut Span {
         Expr::Closure { span: s, .. } | Expr::Cast(_, _, s) |
         Expr::Range(_, _, _, s) | Expr::Unsafe(_, _, s) |
         Expr::Return(_, s) | Expr::SelfExpr(s) | Expr::Try(_, s) |
-        Expr::Await(_, s) => s,
+        Expr::Await(_, s) | Expr::Path(_, s) => s,
     }
 }
 
