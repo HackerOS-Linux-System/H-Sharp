@@ -1,36 +1,124 @@
-;; H# Standard Library — std -> strings
+;; std -> strings — String utilities
+;; H# Standard Library v0.6
 
-pub fn trim(s: string) -> string is return s end
-pub fn trim_start(s: string) -> string is return s end
-pub fn trim_end(s: string) -> string is return s end
-pub fn to_upper(s: string) -> string is return s end
-pub fn to_lower(s: string) -> string is return s end
-pub fn contains(s: string, sub: string) -> bool is
-    return false
+/// Trim whitespace from both ends.
+pub fn trim(s: string) -> string is
+    return __builtin_str_trim(s)
 end
-pub fn starts_with(s: string, prefix: string) -> bool is
-    return false
+
+/// Trim leading whitespace.
+pub fn trim_start(s: string) -> string is
+    return __builtin_str_trim_start(s)
 end
-pub fn ends_with(s: string, suffix: string) -> bool is
-    return false
+
+/// Trim trailing whitespace.
+pub fn trim_end(s: string) -> string is
+    return __builtin_str_trim_end(s)
 end
-pub fn replace(s: string, src_path: string, to: string) -> string is return s end
-pub fn split(s: string, sep: string) -> string is
-    return ""
+
+/// Split string by delimiter. Returns array of strings.
+pub fn split(s: string, delim: string) -> [string] is
+    return __builtin_str_split(s, delim)
 end
+
+/// Split by whitespace (any run of spaces/tabs/newlines).
+pub fn split_whitespace(s: string) -> [string] is
+    return __builtin_str_split_whitespace(s)
+end
+
+/// Join an array of strings with a separator.
 pub fn join(parts: [string], sep: string) -> string is
-    return ""
+    return __builtin_str_join(parts, sep)
 end
-pub fn repeat(s: string, n: int) -> string is return s end
-pub fn pad_left(s: string, width: int, ch: string) -> string is return s end
-pub fn pad_right(s: string, width: int, ch: string) -> string is return s end
-pub fn char_at(s: string, i: int) -> string is
-    return ""
+
+/// Replace first occurrence of `from` with `to`.
+pub fn replace(s: string, from: string, to: string) -> string is
+    return __builtin_str_replace(s, from, to)
 end
+
+/// Replace all occurrences of `from` with `to`.
+pub fn replace_all(s: string, from: string, to: string) -> string is
+    return __builtin_str_replace_all(s, from, to)
+end
+
+/// Convert to uppercase.
+pub fn to_upper(s: string) -> string is
+    return __builtin_str_to_upper(s)
+end
+
+/// Convert to lowercase.
+pub fn to_lower(s: string) -> string is
+    return __builtin_str_to_lower(s)
+end
+
+/// Repeat a string n times.
+pub fn repeat(s: string, n: int) -> string is
+    let mut result: string = ""
+    let mut i: int = 0
+    while i < n is
+        result = result + s
+        i += 1
+    end
+    return result
+end
+
+/// Reverse a string.
+pub fn reverse(s: string) -> string is
+    return __builtin_str_reverse(s)
+end
+
+/// Pad start with a character to reach target length.
+pub fn pad_start(s: string, len: int, ch: string) -> string is
+    let diff = len - s.len()
+    if diff <= 0 is return s end
+    return repeat(ch, diff) + s
+end
+
+/// Pad end with a character to reach target length.
+pub fn pad_end(s: string, len: int, ch: string) -> string is
+    let diff = len - s.len()
+    if diff <= 0 is return s end
+    return s + repeat(ch, diff)
+end
+
+/// Check if string is empty or only whitespace.
+pub fn is_blank(s: string) -> bool is
+    return trim(s).len() == 0
+end
+
+/// Count occurrences of a substring.
+pub fn count(s: string, sub: string) -> int is
+    if sub.len() == 0 is return 0 end
+    return __builtin_str_count(s, sub)
+end
+
+/// Get a slice of the string.
+pub fn slice(s: string, start: int, end_: int) -> string is
+    return s[start..end_]
+end
+
+/// Find index of first occurrence. Returns -1 if not found.
 pub fn index_of(s: string, sub: string) -> int is
-    return -1
+    return __builtin_str_index_of(s, sub)
 end
-pub fn substring(s: string, start: int, end_i: int) -> string is return s end
-pub fn is_empty(s: string) -> bool is return len(s) == 0 end
-pub fn strip_prefix(s: string, prefix: string) -> string is return s end
-pub fn strip_suffix(s: string, suffix: string) -> string is return s end
+
+/// Check if string contains only digits.
+pub fn is_numeric(s: string) -> bool is
+    return __builtin_str_is_numeric(s)
+end
+
+/// Remove a prefix if present.
+pub fn remove_prefix(s: string, prefix: string) -> string is
+    if s.starts_with(prefix) is
+        return s[prefix.len()..]
+    end
+    return s
+end
+
+/// Remove a suffix if present.
+pub fn remove_suffix(s: string, suffix: string) -> string is
+    if s.ends_with(suffix) is
+        return s[0..s.len() - suffix.len()]
+    end
+    return s
+end
