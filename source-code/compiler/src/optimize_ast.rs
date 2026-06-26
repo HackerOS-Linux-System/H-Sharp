@@ -1,4 +1,3 @@
-
 use hsharp_parser::ast::*;
 use hsharp_parser::span::Span;
 use std::collections::{HashMap, HashSet};
