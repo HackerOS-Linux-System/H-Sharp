@@ -13,7 +13,7 @@ end
 pub fn add_flag(p: ArgParser, name: string, help: string) -> ArgParser is return p end
 pub fn add_arg(p: ArgParser, name: string, help: string) -> ArgParser is return p end
 pub fn add_option(p: ArgParser, name: string, default: string, help: string) -> ArgParser is return p end
-pub fn parse(p: ArgParser) -> string is return "{}" end
+pub fn parse(p: ArgParser) -> string is return "{{}}" end
 pub fn get_flag(parsed: string, name: string) -> bool is return false end
 pub fn get_arg(parsed: string, name: string) -> string is return "" end
 pub fn get_option(parsed: string, name: string) -> string is return "" end
