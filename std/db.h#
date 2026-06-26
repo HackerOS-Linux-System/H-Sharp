@@ -1,27 +1,88 @@
-;; H# Standard Library — std -> db
-;; SQLite + PostgreSQL + Redis bindings
+;; std -> db — Generic database interface
+;; H# Standard Library v0.6
 
-struct DbConn is
-    pub driver: string
-    pub dsn:    string
-end
-
-pub fn sqlite_open(path: string) -> DbConn is
-    return DbConn { driver: "sqlite", dsn: path }
-end
-pub fn pg_connect(dsn: string) -> DbConn is
-    return DbConn { driver: "postgres", dsn: dsn }
-end
-pub fn redis_connect(host: string, port: int) -> DbConn is
-    return DbConn { driver: "redis", dsn: host }
+/// Open a database connection. URI format:
+///   sqlite:./mydb.sqlite
+///   postgres://user:pass@host:5432/dbname
+///   mysql://user:pass@host:3306/dbname
+pub fn open(uri: string) -> any is
+    return __builtin_db_open(uri)
 end
 
-pub fn query(conn: DbConn, sql: string) -> string is return "" end
-pub fn exec(conn: DbConn, sql: string) -> int is return 0 end
-pub fn begin(conn: DbConn) is end
-pub fn commit(conn: DbConn) is end
-pub fn rollback(conn: DbConn) is end
-pub fn close_db(conn: DbConn) is end
-pub fn last_insert_id(conn: DbConn) -> int is return 0 end
-pub fn affected_rows(conn: DbConn) -> int is return 0 end
-pub fn escape(s: string) -> string is return s end
+/// Execute a query and return rows as array of maps.
+pub fn query(conn: any, sql: string) -> [any] is
+    return __builtin_db_query(conn, sql)
+end
+
+/// Execute a query with parameters (? placeholders).
+pub fn query_params(conn: any, sql: string, params: [any]) -> [any] is
+    return __builtin_db_query_params(conn, sql, params)
+end
+
+/// Execute a non-SELECT statement. Returns rows affected.
+pub fn exec(conn: any, sql: string) -> int is
+    return __builtin_db_exec(conn, sql)
+end
+
+/// Execute with parameters.
+pub fn exec_params(conn: any, sql: string, params: [any]) -> int is
+    return __builtin_db_exec_params(conn, sql, params)
+end
+
+/// Begin a transaction. Returns transaction handle.
+pub fn begin(conn: any) -> any is
+    return __builtin_db_begin(conn)
+end
+
+/// Commit a transaction.
+pub fn commit(tx: any) is
+    __builtin_db_commit(tx)
+end
+
+/// Rollback a transaction.
+pub fn rollback(tx: any) is
+    __builtin_db_rollback(tx)
+end
+
+/// Run queries inside a transaction automatically.
+/// Commits on success, rolls back on error.
+pub fn transaction(conn: any, f: fn(any)) is
+    let tx = begin(conn)
+    f(tx)
+    commit(tx)
+end
+
+/// Get a string column value from a row.
+pub fn col_str(row: any, col: string) -> string is
+    return __builtin_db_col_str(row, col)
+end
+
+/// Get an int column value from a row.
+pub fn col_int(row: any, col: string) -> int is
+    return __builtin_db_col_int(row, col)
+end
+
+/// Get a float column value from a row.
+pub fn col_float(row: any, col: string) -> f64 is
+    return __builtin_db_col_float(row, col)
+end
+
+/// Get a bool column value from a row.
+pub fn col_bool(row: any, col: string) -> bool is
+    return __builtin_db_col_bool(row, col)
+end
+
+/// Check if column is NULL.
+pub fn col_is_null(row: any, col: string) -> bool is
+    return __builtin_db_col_is_null(row, col)
+end
+
+/// Close the connection.
+pub fn close(conn: any) is
+    __builtin_db_close(conn)
+end
+
+/// Ping the database (check connectivity).
+pub fn ping(conn: any) -> bool is
+    return __builtin_db_ping(conn)
+end
