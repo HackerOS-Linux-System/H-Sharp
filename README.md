@@ -1,5 +1,5 @@
 # ![H# - Programming Language for HackerOS.](https://github.com/HackerOS-Linux-System/H-Sharp/blob/main/images/logo.png)
-# H# Language — v0.6
+# H# Language — v0.8
 
 **H#** (H-Sharp) to kompilowany język programowania pisany z myślą o HackerOS — bezpieczny, ekstremalnie szybki, z natywnym wsparciem dla cybersecurity, systemów i narzędzi CLI.
 
@@ -107,7 +107,7 @@ let x: int = 42
 let mut counter: int = 0
 let name: string = "HackerOS"
 
-;; String interpolation (v0.6)
+;; String interpolation (v0.8 — now with working {expr} markers)
 let msg: string = "Hello, {name}! x = {x}"
 write(msg)
 
@@ -170,7 +170,7 @@ impl Point : Printable is
     end
 end
 
-;; Closures (v0.6)
+;; Closures (read-only capture; see Known Limitations for mutable capture)
 let double = |x: int| -> int is x * 2 end
 let sum = arr.iter().map(|x| x * 2).filter(|x| x > 4).collect()
 
@@ -198,7 +198,7 @@ match status is
     Status::Pending     => write("pending")
 end
 
-;; Operator ? (v0.6)
+;; Operator ?
 fn read_config(path: string) -> string? is
     let content = fs::read(path)?
     return content
@@ -224,14 +224,14 @@ unsafe arena(65536) is
     let raw: string = "raw data"
 end
 
-;; Moduły (v0.6)
+;; Moduły
 mod utils is
     pub fn hex_encode(data: string) -> string is
         return conv::to_hex(data)
     end
 end
 
-;; Testy (v0.6)
+;; Testy
 #[test]
 fn test_add() is
     assert_eq(add(2, 3), 5)
@@ -400,17 +400,35 @@ end
 
 ---
 
-## Roadmap
+## Znane ograniczenia (v0.7)
 
-| Wersja | Plan | Status |
-|--------|------|--------|
-| v0.2 | Parser, Interpreter, LLVM codegen, FFI extern, std 51 lib | ✅ Done |
-| v0.3 | `?` operator, closures, stdlib real impl, async/await | ✅ Done |
-| v0.4 | Generics runtime, traits dispatch, modules, string interpolation | ✅ Done |
-| v0.5 | Borrow checker / lifetimes (region-based safety) | ✅ Done |
-| v0.6 | Test suite, std pełne implementacje, nowe szablony, fmt/doc | ✅ Done |
-| v0.7 | Performance, large projects, profiling, WASM target | 🔨 In Progress |
-| v1.0 | Stable + editions (2026, 2027...) | 🎯 Goal |
+Poniższe ograniczenia zostały zidentyfikowane podczas audytu i **większość naprawiona** w tej wersji. Poniżej lista tego, co **nadal** pozostaje otwarte:
+
+- **Mutowalne przechwytywanie w closures** — closure może *odczytać* zmienną z otaczającego scope (`let f = |x| x * outer_var`), ale mutacja przechwyconej zmiennej wewnątrz closure (`let f = || counter += 1`) nie jest widoczna po powrocie z `f()`. Naprawienie wymaga zmiany `Env` na `Rc<RefCell<...>>` per-zmienna — architektoniczna zmiana zaplanowana na v0.8.
+- **LLVM codegen — pełna weryfikacja** — backen LLVM obsługuje Path calls (`module::function()`) na poziomie kodu, ale nie był uruchamiany z pełnym zestawem stdlib bindings (LLVM kompiluje do maszynowego kodu, interpreter jest do preview/test). To normalne: LLVM target to produkcja, interpreter to dev.
+
+### Co zostało naprawione w v0.7
+
+Poniższe punkty były w poprzedniej liście "znanych ograniczeń" i zostały **całkowicie wdrożone**:
+
+- ✅ **`crypto::hmac_sha256`** — prawdziwy HMAC-SHA256 przez `sha2`/`hmac` crates (native Rust, zero zależności od shella)
+- ✅ **`crypto::sha256`/`sha512`/`md5`/`sha1`** — wszystkie przepisane z shella (`sha256sum`) na native Rust  
+- ✅ **`sec::rot13`** — native Rust implementation
+- ✅ **`fs::is_file`** — prawdziwe `Path::is_file()` odróżniające plik od katalogu (wcześniej błędny alias do `fs_exists`)
+- ✅ **Literalne `{{`/`}}`** w stringach — poprawnie redukują się do `{`/`}`, w tym stringi zawierające **wyłącznie** escaped klamry bez żadnej prawdziwej interpolacji (np. literały JSON)
+- ✅ **`module::function()` parsing** — `col::HashMap::new()`, `async::spawn()`, `fs::write()` i każda inna `keyword::fn()` ścieżka parsuje się poprawnie
+- ✅ **`fn(int) -> int` jako typ parametru** — powodowało hang; teraz parsuje się do `TypeExpr::Fn` i jest obsługiwane przez typechecker i interpreter
+- ✅ **Pełne pattern matching** — `match c is Color::Red =>`, `Color::Custom(_, _, _) =>`, struct patterns, range patterns — wszystkie działają
+- ✅ **Enum wartości** — `Color::Red`, `Color::Custom(255, 0, 0)` jako wyrażenia tworzą runtime `Value::Struct`
+- ✅ **`impl` method dispatch** — `p.distance_to(other)`, `Type::new(x, y)` i wszystkie user-defined metody na struct działają przez interpreter
+- ✅ **`arr.push(x)`/`map.insert(k,v)` mutacja** — mutujące metody faktycznie modyfikują zmienną w scope (write-back do env)
+- ✅ **`let (a, b) = swap(1, 2)`** — tuple destructuring w `let` przez desugar do tymczasowej zmiennej
+- ✅ **`|| -> T is ... end`** (zero-param closures) — parser poprawnie rozróżnia `||` (Or token) jako pustą listę parametrów
+- ✅ **`!expr.method()` precedencja** — krytyczny bug: `!map.contains_key("k")` parsowało się jako `(!map).contains_key("k")` zamiast `!(map.contains_key("k"))` — naprawiony przez `parse_expr(29)` zamiast `parse_prefix()`
+- ✅ **`match arm => assignment`** — `match x is 1 => handled = true end` nie wykonywało przypisania (omijało `exec_stmt`); naprawione przez zawsze przechodzenie przez `exec_block`
+- ✅ **Operator `?` short-circuit** — `let r = fn()?` nie przerywał funkcji przy `nil`, bo `Stmt::Let` nie sprawdzał `Value::Return` sygnału; naprawione
+- ✅ **`assert_eq`/`assert_true`/etc.** — wszystkie wcześniej **cicho ignorowane** (catch-all `Ok(Nil)`); teraz prawdziwe buildiny z `RuntimeError::Panic`
+- ✅ **`json::parse`/`json::get_str`/etc.** — brakowało aliasów `json::X → json_X`; wszystkie 19 funkcji json:: teraz poprawnie zmapowane
 
 ---
 
