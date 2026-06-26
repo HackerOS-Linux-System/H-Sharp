@@ -1,46 +1,106 @@
-;; H# Standard Library — std -> test
-;; Unit testing framework
+;; std -> test — Test framework
+;; H# Standard Library v0.6
 
-struct TestSuite is
-    pub name:   string
-    pub passed: int
-    pub failed: int
-end
-
-pub fn new_suite(name: string) -> TestSuite is
-    return TestSuite { name: name, passed: 0, failed: 0 }
-end
-
-pub fn assert_eq(a: string, b: string) -> bool is
-    if a == b is return true end
-    write("[FAIL] expected: " + b + " got: " + a)
-    return false
-end
-
-pub fn assert_eq_int(a: int, b: int) -> bool is
-    if a == b is return true end
-    write("[FAIL] expected: " + to_string(b) + " got: " + to_string(a))
-    return false
-end
-
-pub fn assert_true(cond: bool, msg: string) -> bool is
-    if cond is return true end
-    write("[FAIL] " + msg)
-    return false
-end
-
-pub fn assert_false(cond: bool, msg: string) -> bool is
-    if cond is
-        write("[FAIL] expected false — " + msg)
-        return false
+/// Assert two values are equal. Panics with a message if not.
+pub fn assert_eq(actual: any, expected: any) is
+    if actual != expected is
+        let msg = "assert_eq failed:\n  expected: " + to_string(expected) +
+                  "\n  actual:   " + to_string(actual)
+        __builtin_test_fail(msg)
     end
-    return true
 end
 
-pub fn assert_contains(s: string, sub: string) -> bool is return false end
-pub fn assert_not_empty(s: string) -> bool is return s != "" end
-pub fn assert_nil(s: string) -> bool is return s == "" end
+/// Assert two values are NOT equal.
+pub fn assert_ne(actual: any, unexpected: any) is
+    if actual == unexpected is
+        let msg = "assert_ne failed: both equal " + to_string(actual)
+        __builtin_test_fail(msg)
+    end
+end
 
-pub fn report(suite: TestSuite) is
-    write("[TEST] " + suite.name + " — passed: " + to_string(suite.passed) + " failed: " + to_string(suite.failed))
+/// Assert a boolean condition is true.
+pub fn assert_true(cond: bool) is
+    if !cond is
+        __builtin_test_fail("assert_true failed: condition was false")
+    end
+end
+
+/// Assert a boolean condition is false.
+pub fn assert_false(cond: bool) is
+    if cond is
+        __builtin_test_fail("assert_false failed: condition was true")
+    end
+end
+
+/// Assert value is nil.
+pub fn assert_nil(val: any) is
+    if val != nil is
+        let msg = "assert_nil failed: got " + to_string(val)
+        __builtin_test_fail(msg)
+    end
+end
+
+/// Assert value is not nil.
+pub fn assert_not_nil(val: any) is
+    if val == nil is
+        __builtin_test_fail("assert_not_nil failed: value was nil")
+    end
+end
+
+/// Assert a result is an error / nil (for ? operator results).
+pub fn assert_err(val: any) is
+    if val != nil is
+        let msg = "assert_err failed: expected error but got " + to_string(val)
+        __builtin_test_fail(msg)
+    end
+end
+
+/// Assert two floats are within delta of each other.
+pub fn assert_approx(actual: f64, expected: f64, delta: f64) is
+    let diff = actual - expected
+    let abs_diff = if diff < 0.0 is -diff else is diff end
+    if abs_diff > delta is
+        let msg = "assert_approx failed: |" + to_string(actual) +
+                  " - " + to_string(expected) + "| = " + to_string(abs_diff) +
+                  " > " + to_string(delta)
+        __builtin_test_fail(msg)
+    end
+end
+
+/// Assert a string contains a substring.
+pub fn assert_contains(s: string, sub: string) is
+    if !s.contains(sub) is
+        let msg = "assert_contains failed:\n  string:    " + s +
+                  "\n  substring: " + sub
+        __builtin_test_fail(msg)
+    end
+end
+
+/// Assert a string starts with a prefix.
+pub fn assert_starts_with(s: string, prefix: string) is
+    if !s.starts_with(prefix) is
+        let msg = "assert_starts_with failed:\n  string: " + s +
+                  "\n  prefix: " + prefix
+        __builtin_test_fail(msg)
+    end
+end
+
+/// Assert array length.
+pub fn assert_len(arr: [any], expected: int) is
+    let actual = arr.len()
+    if actual != expected is
+        let msg = "assert_len failed: expected " + to_string(expected) +
+                  ", got " + to_string(actual)
+        __builtin_test_fail(msg)
+    end
+end
+
+/// Explicitly fail a test with a message.
+pub fn fail(msg: string) is
+    __builtin_test_fail("test failed: " + msg)
+end
+
+/// Skip a test with a reason (marks as skipped, not failed).
+pub fn skip(reason: string) is
+    __builtin_test_skip(reason)
 end
