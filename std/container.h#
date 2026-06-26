@@ -9,7 +9,7 @@ pub fn remove(id: string) is end
 pub fn list() -> string is return "[]" end
 pub fn exec_container(id: string, cmd: string) -> string is return "" end
 pub fn logs(id: string) -> string is return "" end
-pub fn inspect(id: string) -> string is return "{}" end
+pub fn inspect(id: string) -> string is return "{{}}" end
 pub fn build(dockerfile: string, tag: string) is end
 pub fn push(image: string) is end
 pub fn pull_image(image: string) is end
