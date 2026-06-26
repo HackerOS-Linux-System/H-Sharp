@@ -37,6 +37,11 @@ pub struct LlvmCodegen {
     /// in the module being compiled. Populated at the start of
     /// `compile_full` (which takes `&self`, hence `RefCell`).
     link_flags: std::cell::RefCell<ffi_linker::LinkFlags>,
+    /// Whether the module uses regex:: (needs runtime/regex.c + -lpcre2-8).
+    /// RefCell so compile_full (&self) can set it without unsafe.
+    uses_regex: std::cell::Cell<bool>,
+    /// Whether the module uses db:: (needs runtime/sqlite.c + -lsqlite3).
+    uses_db: std::cell::Cell<bool>,
 }
 
 impl LlvmCodegen {
@@ -46,6 +51,8 @@ impl LlvmCodegen {
             context: Context::create(),
            opts: opts.clone(),
            link_flags: std::cell::RefCell::new(ffi_linker::LinkFlags::default()),
+           uses_regex: std::cell::Cell::new(false),
+           uses_db:    std::cell::Cell::new(false),
         })
     }
 
@@ -55,8 +62,25 @@ impl LlvmCodegen {
     pub fn emit(&self, _output: &str, _optimize: bool) -> R<()> { Ok(()) }
     pub fn emit_object_file(&self, _out: &str) -> R<()>         { Ok(()) }
 
+    /// Scan for `regex::` / `db::` usage in expressions and statements.
+    /// Called once at compile_full start so emit_binary_with_machine
+    /// can decide which optional runtime modules to compile/link.
+    fn scan_module_features(m: &HshModule) -> (bool, bool) {
+        let mut has_regex = false;
+        let mut has_db    = false;
+        for item in &m.items {
+            scan_item_features(item, &mut has_regex, &mut has_db);
+            if has_regex && has_db { break; }
+        }
+        (has_regex, has_db)
+    }
+
     /// Full compilation: AST -> LLVM IR -> optimised binary.
     pub fn compile_full(&self, m: &HshModule) -> R<()> {
+        let (uses_regex, uses_db) = Self::scan_module_features(m);
+        self.uses_regex.set(uses_regex);
+        self.uses_db.set(uses_db);
+
         let (module, machine) = self.build_module(m)?;
         self.emit_binary_with_machine(&module, &machine)
     }
@@ -452,42 +476,99 @@ impl LlvmCodegen {
     }
 
     fn emit_binary_with_machine(&self, module: &Module, machine: &TargetMachine) -> R<()> {
+        // ── Locate the runtime directory ─────────────────────────────────────
+        // The runtime/ directory lives next to the compiler binary:
+        //   <exe_dir>/runtime/core.c
+        //   <exe_dir>/runtime/regex.c   (optional — only if program uses regex::)
+        //   <exe_dir>/runtime/sqlite.c  (optional — only if program uses db::)
+        //
+        // Fallback: try the source tree at compile time (dev builds).
+        let rt_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("runtime")))
+            .filter(|p| p.is_dir())
+            .or_else(|| {
+                // Dev fallback: source-code/compiler/runtime/ relative to this file
+                option_env!("CARGO_MANIFEST_DIR")
+                    .map(|d| std::path::PathBuf::from(d).join("runtime"))
+                    .filter(|p| p.is_dir())
+            });
+
         let tmp_base = std::env::temp_dir().join(format!("hsharp_rt_{}", std::process::id()));
-        let rt_c = format!("{}_rt.c",  tmp_base.display());
-        let rt_o = format!("{}_rt.o",  tmp_base.display());
-        std::fs::write(&rt_c, crate::runtime::runtime_c_source())?;
         let rt_opt = if self.opts.optimize { "-O2" } else { "-O0" };
 
-        // The H# runtime uses PCRE2 (§11) and real libsqlite3 (§12), both
-        // of which need their headers available at compile time.
-        // pkg-config gives us the right include paths across distros.
-        let mut rt_cflags: Vec<String> = vec![rt_opt.to_string(),
-        "-ffunction-sections".into(), "-fdata-sections".into(), "-fPIC".into()];
-        if self.opts.optimize {
-            // Smaller/faster runtime object: H# never unwinds (panic =
-            // abort), so omit unwind-table generation; frame pointers
-            // aren't needed for backtraces we don't produce.
-            rt_cflags.push("-fno-asynchronous-unwind-tables".into());
-            rt_cflags.push("-fomit-frame-pointer".into());
-        }
-        for pkg in ["libpcre2-8", "sqlite3"] {
-            if let Some(flags) = pkg_config_cflags(pkg) {
-                rt_cflags.extend(flags);
-            }
-        }
-        rt_cflags.push("-c".into());
-        rt_cflags.push(rt_c.clone());
-        rt_cflags.push("-o".into());
-        rt_cflags.push(rt_o.clone());
+        // ── Detect which optional runtime modules the program needs ──────────
+        // Walk the AST once to check for regex:: and db:: usage.
+        // This determines which .c files (and -l flags) are compiled in.
+        let (needs_regex, needs_db) = self.detect_runtime_needs();
 
-        let ok = std::process::Command::new("cc")
-        .args(&rt_cflags)
-        .status()?.success();
-        if !ok {
-            return Err(CodegenError::Link(
-                "runtime compile failed — is libpcre2-dev and libsqlite3-dev installed? \
-(sudo apt install libpcre2-dev libsqlite3-dev)".into()
-            ));
+        // ── Compile each runtime C file → object file ────────────────────────
+        let mut rt_objects: Vec<String> = Vec::new();
+
+        let rt_files: &[(&str, bool, &[&str])] = &[
+            // (filename, always_include, extra_packages_for_pkg_config)
+            ("core.c",   true,         &[]),
+            ("regex.c",  needs_regex,  &["libpcre2-8"]),
+            ("sqlite.c", needs_db,     &["sqlite3"]),
+        ];
+
+        for (fname, include, pkgs) in rt_files {
+            if !include { continue; }
+
+            let src_path = if let Some(ref dir) = rt_dir {
+                dir.join(fname)
+            } else {
+                // Last resort: write from embedded fallback string
+                // (only core.c has a fallback; regex/sqlite don't need one
+                // since if rt_dir is missing they also aren't being compiled)
+                let p = tmp_base.with_extension(format!("{}.c", fname));
+                if *fname == "core.c" {
+                    std::fs::write(&p, crate::runtime::runtime_c_source())?;
+                }
+                p
+            };
+
+            let obj_path = tmp_base.with_extension(format!("{}.o", fname));
+            let obj_str  = obj_path.to_string_lossy().into_owned();
+
+            let mut cflags: Vec<String> = vec![
+                rt_opt.to_string(),
+                "-ffunction-sections".into(),
+                "-fdata-sections".into(),
+                "-fPIC".into(),
+            ];
+            if self.opts.optimize {
+                cflags.push("-fno-asynchronous-unwind-tables".into());
+                cflags.push("-fomit-frame-pointer".into());
+            }
+            for pkg in *pkgs {
+                if let Some(flags) = pkg_config_cflags(pkg) {
+                    cflags.extend(flags);
+                }
+            }
+            cflags.extend([
+                "-c".to_string(),
+                src_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                obj_str.clone(),
+            ]);
+
+            let ok = std::process::Command::new("cc")
+                .args(&cflags)
+                .status()?.success();
+            if !ok {
+                let hint = if *fname == "regex.c" {
+                    " — is libpcre2-dev installed? (sudo apt install libpcre2-dev)"
+                } else if *fname == "sqlite.c" {
+                    " — is libsqlite3-dev installed? (sudo apt install libsqlite3-dev)"
+                } else {
+                    " — check that cc/gcc is installed"
+                };
+                return Err(CodegenError::Link(
+                    format!("runtime compile failed ({}){}", fname, hint)
+                ));
+            }
+            rt_objects.push(obj_str);
         }
 
         let obj_path = format!("{}_main.o", self.opts.output);
@@ -500,34 +581,34 @@ impl LlvmCodegen {
             std::fs::copy(&obj_path, &obj_out).ok();
             eprintln!("  note: no `main` fn — compiled as object: {}", obj_out);
             std::fs::remove_file(&obj_path).ok();
-            std::fs::remove_file(&rt_c).ok();
-            std::fs::remove_file(&rt_o).ok();
+            for rt_o in &rt_objects { std::fs::remove_file(rt_o).ok(); }
             return Ok(());
         }
 
         let suffix = self.opts.target.exe_suffix();
         let out    = format!("{}{}", self.opts.output, suffix);
 
-        // §11/§12 runtime link deps. Prefer pkg-config --libs (handles
-        // e.g. Debian's `libpcre2-8` -> `-lpcre2-8`, and any extra deps
-        // like -lz that pcre2 sometimes needs), falling back to a
-        // hardcoded `-l{name}` guess.
+        // ── Link flags — only what's actually needed ─────────────────────────
         let mut runtime_libs: Vec<String> = Vec::new();
-        for (pkg, fallback) in [("libpcre2-8", "-lpcre2-8"), ("sqlite3", "-lsqlite3")] {
-            match pkg_config_libs(pkg) {
+        if needs_regex {
+            match pkg_config_libs("libpcre2-8") {
                 Some(libs) => runtime_libs.extend(libs),
-                None       => runtime_libs.push(fallback.to_string()),
+                None       => runtime_libs.push("-lpcre2-8".to_string()),
+            }
+        }
+        if needs_db {
+            match pkg_config_libs("sqlite3") {
+                Some(libs) => runtime_libs.extend(libs),
+                None       => runtime_libs.push("-lsqlite3".to_string()),
             }
         }
 
-        // §5: user `extern [c/cpp/rust, "lib"]` link flags (dynamic libs,
-        // static libs with -Bstatic/-Bdynamic, and Rust staticlibs linked
-        // --whole-archive). See ffi_linker.rs.
         let extern_args = self.link_flags.borrow().to_cc_args();
 
         let mut cmd = std::process::Command::new("cc");
-        cmd.arg(&obj_path).arg(&rt_o).arg("-o").arg(&out);
-        cmd.arg("-no-pie");
+        cmd.arg(&obj_path);
+        for rt_o in &rt_objects { cmd.arg(rt_o); }
+        cmd.arg("-o").arg(&out).arg("-no-pie");
         cmd.args(["-lm", "-lpthread", "-ldl"]);
         for lib in &runtime_libs { cmd.arg(lib); }
         for a in &extern_args    { cmd.arg(a); }
@@ -541,11 +622,11 @@ impl LlvmCodegen {
 
         let result = cmd.output()?;
         if !result.status.success() {
-            // Retry without advanced linker flags (some distros' ld
-            // chokes on --gc-sections + LTO combinations).
             let mut cmd2 = std::process::Command::new("cc");
-            cmd2.arg(&obj_path).arg(&rt_o).arg("-o").arg(&out)
-            .arg("-no-pie").args(["-lm", "-lpthread", "-ldl"]);
+            cmd2.arg(&obj_path);
+            for rt_o in &rt_objects { cmd2.arg(rt_o); }
+            cmd2.arg("-o").arg(&out).arg("-no-pie")
+                .args(["-lm", "-lpthread", "-ldl"]);
             for lib in &runtime_libs { cmd2.arg(lib); }
             for a in &extern_args    { cmd2.arg(a); }
             if self.opts.optimize { cmd2.arg("-O2"); }
@@ -573,9 +654,156 @@ impl LlvmCodegen {
         }
 
         let _ = std::fs::remove_file(&obj_path);
-        let _ = std::fs::remove_file(&rt_c);
-        let _ = std::fs::remove_file(&rt_o);
+        for rt_o in &rt_objects { let _ = std::fs::remove_file(rt_o); }
         Ok(())
+    }
+
+    /// Scan the H# module AST once to determine which optional runtime
+    /// modules are actually needed. Returns (needs_regex, needs_db).
+    ///
+    /// - needs_regex → compile runtime/regex.c + link -lpcre2-8
+    /// - needs_db    → compile runtime/sqlite.c + link -lsqlite3
+    ///
+    /// Programs that use neither get a binary with zero pcre2/sqlite3
+    /// dependency — the linker never sees those symbols at all.
+    fn detect_runtime_needs(&self) -> (bool, bool) {
+        (self.uses_regex.get(), self.uses_db.get())
+    }
+}
+
+/// Walk an Item and set `has_regex`/`has_db` if `regex::` or `db::` paths
+/// are found anywhere inside (expressions, sub-items, nested blocks).
+fn scan_item_features(item: &Item, has_regex: &mut bool, has_db: &mut bool) {
+    match item {
+        Item::FnDef(f) => {
+            for stmt in &f.body { scan_stmt_features(stmt, has_regex, has_db); }
+        }
+        Item::ImplBlock(imp) => {
+            for m in &imp.methods {
+                for stmt in &m.body { scan_stmt_features(stmt, has_regex, has_db); }
+            }
+        }
+        Item::ModDecl { inline: Some(items), .. } => {
+            for it in items { scan_item_features(it, has_regex, has_db); }
+        }
+        _ => {}
+    }
+}
+
+fn scan_stmt_features(stmt: &Stmt, has_regex: &mut bool, has_db: &mut bool) {
+    match stmt {
+        Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) |
+        Stmt::Expr(e, _) | Stmt::Break(Some(e), _) =>
+            scan_expr_features(e, has_regex, has_db),
+        Stmt::Item(it) => scan_item_features(it, has_regex, has_db),
+        _ => {}
+    }
+}
+
+fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
+    if *has_regex && *has_db { return; }
+    match expr {
+        Expr::Call(callee, args, _) => {
+            if let Expr::Path(segs, _) = callee.as_ref() {
+                if !segs.is_empty() {
+                    match segs[0].as_str() {
+                        "regex" => *has_regex = true,
+                        "db"    => *has_db = true,
+                        _       => {}
+                    }
+                }
+            }
+            scan_expr_features(callee, has_regex, has_db);
+            for a in args { scan_expr_features(a, has_regex, has_db); }
+        }
+        Expr::Path(segs, _) => {
+            if !segs.is_empty() {
+                match segs[0].as_str() {
+                    "regex" => *has_regex = true,
+                    "db"    => *has_db = true,
+                    _       => {}
+                }
+            }
+        }
+        Expr::MethodCall(obj, _, args, _) => {
+            scan_expr_features(obj, has_regex, has_db);
+            for a in args { scan_expr_features(a, has_regex, has_db); }
+        }
+        // BinOp(Box<Expr>, BinOp, Box<Expr>, Span)
+        Expr::BinOp(a, _, b, _) => {
+            scan_expr_features(a, has_regex, has_db);
+            scan_expr_features(b, has_regex, has_db);
+        }
+        // UnOp(UnOp, Box<Expr>, Span)
+        Expr::UnOp(_, a, _) => scan_expr_features(a, has_regex, has_db),
+        Expr::Try(a, _)   => scan_expr_features(a, has_regex, has_db),
+        Expr::Await(a, _) => scan_expr_features(a, has_regex, has_db),
+        Expr::FieldAccess(a, _, _) => scan_expr_features(a, has_regex, has_db),
+        // IndexAccess(Box<Expr>, Box<Expr>, Span)
+        Expr::IndexAccess(a, b, _) => {
+            scan_expr_features(a, has_regex, has_db);
+            scan_expr_features(b, has_regex, has_db);
+        }
+        Expr::Return(Some(a), _) => scan_expr_features(a, has_regex, has_db),
+        Expr::Cast(a, _, _) => scan_expr_features(a, has_regex, has_db),
+        Expr::Range(a, b, _, _) => {
+            scan_expr_features(a, has_regex, has_db);
+            scan_expr_features(b, has_regex, has_db);
+        }
+        // Assign(Box<Expr>, Box<Expr>, Span)
+        Expr::Assign(a, b, _) => {
+            scan_expr_features(a, has_regex, has_db);
+            scan_expr_features(b, has_regex, has_db);
+        }
+        // CompoundAssign(Box<Expr>, BinOp, Box<Expr>, Span)
+        Expr::CompoundAssign(a, _, b, _) => {
+            scan_expr_features(a, has_regex, has_db);
+            scan_expr_features(b, has_regex, has_db);
+        }
+        // If { condition, then_body, elsif_branches, else_body, .. }
+        Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+            scan_expr_features(condition, has_regex, has_db);
+            for s in then_body { scan_stmt_features(s, has_regex, has_db); }
+            for (cond, body) in elsif_branches {
+                scan_expr_features(cond, has_regex, has_db);
+                for s in body { scan_stmt_features(s, has_regex, has_db); }
+            }
+            if let Some(body) = else_body {
+                for s in body { scan_stmt_features(s, has_regex, has_db); }
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            scan_expr_features(subject, has_regex, has_db);
+            for arm in arms { for s in &arm.body { scan_stmt_features(s, has_regex, has_db); } }
+        }
+        // While { condition, body, .. }
+        Expr::While { condition, body, .. } => {
+            scan_expr_features(condition, has_regex, has_db);
+            for s in body { scan_stmt_features(s, has_regex, has_db); }
+        }
+        // For { pattern, iterable, body, .. }
+        Expr::For { iterable, body, .. } => {
+            scan_expr_features(iterable, has_regex, has_db);
+            for s in body { scan_stmt_features(s, has_regex, has_db); }
+        }
+        Expr::Do { body, .. } => {
+            for s in body { scan_stmt_features(s, has_regex, has_db); }
+        }
+        // StructLit(String, Vec<(String, Expr)>, Span)
+        Expr::StructLit(_, fields, _) => {
+            for (_, e) in fields { scan_expr_features(e, has_regex, has_db); }
+        }
+        // ArrayLit(Vec<Expr>, Span) | TupleLit(Vec<Expr>, Span)
+        Expr::ArrayLit(items, _) | Expr::TupleLit(items, _) => {
+            for i in items { scan_expr_features(i, has_regex, has_db); }
+        }
+        Expr::Closure { body, .. } => {
+            for s in body { scan_stmt_features(s, has_regex, has_db); }
+        }
+        Expr::Unsafe(stmts, _, _) => {
+            for s in stmts { scan_stmt_features(s, has_regex, has_db); }
+        }
+        _ => {}
     }
 }
 
@@ -870,6 +1098,20 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        Expr::Call(callee, args, _) => {
                            if let Expr::Ident(name, _) = callee.as_ref() {
                                self.call_fn(name, args, hint)
+                           } else if let Expr::Path(segments, _) = callee.as_ref() {
+                               // module::function — try the snake_case mangled
+                               // runtime symbol first (matches the interpreter's
+                               // stdlib bridge convention: json::parse -> json_parse),
+                               // then the bare last segment as a locally-defined
+                               // or namespace-flattened function.
+                               let snake = segments.join("_");
+                               if self.func_vals.contains_key(snake.as_str()) {
+                                   self.call_fn(&snake, args, hint)
+                               } else if let Some(last) = segments.last() {
+                                   self.call_fn(last, args, hint)
+                               } else {
+                                   Ok(self.ctx.i64_type().const_zero().into())
+                               }
                            } else {
                                Ok(self.ctx.i64_type().const_zero().into())
                            }
