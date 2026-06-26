@@ -15,3 +15,4 @@ pub fn set_format(fmt: string) is end
 
 pub fn info_fmt(msg: string, args: string) is write("[INFO]  " + msg + args) end
 pub fn debug_fmt(msg: string, args: string) is write("[DEBUG] " + msg + args) end
+
