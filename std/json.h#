@@ -1,38 +1,113 @@
-;; H# Standard Library — std -> json
-;; Parser i serializer JSON
+;; std -> json — JSON parsing and generation
+;; H# Standard Library v0.6
 
-struct JsonValue is
-    pub raw: string
+/// Parse a JSON string into a JsonValue object.
+/// Returns a JsonValue that can be queried with get_str, get_int, etc.
+pub fn parse(raw: string) -> any is
+    ;; Implemented by the H# runtime — bridged via hsh_json_parse()
+    return __builtin_json_parse(raw)
 end
 
-;; Sparsuj string JSON
-pub fn parse(s: string) -> JsonValue is
-    return JsonValue { raw: s }
+/// Parse a JSON array string into a list of JsonValues.
+pub fn parse_array(raw: string) -> [any] is
+    return __builtin_json_parse_array(raw)
 end
 
-;; Serializuj do string JSON
-pub fn stringify(v: JsonValue) -> string is
-    return v.raw
+/// Stringify a JsonValue back to a JSON string.
+pub fn stringify(val: any) -> string is
+    return __builtin_json_stringify(val)
 end
 
-;; Pobierz string po kluczu
-pub fn get_str(v: JsonValue, key: string) -> string is
-    ;; runtime: extract string field from JSON
-    return ""
+/// Stringify with indentation (pretty print).
+pub fn stringify_pretty(val: any, indent: int) -> string is
+    return __builtin_json_stringify_pretty(val, indent)
 end
 
-;; Pobierz int po kluczu
-pub fn get_int(v: JsonValue, key: string) -> int is
-    ;; runtime: extract int field from JSON
-    return 0
+/// Create an empty JSON object.
+pub fn empty_object() -> any is
+    return __builtin_json_empty_object()
 end
 
-;; Pobierz bool po kluczu
-pub fn get_bool(v: JsonValue, key: string) -> bool is
-    return false
+/// Create a JSON object from key-value pairs.
+pub fn object(pairs: [(string, any)]) -> any is
+    let mut obj = empty_object()
+    for pair in pairs is
+        set_str(obj, pair.0, pair.1)
+    end
+    return obj
 end
 
-;; Sprawdź czy klucz istnieje
-pub fn has_key(v: JsonValue, key: string) -> bool is
-    return false
+/// Get a string value by key.
+pub fn get_str(obj: any, key: string) -> string is
+    return __builtin_json_get_str(obj, key)
+end
+
+/// Get an integer value by key.
+pub fn get_int(obj: any, key: string) -> int is
+    return __builtin_json_get_int(obj, key)
+end
+
+/// Get a float value by key.
+pub fn get_float(obj: any, key: string) -> f64 is
+    return __builtin_json_get_float(obj, key)
+end
+
+/// Get a bool value by key.
+pub fn get_bool(obj: any, key: string) -> bool is
+    return __builtin_json_get_bool(obj, key)
+end
+
+/// Get a nested object value by key.
+pub fn get_obj(obj: any, key: string) -> any is
+    return __builtin_json_get_obj(obj, key)
+end
+
+/// Get an array value by key.
+pub fn get_arr(obj: any, key: string) -> [any] is
+    return __builtin_json_get_arr(obj, key)
+end
+
+/// Check if a key exists.
+pub fn has_key(obj: any, key: string) -> bool is
+    return __builtin_json_has_key(obj, key)
+end
+
+/// Check if a key's value is null.
+pub fn is_null(obj: any, key: string) -> bool is
+    return __builtin_json_is_null(obj, key)
+end
+
+/// Set a string value by key (mutates obj).
+pub fn set_str(obj: any, key: string, val: any) is
+    __builtin_json_set(obj, key, val)
+end
+
+/// Set an int value by key.
+pub fn set_int(obj: any, key: string, val: int) is
+    __builtin_json_set(obj, key, val)
+end
+
+/// Set a bool value by key.
+pub fn set_bool(obj: any, key: string, val: bool) is
+    __builtin_json_set(obj, key, val)
+end
+
+/// Get an item from a JSON array by index (as JsonValue).
+pub fn obj_at(arr: [any], idx: int) -> any is
+    return arr[idx]
+end
+
+/// Get an integer from a JSON array at index.
+pub fn int_at(arr: [any], idx: int) -> int is
+    return __builtin_json_as_int(arr[idx])
+end
+
+/// Get a string from a JSON array at index.
+pub fn str_at(arr: [any], idx: int) -> string is
+    return __builtin_json_as_str(arr[idx])
+end
+
+/// Query with a dot-path like "user.address.city".
+pub fn query(obj: any, path: string) -> any is
+    return __builtin_json_query(obj, path)
 end
