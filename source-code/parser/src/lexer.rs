@@ -7,6 +7,15 @@ pub enum TokenKind {
     Integer(i64),
     Float(f64),
     StringLit(String),
+    /// A double-quoted string literal that contains one or more `{expr}`
+    /// interpolation markers (and possibly `{{`/`}}` escaped literal
+    /// braces). The lexer doesn't parse the expressions inside `{...}`
+    /// itself — it just identifies that interpolation is present and
+    /// passes the raw (already escape-processed) string through; the
+    /// parser is responsible for splitting it into text/expression parts
+    /// and recursively parsing each `{...}` segment as a full expression
+    /// (see `parse_interpolated_string` in parser.rs).
+    InterpStringLit(String),
     ByteLit(Vec<u8>),
     Bool(bool),
     Nil,
@@ -71,6 +80,55 @@ impl Token {
     pub fn new(kind: TokenKind, span: Span, text: impl Into<String>) -> Self {
         Self { kind, span, text: text.into() }
     }
+}
+
+/// Detects whether an already-escape-processed string literal body contains
+/// at least one genuine `{expr}` interpolation marker, as opposed to only
+/// escaped literal braces (`{{` / `}}`, which the parser later collapses to
+/// single `{` / `}` characters in the output). Scans left to right tracking
+/// brace depth so nested braces inside the expression (e.g. `{a.foo({1:2})}`
+/// — admittedly unusual, but struct/array literals can appear) don't
+/// prematurely close the marker.
+fn has_unescaped_interp_marker(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            // `{{` is an escaped literal brace. It still needs to reach
+            // `parse_interpolated_string` to be reduced to a single `{` —
+            // a string consisting *only* of `{{`/`}}` pairs (e.g. literal
+            // JSON like `"{{\"a\":1}}"`) would otherwise never be routed
+            // through the interpolation parser at all (every `{` it
+            // contains matches the `{{` case below and gets skipped), so
+            // the doubled braces would reach the output completely
+            // unreduced. Report it as needing processing rather than
+            // silently continuing the scan.
+            if chars.get(i + 1) == Some(&'{') {
+                return true;
+            }
+            // A lone `{` followed eventually by a matching `}` (not `}}`)
+            // is a real interpolation marker.
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 && j > i + 1 {
+                return true;
+            }
+        } else if chars[i] == '}' && chars.get(i + 1) == Some(&'}') {
+            // A `}}` pair with no preceding unmatched `{` (e.g. a string
+            // that's just "}}") also needs reduction to a single `}`.
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 pub struct Lexer {
@@ -231,6 +289,20 @@ impl Lexer {
             }
         }
         let end = self.position();
+        // Detect interpolation: a `{` not part of an escaped `{{` literal
+        // brace pair, with a matching unescaped `}` somewhere after it,
+        // means this string has at least one `{expr}` marker. The parser
+        // does the actual splitting/parsing; the lexer's job is just to
+        // route interpolated strings to a different token kind so the
+        // parser knows to look for markers at all (plain strings with no
+        // braces stay on the fast StringLit path, completely unaffected).
+        if has_unescaped_interp_marker(&s) {
+            return Ok(Token::new(
+                TokenKind::InterpStringLit(s.clone()),
+                Span::new(start, end, self.file.clone()),
+                format!("\"{}\"", s),
+            ));
+        }
         Ok(Token::new(
             TokenKind::StringLit(s.clone()),
                       Span::new(start, end, self.file.clone()),
