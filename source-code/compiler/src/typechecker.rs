@@ -213,6 +213,12 @@ impl HType {
         if self == other { return true; }
         if matches!(self, HType::Any) || matches!(other, HType::Any) { return true; }
         if self.is_numeric() && other.is_numeric() { return true; }
+        // `nil` infers as `any?` (Optional(Any)) — it's compatible with any
+        // declared optional type, e.g. `int?`, `string?`, `MyStruct?`.
+        // Likewise Optional(T) is compatible with Optional(U) if T and U are.
+        if let (HType::Optional(a), HType::Optional(b)) = (self, other) {
+            return a.compatible_with(b);
+        }
         false
     }
 
@@ -482,6 +488,7 @@ impl TypeChecker {
     }
 
     /// Push an error diagnostic.
+    #[allow(dead_code)]
     fn err(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic::error(span, message));
     }
@@ -492,6 +499,7 @@ impl TypeChecker {
     }
 
     /// Push a warning diagnostic.
+    #[allow(dead_code)]
     fn warn(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic::warning(span, message));
     }
@@ -524,7 +532,41 @@ impl TypeChecker {
                     self.fns.insert(full_name, FnSig { params, return_type: ret });
                 }
             }
+            Item::ModDecl { name, inline: Some(items), .. } => {
+                self.collect_mod_signatures(name, items);
+            }
             _ => {}
+        }
+    }
+
+    /// Recursively collect signatures from an inline module's items,
+    /// registering each fn under both its namespaced path
+    /// (`mod_name::fn_name`, for `module::fn(...)` call sites) and its
+    /// bare name (so sibling functions inside the module can call each
+    /// other without the prefix — mirrors the interpreter's behavior in
+    /// `register_mod_items`).
+    fn collect_mod_signatures(&mut self, mod_name: &str, items: &[Item]) {
+        for item in items {
+            match item {
+                Item::FnDef(f) => {
+                    let params = f.params.iter().map(|p| HType::from_type_expr(&p.ty)).collect::<Vec<_>>();
+                    let ret    = f.return_type.as_ref().map(HType::from_type_expr).unwrap_or(HType::Void);
+                    let namespaced = format!("{}::{}", mod_name, f.name);
+                    self.fns.insert(namespaced, FnSig { params: params.clone(), return_type: ret.clone() });
+                    self.fns.insert(f.name.clone(), FnSig { params, return_type: ret });
+                }
+                Item::StructDef(s) => {
+                    let fields = s.fields.iter()
+                        .map(|f| (f.name.clone(), HType::from_type_expr(&f.ty)))
+                        .collect();
+                    self.structs.insert(s.name.clone(), fields);
+                }
+                Item::ModDecl { name: sub_name, inline: Some(sub_items), .. } => {
+                    let nested = format!("{}::{}", mod_name, sub_name);
+                    self.collect_mod_signatures(&nested, sub_items);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -533,6 +575,9 @@ impl TypeChecker {
             Item::FnDef(f) => self.check_fn(f),
             Item::ImplBlock(imp) => {
                 for method in &imp.methods { self.check_fn(method); }
+            }
+            Item::ModDecl { inline: Some(items), .. } => {
+                for sub_item in items { self.check_item(sub_item); }
             }
             _ => {}
         }
@@ -665,14 +710,29 @@ impl TypeChecker {
                     _            => ty,
                 }
             }
-            Expr::Call(callee, args, _) => {
+            Expr::Call(callee, _args, _) => {
                 if let Expr::Ident(name, _) = callee.as_ref() {
                     if let Some(sig) = self.fns.get(name).cloned() {
                         return sig.return_type.clone();
                     }
                 }
+                if let Expr::Path(segments, _) = callee.as_ref() {
+                    // Try the fully-qualified name first ("json::parse"),
+                    // then fall back to just the last segment (for modules
+                    // that were namespace-flattened at expansion time).
+                    let full = segments.join("::");
+                    if let Some(sig) = self.fns.get(&full).cloned() {
+                        return sig.return_type.clone();
+                    }
+                    if let Some(last) = segments.last() {
+                        if let Some(sig) = self.fns.get(last).cloned() {
+                            return sig.return_type.clone();
+                        }
+                    }
+                }
                 HType::Any
             }
+            Expr::Path(_, _) => HType::Any,
             Expr::MethodCall(_, _, _, _) => HType::Any,
             Expr::FieldAccess(base, field, span) => {
                 let base_ty = self.infer_expr(base);
@@ -744,7 +804,7 @@ impl TypeChecker {
                 if let HType::Optional(i) = ty { *i } else { ty }
             }
             Expr::Assign(_, rhs, _) => self.infer_expr(rhs),
-            Expr::CompoundAssign(lhs, _, rhs, _) => self.infer_expr(lhs),
+            Expr::CompoundAssign(lhs, _, _rhs, _) => self.infer_expr(lhs),
             Expr::Range(_, _, _, _) => HType::Array(Box::new(HType::Int)),
             Expr::Closure { return_type, .. } => {
                 return_type.as_ref().map(HType::from_type_expr).unwrap_or(HType::Any)
