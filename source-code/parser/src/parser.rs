@@ -70,6 +70,47 @@ impl Parser {
         }
     }
 
+    /// Like `expect_ident`, but also accepts a fixed set of "soft" keywords
+    /// that are reserved words in statement/type position but are extremely
+    /// common as method or path-segment names in real-world APIs — most
+    /// importantly `new` (`Type::new()`) and `write` (`module::write()`).
+    /// Without this, `col::HashMap::new()` or `fs::write(...)` fail to
+    /// parse with a confusing "expected identifier, found `new`" error,
+    /// even though `new`/`write` are perfectly unambiguous in path-segment
+    /// position (they can never start a path segment themselves, so there's
+    /// no grammar conflict in allowing them here).
+    fn expect_path_segment(&mut self) -> Result<(String, Span), ParseError> {
+        let span = self.current().span.clone();
+        let text = match &self.current().kind {
+            TokenKind::Ident(name) => Some(name.clone()),
+            TokenKind::New      => Some("new".to_string()),
+            TokenKind::Write    => Some("write".to_string()),
+            TokenKind::Type     => Some("type".to_string()),
+            TokenKind::End      => Some("end".to_string()),
+            TokenKind::As       => Some("as".to_string()),
+            TokenKind::Is       => Some("is".to_string()),
+            TokenKind::From     => Some("from".to_string()),
+            TokenKind::Use      => Some("use".to_string()),
+            TokenKind::Match    => Some("match".to_string()),
+            TokenKind::In       => Some("in".to_string()),
+            TokenKind::For      => Some("for".to_string()),
+            TokenKind::Mod      => Some("mod".to_string()),
+            TokenKind::Async    => Some("async".to_string()),
+            TokenKind::Await    => Some("await".to_string()),
+            TokenKind::Self_    => Some("self".to_string()),
+            _ => None,
+        };
+        match text {
+            Some(name) => { self.advance(); Ok((name, span)) }
+            None => Err(ParseError::new(
+                ParseErrorKind::ExpectedIdent,
+                span,
+                format!("expected identifier, found `{}`", self.current().text),
+                vec!["provide a valid identifier here".to_string()],
+            )),
+        }
+    }
+
     fn error(&self, msg: impl Into<String>, hints: Vec<String>) -> ParseError {
         let msg_str: String = msg.into();
         ParseError::new(
@@ -81,6 +122,19 @@ impl Parser {
     }
 
     fn recover(&mut self) {
+        // Always consume at least one token before checking the stop
+        // condition. Without this, an error that leaves the cursor sitting
+        // exactly on a stop-token (e.g. `Fn`) makes recover() a no-op —
+        // the caller's retry loop then sees the identical token again,
+        // fails the identical way, calls recover() again, and never makes
+        // progress. This was the root cause of a real hang (see the
+        // TokenKind::Fn case in parse_type_base for the original trigger);
+        // advancing unconditionally here makes recovery robust against
+        // this whole class of stuck-cursor bugs, not just the one trigger
+        // that's now also fixed at the source.
+        if !matches!(self.current().kind, TokenKind::EOF) {
+            self.advance();
+        }
         while !matches!(self.current().kind,
             TokenKind::EOF | TokenKind::Newline | TokenKind::Fn | TokenKind::Struct |
             TokenKind::Enum | TokenKind::Impl | TokenKind::Pub | TokenKind::Use |
@@ -285,7 +339,15 @@ impl Parser {
         self.advance(); // fn
         let is_async  = if matches!(self.current().kind, TokenKind::Async)  { self.advance(); true } else { false };
         let is_unsafe = if matches!(self.current().kind, TokenKind::Unsafe) { self.advance(); true } else { false };
-        let (name, _) = self.expect_ident()?;
+        // Use expect_path_segment (not expect_ident) here: `new` and `write`
+        // are reserved keyword tokens but are also extremely common
+        // function/method names (`fn new(...)`, constructor-style; `fn
+        // write(...)`, e.g. inside `impl Buffer`). They're unambiguous in
+        // this position — nothing else can follow `fn` here — so accepting
+        // them avoids a confusing "expected identifier, found `new`" error
+        // on otherwise completely ordinary code (see tests/core/types_test.h#'s
+        // `impl Point is fn new(x, y) -> Point ... end end`).
+        let (name, _) = self.expect_path_segment()?;
         let type_params = self.parse_generics_decl()?;
         self.expect(&TokenKind::LParen)?;
         let params = self.parse_params()?;
@@ -329,7 +391,7 @@ impl Parser {
                 self.skip_newlines();
                 if matches!(self.current().kind, TokenKind::End | TokenKind::EOF) { break; }
                 match self.parse_stmt() {
-                    Ok(s)  => stmts.push(s),
+                    Ok(s)  => stmts.extend(s),
                     Err(e) => { self.errors.report(e); self.recover(); }
                 }
                 self.skip_newlines();
@@ -371,7 +433,7 @@ impl Parser {
                 _ => {}
             }
             match self.parse_stmt() {
-                Ok(s)  => stmts.push(s),
+                Ok(s)  => stmts.extend(s),
                 Err(e) => { self.errors.report(e); self.recover(); }
             }
         }
@@ -658,6 +720,34 @@ impl Parser {
             TokenKind::TBytes  => { self.advance(); Ok(TypeExpr::Named("bytes".into())) }
             TokenKind::TVoid   => { self.advance(); Ok(TypeExpr::Void) }
             TokenKind::TAny    => { self.advance(); Ok(TypeExpr::Named("any".into())) }
+            // Function type: fn(T1, T2, ...) -> R — used for higher-order
+            // function parameters/returns, e.g. `f: fn(int) -> int`.
+            // TypeExpr::Fn already existed in the AST but nothing produced
+            // it, so `fn(...)` as a type previously fell through to the
+            // catch-all error arm below — and worse, since `Fn` is also one
+            // of `recover()`'s stopping tokens, the parser would get stuck
+            // unable to make forward progress on recovery (it stops exactly
+            // on the `fn` it can't parse, recover() sees it's already on a
+            // stop-token and does nothing, and the outer item loop retries
+            // the same token forever). This was the root cause of the
+            // tests/core/functions_test.h# and types_test.h# hangs.
+            TokenKind::Fn => {
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let mut param_types = Vec::new();
+                while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                    param_types.push(self.parse_type()?);
+                    if matches!(self.current().kind, TokenKind::Comma) { self.advance(); } else { break; }
+                }
+                self.expect(&TokenKind::RParen)?;
+                let ret = if matches!(self.current().kind, TokenKind::Arrow) {
+                    self.advance();
+                    self.parse_type()?
+                } else {
+                    TypeExpr::Void
+                };
+                Ok(TypeExpr::Fn(param_types, Box::new(ret)))
+            }
             TokenKind::BitAnd  => {
                 self.advance();
                 let mutable = if matches!(self.current().kind, TokenKind::Mut) { self.advance(); true } else { false };
@@ -704,7 +794,7 @@ impl Parser {
 
     // ── Statements ────────────────────────────────────────────────────────────
 
-    pub fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+    pub fn parse_stmt(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.skip_newlines();
         match &self.current().kind {
             TokenKind::Let    => self.parse_let(),
@@ -714,39 +804,79 @@ impl Parser {
                                         TokenKind::Newline | TokenKind::EOF | TokenKind::End |
                                         TokenKind::Else    | TokenKind::Elsif)
                 { Some(self.parse_expr(0)?) } else { None };
-                Ok(Stmt::Return(expr, span))
+                Ok(vec![Stmt::Return(expr, span)])
             }
             TokenKind::Use => {
                 let (kind, alias, span) = self.parse_import()?;
-                Ok(Stmt::Import(kind, alias, span))
+                Ok(vec![Stmt::Import(kind, alias, span)])
             }
             TokenKind::Break => {
                 let span = self.current().span.clone(); self.advance();
                 let val = if !matches!(self.current().kind,
                                        TokenKind::Newline | TokenKind::EOF | TokenKind::End)
                 { Some(self.parse_expr(0)?) } else { None };
-                Ok(Stmt::Break(val, span))
+                Ok(vec![Stmt::Break(val, span)])
             }
             TokenKind::Continue => {
                 let span = self.current().span.clone(); self.advance();
-                Ok(Stmt::Continue(span))
+                Ok(vec![Stmt::Continue(span)])
             }
             TokenKind::Fn | TokenKind::Struct | TokenKind::Enum |
             TokenKind::Trait | TokenKind::Impl | TokenKind::Type | TokenKind::Pub => {
                 let item = self.parse_item()?;
-                Ok(Stmt::Item(item))
+                Ok(vec![Stmt::Item(item)])
             }
             _ => {
                 let expr = self.parse_expr(0)?;
                 let span = expr.span().clone();
-                Ok(Stmt::Expr(expr, span))
+                Ok(vec![Stmt::Expr(expr, span)])
             }
         }
     }
 
-    fn parse_let(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_let(&mut self) -> Result<Vec<Stmt>, ParseError> {
         let start = self.current().span.clone(); self.advance(); // let
         let mutable = if matches!(self.current().kind, TokenKind::Mut) { self.advance(); true } else { false };
+
+        // Tuple destructuring: let (a, b) = expr  /  let mut (a, b) = expr
+        // Desugars to a hidden temp binding plus one Stmt::Let per name,
+        // each initialized via a tuple-field FieldAccess on the temp
+        // (`.0`, `.1`, ...) — reuses existing, already-supported AST nodes
+        // instead of introducing a new Stmt variant, which would require
+        // updating several exhaustive `match stmt` sites in the compiler
+        // crate (LLVM-dependent, not compile-verifiable in this sandbox).
+        if matches!(self.current().kind, TokenKind::LParen) {
+            self.advance();
+            let mut names = Vec::new();
+            while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                let (n, _) = self.expect_ident()?;
+                names.push(n);
+                if matches!(self.current().kind, TokenKind::Comma) { self.advance(); } else { break; }
+            }
+            self.expect(&TokenKind::RParen)?;
+            self.expect(&TokenKind::Assign)?;
+            let value = self.parse_expr(0)?;
+            let span = start.merge(&self.current().span);
+
+            let tmp_name = format!("__destructure_{}_{}", span.start.line, span.start.offset);
+            let mut out = vec![Stmt::Let {
+                name: tmp_name.clone(), ty: None, mutable: false,
+                value: Some(value), span: span.clone(),
+            }];
+            for (idx, n) in names.into_iter().enumerate() {
+                let field_access = Expr::FieldAccess(
+                    Box::new(Expr::Ident(tmp_name.clone(), span.clone())),
+                    idx.to_string(),
+                    span.clone(),
+                );
+                out.push(Stmt::Let {
+                    name: n, ty: None, mutable,
+                    value: Some(field_access), span: span.clone(),
+                });
+            }
+            return Ok(out);
+        }
+
         let (name, _) = self.expect_ident()?;
         let ty = if matches!(self.current().kind, TokenKind::Colon) {
             self.advance(); Some(self.parse_type()?)
@@ -755,7 +885,7 @@ impl Parser {
             self.advance(); Some(self.parse_expr(0)?)
         } else { None };
         let span = start.merge(&self.current().span);
-        Ok(Stmt::Let { name, ty, mutable, value, span })
+        Ok(vec![Stmt::Let { name, ty, mutable, value, span }])
     }
 
     // ── Expressions ────────────────────────────────────────────────────────────
@@ -833,6 +963,17 @@ impl Parser {
             }
             // Method call / field access
             if matches!(op_tok.kind, TokenKind::Dot) {
+                // Tuple field access: t.0, t.1, ... — the lexer tokenizes
+                // a bare integer here (not an identifier), so handle it
+                // before falling through to the identifier-based path used
+                // for struct field access and method calls.
+                if let TokenKind::Integer(n) = self.current().kind {
+                    let idx_span = self.current().span.clone();
+                    self.advance();
+                    let s = lhs.span().merge(&idx_span);
+                    lhs = Expr::FieldAccess(Box::new(lhs), n.to_string(), s);
+                    continue;
+                }
                 let (name, _) = self.expect_ident()?;
                 if matches!(self.current().kind, TokenKind::LParen) {
                     self.advance();
@@ -905,6 +1046,16 @@ impl Parser {
         if matches!(self.current().kind, TokenKind::Pipe) {
             return self.parse_closure_expr();
         }
+        // Empty-parameter closure: || body. The lexer greedily tokenizes
+        // `||` as a single TokenKind::Or (logical-or operator), since that
+        // reading is far more common lexically — so a zero-parameter
+        // closure can never be seen as two separate Pipe tokens the way
+        // `parse_closure_expr` expects. Handle it here as a distinct case:
+        // consume the Or token (it stands in for `||`) and parse the
+        // closure body directly, with no parameters to collect.
+        if matches!(self.current().kind, TokenKind::Or) {
+            return self.parse_empty_param_closure_expr();
+        }
 
         match self.current().kind.clone() {
             TokenKind::Integer(v) => {
@@ -917,11 +1068,11 @@ impl Parser {
             }
             TokenKind::StringLit(s) => {
                 let span = self.current().span.clone(); self.advance();
-                if s.contains("${") {
-                    Ok(self.parse_interpolated_string(s, span))
-                } else {
-                    Ok(Expr::Literal(Literal::String(s), span))
-                }
+                Ok(Expr::Literal(Literal::String(s), span))
+            }
+            TokenKind::InterpStringLit(s) => {
+                let span = self.current().span.clone(); self.advance();
+                Ok(self.parse_interpolated_string(s, span))
             }
             TokenKind::Bool(b) => {
                 let span = self.current().span.clone(); self.advance();
@@ -953,21 +1104,61 @@ impl Parser {
                 }
             }
             TokenKind::Ident(_)   => self.parse_ident_expr(),
+            // A soft keyword immediately followed by `::` is being used as
+            // the first segment of a module path (e.g. `async::spawn(...)`,
+            // since `async` is also commonly the alias users `use "std ->
+            // async_" from "async"`). This never shadows the keyword's real
+            // meaning elsewhere in the grammar — `async fn ...`, `mod Foo
+            // is ... end`, etc. are all handled earlier, at the statement/
+            // item level, before expression parsing is ever reached for
+            // those tokens; only a bare `KEYWORD::` sequence in expression
+            // position reaches here. Note: `Match`, `For`, and `Self_` are
+            // deliberately NOT included here even though they're also soft
+            // keywords — each has its own earlier, unconditional arm in
+            // this same match (`TokenKind::Match => self.parse_match()`,
+            // etc.) that would always intercept first, making a guarded
+            // entry for them here permanently unreachable.
+            TokenKind::New | TokenKind::Write | TokenKind::Type | TokenKind::End |
+            TokenKind::As | TokenKind::Is | TokenKind::From | TokenKind::Use |
+            TokenKind::Mod | TokenKind::Async | TokenKind::Await | TokenKind::In
+                if matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::ColonColon)) =>
+            {
+                let (name, name_span) = self.expect_path_segment()?;
+                self.parse_ident_expr_from(name, name_span)
+            }
             TokenKind::Minus      => {
                 self.advance();
-                let e = self.parse_prefix()?;
+                // Bind tighter than any binary operator but let postfix
+                // `.method()` / `[index]` / `(call)` on the operand still
+                // apply first — see the long comment on the TokenKind::Not
+                // arm just below for why parse_prefix() alone is wrong here.
+                let e = self.parse_expr(29)?;
                 let s = start.merge(e.span());
                 Ok(Expr::UnOp(UnOp::Neg, Box::new(e), s))
             }
             TokenKind::Not => {
                 self.advance();
-                let e = self.parse_prefix()?;
+                // CRITICAL: must NOT be parse_prefix() here. parse_prefix()
+                // parses only a single primary/prefix expression with no
+                // postfix (`.method()`, `[index]`, `(call)`) handling at
+                // all — that logic lives in parse_expr's Pratt loop, which
+                // parse_prefix() never reaches. The old `parse_prefix()`
+                // call meant `!map.contains_key(x)` parsed as
+                // `(!map).contains_key(x)` (negate first, THEN try to call
+                // a method on the resulting bool — a runtime type error)
+                // instead of the obviously-intended `!(map.contains_key(x))`.
+                // Calling parse_expr(29) — just below Dot/LBracket's binding
+                // power of 30 — lets the operand's full postfix chain
+                // resolve first, while still stopping before lower-
+                // precedence binary operators so `!a == b` keeps meaning
+                // `(!a) == b`.
+                let e = self.parse_expr(29)?;
                 let s = start.merge(e.span());
                 Ok(Expr::UnOp(UnOp::Not, Box::new(e), s))
             }
             TokenKind::BitNot => {
                 self.advance();
-                let e = self.parse_prefix()?;
+                let e = self.parse_expr(29)?;
                 let s = start.merge(e.span());
                 Ok(Expr::UnOp(UnOp::BitNot, Box::new(e), s))
             }
@@ -1050,6 +1241,60 @@ impl Parser {
     fn parse_ident_expr(&mut self) -> Result<Expr, ParseError> {
         let start = self.current().span.clone();
         let (name, _) = self.expect_ident()?;
+        self.parse_ident_expr_from(name, start)
+    }
+
+    /// The body of `parse_ident_expr`, parameterized over an
+    /// already-consumed first segment/name and its span. Used both by
+    /// `parse_ident_expr` (the normal `Ident`-led case) and by the
+    /// soft-keyword-led path case in `parse_primary` (e.g. `async::spawn`,
+    /// where `async` was consumed via `expect_path_segment` instead of
+    /// `expect_ident` since it's a reserved keyword token).
+    fn parse_ident_expr_from(&mut self, name: String, start: Span) -> Result<Expr, ParseError> {
+        // Module path: name::seg::seg ... (e.g. json::parse, math::sqrt, mod::sub::fn)
+        if matches!(self.current().kind, TokenKind::ColonColon) {
+            let mut segments = vec![name];
+            while matches!(self.current().kind, TokenKind::ColonColon) {
+                self.advance(); // consume ::
+                let (seg, _) = self.expect_path_segment()?;
+                segments.push(seg);
+            }
+            let path_span = start.merge(&self.current().span);
+
+            // Path used as a call: module::function(args)
+            if matches!(self.current().kind, TokenKind::LParen) {
+                self.advance();
+                let args = self.parse_call_args()?;
+                let s = start.merge(&self.current().span);
+                let callee = Expr::Path(segments, path_span);
+                return Ok(Expr::Call(Box::new(callee), args, s));
+            }
+
+            // Path used as a struct literal: module::Type { field: val }
+            if matches!(self.current().kind, TokenKind::LBrace) {
+                self.advance();
+                let mut fields = Vec::new();
+                self.skip_newlines();
+                while !matches!(self.current().kind, TokenKind::RBrace | TokenKind::EOF) {
+                    self.skip_newlines();
+                    if matches!(self.current().kind, TokenKind::RBrace) { break; }
+                    let (fname, _) = self.expect_ident()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let fval = self.parse_expr(0)?;
+                    fields.push((fname, fval));
+                    if matches!(self.current().kind, TokenKind::Comma) { self.advance(); }
+                    self.skip_newlines();
+                }
+                self.expect(&TokenKind::RBrace)?;
+                let s = start.merge(&self.current().span);
+                let full_name = segments.join("::");
+                return Ok(Expr::StructLit(full_name, fields, s));
+            }
+
+            // Bare path: module::CONST or module::Variant
+            return Ok(Expr::Path(segments, path_span));
+        }
+
         // Struct literal: Name { field: val, ... }
         if matches!(self.current().kind, TokenKind::LBrace) {
             self.advance();
@@ -1119,7 +1364,7 @@ impl Parser {
                 TokenKind::Else | TokenKind::Elsif)
             { break; }
             match self.parse_stmt() {
-                Ok(s)  => then_body.push(s),
+                Ok(s)  => then_body.extend(s),
                 Err(e) => { self.errors.report(e); self.recover(); }
             }
         }
@@ -1150,7 +1395,7 @@ impl Parser {
                         TokenKind::Else | TokenKind::Elsif)
                     { break; }
                     match self.parse_stmt() {
-                        Ok(s)  => branch_body.push(s),
+                        Ok(s)  => branch_body.extend(s),
                         Err(e) => { self.errors.report(e); self.recover(); }
                     }
                 }
@@ -1181,7 +1426,7 @@ impl Parser {
                             TokenKind::Else | TokenKind::Elsif)
                         { break; }
                         match self.parse_stmt() {
-                            Ok(s)  => branch_body.push(s),
+                            Ok(s)  => branch_body.extend(s),
                             Err(e) => { self.errors.report(e); self.recover(); }
                         }
                     }
@@ -1201,7 +1446,7 @@ impl Parser {
                     self.skip_newlines();
                     if matches!(self.current().kind, TokenKind::End | TokenKind::EOF) { break; }
                     match self.parse_stmt() {
-                        Ok(s)  => body.push(s),
+                        Ok(s)  => body.extend(s),
                         Err(e) => { self.errors.report(e); self.recover(); }
                     }
                 }
@@ -1308,19 +1553,51 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                // Enum variant with fields: Variant(inner)
+                // Qualified enum variant pattern: Type::Variant or
+                // Type::Variant(p1, p2, ...). Mirrors the Expr-side
+                // Type::Variant(...) construction syntax — patterns need
+                // the same qualified form to match values built that way
+                // (see Color::Custom(_, _, _) in match arms).
+                if matches!(self.current().kind, TokenKind::ColonColon) {
+                    self.advance();
+                    let (variant, _) = self.expect_path_segment()?;
+                    let inner = if matches!(self.current().kind, TokenKind::LParen) {
+                        self.advance();
+                        let mut pats = Vec::new();
+                        while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                            pats.push(self.parse_pattern()?);
+                            if matches!(self.current().kind, TokenKind::Comma) { self.advance(); } else { break; }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                        pats
+                    } else {
+                        Vec::new()
+                    };
+                    let s = start.merge(&self.current().span);
+                    return Ok(Pattern::Enum { qualified_type: Some(name), variant, inner, span: s });
+                }
+                // Unqualified enum variant with fields: Variant(p1, p2, ...)
                 if matches!(self.current().kind, TokenKind::LParen) {
                     self.advance();
-                    let inner = self.parse_pattern()?;
+                    let mut pats = Vec::new();
+                    while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
+                        pats.push(self.parse_pattern()?);
+                        if matches!(self.current().kind, TokenKind::Comma) { self.advance(); } else { break; }
+                    }
                     self.expect(&TokenKind::RParen)?;
                     let s = start.merge(&self.current().span);
-                    Ok(Pattern::Enum { variant: name, inner: Some(Box::new(inner)), span: s })
+                    Ok(Pattern::Enum { qualified_type: None, variant: name, inner: pats, span: s })
                 } else {
                     Ok(Pattern::Ident(name, start))
                 }
             }
             TokenKind::Integer(v)  => { self.advance(); Ok(Pattern::Literal(Literal::Int(v), start)) }
             TokenKind::StringLit(s) => { self.advance(); Ok(Pattern::Literal(Literal::String(s), start)) }
+            // A string pattern containing `{...}` has no special meaning in
+            // match-pattern position (patterns match literal values, they
+            // don't interpolate) — treat its raw source text as the literal
+            // string to match against.
+            TokenKind::InterpStringLit(s) => { self.advance(); Ok(Pattern::Literal(Literal::String(s), start)) }
             TokenKind::Bool(b)     => { self.advance(); Ok(Pattern::Literal(Literal::Bool(b), start)) }
             TokenKind::Nil         => { self.advance(); Ok(Pattern::Literal(Literal::Nil, start)) }
             TokenKind::Minus       => {
@@ -1425,6 +1702,27 @@ impl Parser {
 
     // ── Closure ───────────────────────────────────────────────────────────────
 
+    /// Parse a zero-parameter closure body after the lexer has already
+    /// consumed `||` as a single `TokenKind::Or` token. See the call site
+    /// in `parse_primary` for why this needs to be a separate path from
+    /// `parse_closure_expr` (which expects two distinct `Pipe` tokens).
+    fn parse_empty_param_closure_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current().span.clone();
+        self.advance(); // consume the `||` (lexed as one Or token)
+        let return_type = if matches!(self.current().kind, TokenKind::Arrow) {
+            self.advance(); Some(self.parse_type()?)
+        } else { None };
+        let body = if matches!(self.current().kind, TokenKind::Is) {
+            self.parse_block()?
+        } else {
+            let e = self.parse_expr(0)?;
+            let s = e.span().clone();
+            vec![Stmt::Return(Some(e), s)]
+        };
+        let end_sp = self.current().span.clone();
+        Ok(Expr::Closure { params: Vec::new(), return_type, body, span: span.merge(&end_sp) })
+    }
+
     fn parse_closure_expr(&mut self) -> Result<Expr, ParseError> {
         let span = self.current().span.clone();
         self.advance(); // consume opening |
@@ -1463,16 +1761,38 @@ impl Parser {
         let mut text_start = 0;
 
         while i < bytes.len() {
-            if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
+            // `{{` — escaped literal brace. Flush text up to (and
+            // including, as a literal `{`) this marker, then continue
+            // scanning from past `}}` is NOT assumed here — only the `{{`
+            // pair is collapsed to one `{`; a lone `}}` later in plain text
+            // is likewise collapsed to one `}` when encountered below. This
+            // mirrors how `{{` / `}}` are used independently as escapes,
+            // not as a single combined `{{...}}` construct.
+            if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                let text = &raw[text_start..i];
+                parts.push(InterpPart::Text(format!("{}{{", text)));
+                i += 2;
+                text_start = i;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'}' && bytes[i + 1] == b'}' {
+                let text = &raw[text_start..i];
+                parts.push(InterpPart::Text(format!("{}}}", text)));
+                i += 2;
+                text_start = i;
+                continue;
+            }
+            if bytes[i] == b'{' {
+                // Flush any accumulated literal text before the marker.
                 let text = &raw[text_start..i];
                 if !text.is_empty() { parts.push(InterpPart::Text(text.to_string())); }
-                i += 2;
+                i += 1;
                 let expr_start = i;
                 let mut depth = 1usize;
                 // Track whether we're inside a nested string literal (e.g.
-                // ${ if x == "}" is "yes" else "no" end }). Braces inside a
+                // {if x == "}" is "yes" else "no" end}). Braces inside a
                 // string must not affect `depth` — otherwise a `}` inside
-                // a quoted string is mistaken for the end of `${...}`,
+                // a quoted string is mistaken for the end of `{...}`,
                 // silently truncating the interpolated expression.
                 let mut in_str  = false;
                 let mut escaped = false;
@@ -1497,7 +1817,8 @@ impl Parser {
                     }
                 }
                 let expr_src = raw[expr_start..i].trim();
-                i += 1; text_start = i;
+                i += 1; // consume the closing '}'
+                text_start = i;
                 let expr = if expr_src.is_empty() {
                     Expr::Literal(Literal::String(String::new()), span.clone())
                 } else {
@@ -1514,12 +1835,16 @@ impl Parser {
                     } else if expr_src.chars().all(|c| c.is_alphanumeric() || c == '_') {
                         Expr::Ident(expr_src.to_string(), span.clone())
                     } else {
-                        Expr::Literal(Literal::String(format!("${{{}}}", expr_src)), span.clone())
+                        Expr::Literal(Literal::String(format!("{{{}}}", expr_src)), span.clone())
                     }
                 };
                 parts.push(InterpPart::Expr(Box::new(expr)));
             } else {
-                i += 1;
+                // Advance by one full UTF-8 character (not one byte) to
+                // stay on a char boundary for the next `raw[text_start..i]`
+                // slice — `i` must always land on a valid UTF-8 boundary.
+                let ch_len = utf8_char_len_at(bytes, i);
+                i += ch_len;
             }
         }
         let tail = &raw[text_start..];
@@ -1537,6 +1862,26 @@ impl Parser {
 
 // ── Pratt helpers ─────────────────────────────────────────────────────────────
 
+/// Returns the byte length of the UTF-8 character starting at byte index
+/// `i` in `bytes`, based on the leading byte's high-bit pattern. Used by
+/// `parse_interpolated_string` to advance one full character at a time
+/// through plain-text spans (which may contain multi-byte characters like
+/// Polish ą/ę/ć/ł/ń/ó/ś/ż/ź) without ever landing mid-character, which
+/// would otherwise corrupt the subsequent `raw[text_start..i]` string
+/// slice (a non-char-boundary slice index panics in Rust).
+fn utf8_char_len_at(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i) {
+        None => 1,
+        Some(b) if b & 0x80 == 0x00 => 1, // 0xxxxxxx — ASCII
+        Some(b) if b & 0xE0 == 0xC0 => 2, // 110xxxxx — 2-byte sequence
+        Some(b) if b & 0xF0 == 0xE0 => 3, // 1110xxxx — 3-byte sequence
+        Some(b) if b & 0xF8 == 0xF0 => 4, // 11110xxx — 4-byte sequence
+        Some(_) => 1, // continuation byte encountered unexpectedly — advance
+                      // by 1 to avoid an infinite loop; shouldn't happen for
+                      // well-formed UTF-8 input.
+    }
+}
+
 fn infix_bp(kind: &TokenKind) -> Option<(u8, u8)> {
     match kind {
         TokenKind::Question                                          => Some((100, 101)),
@@ -1545,8 +1890,9 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8)> {
         TokenKind::SlashAssign                                       => Some((2, 1)),
         TokenKind::Or                                                => Some((4, 5)),
         TokenKind::And                                               => Some((6, 7)),
-        TokenKind::BitXor                                            => Some((10, 11)),
-        TokenKind::BitAnd                                            => Some((12, 13)),
+        TokenKind::Pipe                                              => Some((8, 9)),
+        TokenKind::BitXor                                            => Some((9, 10)),
+        TokenKind::BitAnd                                            => Some((10, 11)),
         TokenKind::Eq | TokenKind::NotEq                            => Some((14, 15)),
         TokenKind::Lt | TokenKind::Gt | TokenKind::LtEq | TokenKind::GtEq => Some((16, 17)),
         TokenKind::Shl | TokenKind::Shr                             => Some((18, 19)),
@@ -1577,6 +1923,7 @@ fn token_to_binop(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::Or      => Some(BinOp::Or),
         TokenKind::BitAnd  => Some(BinOp::BitAnd),
         TokenKind::BitXor  => Some(BinOp::BitXor),
+        TokenKind::Pipe    => Some(BinOp::BitOr),
         TokenKind::Shl     => Some(BinOp::Shl),
         TokenKind::Shr     => Some(BinOp::Shr),
         _ => None,
