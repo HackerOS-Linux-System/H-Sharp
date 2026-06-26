@@ -1,29 +1,112 @@
-;; H# Standard Library — std -> fs
+;; std -> fs — Filesystem operations
+;; H# Standard Library v0.6
 
+/// Read entire file to string.
 pub fn read(path: string) -> string is
-    return ""
+    return __builtin_fs_read(path)
 end
-pub fn write_file(path: string, content: string) is end
-pub fn append(path: string, content: string) is end
+
+/// Read file as bytes.
+pub fn read_bytes(path: string) -> bytes is
+    return __builtin_fs_read_bytes(path)
+end
+
+/// Read file as array of lines.
+pub fn read_lines(path: string) -> [string] is
+    return __builtin_fs_read_lines(path)
+end
+
+/// Write string to file (creates or overwrites).
+pub fn write(path: string, content: string) is
+    __builtin_fs_write(path, content)
+end
+
+/// Write bytes to file.
+pub fn write_bytes(path: string, data: bytes) is
+    __builtin_fs_write_bytes(path, data)
+end
+
+/// Append string to file.
+pub fn append(path: string, content: string) is
+    __builtin_fs_append(path, content)
+end
+
+/// Check if path exists.
 pub fn exists(path: string) -> bool is
-    return false
+    return __builtin_fs_exists(path)
 end
-pub fn is_file(path: string) -> bool is
-    return false
-end
+
+/// Check if path is a directory.
 pub fn is_dir(path: string) -> bool is
-    return false
+    return __builtin_fs_is_dir(path)
 end
-pub fn mkdir(path: string) is end
-pub fn mkdir_all(path: string) is end
-pub fn remove(path: string) is end
-pub fn remove_dir(path: string) is end
-pub fn rename(src: string, to: string) is end
-pub fn copy(src: string, to: string) is end
+
+/// Check if path is a file.
+pub fn is_file(path: string) -> bool is
+    return __builtin_fs_is_file(path)
+end
+
+/// Create directory (and parents if needed).
+pub fn mkdir(path: string) is
+    __builtin_fs_mkdir(path)
+end
+
+/// Remove a file.
+pub fn remove(path: string) is
+    __builtin_fs_remove(path)
+end
+
+/// Remove a directory (must be empty).
+pub fn rmdir(path: string) is
+    __builtin_fs_rmdir(path)
+end
+
+/// Remove directory and all contents.
+pub fn rmdir_all(path: string) is
+    __builtin_fs_rmdir_all(path)
+end
+
+/// Copy file from src to dst.
+pub fn copy(src: string, dst: string) is
+    __builtin_fs_copy(src, dst)
+end
+
+/// Move / rename file or directory.
+pub fn rename(src: string, dst: string) is
+    __builtin_fs_rename(src, dst)
+end
+
+/// Get file size in bytes.
 pub fn size(path: string) -> int is
-    return 0
+    return __builtin_fs_size(path)
 end
-pub fn read_bytes(path: string) -> string is
-    return ""
+
+/// List directory contents. Returns array of filenames (not full paths).
+pub fn list_dir(path: string) -> [string] is
+    return __builtin_fs_list_dir(path)
 end
-pub fn write_bytes(path: string, data: bytes) is end
+
+/// Walk directory recursively. Returns all file paths.
+pub fn walk(root: string) -> [string] is
+    return __builtin_fs_walk(root)
+end
+
+/// Get file modification time as unix timestamp.
+pub fn modified_time(path: string) -> int is
+    return __builtin_fs_modified_time(path)
+end
+
+/// Create a temporary file. Returns path.
+pub fn temp_file(prefix: string) -> string is
+    return __builtin_fs_temp_file(prefix)
+end
+
+/// Get the current working directory.
+pub fn cwd() -> string is
+    return __builtin_fs_cwd()
+end
+
+/// Change directory.
+pub fn chdir(path: string) is
+    __builtin_fs_chdir(path)
+end
