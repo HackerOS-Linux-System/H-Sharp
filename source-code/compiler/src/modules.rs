@@ -75,7 +75,7 @@ impl ModuleResolver {
         let mut expanded = Vec::new();
         for item in items {
             match item {
-                Item::ModDecl { name, pub_, inline: Some(inline_items), .. } => {
+                Item::ModDecl { name, pub_: _, inline: Some(inline_items), .. } => {
                     // Inline module: namespace items as mod_name::item
                     let sub = self.expand_module(inline_items)?;
                     for sub_item in sub {
@@ -111,7 +111,7 @@ impl ModuleResolver {
 /// Prefix an item's name with module namespace: item_name → mod_name__item_name
 fn namespace_item(item: Item, ns: &str) -> Item {
     match item {
-        Item::FnDef(mut f) => {
+        Item::FnDef(f) => {
             // Keep original name accessible as mod__fn (for mod::fn call syntax)
             // The original name is also kept for direct calls within the module
             let _ = ns; // namespace recorded via import alias
