@@ -1,18 +1,196 @@
-;; H# Standard Library — std -> collections
-;; HashMap, HashSet, Queue, Stack
+;; std -> collections — HashMap, HashSet, Queue, Stack
+;; H# Standard Library v0.6
 
-struct HashMap<K, V> is
-    pub size: int
+// HashMap<K, V>
+
+/// Create a new empty HashMap.
+pub fn hashmap_new() -> any = __builtin_hashmap_new()
+
+/// Insert a key-value pair.
+pub fn hashmap_insert(map: any, key: any, val: any) is
+    __builtin_hashmap_insert(map, key, val)
 end
 
-struct HashSet<T> is
-    pub size: int
+/// Get a value by key. Returns nil if not found.
+pub fn hashmap_get(map: any, key: any) -> any is
+    return __builtin_hashmap_get(map, key)
 end
 
-struct Queue<T> is
-    pub size: int
+/// Check if key exists.
+pub fn hashmap_contains(map: any, key: any) -> bool is
+    return __builtin_hashmap_contains(map, key)
 end
 
-struct Stack<T> is
-    pub size: int
+/// Remove a key.
+pub fn hashmap_remove(map: any, key: any) is
+    __builtin_hashmap_remove(map, key)
+end
+
+/// Number of entries.
+pub fn hashmap_len(map: any) -> int is
+    return __builtin_hashmap_len(map)
+end
+
+/// All keys as array.
+pub fn hashmap_keys(map: any) -> [any] is
+    return __builtin_hashmap_keys(map)
+end
+
+/// All values as array.
+pub fn hashmap_values(map: any) -> [any] is
+    return __builtin_hashmap_values(map)
+end
+
+// HashMap struct-style sugar
+struct HashMap is
+    pub _inner: any
+end
+
+impl HashMap is
+    fn new() -> HashMap is
+        return HashMap { _inner: hashmap_new() }
+    end
+
+    fn insert(self, key: any, val: any) is
+        hashmap_insert(self._inner, key, val)
+    end
+
+    fn get(self, key: any) -> any is
+        return hashmap_get(self._inner, key)
+    end
+
+    fn contains_key(self, key: any) -> bool is
+        return hashmap_contains(self._inner, key)
+    end
+
+    fn remove(self, key: any) is
+        hashmap_remove(self._inner, key)
+    end
+
+    fn len(self) -> int is
+        return hashmap_len(self._inner)
+    end
+
+    fn keys(self) -> [any] is
+        return hashmap_keys(self._inner)
+    end
+
+    fn values(self) -> [any] is
+        return hashmap_values(self._inner)
+    end
+
+    fn is_empty(self) -> bool is
+        return self.len() == 0
+    end
+end
+
+// HashSet
+
+struct HashSet is
+    pub _inner: any
+end
+
+impl HashSet is
+    fn new() -> HashSet is
+        return HashSet { _inner: __builtin_hashset_new() }
+    end
+
+    fn insert(self, val: any) is
+        __builtin_hashset_insert(self._inner, val)
+    end
+
+    fn contains(self, val: any) -> bool is
+        return __builtin_hashset_contains(self._inner, val)
+    end
+
+    fn remove(self, val: any) is
+        __builtin_hashset_remove(self._inner, val)
+    end
+
+    fn len(self) -> int is
+        return __builtin_hashset_len(self._inner)
+    end
+
+    fn is_empty(self) -> bool is
+        return self.len() == 0
+    end
+
+    fn to_array(self) -> [any] is
+        return __builtin_hashset_to_array(self._inner)
+    end
+end
+
+// Queue (FIFO)
+
+struct Queue is
+    pub _items: [any]
+end
+
+impl Queue is
+    fn new() -> Queue is
+        return Queue { _items: [] }
+    end
+
+    fn push(self, val: any) is
+        self._items.push(val)
+    end
+
+    fn pop(self) -> any is
+        if self._items.len() == 0 is
+            return nil
+        end
+        let val = self._items[0]
+        self._items = self._items[1..]
+        return val
+    end
+
+    fn peek(self) -> any is
+        if self._items.len() == 0 is return nil end
+        return self._items[0]
+    end
+
+    fn len(self) -> int is
+        return self._items.len()
+    end
+
+    fn is_empty(self) -> bool is
+        return self._items.len() == 0
+    end
+end
+
+// Stack (LIFO)
+
+struct Stack is
+    pub _items: [any]
+end
+
+impl Stack is
+    fn new() -> Stack is
+        return Stack { _items: [] }
+    end
+
+    fn push(self, val: any) is
+        self._items.push(val)
+    end
+
+    fn pop(self) -> any is
+        if self._items.len() == 0 is return nil end
+        let last = self._items.len() - 1
+        let val  = self._items[last]
+        self._items = self._items[0..last]
+        return val
+    end
+
+    fn peek(self) -> any is
+        if self._items.len() == 0 is return nil end
+        return self._items[self._items.len() - 1]
+    end
+
+    fn len(self) -> int is
+        return self._items.len()
+    end
+
+    fn is_empty(self) -> bool is
+        return self._items.len() == 0
+    end
 end
