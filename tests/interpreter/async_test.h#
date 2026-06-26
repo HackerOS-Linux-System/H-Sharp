@@ -1,0 +1,55 @@
+;; H# Async/Await Tests
+use "std -> test"   from "test"
+use "std -> async_" from "async"
+use "std -> time"   from "t"
+
+async fn compute(x: int) -> int is
+    return x * x
+end
+
+async fn fetch_data(id: int) -> string is
+    ;; Simulated async fetch
+    return "data_" + to_string(id)
+end
+
+async fn chain(x: int) -> int is
+    let a = await compute(x)
+    let b = await compute(a)
+    return b
+end
+
+#[test]
+fn test_async_basic() is
+    let result = await compute(5)
+    assert_eq(result, 25)
+end
+
+#[test]
+fn test_async_string() is
+    let result = await fetch_data(42)
+    assert_eq(result, "data_42")
+end
+
+#[test]
+fn test_async_chain() is
+    ;; chain(3) = compute(compute(3)) = compute(9) = 81
+    let result = await chain(3)
+    assert_eq(result, 81)
+end
+
+#[test]
+fn test_async_spawn() is
+    let task = async::spawn(|| -> int is
+        return 42
+    end)
+    let result = await task
+    assert_eq(result, 42)
+end
+
+#[test]
+fn test_async_timeout() is
+    let result = async::timeout(100, || -> string is
+        return "ok"
+    end)
+    assert_eq(result, "ok")
+end
