@@ -1,48 +1,158 @@
-;; H# Standard Library — std -> math
+;; std -> math — Mathematical functions
+;; H# Standard Library v0.8
 
 pub fn sin(x: f64) -> f64 is
-    return 0.0
-end
-pub fn cos(x: f64) -> f64 is
-    return 0.0
-end
-pub fn tan(x: f64) -> f64 is
-    return 0.0
-end
-pub fn sqrt(x: f64) -> f64 is
-    return 0.0
-end
-pub fn abs(x: f64) -> f64 is
-    return 0.0
-end
-pub fn pow(base: f64, exp: f64) -> f64 is
-    return 0.0
-end
-pub fn floor(x: f64) -> f64 is
-    return 0.0
-end
-pub fn ceil(x: f64) -> f64 is
-    return 0.0
-end
-pub fn round(x: f64) -> f64 is
-    return 0.0
-end
-pub fn log(x: f64) -> f64 is
-    return 0.0
-end
-pub fn log2(x: f64) -> f64 is
-    return 0.0
-end
-pub fn log10(x: f64) -> f64 is
-    return 0.0
-end
-pub fn min(a: f64, b: f64) -> f64 is
-    return 0.0
-end
-pub fn max(a: f64, b: f64) -> f64 is
-    return 0.0
+    return __builtin_math_sin(x)
 end
 
-pub fn pi() -> f64 = 3.141592653589793
-pub fn e()  -> f64 = 2.718281828459045
-pub fn tau() -> f64 = 6.283185307179586
+pub fn cos(x: f64) -> f64 is
+    return __builtin_math_cos(x)
+end
+
+pub fn tan(x: f64) -> f64 is
+    return __builtin_math_tan(x)
+end
+
+pub fn asin(x: f64) -> f64 is
+    return __builtin_math_asin(x)
+end
+
+pub fn acos(x: f64) -> f64 is
+    return __builtin_math_acos(x)
+end
+
+pub fn atan(x: f64) -> f64 is
+    return __builtin_math_atan(x)
+end
+
+pub fn atan2(y: f64, x: f64) -> f64 is
+    return __builtin_math_atan2(y, x)
+end
+
+/// Square root of a float.
+pub fn sqrt(x: f64) -> f64 is
+    return __builtin_math_sqrt(x)
+end
+
+/// Absolute value of an integer.
+pub fn abs(x: int) -> int is
+    if x < 0 is return -x end
+    return x
+end
+
+/// Absolute value of a float.
+pub fn fabs(x: f64) -> f64 is
+    if x < 0.0 is return -x end
+    return x
+end
+
+pub fn pow(base: f64, exp: f64) -> f64 is
+    return __builtin_math_pow(base, exp)
+end
+
+/// Integer power (repeated multiplication).
+pub fn ipow(base: int, exp: int) -> int is
+    let mut result: int = 1
+    let mut i: int = 0
+    while i < exp is
+        result = result * base
+        i += 1
+    end
+    return result
+end
+
+pub fn floor(x: f64) -> f64 is
+    return __builtin_math_floor(x)
+end
+
+pub fn ceil(x: f64) -> f64 is
+    return __builtin_math_ceil(x)
+end
+
+pub fn round(x: f64) -> f64 is
+    return __builtin_math_round(x)
+end
+
+pub fn trunc(x: f64) -> f64 is
+    return __builtin_math_trunc(x)
+end
+
+pub fn log(x: f64) -> f64 is
+    return __builtin_math_log(x)
+end
+
+pub fn log2(x: f64) -> f64 is
+    return __builtin_math_log2(x)
+end
+
+pub fn log10(x: f64) -> f64 is
+    return __builtin_math_log10(x)
+end
+
+pub fn exp(x: f64) -> f64 is
+    return __builtin_math_exp(x)
+end
+
+/// Minimum of two integers.
+pub fn min(a: int, b: int) -> int is
+    if a < b is return a end
+    return b
+end
+
+/// Maximum of two integers.
+pub fn max(a: int, b: int) -> int is
+    if a > b is return a end
+    return b
+end
+
+/// Minimum of two floats.
+pub fn fmin(a: f64, b: f64) -> f64 is
+    if a < b is return a end
+    return b
+end
+
+/// Maximum of two floats.
+pub fn fmax(a: f64, b: f64) -> f64 is
+    if a > b is return a end
+    return b
+end
+
+/// Clamp an integer to [lo, hi].
+pub fn clamp(v: int, lo: int, hi: int) -> int is
+    if v < lo is return lo end
+    if v > hi is return hi end
+    return v
+end
+
+/// Clamp a float to [lo, hi].
+pub fn fclamp(v: f64, lo: f64, hi: f64) -> f64 is
+    if v < lo is return lo end
+    if v > hi is return hi end
+    return v
+end
+
+/// Greatest common divisor.
+pub fn gcd(a: int, b: int) -> int is
+    let mut x: int = abs(a)
+    let mut y: int = abs(b)
+    while y != 0 is
+        let t: int = y
+        y = x % y
+        x = t
+    end
+    return x
+end
+
+/// Least common multiple.
+pub fn lcm(a: int, b: int) -> int is
+    if a == 0 || b == 0 is return 0 end
+    return abs(a / gcd(a, b) * b)
+end
+
+pub let PI:  f64 = 3.141592653589793
+pub let E:   f64 = 2.718281828459045
+pub let TAU: f64 = 6.283185307179586
+
+pub fn pi()  -> f64 = PI
+pub fn e()   -> f64 = E
+pub fn tau() -> f64 = TAU
