@@ -1,12 +1,61 @@
-;; H# Standard Library — std -> regex
+;; std -> regex — Regular expressions
+;; H# Standard Library v0.6
 
-pub fn is_match(pattern: string, text: string) -> bool is
-    return false
+/// Check if string matches a regex pattern.
+pub fn is_match(s: string, pattern: string) -> bool is
+    return __builtin_regex_is_match(s, pattern)
 end
-pub fn find(pattern: string, text: string) -> string is
-    return ""
+
+/// Find first match. Returns empty string if none.
+pub fn find(s: string, pattern: string) -> string is
+    return __builtin_regex_find(s, pattern)
 end
-pub fn find_all(pattern: string, text: string) -> string is
-    return ""
+
+/// Find all matches. Returns array of strings.
+pub fn find_all(s: string, pattern: string) -> [string] is
+    return __builtin_regex_find_all(s, pattern)
 end
-pub fn replace(pattern: string, text: string, rep: string) -> string is return text end
+
+/// Replace first match with replacement.
+pub fn replace(s: string, pattern: string, repl: string) -> string is
+    return __builtin_regex_replace(s, pattern, repl)
+end
+
+/// Replace all matches with replacement.
+pub fn replace_all(s: string, pattern: string, repl: string) -> string is
+    return __builtin_regex_replace_all(s, pattern, repl)
+end
+
+/// Split string by pattern.
+pub fn split(s: string, pattern: string) -> [string] is
+    return __builtin_regex_split(s, pattern)
+end
+
+/// Extract capture groups from the first match. Returns array of captured groups.
+pub fn captures(s: string, pattern: string) -> [string] is
+    return __builtin_regex_captures(s, pattern)
+end
+
+/// Extract all capture group matches.
+pub fn captures_all(s: string, pattern: string) -> [[string]] is
+    return __builtin_regex_captures_all(s, pattern)
+end
+
+/// Compile a pattern for reuse (returns an opaque Regex handle).
+pub fn compile(pattern: string) -> any is
+    return __builtin_regex_compile(pattern)
+end
+
+/// Run a pre-compiled regex against a string.
+pub fn exec(re: any, s: string) -> bool is
+    return __builtin_regex_exec(re, s)
+end
+
+;; Common pattern constants
+pub let EMAIL_PATTERN:    string = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+pub let URL_PATTERN:      string = r"^https?://[^\s/$.?#].[^\s]*$"
+pub let IP_PATTERN:       string = r"^(\d{1,3}\.){3}\d{1,3}$"
+pub let UUID_PATTERN:     string = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+pub let DIGITS_PATTERN:   string = r"^[0-9]+$"
+pub let HEX_PATTERN:      string = r"^[0-9a-fA-F]+$"
+pub let ALPHANUM_PATTERN: string = r"^[a-zA-Z0-9]+$"
