@@ -1,27 +1,80 @@
-;; H# Standard Library — std -> crypto
-;; Kryptografia: AES, SHA, HMAC, RSA, random
+;; std -> crypto — Cryptographic functions
+;; H# Standard Library v0.6
 
-pub fn sha256(data: string) -> string is return "" end
-pub fn sha512(data: string) -> string is return "" end
-pub fn sha1(data: string) -> string is return "" end
-pub fn md5(data: string) -> string is return "" end
-pub fn hmac_sha256(key: string, data: string) -> string is return "" end
-pub fn hmac_sha512(key: string, data: string) -> string is return "" end
+/// Compute SHA-256 hash. Returns lowercase hex string.
+pub fn sha256(data: string) -> string is
+    return __builtin_crypto_sha256(data)
+end
 
-pub fn aes_encrypt(key: string, plaintext: string) -> string is return plaintext end
-pub fn aes_decrypt(key: string, ciphertext: string) -> string is return ciphertext end
-pub fn aes_encrypt_gcm(key: string, iv: string, data: string) -> string is return data end
-pub fn aes_decrypt_gcm(key: string, iv: string, data: string) -> string is return data end
+/// Compute SHA-256 of raw bytes. Returns lowercase hex string.
+pub fn sha256_bytes(data: bytes) -> string is
+    return __builtin_crypto_sha256_bytes(data)
+end
 
-pub fn random_bytes(n: int) -> string is return "" end
-pub fn random_hex(n: int) -> string is return "" end
-pub fn random_int(min: int, max: int) -> int is return 0 end
-pub fn random_string(n: int) -> string is return "" end
+/// Compute SHA-512 hash. Returns lowercase hex string.
+pub fn sha512(data: string) -> string is
+    return __builtin_crypto_sha512(data)
+end
 
-pub fn pbkdf2(password: string, salt: string, iterations: int) -> string is return "" end
-pub fn bcrypt_hash(password: string) -> string is return "" end
-pub fn bcrypt_verify(password: string, hash: string) -> bool is return false end
+/// Compute MD5 hash. Returns lowercase hex string.
+/// Warning: MD5 is cryptographically broken — use only for checksums.
+pub fn md5(data: string) -> string is
+    return __builtin_crypto_md5(data)
+end
 
-pub fn hex_encode(data: string) -> string is return "" end
-pub fn hex_decode(hex: string) -> string is return "" end
-pub fn is_valid_hex(s: string) -> bool is return false end
+/// Compute SHA-1. Returns lowercase hex string.
+/// Warning: SHA-1 is deprecated — use SHA-256 or better.
+pub fn sha1(data: string) -> string is
+    return __builtin_crypto_sha1(data)
+end
+
+/// BLAKE3 hash. Returns hex string.
+pub fn blake3(data: string) -> string is
+    return __builtin_crypto_blake3(data)
+end
+
+/// HMAC-SHA256 keyed MAC.
+pub fn hmac_sha256(key: string, msg: string) -> string is
+    return __builtin_crypto_hmac_sha256(key, msg)
+end
+
+/// HMAC-SHA512 keyed MAC.
+pub fn hmac_sha512(key: string, msg: string) -> string is
+    return __builtin_crypto_hmac_sha512(key, msg)
+end
+
+/// Generate cryptographically secure random bytes.
+pub fn random_bytes(n: int) -> bytes is
+    return __builtin_crypto_random_bytes(n)
+end
+
+/// Generate a random integer in range [min, max].
+pub fn random_int(min: int, max: int) -> int is
+    return __builtin_crypto_random_int(min, max)
+end
+
+/// Constant-time byte comparison (for MAC verification).
+pub fn bytes_eq(a: bytes, b: bytes) -> bool is
+    return __builtin_crypto_bytes_eq(a, b)
+end
+
+/// XOR two byte arrays (must be same length).
+pub fn xor_bytes(a: bytes, b: bytes) -> bytes is
+    return __builtin_crypto_xor_bytes(a, b)
+end
+
+/// Derive key using PBKDF2-SHA256.
+/// Returns derived key as bytes.
+pub fn pbkdf2(password: string, salt: bytes, iterations: int, key_len: int) -> bytes is
+    return __builtin_crypto_pbkdf2(password, salt, iterations, key_len)
+end
+
+/// Hash a password using Argon2id (recommended for passwords).
+pub fn argon2_hash(password: string) -> string is
+    return __builtin_crypto_argon2_hash(password)
+end
+
+/// Verify a password against an Argon2id hash.
+pub fn argon2_verify(password: string, hash: string) -> bool is
+    return __builtin_crypto_argon2_verify(password, hash)
+end
