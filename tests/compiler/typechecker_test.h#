@@ -1,0 +1,103 @@
+;; H# Typechecker Tests — these should all pass typecheck
+use "std -> test" from "test"
+
+;; ── Type inference ──────────────────────────────────────────────────────────
+
+fn infer_test() is
+    let x = 42         ;; inferred: int
+    let y = 3.14       ;; inferred: f64
+    let s = "hello"    ;; inferred: string
+    let b = true       ;; inferred: bool
+    assert_eq(x, 42)
+    assert_eq(s, "hello")
+    assert_true(b)
+end
+
+#[test]
+fn test_type_inference() is
+    infer_test()
+end
+
+;; ── Numeric coercions ───────────────────────────────────────────────────────
+
+#[test]
+fn test_int_to_float_cast() is
+    let i: int = 7
+    let f: f64 = i as f64
+    assert_true(f > 6.9 && f < 7.1)
+end
+
+#[test]
+fn test_float_to_int_cast() is
+    let f: f64 = 3.9
+    let i: int = f as int
+    assert_eq(i, 3)  ;; truncates
+end
+
+;; ── Mutable vs immutable ────────────────────────────────────────────────────
+
+#[test]
+fn test_mut_variable() is
+    let mut x: int = 1
+    x = 2
+    x += 3
+    assert_eq(x, 5)
+end
+
+;; ── Return type checking ────────────────────────────────────────────────────
+
+fn returns_int() -> int is
+    return 42
+end
+
+fn returns_string() -> string is
+    return "hello"
+end
+
+fn returns_optional() -> int? is
+    return nil
+end
+
+#[test]
+fn test_return_types() is
+    assert_eq(returns_int(), 42)
+    assert_eq(returns_string(), "hello")
+    assert_true(returns_optional() == nil)
+end
+
+;; ── Trait bounds ────────────────────────────────────────────────────────────
+
+trait Describable is
+    fn describe(self) -> string
+end
+
+struct Dog is
+    pub name: string
+end
+
+impl Dog : Describable is
+    fn describe(self) -> string is
+        return "Dog: " + self.name
+    end
+end
+
+#[test]
+fn test_trait_impl() is
+    let d = Dog { name: "Rex" }
+    assert_eq(d.describe(), "Dog: Rex")
+end
+
+;; ── Generic constraints ─────────────────────────────────────────────────────
+
+fn identity<T>(x: T) -> T = x
+
+fn to_string_pair<T>(a: T, b: T) -> string is
+    return to_string(a) + "," + to_string(b)
+end
+
+#[test]
+fn test_generic_identity() is
+    assert_eq(identity(42), 42)
+    assert_eq(identity("hi"), "hi")
+    assert_true(identity(true))
+end
