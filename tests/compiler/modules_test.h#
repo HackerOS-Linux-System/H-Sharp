@@ -1,0 +1,84 @@
+;; H# Module System Tests (v0.6)
+use "std -> test" from "test"
+
+mod math_utils is
+    pub fn gcd(a: int, b: int) -> int is
+        if b == 0 is return a end
+        return gcd(b, a % b)
+    end
+
+    pub fn lcm(a: int, b: int) -> int is
+        return a / gcd(a, b) * b
+    end
+
+    pub fn is_even(n: int) -> bool = n % 2 == 0
+    pub fn is_odd(n: int)  -> bool = !is_even(n)
+end
+
+mod string_utils is
+    pub fn reverse(s: string) -> string is
+        let mut result: string = ""
+        let len = s.len()
+        let mut i: int = len - 1
+        while i >= 0 is
+            result = result + s[i]
+            i -= 1
+        end
+        return result
+    end
+
+    pub fn count_char(s: string, c: string) -> int is
+        let mut count: int = 0
+        for ch in s is
+            if ch == c is count += 1 end
+        end
+        return count
+    end
+
+    pub fn capitalize(s: string) -> string is
+        if s.len() == 0 is return s end
+        let first = s[0..1].to_upper()
+        let rest  = s[1..s.len()]
+        return first + rest
+    end
+end
+
+#[test]
+fn test_module_gcd() is
+    assert_eq(math_utils::gcd(12, 8), 4)
+    assert_eq(math_utils::gcd(7, 5), 1)
+    assert_eq(math_utils::gcd(100, 25), 25)
+end
+
+#[test]
+fn test_module_lcm() is
+    assert_eq(math_utils::lcm(4, 6), 12)
+    assert_eq(math_utils::lcm(3, 5), 15)
+end
+
+#[test]
+fn test_module_parity() is
+    assert_true(math_utils::is_even(4))
+    assert_true(!math_utils::is_even(7))
+    assert_true(math_utils::is_odd(3))
+end
+
+#[test]
+fn test_module_reverse() is
+    assert_eq(string_utils::reverse("hello"), "olleh")
+    assert_eq(string_utils::reverse("H#"), "#H")
+    assert_eq(string_utils::reverse(""), "")
+end
+
+#[test]
+fn test_module_count_char() is
+    assert_eq(string_utils::count_char("hello", "l"), 2)
+    assert_eq(string_utils::count_char("aaa", "a"), 3)
+    assert_eq(string_utils::count_char("abc", "z"), 0)
+end
+
+#[test]
+fn test_module_capitalize() is
+    assert_eq(string_utils::capitalize("hello"), "Hello")
+    assert_eq(string_utils::capitalize("h#"), "H#")
+end
