@@ -187,7 +187,7 @@ impl LifetimeChecker {
         }
     }
 
-    fn check_no_local_ref_return(&mut self, lt: &Lifetime, span: &hsharp_parser::span::Span) {
+    fn check_no_local_ref_return(&mut self, lt: &Lifetime, _span: &hsharp_parser::span::Span) {
         // For now: warn if returning a local reference (simplified check)
         // Full impl: track scope depth of each variable's lifetime
         match lt {
