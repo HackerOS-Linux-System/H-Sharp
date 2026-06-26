@@ -1,6 +1,8 @@
 ;; H# std -> crypto Tests
 use "std -> test"   from "test"
 use "std -> crypto" from "crypto"
+use "std -> sec" from "sec"
+use "std -> fs" from "fs"
 use "std -> hex"    from "hex"
 
 #[test]
@@ -63,4 +65,25 @@ fn test_hex_encode_decode() is
     let encoded = hex::encode(data)
     let decoded = hex::decode(encoded)
     assert_eq(decoded, data)
+end
+
+#[test]
+fn test_rot13() is
+    let result = sec::rot13("Hello")
+    assert_eq(result, "Uryyb")
+    ;; rot13 is its own inverse
+    assert_eq(sec::rot13(result), "Hello")
+end
+
+#[test]
+fn test_fs_is_file() is
+    ;; fs::is_file now distinguishes files from directories (previously an
+    ;; alias to fs::exists, which couldn't tell them apart). Self-contained:
+    ;; creates its own temp file rather than depending on a specific path
+    ;; existing on the host system.
+    let p = "/tmp/hsharp_test_is_file.txt"
+    fs::write(p, "data")
+    assert_true(fs::is_file(p))
+    assert_true(!fs::is_dir(p))
+    fs::remove(p)
 end
