@@ -1,14 +1,112 @@
-;; H# Standard Library — std -> sort
-;; Algorytmy sortowania
+;; std -> sort — Sorting and searching
+;; H# Standard Library v0.6
 
-pub fn sort_ints(data: string) -> string is return data end
-pub fn sort_strings(data: string) -> string is return data end
-pub fn sort_floats(data: string) -> string is return data end
-pub fn sort_by(data: string, key: string) -> string is return data end
-pub fn sort_reverse(data: string) -> string is return data end
-pub fn is_sorted(data: string) -> bool is return true end
-pub fn binary_search(data: string, val: string) -> int is return -1 end
-pub fn lower_bound(data: string, val: string) -> int is return 0 end
-pub fn upper_bound(data: string, val: string) -> int is return 0 end
-pub fn nth_element(data: string, n: int) -> string is return "" end
-pub fn partition(data: string, pivot: string) -> string is return data end
+/// Sort an int array in-place (ascending).
+pub fn sort_ints(arr: [int]) is
+    __builtin_sort_ints(arr)
+end
+
+/// Sort an int array in-place (descending).
+pub fn sort_ints_desc(arr: [int]) is
+    sort_ints(arr)
+    let mut l: int = 0
+    let mut r: int = arr.len() - 1
+    while l < r is
+        let tmp = arr[l]
+        arr[l] = arr[r]
+        arr[r] = tmp
+        l += 1
+        r -= 1
+    end
+end
+
+/// Sort a string array in-place (ascending).
+pub fn sort_strings(arr: [string]) is
+    __builtin_sort_strings(arr)
+end
+
+/// Sort an array in-place using a comparator fn.
+/// comparator(a, b) should return negative if a < b, 0 if equal, positive if a > b.
+pub fn sort_by(arr: [any], cmp: fn(any, any) -> int) is
+    __builtin_sort_by(arr, cmp)
+end
+
+/// Sort by a key extractor function (stable).
+pub fn sort_by_key(arr: [any], key_fn: fn(any) -> any) is
+    sort_by(arr, |a: any, b: any| -> int is
+        let ka = key_fn(a)
+        let kb = key_fn(b)
+        if ka < kb is return -1 end
+        if ka > kb is return  1 end
+        return 0
+    end)
+end
+
+/// Binary search in a sorted int array. Returns index or -1 if not found.
+pub fn binary_search(arr: [int], target: int) -> int is
+    let mut lo: int = 0
+    let mut hi: int = arr.len() - 1
+    while lo <= hi is
+        let mid = lo + (hi - lo) / 2
+        if arr[mid] == target is return mid end
+        if arr[mid] < target is
+            lo = mid + 1
+        else is
+            hi = mid - 1
+        end
+    end
+    return -1
+end
+
+/// Binary search for insertion position (leftmost position where target could be inserted).
+pub fn binary_search_left(arr: [int], target: int) -> int is
+    let mut lo: int = 0
+    let mut hi: int = arr.len()
+    while lo < hi is
+        let mid = lo + (hi - lo) / 2
+        if arr[mid] < target is
+            lo = mid + 1
+        else is
+            hi = mid
+        end
+    end
+    return lo
+end
+
+/// Check if sorted array contains a value.
+pub fn contains_sorted(arr: [int], target: int) -> bool is
+    return binary_search(arr, target) != -1
+end
+
+/// Merge two sorted arrays into one sorted array.
+pub fn merge_sorted(a: [int], b: [int]) -> [int] is
+    let mut result: [int] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < a.len() && j < b.len() is
+        if a[i] <= b[j] is
+            result.push(a[i]); i += 1
+        else is
+            result.push(b[j]); j += 1
+        end
+    end
+    while i < a.len() is result.push(a[i]); i += 1 end
+    while j < b.len() is result.push(b[j]); j += 1 end
+    return result
+end
+
+/// Find minimum of an int array. Returns nil if empty.
+pub fn min_int(arr: [int]) -> int? is
+    if arr.len() == 0 is return nil end
+    let mut m: int = arr[0]
+    for x in arr is if x < m is m = x end end
+    return m
+end
+
+/// Find maximum of an int array. Returns nil if empty.
+pub fn max_int(arr: [int]) -> int? is
+    if arr.len() == 0 is return nil end
+    let mut m: int = arr[0]
+    for x in arr is if x > m is m = x end end
+    return m
+end
