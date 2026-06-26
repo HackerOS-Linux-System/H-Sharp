@@ -71,7 +71,7 @@ pub enum Pattern {
     Literal(Literal, Span),
     Tuple(Vec<Pattern>, Span),
     Struct { name: String, fields: Vec<(String, Pattern)>, span: Span },
-    Enum { variant: String, inner: Option<Box<Pattern>>, span: Span },
+    Enum { qualified_type: Option<String>, variant: String, inner: Vec<Pattern>, span: Span },
     Or(Vec<Pattern>, Span),
     Range(Box<Pattern>, Box<Pattern>, bool, Span),
 }
@@ -133,6 +133,9 @@ pub enum Expr {
     SelfExpr(Span),
     Try(Box<Expr>, Span),
     Await(Box<Expr>, Span),
+    /// Module path access: `module::function` or `module::CONST`.
+    /// Segments are the dotted/coloned path components (e.g. ["json", "parse"]).
+    Path(Vec<String>, Span),
 }
 
 impl Expr {
@@ -164,6 +167,7 @@ impl Expr {
             Expr::SelfExpr(s)                  => s,
             Expr::Try(_, s)                    => s,
             Expr::Await(_, s)                  => s,
+            Expr::Path(_, s)                   => s,
         }
     }
 }
