@@ -1,4 +1,5 @@
 // cargo
+// rustc
 
 > LLVM_SYS_210_PREFIX=/usr/lib/llvm-21 cargo build --release
 
