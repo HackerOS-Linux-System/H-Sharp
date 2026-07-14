@@ -10,4 +10,4 @@ website https://hackeros-linux-system.github.io/HackerOS-Website/h-sharp/docs.ht
 isOpenSource true
 fileType text
 
-description A HackerOS-first compiled programming language featuring a highly unique yet remarkably simple syntax. It includes a Rust-based backend, support for advanced memory management (Arena memory, unsafe blocks), traits, pattern matching, and is heavily tailored towards cybersecurity tools and ecosystem development.
+description A HackerOS-first compiled programming language featuring a simple, slightly unique syntax that is heavily inspired by Rust but designed to be more straightforward. Built with a Rust-based backend, it supports arena memory management and traits.
