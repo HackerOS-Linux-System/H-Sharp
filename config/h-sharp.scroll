@@ -1,0 +1,13 @@
+h-sharp.scroll
+../code/conceptPage.scroll
+
+id h-sharp
+name H#
+appeared 2026
+tags pl
+website https://hackeros-linux-system.github.io/HackerOS-Website/h-sharp/docs.html
+
+isOpenSource true
+fileType text
+
+description A HackerOS-first compiled programming language featuring a highly unique yet remarkably simple syntax. It includes a Rust-based backend, support for advanced memory management (Arena memory, unsafe blocks), traits, pattern matching, and is heavily tailored towards cybersecurity tools and ecosystem development.
