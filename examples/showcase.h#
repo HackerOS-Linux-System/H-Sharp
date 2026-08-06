@@ -1,1 +1,520 @@
+use "std -> math"   from "math"
+use "std -> crypto -> sha" from "sha"
 
+extern dynamic [c] is
+    fn strlen(s: string) -> int
+    fn rand()            -> int
+end
+
+extern dynamic [c++, "libcompute"] is
+    fn compute_dot(a: bytes, b: bytes, n: int) -> f64
+end
+
+extern dynamic [python, "numpy"] is
+    fn np_mean(data: string) -> f64
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 1. TYPY PODSTAWOWE
+;; ══════════════════════════════════════════════════════════════
+
+fn demo_types() is
+    write("── 1. Typy podstawowe ───────────────────────────────")
+
+    let a:   i8   = -128
+    let b:   i16  = 32767
+    let c:   i32  = 2_147_483_647
+    let d:   i64  = 9_223_372_036_854_775_807
+    let e:   u8   = 255
+    let f:   u64  = 18_446_744_073_709_551_615
+    let pi:  f64  = 3.14159265358979
+    let phi: f32  = 1.61803
+    let yes: bool = true
+
+    let msg:  string = "Witaj, H#!"
+    let raw:  bytes  = b"\xDE\xAD\xBE\xEF"
+
+    let mut x: int = 0
+    x += 10
+    x *= 3
+
+    write("  i64 max : " + to_string(d))
+    write("  u8  max : " + to_string(e))
+    write("  pi      : " + to_string(pi))
+    write("  string  : " + msg)
+    write("  x=0+10*3: " + to_string(x))
+    write("  bool    : " + to_string(yes))
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 2. STRUKTURY
+;; ══════════════════════════════════════════════════════════════
+
+struct Vec2 is
+    pub x: f64
+    pub y: f64
+end
+
+fn vec2(x: f64, y: f64) -> Vec2 is
+    return Vec2 { x: x, y: y }
+end
+
+fn vec2_add(a: Vec2, b: Vec2) -> Vec2 is
+    return Vec2 { x: a.x + b.x, y: a.y + b.y }
+end
+
+fn vec2_len(v: Vec2) -> f64 is
+    return math::sqrt(v.x * v.x + v.y * v.y)
+end
+
+fn vec2_dot(a: Vec2, b: Vec2) -> f64 is
+    return a.x * b.x + a.y * b.y
+end
+
+fn vec2_str(v: Vec2) -> string is
+    return "(" + to_string(v.x) + ", " + to_string(v.y) + ")"
+end
+
+struct AABB is
+    pub min: Vec2
+    pub max: Vec2
+end
+
+fn aabb_contains(b: AABB, p: Vec2) -> bool is
+    return p.x >= b.min.x && p.x <= b.max.x &&
+           p.y >= b.min.y && p.y <= b.max.y
+end
+
+fn demo_structs() is
+    write("── 2. Struktury ─────────────────────────────────────")
+
+    let v1: Vec2 = vec2(3.0, 4.0)
+    let v2: Vec2 = vec2(1.0, 2.0)
+    let v3: Vec2 = vec2_add(v1, v2)
+
+    write("  v1          : " + vec2_str(v1))
+    write("  v2          : " + vec2_str(v2))
+    write("  v1 + v2     : " + vec2_str(v3))
+    write("  |v1|        : " + to_string(vec2_len(v1)))
+    write("  v1 · v2     : " + to_string(vec2_dot(v1, v2)))
+
+    let box: AABB = AABB {
+        min: Vec2 { x: 0.0, y: 0.0 },
+        max: Vec2 { x: 10.0, y: 10.0 },
+    }
+    write("  (5,5) in box: " + to_string(aabb_contains(box, vec2(5.0, 5.0))))
+    write("  (15,5) in box:" + to_string(aabb_contains(box, vec2(15.0, 5.0))))
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 3. ENUMS I MATCH
+;; ══════════════════════════════════════════════════════════════
+
+enum Color is
+    Red
+    Green
+    Blue
+    Rgb(int, int, int)
+    Named(string)
+end
+
+fn color_hex(c: Color) -> string is
+    match c is
+        Color::Red           => "#FF0000"
+        Color::Green         => "#00FF00"
+        Color::Blue          => "#0000FF"
+        Color::Rgb(r, g, b)  => "#" + to_hex(r) + to_hex(g) + to_hex(b)
+        Color::Named(s)      => s
+    end
+end
+
+enum Maybe<T> is
+    Some(T)
+    None
+end
+
+fn safe_div(a: f64, b: f64) -> Maybe<f64> is
+    if b == 0.0 is
+        return Maybe::None
+    end
+    return Maybe::Some(a / b)
+end
+
+fn demo_enums() is
+    write("── 3. Enums i match ─────────────────────────────────")
+
+    write("  Red          : " + color_hex(Color::Red))
+    write("  Rgb(64,0,128): " + color_hex(Color::Rgb(64, 0, 128)))
+    write("  Named(#abc)  : " + color_hex(Color::Named("#aabbcc")))
+
+    let r1: Maybe<f64> = safe_div(10.0, 3.0)
+    let r2: Maybe<f64> = safe_div(10.0, 0.0)
+
+    match r1 is
+        Maybe::Some(v) => write("  10/3 = " + to_string(v))
+        Maybe::None    => write("  10/3 = błąd")
+    end
+
+    match r2 is
+        Maybe::Some(v) => write("  10/0 = " + to_string(v))
+        Maybe::None    => write("  10/0 = dzielenie przez zero")
+    end
+
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 4. GENERYKI
+;; ══════════════════════════════════════════════════════════════
+
+struct Pair<A, B> is
+    pub first:  A
+    pub second: B
+end
+
+fn pair<A, B>(a: A, b: B) -> Pair<A, B> is
+    return Pair { first: a, second: b }
+end
+
+fn pair_str_int(p: Pair<string, int>) -> string is
+    return "(" + p.first + ", " + to_string(p.second) + ")"
+end
+
+fn clamp(val: f64, lo: f64, hi: f64) -> f64 is
+    if val < lo is return lo end
+    if val > hi is return hi end
+    return val
+end
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 is
+    return a + (b - a) * clamp(t, 0.0, 1.0)
+end
+
+fn demo_generics() is
+    write("── 4. Generyki ──────────────────────────────────────")
+
+    let p: Pair<string, int> = pair("odpowiedź", 42)
+    write("  Pair<string,int>: " + pair_str_int(p))
+
+    write("  clamp(15, 0, 10) = " + to_string(clamp(15.0, 0.0, 10.0)))
+    write("  lerp(0, 100, 0.3)= " + to_string(lerp(0.0, 100.0, 0.3)))
+    write("  lerp(0, 100, 1.5)= " + to_string(lerp(0.0, 100.0, 1.5)))
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 5. KONTROLA PRZEPŁYWU
+;; ══════════════════════════════════════════════════════════════
+
+fn fizzbuzz(n: int) -> string is
+    if n % 15 == 0 is return "FizzBuzz" end
+    if n % 3  == 0 is return "Fizz"     end
+    if n % 5  == 0 is return "Buzz"     end
+    return to_string(n)
+end
+
+fn collatz(n: int) -> int is
+    let mut x:     int = n
+    let mut steps: int = 0
+    while x != 1 is
+        if x % 2 == 0 is
+            x = x / 2
+        else is
+            x = x * 3 + 1
+        end
+        steps += 1
+    end
+    return steps
+end
+
+fn is_prime(n: int) -> bool is
+    if n < 2 is return false end
+    let mut i: int = 2
+    while i * i <= n is
+        if n % i == 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+fn sum_range(lo: int, hi: int) -> int is
+    let mut s: int = 0
+    for i in lo..=hi is
+        s += i
+    end
+    return s
+end
+
+fn demo_flow() is
+    write("── 5. Kontrola przepływu ────────────────────────────")
+
+    let mut line: string = "  "
+    for i in 1..=20 is
+        line = line + fizzbuzz(i) + " "
+    end
+    write(line)
+
+    write("  collatz(27) = " + to_string(collatz(27)) + " kroków")
+    write("  Σ(1..100)   = " + to_string(sum_range(1, 100)))
+
+    ;; pierwsze 10 liczb pierwszych
+    let mut primes: string = "  pierwsze: "
+    let mut found: int = 0
+    let mut n:     int = 2
+    while found < 10 is
+        if is_prime(n) is
+            primes = primes + to_string(n) + " "
+            found += 1
+        end
+        n += 1
+    end
+    write(primes)
+
+    ;; match tuple
+    let x: int = 7
+    let y: int = 3
+    let rel: string = match (x > y, x == y) is
+        (true,  false) => "x > y"
+        (false, false) => "x < y"
+        (false, true)  => "x == y"
+        _              => "?"
+    end
+    write("  7 vs 3: " + rel)
+
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 6. PAMIĘĆ — UNSAFE
+;; ══════════════════════════════════════════════════════════════
+
+fn demo_memory() is
+    write("── 6. Pamięć (unsafe) ───────────────────────────────")
+
+    unsafe arena(4096) is
+        let buf:  bytes = b"\xAA\xBB\xCC\xDD"
+        let size: int   = 4096
+        write("  arena(4096) : " + to_string(size) + "B na stosie")
+        write("  buf[0]      : 0x" + to_hex(0xAA))
+    end
+
+    unsafe manual is
+        write("  manual heap : malloc/free semantics")
+    end
+
+    unsafe raw is
+        write("  raw block   : pełny dostęp niskopoziomowy")
+    end
+
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 7. ZAMKNIĘCIA
+;; ══════════════════════════════════════════════════════════════
+
+fn apply_int(val: int, f: fn(int) -> int) -> int is
+    return f(val)
+end
+
+fn apply_pred(val: int, f: fn(int) -> bool) -> bool is
+    return f(val)
+end
+
+fn map_arr(n: int, arr: [int], f: fn(int) -> int) -> [int] is
+    let mut res: [int] = arr
+    for i in 0..n is
+        res[i] = f(arr[i])
+    end
+    return res
+end
+
+fn reduce_arr(n: int, arr: [int], init: int, f: fn(int, int) -> int) -> int is
+    let mut acc: int = init
+    for i in 0..n is
+        acc = f(acc, arr[i])
+    end
+    return acc
+end
+
+fn demo_closures() is
+    write("── 7. Zamknięcia ────────────────────────────────────")
+
+    let double:  fn(int) -> int  = fn(x: int) -> int  is return x * 2      end
+    let is_even: fn(int) -> bool = fn(x: int) -> bool is return x % 2 == 0 end
+    let square:  fn(int) -> int  = fn(x: int) -> int  is return x * x      end
+    let add:     fn(int, int) -> int = fn(a: int, b: int) -> int is return a + b end
+
+    write("  double(7)   = " + to_string(apply_int(7, double)))
+    write("  square(9)   = " + to_string(apply_int(9, square)))
+    write("  is_even(4)  = " + to_string(apply_pred(4, is_even)))
+    write("  is_even(7)  = " + to_string(apply_pred(7, is_even)))
+
+    let nums: [int] = [1, 2, 3, 4, 5]
+    let doubled: [int] = map_arr(5, nums, double)
+    let total: int = reduce_arr(5, nums, 0, add)
+    write("  map double [1..5]: [2,4,6,8,10]")
+    write("  reduce sum [1..5]= " + to_string(total))
+
+    ;; Przechwytywanie
+    let base: int = 1000
+    let add_base: fn(int) -> int = fn(n: int) -> int is return n + base end
+    write("  closure(base=1000): add_base(42) = " + to_string(add_base(42)))
+
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 8. STRINGI
+;; ══════════════════════════════════════════════════════════════
+
+struct Person is
+    pub name:  string
+    pub age:   int
+    pub score: f64
+end
+
+fn demo_strings() is
+    write("── 8. Stringi i interpolacja ────────────────────────")
+
+    let p: Person = Person { name: "HackerOS", age: 25, score: 99.7 }
+
+    let m1: string = "Użytkownik: {p.name}, wiek: {p.age}"
+    let m2: string = "Wynik: {p.score}"
+    let m3: string = "ID hex: 0x{to_hex(p.age)}"
+
+    write("  " + m1)
+    write("  " + m2)
+    write("  " + m3)
+
+    let s: string = "Hello, HackerOS World!"
+    write("  len      : " + to_string(string_len(s)))
+    write("  upper    : " + string_upper(s))
+    write("  contains : " + to_string(string_contains(s, "HackerOS")))
+    write("  replace  : " + string_replace(s, "HackerOS", "H#"))
+
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 9. FFI
+;; ══════════════════════════════════════════════════════════════
+
+fn demo_ffi() is
+    write("── 9. FFI ───────────────────────────────────────────")
+
+    ;; C
+    let len: int = strlen("Hello FFI")
+    write("  [c]      strlen('Hello FFI') = " + to_string(len))
+
+    ;; C++ — przez unsafe arena
+    unsafe arena(512) is
+        let a: bytes = b"\x00" * 4
+        let b: bytes = b"\x00" * 4
+        let dot: f64 = compute_dot(a, b, 4)
+        write("  [c++]    compute_dot(zeros) = " + to_string(dot))
+    end
+
+    ;; Python bridge — brak flag linkowania, trampoline hsh_py_call
+    let mean: f64 = np_mean("[1,2,3,4,5]")
+    write("  [python]  np.mean([1..5]) = " + to_string(mean))
+
+    write("")
+    write("  extern static [rust, 'libfoo'] → --whole-archive -lfoo")
+    write("  extern dynamic [c++, 'libbar'] → -lbar -lstdc++")
+    write("  extern dynamic [c, 'libssl']   → pkg-config --libs libssl")
+    write("  extern dynamic [python, 'mod'] → hsh_py_call(), zero -l")
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 10. OPERACJE BITOWE I CRYPTO
+;; ══════════════════════════════════════════════════════════════
+
+fn rol64(x: u64, n: int) -> u64 is
+    return (x << n) | (x >> (64 - n))
+end
+
+fn xor_byte(data: bytes, key: u8) -> bytes is
+    unsafe arena(4096) is
+        let mut res: bytes = data
+        let n: int = bytes_len(data)
+        let mut i: int = 0
+        while i < n is
+            res[i] = data[i] ^ key
+            i += 1
+        end
+        return res
+    end
+end
+
+fn demo_bitwise() is
+    write("── 10. Bitowe i crypto ──────────────────────────────")
+
+    let a: u64 = 0xDEAD_BEEF_0000_0001
+    let b: u64 = 0x1234_5678_9ABC_DEF0
+
+    write("  a XOR b   = 0x" + to_hex(a ^ b))
+    write("  a AND b   = 0x" + to_hex(a & b))
+    write("  a OR  b   = 0x" + to_hex(a | b))
+    write("  a << 4    = 0x" + to_hex(a << 4))
+    write("  ROL64(a,8)= 0x" + to_hex(rol64(a, 8)))
+
+    let plain:  bytes = b"H# crypto v0.8"
+    let cipher: bytes = xor_byte(plain, 0x42)
+    let back:   bytes = xor_byte(cipher, 0x42)
+    write("  XOR 0x42: encrypt+decrypt OK")
+
+    let hash: string = sha::sha256_hex("HackerOS v0.8")
+    write("  SHA-256('HackerOS v0.8'):")
+    write("    " + hash)
+
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; 11. COMPILE OUTPUT MODES
+;; ══════════════════════════════════════════════════════════════
+
+fn demo_compile() is
+    write("── 11. h# compile — tryby wyjścia ──────────────────")
+    write("")
+    write("  h# compile main.h#               → binarka (domyślnie)")
+    write("  h# compile lib.h#  --emit obj    → lib.o")
+    write("  h# compile lib.h#  --emit so     → lib.so / .dylib / .dll")
+    write("  h# compile lib.h#  --emit lib    → lib.a  (ar rcs)")
+    write("")
+    write("  h# compile main.h# --target linux-aarch64  --release")
+    write("  h# compile main.h# --target windows-x86_64 --release")
+    write("")
+end
+
+;; ══════════════════════════════════════════════════════════════
+;; MAIN
+;; ══════════════════════════════════════════════════════════════
+
+fn main() is
+    write("")
+    write("\x1b[1;32m╔═══════════════════════════════════════════════════╗\x1b[0m")
+    write("\x1b[1;32m║\x1b[0m  \x1b[1;37mH# showcase.h#\x1b[0m  —  demo języka  \x1b[1;32mv0.8\x1b[0m          \x1b[1;32m║\x1b[0m")
+    write("\x1b[1;32m╚═══════════════════════════════════════════════════╝\x1b[0m")
+    write("")
+
+    demo_types()
+    demo_structs()
+    demo_enums()
+    demo_generics()
+    demo_flow()
+    demo_memory()
+    demo_closures()
+    demo_strings()
+    demo_ffi()
+    demo_bitwise()
+    demo_compile()
+
+    write("\x1b[2m─────────────────────────────────────────────────────\x1b[0m")
+    write("  \x1b[1mH# v0.8\x1b[0m  \x1b[2mLLVM · bytes PM · eiv scanner\x1b[0m")
+    write("")
+end
