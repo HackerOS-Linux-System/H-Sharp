@@ -38,9 +38,20 @@ pub fn run(file: Option<PathBuf>) {
             total_errors += result.errors.len();
             eprint!("{}", result.render_errors());
         } else {
+            let mut module = result.module;
+            let mut resolver = hsharp_compiler::modules::ModuleResolver::new(src_path);
+            let entry_dir = src_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            match resolver.expand_module(module.items, entry_dir) {
+                Ok(items) => module.items = items,
+                Err(e) => {
+                    eprintln!("{} {}: {}", "Error:".red().bold(), src_path.display(), e);
+                    total_errors += 1;
+                    continue;
+                }
+            }
             // check_module now returns Vec<Diagnostic> (not Result) — collect all errors
             let mut tc = hsharp_compiler::typechecker::TypeChecker::new();
-            let diags = tc.check_module(&result.module);
+            let diags = tc.check_module(&module);
             let errs: Vec<_> = diags.iter().filter(|d| d.severity == hsharp_compiler::Severity::Error).collect();
             if errs.is_empty() {
                 println!("  {} {}", "✓".green(), src_path.display());
@@ -84,8 +95,19 @@ pub fn run_multi(files: Vec<std::path::PathBuf>) {
                 total_errors += result.errors.len();
                 eprint!("{}", result.render_errors());
             } else {
+                let mut module = result.module;
+                let mut resolver = hsharp_compiler::modules::ModuleResolver::new(src_path);
+                let entry_dir = src_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                match resolver.expand_module(module.items, entry_dir) {
+                    Ok(items) => module.items = items,
+                    Err(e) => {
+                        eprintln!("{} {}: {}", "Error:".red().bold(), src_path.display(), e);
+                        total_errors += 1;
+                        continue;
+                    }
+                }
                 let mut tc = hsharp_compiler::typechecker::TypeChecker::new();
-                let diags = tc.check_module(&result.module);
+                let diags = tc.check_module(&module);
                 let errs: Vec<_> = diags.iter().filter(|d| d.severity == hsharp_compiler::Severity::Error).collect();
                 if errs.is_empty() {
                     println!("  {} {}", "✓".green().bold(), src_path.display().to_string().dimmed());
