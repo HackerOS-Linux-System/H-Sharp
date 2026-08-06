@@ -147,12 +147,50 @@ impl Parser {
     // ── Module ─────────────────────────────────────────────────────────────────
 
     pub fn parse_module(&mut self) -> Module {
-        let mut directives = Vec::new();
         let mut items      = Vec::new();
         let mut imports    = Vec::new();
         let mut edition: Option<String> = None;
+        let mut file_mem_mode: Option<MemoryMode> = None;
 
         self.skip_newlines();
+
+        // File-level `@: mode` directive — `@` immediately followed by `:`
+        // (as opposed to `@identifier`, which is the existing per-function
+        // annotation handled by `parse_mem_mode` inside `parse_item`).
+        // Checked once, here, before the main loop below ever gets a
+        // chance to route a leading `@` through `parse_item`/
+        // `parse_mem_mode`, which expects an identifier right after `@`
+        // and would otherwise fail on the `:`. See `apply_file_mem_mode`
+        // in ast.rs for what actually happens with this afterward — it's
+        // applied as a post-parse rewrite pass, not threaded through
+        // codegen/the typechecker directly, so both of those (and the
+        // interpreter) only ever have to deal with a plain per-function
+        // `MemoryMode` like before.
+        if matches!(self.current().kind, TokenKind::At)
+            && matches!(self.peek_at(1).kind, TokenKind::Colon)
+        {
+            self.advance(); // @
+            self.advance(); // :
+            match self.expect_ident() {
+                Ok((name, name_span)) => {
+                    match name.as_str() {
+                        "default"  => file_mem_mode = Some(MemoryMode::Default),
+                        "safety"   => file_mem_mode = Some(MemoryMode::Safety),
+                        "arc"      => file_mem_mode = Some(MemoryMode::Arc),
+                        "arena"    => file_mem_mode = Some(MemoryMode::Arena),
+                        "pointers" => file_mem_mode = Some(MemoryMode::Pointers),
+                        other => self.errors.report(ParseError::new(
+                            ParseErrorKind::Custom(format!("unknown file-level memory annotation `@: {}`", other)),
+                            name_span,
+                            format!("unknown file-level memory annotation `@: {}`", other),
+                            vec!["expected one of: @: default, @: safety, @: arc, @: arena, @: pointers".to_string()],
+                        )),
+                    }
+                }
+                Err(e) => self.errors.report(e),
+            }
+            self.skip_newlines();
+        }
 
         while !matches!(self.current().kind, TokenKind::EOF) {
             self.skip_newlines();
@@ -166,18 +204,6 @@ impl Parser {
                     self.advance();
                 }
                 self.skip_newlines();
-                continue;
-            }
-
-            // Directives ~ / ~~
-            if let TokenKind::Directive(s) = &self.current().kind.clone() {
-                let span = self.current().span.clone(); let s = s.clone(); self.advance();
-                directives.push(Directive { kind: DirectiveKind::Dynamic, value: s, span });
-                continue;
-            }
-            if let TokenKind::FastDirective(s) = &self.current().kind.clone() {
-                let span = self.current().span.clone(); let s = s.clone(); self.advance();
-                directives.push(Directive { kind: DirectiveKind::Fast, value: s, span });
                 continue;
             }
 
@@ -197,7 +223,7 @@ impl Parser {
             }
         }
 
-        Module { file: self.file.clone(), edition, directives, items, imports }
+        Module { file: self.file.clone(), edition, file_mem_mode, items, imports }
     }
 
     // ── Import ────────────────────────────────────────────────────────────────
@@ -228,7 +254,7 @@ impl Parser {
             ParseErrorKind::Custom("invalid use path".into()),
                                        span.clone(),
                                        format!("cannot parse use path `{}`", path_tok),
-                                           vec![r#"valid forms: "std -> module", "vira -> pkg/1.0""#.to_string()],
+                                           vec![r#"valid forms: "std -> module", "bytes -> pkg/1.0", "github -> owner/repo""#.to_string()],
         ))?;
         Ok((kind, alias, span))
     }
@@ -271,15 +297,45 @@ impl Parser {
 
     // ── Items ─────────────────────────────────────────────────────────────────
 
+    /// Parse an optional `@tag` memory-mode annotation (`@default`,
+    /// `@safety`, `@arc`, `@arena`, `@pointers`) preceding a `fn`. No `@`
+    /// at all is exactly equivalent to writing `@default`. Returns the
+    /// mode plus its span (for the "only valid on fn" check in callers
+    /// that don't expect one), or `None` if there was no `@` here at all.
+    fn parse_mem_mode(&mut self) -> Result<Option<(MemoryMode, Span)>, ParseError> {
+        if !matches!(self.current().kind, TokenKind::At) { return Ok(None); }
+        let start = self.current().span.clone();
+        self.advance(); // @
+        let (name, name_span) = self.expect_ident()?;
+        let mode = match name.as_str() {
+            "default"  => MemoryMode::Default,
+            "safety"   => MemoryMode::Safety,
+            "arc"      => MemoryMode::Arc,
+            "arena"    => MemoryMode::Arena,
+            "pointers" => MemoryMode::Pointers,
+            other => return Err(self.error(
+                format!("unknown memory annotation `@{}`", other),
+                vec!["expected one of: @default, @safety, @arc, @arena, @pointers".to_string()],
+            )),
+        };
+        self.skip_newlines();
+        Ok(Some((mode, start.merge(&name_span))))
+    }
+
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         self.skip_newlines();
         let attrs = self.parse_attributes();
+        let mem_mode = self.parse_mem_mode()?;
         let pub_ = if matches!(self.current().kind, TokenKind::Pub) {
             self.advance(); true
         } else { false };
 
         match &self.current().kind {
-            TokenKind::Fn     => self.parse_fn_with_attrs(pub_, attrs).map(Item::FnDef),
+            TokenKind::Fn     => {
+                let mut f = self.parse_fn_with_attrs(pub_, attrs)?;
+                if let Some((m, _)) = mem_mode { f.mem_mode = m; }
+                Ok(Item::FnDef(f))
+            }
             TokenKind::Struct => self.parse_struct(pub_).map(Item::StructDef),
             TokenKind::Enum   => self.parse_enum(pub_).map(Item::EnumDef),
             TokenKind::Trait  => self.parse_trait(pub_).map(Item::TraitDef),
@@ -288,7 +344,9 @@ impl Parser {
             TokenKind::Async  => {
                 self.advance();
                 let fn_def = self.parse_fn_with_attrs(pub_, attrs)?;
-                Ok(Item::FnDef(FnDef { is_async: true, ..fn_def }))
+                let mut fn_def = FnDef { is_async: true, ..fn_def };
+                if let Some((m, _)) = mem_mode { fn_def.mem_mode = m; }
+                Ok(Item::FnDef(fn_def))
             }
             TokenKind::Mod    => self.parse_mod_decl(pub_),
             TokenKind::Extern => self.parse_extern_block_inline(),
@@ -298,10 +356,18 @@ impl Parser {
                 self.skip_newlines();
                 self.parse_item()
             }
-            _ => Err(self.error(
-                format!("unexpected token `{}` at top level", self.current().text),
-                    vec!["expected fn, struct, enum, trait, impl, type, mod, or extern".to_string()],
-            )),
+            other => {
+                if let Some((_, span)) = mem_mode {
+                    return Err(self.error(
+                        "memory annotations (`@arena`, `@safety`, ...) are only valid on `fn` right now".to_string(),
+                        vec![format!("found `{:?}` right after the annotation, at {:?}", other, span)],
+                    ));
+                }
+                Err(self.error(
+                    format!("unexpected token `{}` at top level", self.current().text),
+                        vec!["expected fn, struct, enum, trait, impl, type, mod, or extern".to_string()],
+                ))
+            }
         }
     }
 
@@ -358,7 +424,7 @@ impl Parser {
         self.skip_newlines();
         let body = self.parse_block()?;
         let span = start.merge(&self.current().span);
-        Ok(FnDef { attrs, type_params, name, params, return_type, body, pub_, is_async, is_unsafe, span })
+        Ok(FnDef { attrs, type_params, name, params, return_type, body, pub_, is_async, is_unsafe, mem_mode: MemoryMode::Default, span })
     }
 
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
@@ -372,7 +438,7 @@ impl Parser {
                 let s = self.advance().span.clone();
                 params.push(Param { name: "self".to_string(), ty: TypeExpr::Named("Self".to_string()), mutable, span: s });
             } else {
-                let (name, _) = self.expect_ident()?;
+                let (name, _) = self.expect_path_segment()?;
                 self.expect(&TokenKind::Colon)?;
                 let ty = self.parse_type()?;
                 params.push(Param { name, ty, mutable, span });
@@ -575,10 +641,14 @@ impl Parser {
             while !matches!(self.current().kind, TokenKind::End | TokenKind::EOF) {
                 self.skip_newlines();
                 if matches!(self.current().kind, TokenKind::End) { break; }
+                let mem_mode = self.parse_mem_mode()?;
                 let pub_ = if matches!(self.current().kind, TokenKind::Pub) { self.advance(); true } else { false };
                 if matches!(self.current().kind, TokenKind::Fn) {
                     match self.parse_fn(pub_) {
-                        Ok(f)  => methods.push(f),
+                        Ok(mut f)  => {
+                            if let Some((m, _)) = mem_mode { f.mem_mode = m; }
+                            methods.push(f);
+                        }
                         Err(e) => { self.errors.report(e); self.recover(); }
                     }
                 } else {
@@ -771,7 +841,29 @@ impl Parser {
                 Ok(TypeExpr::Tuple(types))
             }
             TokenKind::Ident(name) => {
-                let name = name.clone(); self.advance();
+                let mut name = name.clone(); self.advance();
+                // Module-qualified type path: `module::Type` or
+                // `a::b::Type` (e.g. `c: helpers::Colors`). H# struct and
+                // enum names are looked up globally by their *bare* name
+                // everywhere in the typechecker and codegen (mod-file
+                // inlining does not currently namespace type definitions —
+                // only call sites use the `module::` prefix). We therefore
+                // accept the qualified syntax for readability at the
+                // call/declaration site but only keep the final segment,
+                // which is what the struct/enum is actually registered
+                // under.
+                while matches!(self.current().kind, TokenKind::ColonColon) {
+                    self.advance();
+                    if let TokenKind::Ident(seg) = &self.current().kind {
+                        name = seg.clone();
+                        self.advance();
+                    } else {
+                        return Err(self.error(
+                            format!("expected identifier after `::` in type path, found `{}`", self.current().text),
+                            vec!["valid form: module::Type".to_string()],
+                        ));
+                    }
+                }
                 if matches!(self.current().kind, TokenKind::Lt) {
                     self.advance();
                     let mut args = Vec::new();
@@ -849,7 +941,7 @@ impl Parser {
             self.advance();
             let mut names = Vec::new();
             while !matches!(self.current().kind, TokenKind::RParen | TokenKind::EOF) {
-                let (n, _) = self.expect_ident()?;
+                let (n, _) = self.expect_path_segment()?;
                 names.push(n);
                 if matches!(self.current().kind, TokenKind::Comma) { self.advance(); } else { break; }
             }
@@ -877,7 +969,7 @@ impl Parser {
             return Ok(out);
         }
 
-        let (name, _) = self.expect_ident()?;
+        let (name, _) = self.expect_path_segment()?;
         let ty = if matches!(self.current().kind, TokenKind::Colon) {
             self.advance(); Some(self.parse_type()?)
         } else { None };
@@ -1103,6 +1195,13 @@ impl Parser {
                     Ok(Expr::Ident(name, span))
                 }
             }
+            TokenKind::From if !matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::ColonColon)) => {
+                // (The `From ::` case is already handled by the guarded
+                // soft-keyword-path arm below; this arm only covers bare
+                // `from` used as a plain identifier/variable name.)
+                let span = self.current().span.clone(); self.advance();
+                self.parse_ident_expr_from("from".to_string(), span)
+            }
             TokenKind::Ident(_)   => self.parse_ident_expr(),
             // A soft keyword immediately followed by `::` is being used as
             // the first segment of a module path (e.g. `async::spawn(...)`,
@@ -1118,7 +1217,7 @@ impl Parser {
             // this same match (`TokenKind::Match => self.parse_match()`,
             // etc.) that would always intercept first, making a guarded
             // entry for them here permanently unreachable.
-            TokenKind::New | TokenKind::Write | TokenKind::Type | TokenKind::End |
+            TokenKind::New | TokenKind::Type | TokenKind::End |
             TokenKind::As | TokenKind::Is | TokenKind::From | TokenKind::Use |
             TokenKind::Mod | TokenKind::Async | TokenKind::Await | TokenKind::In
                 if matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::ColonColon)) =>
@@ -1213,6 +1312,7 @@ impl Parser {
             TokenKind::If      => self.parse_if(),
             TokenKind::Match   => self.parse_match(),
             TokenKind::While   => self.parse_while(),
+            TokenKind::Loop    => self.parse_loop(),
             TokenKind::For     => self.parse_for(),
             TokenKind::Is      => {
                 let body = self.parse_block()?;
@@ -1345,6 +1445,72 @@ impl Parser {
         let condition = self.parse_expr(0)?;
         self.skip_newlines();
 
+        // Ternary shorthand: `if cond then expr1 else expr2` (no `is`/`end`).
+        // Desugars to the same Expr::If used by the block form, with each
+        // branch wrapped as a single-statement body. This is the common
+        // "inline if" people reach for when assigning a value, e.g.
+        // `let x: int = if n > 0 then 1 else -1`.
+        if matches!(self.current().kind, TokenKind::Then) {
+            self.advance(); // consume `then`
+            let then_expr = self.parse_expr(0)?;
+            let then_span = then_expr.span().clone();
+            let then_body = vec![Stmt::Expr(then_expr, then_span)];
+
+            self.skip_newlines();
+            let mut elsif_branches: Vec<(Expr, Vec<Stmt>)> = Vec::new();
+            let mut else_body: Option<Vec<Stmt>> = None;
+
+            loop {
+                if matches!(self.current().kind, TokenKind::Elsif) {
+                    self.advance();
+                    let cond = self.parse_expr(0)?;
+                    self.skip_newlines();
+                    self.expect(&TokenKind::Then)?;
+                    let e = self.parse_expr(0)?;
+                    let sp = e.span().clone();
+                    elsif_branches.push((cond, vec![Stmt::Expr(e, sp)]));
+                    self.skip_newlines();
+                    continue;
+                }
+                if matches!(self.current().kind, TokenKind::Else) {
+                    self.advance();
+                    // Support both `else then expr` and bare `else expr`
+                    if matches!(self.current().kind, TokenKind::Then) { self.advance(); }
+                    let e = self.parse_expr(0)?;
+                    let sp = e.span().clone();
+                    else_body = Some(vec![Stmt::Expr(e, sp)]);
+                }
+                break;
+            }
+
+            // The shorthand form is documented/intended as a true one-liner
+            // with no terminator (`if cond then a else b`) — but every
+            // other multi-line construct in H# (if/while/for/match/fn) is
+            // closed with `end`, so writing `if cond then a else b end`
+            // out of habit is an extremely natural mistake, not a
+            // malformed program. Previously that trailing `end` was left
+            // completely unconsumed here and bubbled up as a confusing
+            // "unexpected token `end`, expected an expression" error from
+            // whatever enclosing construct happened to be parsing next
+            // (a call's argument list, in the reported case) — nothing
+            // about that error pointed back at the real cause. Silently
+            // accepting one optional trailing `end` fixes real-world code
+            // like this without changing anything about the terminator-
+            // free form still working exactly as before.
+            if matches!(self.current().kind, TokenKind::End) {
+                self.advance();
+            }
+
+            let s = start.merge(&self.current().span);
+            return Ok(Expr::If {
+                condition: Box::new(condition),
+                then_body,
+                elsif_branches,
+                else_body,
+                span: s,
+            });
+        }
+
         // Must have `is`
         if !matches!(self.current().kind, TokenKind::Is) {
             return Err(self.error(
@@ -1457,10 +1623,23 @@ impl Parser {
             break;
         }
 
-        // Consume the final `end`
-        if matches!(self.current().kind, TokenKind::End) {
-            self.advance();
-        }
+        // Consume the final `end`. Every other block construct in the
+        // grammar (fn/while/for/match/struct/...) requires this via
+        // `self.expect(&TokenKind::End)?` — a clear, immediate parse error
+        // if it's missing. This one used to just do `if matches!(End) {
+        // advance }` and silently move on otherwise, which meant a
+        // missing `end` here didn't fail here at all: the *next*
+        // construct's parser would just keep consuming subsequent
+        // statements (thinking they belonged to this `if`'s else-branch)
+        // until it stumbled onto *some* `end` token further down the
+        // file — typically the one that was meant to close a completely
+        // unrelated enclosing block (a `match` arm, in the reported case)
+        // — leaving that enclosing block's own `end` "stolen" and
+        // producing a confusing "unexpected token" error potentially many
+        // lines away from the real mistake. Requiring it here instead
+        // means a missing `end` after an `if...is...end` fails immediately,
+        // at the right place.
+        self.expect(&TokenKind::End)?;
 
         let s = start.merge(&self.current().span);
         Ok(Expr::If {
@@ -1637,6 +1816,22 @@ impl Parser {
 
     // ── while / for ───────────────────────────────────────────────────────────
 
+    /// `loop is ... end` — an unconditional loop, exited via `break` (just
+    /// like Rust's `loop {}`). Desugars straight to `while true is ... end`
+    /// at parse time rather than adding a whole new `Expr::Loop` AST
+    /// variant + codegen path for what is, semantically, exactly a while-
+    /// true loop — `break`/`continue` inside it already work correctly
+    /// because they're compiled against the (real) `Expr::While` they end
+    /// up nested in.
+    fn parse_loop(&mut self) -> Result<Expr, ParseError> {
+        let start = self.current().span.clone(); self.advance();
+        self.skip_newlines();
+        let body = self.parse_block()?;
+        let s = start.merge(&self.current().span);
+        let condition = Expr::Literal(Literal::Bool(true), s.clone());
+        Ok(Expr::While { condition: Box::new(condition), body, span: s })
+    }
+
     fn parse_while(&mut self) -> Result<Expr, ParseError> {
         let start = self.current().span.clone(); self.advance();
         let condition = self.parse_expr(0)?;
@@ -1659,18 +1854,51 @@ impl Parser {
 
     // ── unsafe block ──────────────────────────────────────────────────────────
 
+    /// Parses an optional `(N)` after an arena-kind keyword, returning the
+    /// size if present. Shared by `pool(N)`/`ring(N)`/`page(N)`/the
+    /// `arena(...)` sub-forms — they all take the same "optional single
+    /// integer in parens" shape.
+    fn parse_optional_paren_size(&mut self) -> Result<Option<usize>, ParseError> {
+        if !matches!(self.current().kind, TokenKind::LParen) { return Ok(None); }
+        self.advance();
+        let size = if let TokenKind::Integer(n) = self.current().kind.clone() {
+            self.advance(); Some(n as usize)
+        } else { None };
+        self.expect(&TokenKind::RParen)?;
+        Ok(size)
+    }
+
     fn parse_unsafe_block(&mut self, start: Span) -> Result<Expr, ParseError> {
         self.advance(); // consume `unsafe`
+        // `pool`/`page`/`ring`/`classic` aren't reserved lexer keywords (only
+        // `arena`/`manual` are — see lexer.rs) — they're plain identifiers
+        // matched by name here, same as the `fixed`/`pool`/`page`/`ring`
+        // sub-keywords already were inside `arena(...)`. This lets the
+        // documented standalone forms (`unsafe pool(N) is...end`, `unsafe
+        // page is...end`, `unsafe ring(N) is...end`, `unsafe classic
+        // is...end`) parse directly, not just the equivalent nested
+        // `arena(pool, N)` / `manual(classic)` spellings, which is all the
+        // parser understood before.
+        let ident_here = |p: &Self| -> Option<String> {
+            if let TokenKind::Ident(s) = &p.current().kind { Some(s.clone()) } else { None }
+        };
         let arena: Option<ArenaConfig> = if matches!(self.current().kind, TokenKind::Arena) {
             self.advance();
-            let kind = if matches!(self.current().kind, TokenKind::LParen) {
+            let (kind, size) = if matches!(self.current().kind, TokenKind::LParen) {
                 self.advance();
                 let k = match &self.current().kind.clone() {
                     TokenKind::Ident(s) if s == "fixed"   => { self.advance(); ArenaKind::Fixed }
                     TokenKind::Ident(s) if s == "pool"    => { self.advance(); ArenaKind::Pool }
                     TokenKind::Ident(s) if s == "page"    => { self.advance(); ArenaKind::Page }
                     TokenKind::Ident(s) if s == "ring"    => { self.advance(); ArenaKind::Ring }
-                    TokenKind::Integer(_)                  => ArenaKind::General,
+                    // `arena(N)` with a bare integer and no kind keyword is
+                    // documented as the *fixed*-capacity variant (panics on
+                    // overflow instead of falling back to malloc) — `arena`
+                    // with no parens at all is the one that means "general"
+                    // (malloc fallback). Previously both spellings collapsed
+                    // to `General`, silently dropping the "panic on
+                    // overflow" behavior `arena(N)` is supposed to have.
+                    TokenKind::Integer(_)                  => ArenaKind::Fixed,
                     _                                      => ArenaKind::General,
                 };
                 let size = if let TokenKind::Integer(n) = self.current().kind.clone() {
@@ -1679,7 +1907,22 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
                 (k, size)
             } else { (ArenaKind::General, None) };
-            Some(ArenaConfig { mode: UnsafeMode::Arena { kind: kind.0, size: kind.1 } })
+            Some(ArenaConfig { mode: UnsafeMode::Arena { kind, size } })
+        } else if ident_here(self).as_deref() == Some("pool") {
+            self.advance();
+            let size = self.parse_optional_paren_size()?;
+            Some(ArenaConfig { mode: UnsafeMode::Arena { kind: ArenaKind::Pool, size } })
+        } else if ident_here(self).as_deref() == Some("page") {
+            self.advance();
+            let size = self.parse_optional_paren_size()?;
+            Some(ArenaConfig { mode: UnsafeMode::Arena { kind: ArenaKind::Page, size } })
+        } else if ident_here(self).as_deref() == Some("ring") {
+            self.advance();
+            let size = self.parse_optional_paren_size()?;
+            Some(ArenaConfig { mode: UnsafeMode::Arena { kind: ArenaKind::Ring, size } })
+        } else if ident_here(self).as_deref() == Some("classic") {
+            self.advance();
+            Some(ArenaConfig { mode: UnsafeMode::Manual(ManualKind::Classic) })
         } else if matches!(self.current().kind, TokenKind::Manual) {
             self.advance();
             let manual_kind = if matches!(self.current().kind, TokenKind::LParen) {
@@ -1825,13 +2068,22 @@ impl Parser {
                     let sub = format!("fn __interp__() is\n    return {}\nend", expr_src);
                     let result = crate::parse(&sub, "<interp>");
                     if !result.has_errors() {
-                        result.module.items.into_iter().find_map(|item| {
+                        let mut found = result.module.items.into_iter().find_map(|item| {
                             if let Item::FnDef(f) = item {
                                 f.body.into_iter().find_map(|s| {
                                     if let Stmt::Return(Some(e), _) = s { Some(e) } else { None }
                                 })
                             } else { None }
-                        }).unwrap_or_else(|| Expr::Ident(expr_src.to_string(), span.clone()))
+                        }).unwrap_or_else(|| Expr::Ident(expr_src.to_string(), span.clone()));
+                        // See `Expr::remap_span`'s doc comment: without this,
+                        // every span in `found` points at the throwaway
+                        // "<interp>" snippet instead of the real file, so
+                        // e.g. an undefined-variable error from inside an
+                        // interpolated `{expr}` would report a file that
+                        // doesn't exist instead of where the string literal
+                        // actually is.
+                        found.remap_span(&span);
+                        found
                     } else if expr_src.chars().all(|c| c.is_alphanumeric() || c == '_') {
                         Expr::Ident(expr_src.to_string(), span.clone())
                     } else {
@@ -1988,11 +2240,6 @@ fn parse_use_path(path: &str, alias: Option<String>) -> Option<ImportKind> {
         .filter(|s| !s.is_empty() && s != "core")
         .collect();
         if !parts.is_empty() { return Some(ImportKind::Core { path: parts, alias }); }
-    }
-    if path.starts_with("vira") && path.contains(arrow) {
-        let rest = path.splitn(2, arrow).nth(1)?.trim();
-        let (name, ver) = split_name_ver(rest);
-        return Some(ImportKind::Vira { name, version: ver, alias });
     }
     if path.starts_with("github") && path.contains(arrow) {
         let name = path.split(arrow).nth(1)?.trim().to_string();
