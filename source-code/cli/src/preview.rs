@@ -35,8 +35,28 @@ pub fn run(file: Option<PathBuf>) {
         std::process::exit(1);
     }
 
+    let mut module = result.module;
+    let mut resolver = hsharp_compiler::modules::ModuleResolver::new(&src_path);
+    let entry_dir = src_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    match resolver.expand_module(module.items, &entry_dir) {
+        Ok(items) => module.items = items,
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+    // Same `@: mode` file-level directive the LLVM backend applies (see
+    // hsharp_compiler::lib::compile / ast.rs's `apply_file_mem_mode`) —
+    // without this, `hsharp run` and `hsharp build`/`compile` would
+    // disagree about which `MemoryMode` a function without its own
+    // `@mode` annotation ends up with whenever a file used the new
+    // directive, exactly the kind of interpreter/LLVM divergence the
+    // rest of `MemoryMode` handling here already tries to surface rather
+    // than hide.
+    hsharp_parser::ast::apply_file_mem_mode(&mut module);
+
     let mut interp = hsharp_interpreter::Interpreter::new();
-    match interp.run_module(&result.module) {
+    match interp.run_module(&module) {
         Ok(()) => {
             println!("{}", "─".repeat(50).dimmed());
             println!("{} Preview completed.", "✓".green().bold());
