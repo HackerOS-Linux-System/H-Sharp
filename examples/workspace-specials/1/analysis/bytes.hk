@@ -1,0 +1,8 @@
+[package]
+-> name    => analysis
+-> version => 0.8.0
+
+[build]
+-> lang   => rust
+-> entry  => src/main.rs
+-> output => build/libanalysis.so
