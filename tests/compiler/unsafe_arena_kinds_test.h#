@@ -1,0 +1,127 @@
+;; H# `unsafe` arena-kind tests — pool(N) / page / ring(N) / arena(N) /
+;; classic.
+;;
+;; Previously the parser only accepted these as the nested
+;; `arena(fixed|pool|page|ring, N)` sub-form, and even then codegen threw
+;; the requested `kind` away entirely (`Some(UnsafeMode::Arena { size,
+;; .. })`) — every kind compiled to the exact same general bump allocator.
+;; Now the standalone keyword forms the docs always described
+;; (`unsafe pool(N) is...end`, `unsafe page is...end`, `unsafe ring(N)
+;; is...end`, `unsafe classic is...end`) parse directly, `arena(N)` with
+;; a bare integer correctly means the *fixed* (panic-on-overflow) kind
+;; rather than silently being treated as general, and each kind actually
+;; behaves differently at runtime (see core.c's hsh_arena_alloc).
+use "std -> test" from "test"
+
+;; ── arena(N) — fixed capacity, panics on overflow ───────────────────────
+;; (We only exercise the *non*-overflowing path here — deliberately
+;; overflowing would abort the whole test process via hsh_panic, which
+;; isn't something a #[test] can catch. The overflow behavior itself is
+;; a one-line change in hsh_arena_alloc, not something meaningfully
+;; re-verified by a test that can't observe a panic anyway.)
+fn arena_fixed_sum(n: int) -> int is
+    let mut total: int = 0
+    unsafe arena(4096) is
+        let mut i: int = 0
+        while i < n is
+            total = total + i
+            i += 1
+        end
+    end
+    return total
+end
+
+#[test]
+fn test_arena_fixed_within_capacity() is
+    assert_eq(arena_fixed_sum(10), 45)
+end
+
+;; ── pool(N) — uniform chunk-size allocations ─────────────────────────────
+;; Alignment granularity changes (every allocation rounds up to a fixed
+;; chunk size instead of 8 bytes), but that's invisible to program
+;; correctness — this checks ordinary string/array work still produces
+;; the right values when compiled under `pool`.
+fn pool_build_names(count: int) -> string is
+    let mut result: string = ""
+    unsafe pool(65536) is
+        let mut i: int = 0
+        while i < count is
+            result = result + "name_" + to_string(i) + ";"
+            i += 1
+        end
+    end
+    return result
+end
+
+#[test]
+fn test_pool_allocations_correct() is
+    assert_eq(pool_build_names(3), "name_0;name_1;name_2;")
+end
+
+;; ── page — 4096-byte page-aligned allocations ────────────────────────────
+fn page_build_buffer(len: int) -> int is
+    let mut total: int = 0
+    unsafe page is
+        let mut i: int = 0
+        while i < len is
+            total = total + i * i
+            i += 1
+        end
+    end
+    return total
+end
+
+#[test]
+fn test_page_mode_correct() is
+    assert_eq(page_build_buffer(4), 14)   ;; 0 + 1 + 4 + 9
+end
+
+;; ── ring(N) — wraps and overwrites oldest data instead of erroring ───────
+;; The point of this test is specifically that a ring arena *never*
+;; panics or falls back to malloc once its capacity is exceeded — it
+;; just quietly wraps back to the start and keeps going. Looping well
+;; past a tiny capacity and confirming the function still returns a
+;; normal result (rather than crashing) is exactly what distinguishes
+;; `ring` from `fixed` (which would panic in this same situation).
+fn ring_accumulate(iterations: int) -> int is
+    let mut total: int = 0
+    unsafe ring(256) is
+        let mut i: int = 0
+        while i < iterations is
+            let tag: string = "iter_" + to_string(i)   ;; keeps allocating
+            total = total + tag.len()
+            i += 1
+        end
+    end
+    return total
+end
+
+#[test]
+fn test_ring_mode_survives_exceeding_capacity() is
+    ;; 500 small string allocations into a 256-byte ring — guaranteed to
+    ;; wrap around multiple times. A `fixed`-kind arena of the same size
+    ;; would panic; `ring` should complete normally instead.
+    let result: int = ring_accumulate(500)
+    assert_true(result > 0)
+end
+
+;; ── classic — standalone form of `manual(classic)`, libc malloc/free ────
+extern static [c] is
+    fn malloc(size: int) -> int
+    fn free(ptr: int)
+end
+
+fn classic_roundtrip() -> bool is
+    let mut ok: bool = false
+    unsafe classic is
+        let p: int = malloc(64)
+        ok = p != 0
+        free(p)
+    end
+    return ok
+end
+
+#[test]
+fn test_classic_standalone_keyword() is
+    assert_true(classic_roundtrip())
+end
