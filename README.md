@@ -26,7 +26,7 @@ hacker unpack h#-utils    # bytes + h# check/new/targets
 
 ### Manualna
 ```bash
-tar -xzf h-sharp-0.6.0.tar.gz && cd h-sharp-0.6
+tar -xzf h-sharp-0.8.0.tar.gz && cd h-sharp-0.8
 sudo ./install.sh
 # Std library
 sudo cp std/*.h# /usr/lib/HackerOS/H#/std/
@@ -52,10 +52,16 @@ LLVM_SYS_210_PREFIX=/usr/lib/llvm-21 cargo build --release
 # Interpreter — natychmiastowe uruchomienie
 h# preview src/main.h#
 
-# Kompilacja LLVM — produkcyjna binarka
+# Kompilacja LLVM — domyślnie binarka natywna
 h# compile src/main.h#
 h# compile src/main.h# --release -o myapp
 h# compile src/main.h# --target linux-aarch64
+
+# --emit: kontrola rodzaju artefaktu
+h# compile src/main.h#               # -> binarka (domyślnie)
+h# compile src/main.h# --emit obj    # -> plik .o (obiekt)
+h# compile src/main.h# --emit so     # -> biblioteka .so/.dylib
+h# compile src/main.h# --emit lib    # -> archiwum statyczne .a
 
 # Sprawdź składnię i typy
 h# check src/main.h#
@@ -434,4 +440,4 @@ Poniższe punkty były w poprzedniej liście "znanych ograniczeń" i zostały **
 
 ## Licencja
 
-Apache 2.0 — HackerOS Team
+MPL 2.0 — HackerOS Team
