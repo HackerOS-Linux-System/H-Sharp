@@ -1,0 +1,185 @@
+;; H# `@` memory-mode tests — @arena / @arc / @pointers / @safety.
+;;
+;; Previously none of these four annotations had any test coverage at
+;; all (zero files under tests/ or examples/ exercised them), so a
+;; regression in any of them — codegen, the typechecker's mem-mode
+;; gate, or the interpreter's parity notes — could land silently.
+;; These are LLVM-backend-only features (see mem_modes_interpreter_
+;; parity below for the one thing that's deliberately cross-backend),
+;; so they only really prove themselves under `hsharp build`, not
+;; `hsharp run` — but the tests themselves are plain H# and the test
+;; runner works the same way either way.
+use "std -> test" from "test"
+
+;; ── @arena ───────────────────────────────────────────────────────────────
+;; Everything this function allocates comes from a fresh bump-allocator
+;; arena that's freed in one shot on every exit path (see codegen.rs's
+;; `emit_arena_epilogue`). Observably identical to @default — the point
+;; is the *allocation strategy*, not a different result — so the test
+;; just confirms normal array/string work still produces correct values
+;; when compiled under @arena.
+
+@arena
+fn arena_sum(n: int) -> int is
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < n is
+        total = total + i
+        i += 1
+    end
+    return total
+end
+
+@arena
+fn arena_build_greeting(name: string) -> string is
+    let greeting: string = "Hello, " + name + "!"
+    return greeting
+end
+
+#[test]
+fn test_arena_basic_arithmetic() is
+    assert_eq(arena_sum(5), 10)
+    assert_eq(arena_sum(0), 0)
+end
+
+#[test]
+fn test_arena_string_alloc() is
+    assert_eq(arena_build_greeting("H#"), "Hello, H#!")
+end
+
+;; ── @arc ─────────────────────────────────────────────────────────────────
+;; `arc_alloc(n)` actually allocates a real refcounted `n`-byte block now
+;; (previously `hsh_rc_alloc` was declared but never callable from H# at
+;; all — see codegen.rs's history comment on the `arc_alloc` builtin).
+;; `let x = arc_alloc(n)` / `let y = x` at a function's top level are
+;; retained/released for you automatically; this test also exercises the
+;; manual `arc_retain`/`arc_release`/`arc_count` builtins directly to
+;; check the atomic bookkeeping itself, independent of the automatic
+;; tracking.
+
+@arc
+fn arc_roundtrip_i64(val: int) -> int is
+    let buf = arc_alloc(8)
+    ptr_write_i64(buf, 0, val)
+    let read_back: int = ptr_read_i64(buf, 0)
+    arc_release(buf)
+    return read_back
+end
+
+#[test]
+fn test_arc_alloc_and_rw() is
+    assert_eq(arc_roundtrip_i64(42), 42)
+    assert_eq(arc_roundtrip_i64(-7), -7)
+end
+
+#[test]
+fn test_arc_manual_retain_release_count() is
+    let buf = arc_alloc(8)
+    assert_eq(arc_count(buf), 1)
+    arc_retain(buf)
+    assert_eq(arc_count(buf), 2)
+    arc_release(buf)
+    assert_eq(arc_count(buf), 1)
+    arc_release(buf)
+end
+
+;; ── @pointers ────────────────────────────────────────────────────────────
+;; Basic v2: typed read/write at every common width, not just i64 (see
+;; core.c's hsh_ptr_{read,write}_{i8,i16,i32,i64,f32,f64,ptr}). Allocates
+;; a plain raw buffer with `arc_alloc` just to get an addressable pointer
+;; to test against — @pointers itself doesn't care how the pointer was
+;; obtained, only what you do with it once you have one.
+
+@pointers
+fn pointers_roundtrip_widths() -> bool is
+    let buf = arc_alloc(32)
+
+    ptr_write_i8(buf, 0, 127)
+    ptr_write_i16(buf, 2, 30000)
+    ptr_write_i32(buf, 4, 70000)
+    ptr_write_i64(buf, 8, 9000000000)
+    ptr_write_f64(buf, 16, 3.5)
+
+    let ok: bool =
+        ptr_read_i8(buf, 0) == 127 &&
+        ptr_read_i16(buf, 2) == 30000 &&
+        ptr_read_i32(buf, 4) == 70000 &&
+        ptr_read_i64(buf, 8) == 9000000000 &&
+        ptr_read_f64(buf, 16) == 3.5
+
+    arc_release(buf)
+    return ok
+end
+
+@pointers
+fn pointers_is_null_and_add() -> bool is
+    let buf = arc_alloc(16)
+    let offset_ptr = ptr_add(buf, 8)
+    ptr_write_i64(offset_ptr, 0, 99)
+    let ok: bool = !ptr_is_null(buf) && ptr_read_i64(buf, 8) == 99
+    arc_release(buf)
+    return ok
+end
+
+#[test]
+fn test_pointers_typed_widths() is
+    assert_true(pointers_roundtrip_widths())
+end
+
+#[test]
+fn test_pointers_add_and_null_check() is
+    assert_true(pointers_is_null_and_add())
+end
+
+;; A `@default` function using an `unsafe is ... end` block gets the same
+;; access as a `@pointers` function for the scope of that block (see
+;; typechecker.rs's §13 mem-mode gate) — this is the "scoped unsafe"
+;; escape hatch rather than annotating the whole function.
+fn unsafe_block_scoped_pointer_access() -> int is
+    let mut result: int = 0
+    unsafe is
+        let buf = arc_alloc(8)
+        ptr_write_i64(buf, 0, 123)
+        result = ptr_read_i64(buf, 0)
+        arc_release(buf)
+    end
+    return result
+end
+
+#[test]
+fn test_unsafe_block_scopes_pointer_access() is
+    assert_eq(unsafe_block_scoped_pointer_access(), 123)
+end
+
+;; ── @safety ──────────────────────────────────────────────────────────────
+;; @safety never blocks compilation (see codegen.rs's check_moves_basic) —
+;; it only ever warns to stderr. This is a smoke test that ordinary,
+;; move-safe code under @safety still compiles and produces correct
+;; results, i.e. the annotation is harmless when there's nothing to warn
+;; about. (The move-after-use warning itself is intentionally not
+;; something a #[test] can assert on — it's advisory stderr output, not
+;; part of the program's return value or a caught runtime error.)
+
+@safety
+fn safety_no_move_issue(a: string, b: string) -> string is
+    let combined: string = a + b
+    return combined
+end
+
+@safety
+fn safety_moved_then_reused_in_branch(flag: bool) -> string is
+    let s: string = "owned"
+    let moved_into: string = s
+    if flag is
+        return moved_into
+    else is
+        return "fallback"
+    end
+end
+
+#[test]
+fn test_safety_mode_compiles_and_runs() is
+    assert_eq(safety_no_move_issue("foo", "bar"), "foobar")
+    assert_eq(safety_moved_then_reused_in_branch(true), "owned")
+    assert_eq(safety_moved_then_reused_in_branch(false), "fallback")
+end
