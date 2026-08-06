@@ -22,14 +22,11 @@ pub enum TokenKind {
     // Identifiers & keywords
     Ident(String),
     // Keywords
-    Fn, Let, Mut, If, Else, Elsif, While, For, In,
+    Fn, Let, Mut, If, Else, Elsif, While, Loop, For, In,
     Return, Use, From, Pub, Struct, Enum, Impl, Trait,
     Match, Is, End, Then, Type, As, Self_, New,
     Break, Continue, Unsafe, Extern, Mod, Async, Await,
     Arena, Manual, Write, Using,
-    // Directives
-    Directive(String),
-    FastDirective(String),
     // Doc / block comments
     DocComment(String),
     BlockCommentStart,
@@ -433,6 +430,7 @@ impl Lexer {
             "else"     => TokenKind::Else,
             "elsif"    => TokenKind::Elsif,
             "while"    => TokenKind::While,
+            "loop"     => TokenKind::Loop,
             "for"      => TokenKind::For,
             "in"       => TokenKind::In,
             "return"   => TokenKind::Return,
@@ -601,35 +599,6 @@ impl Lexer {
                     match self.read_string(start) {
                         Ok(t)  => tokens.push(t),
                         Err(e) => errors.push(e),
-                    }
-                }
-
-                // Directives ~ / ~~
-                Some('~') => {
-                    self.advance();
-                    let is_fast = self.current() == Some('~');
-                    if is_fast { self.advance(); }
-                    self.skip_whitespace_no_newline();
-                    if self.current() == Some('"') {
-                        self.advance();
-                        let s_start = self.position();
-                        match self.read_string(s_start) {
-                            Ok(t) => {
-                                if let TokenKind::StringLit(s) = t.kind {
-                                    let kind = if is_fast {
-                                        TokenKind::FastDirective(s.clone())
-                                    } else {
-                                        TokenKind::Directive(s.clone())
-                                    };
-                                    tokens.push(Token::new(
-                                        kind,
-                                        Span::new(start, self.position(), self.file.clone()),
-                                                           s,
-                                    ));
-                                }
-                            }
-                            Err(e) => errors.push(e),
-                        }
                     }
                 }
 
