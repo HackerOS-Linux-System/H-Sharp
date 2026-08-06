@@ -61,9 +61,23 @@ pub enum Command {
         #[arg(long = "emit-ir")]
         emit_ir: bool,
 
+        /// Emit kind: bin (default), obj (.o), so (.so/.dylib/.dll), lib (.a)
+        /// Example: h# compile src/main.h# --emit so
+        #[arg(long = "emit", value_name = "KIND")]
+        emit_kind: Option<String>,
+
         /// Print every compilation step
         #[arg(short, long)]
         verbose: bool,
+
+        /// Project-wide default MemoryMode fallback (weaker than a
+        /// function's own @mode and weaker than its file's `@: mode`
+        /// directive — see CompileOptions::default_mem_mode). Mainly set
+        /// by the `bytes` package manager from `bytes.hk`'s `mem_mode`
+        /// key, not typed by hand.
+        /// Valid: default, safety, arc, arena, pointers
+        #[arg(long = "mem-mode", value_name = "MODE")]
+        mem_mode: Option<String>,
     },
 
     /// Preview / interpret a file without compiling
@@ -86,14 +100,17 @@ pub enum Command {
 
     /// List available cross-compilation targets
     Targets,
+
+    /// Open the H# documentation in your browser
+    Docs,
 }
 
 fn main() {
     print_banner();
     let cli = Cli::parse();
     match cli.command {
-        Command::Compile { file, output, target, release, no_opt, debug, dynamic, emit_ir, verbose } =>
-        compile::run(file, output, target, release, no_opt, debug, dynamic, emit_ir, verbose),
+        Command::Compile { file, output, target, release, no_opt, debug, dynamic, emit_ir, emit_kind, verbose, mem_mode } =>
+        compile::run(file, output, target, release, no_opt, debug, dynamic, emit_ir, emit_kind, verbose, mem_mode),
         Command::Preview { file }  => preview::run(Some(file)),
         Command::Check { files }   => check::run_multi(files),
         Command::New { name, template } => new::run(name, template),
@@ -104,11 +121,42 @@ fn main() {
             }
             println!("\n{}", "Usage: h# compile --target linux-aarch64 src/main.h#".dimmed());
         }
+        Command::Docs => open_docs(),
+    }
+}
+
+/// Open the H# documentation site in the user's default browser. Tries,
+/// in order: `termux-open-url` (Termux has no real desktop/xdg session —
+/// this is its own opener that hands the URL to whatever browser app is
+/// installed on the phone), `xdg-open` (Linux desktop), `open` (macOS),
+/// `cmd /c start` (Windows). Falls back to just printing the URL if none
+/// of those exist or the launch fails, so the person can still get there.
+fn open_docs() {
+    const DOCS_URL: &str = "https://hackeros-linux-system.github.io/HackerOS-Website/h-sharp/docs.html";
+
+    let opened = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd").args(["/c", "start", DOCS_URL]).status()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(DOCS_URL).status()
+    } else if std::env::var_os("TERMUX_VERSION").is_some() {
+        std::process::Command::new("termux-open-url").arg(DOCS_URL).status()
+    } else {
+        std::process::Command::new("xdg-open").arg(DOCS_URL).status()
+    };
+
+    match opened {
+        Ok(status) if status.success() => {
+            println!("{} {}", "Opened docs:".green().bold(), DOCS_URL.dimmed());
+        }
+        _ => {
+            println!("{}", "Couldn't open a browser automatically. Docs are here:".yellow());
+            println!("  {}", DOCS_URL.cyan().underline());
+        }
     }
 }
 
 fn print_banner() {
-    println!("{}", "  h# v0.8  —  HackerOS-first compiled language  (LLVM backend)".cyan().bold());
+    println!("{}", "  H# v0.8  LLVM backend".cyan().bold());
     println!();
 }
 
