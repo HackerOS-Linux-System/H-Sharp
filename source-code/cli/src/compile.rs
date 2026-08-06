@@ -4,21 +4,23 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use hsharp_compiler::{
-    compile, CompileOptions, TargetTriple,
+    compile, CompileOptions, OutputKind, TargetTriple,
     ffi_linker,
 };
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    file:     PathBuf,
-    output:   Option<String>,
-    target:   Option<String>,
-    release:  bool,
-    no_opt:   bool,
-    debug:    bool,
-    dynamic:  bool,
-    emit_ir:  bool,
-    verbose:  bool,
+    file:      PathBuf,
+    output:    Option<String>,
+    target:    Option<String>,
+    release:   bool,
+    no_opt:    bool,
+    debug:     bool,
+    dynamic:   bool,
+    emit_ir:   bool,
+    emit_kind: Option<String>,
+    verbose:   bool,
+    mem_mode:  Option<String>,
 ) {
     let t0 = Instant::now();
 
@@ -44,9 +46,48 @@ pub fn run(
         TargetTriple::host()
     };
 
+    // ── Output kind (--emit flag) ────────────────────────────────────────────
+    let output_kind = if let Some(ref kind_str) = emit_kind {
+        match OutputKind::from_str(kind_str) {
+            Some(k) => k,
+            None => {
+                eprintln!(
+                    "{} unknown --emit kind `{}`. Valid: bin, obj, so, lib",
+                    "Error:".red().bold(), kind_str
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        OutputKind::Binary
+    };
+
     // ── Flags ───────────────────────────────────────────────────────────────
-    let optimize  = release && !no_opt;
+    let optimize    = release && !no_opt;
     let static_link = !dynamic;
+
+    // ── --mem-mode (project-wide MemoryMode fallback) ────────────────────────
+    // See `CompileOptions::default_mem_mode`'s doc comment: this is the
+    // weakest of the three ways a function ends up with a `MemoryMode` —
+    // its own `@mode` annotation wins, then its file's `@: mode`
+    // directive, then finally this flag. Mainly meant to be set by the
+    // `bytes` package manager reading a `mem_mode` key out of `bytes.hk`,
+    // not typed by hand very often.
+    let default_mem_mode = match mem_mode.as_deref() {
+        None => None,
+        Some("default")  => Some(hsharp_parser::ast::MemoryMode::Default),
+        Some("safety")   => Some(hsharp_parser::ast::MemoryMode::Safety),
+        Some("arc")      => Some(hsharp_parser::ast::MemoryMode::Arc),
+        Some("arena")    => Some(hsharp_parser::ast::MemoryMode::Arena),
+        Some("pointers") => Some(hsharp_parser::ast::MemoryMode::Pointers),
+        Some(other) => {
+            eprintln!(
+                "{} unknown --mem-mode `{}`. Valid: default, safety, arc, arena, pointers",
+                "Error:".red().bold(), other
+            );
+            std::process::exit(1);
+        }
+    };
 
     let opts = CompileOptions {
         target:      triple.clone(),
@@ -54,6 +95,8 @@ pub fn run(
         static_link,
         debug_info:  debug,
         output:      out_path.clone(),
+        output_kind: output_kind.clone(),
+        default_mem_mode,
     };
 
     if verbose {
@@ -91,12 +134,35 @@ pub fn run(
     }
     pb2.finish_with_message(format!("{} Parsed", "✓".green()));
 
+    // ── Resolve `mod X` declarations ─────────────────────────────────────────
+    // `mod cli` (etc.) previously did nothing: ModuleResolver::expand_module
+    // existed in modules.rs but was never called anywhere in the pipeline, so
+    // every item declared in a submodule file was silently absent from the
+    // compiled program — any function in it would fail later as
+    // "undefined fn: ..." with no indication the real problem was an
+    // unresolved `mod` declaration. Expand submodules into the top-level
+    // module's item list right after parsing, before anything downstream
+    // (typecheck/codegen) ever sees it.
+    let mut module = parsed.module.clone();
+    {
+        let mut resolver = hsharp_compiler::modules::ModuleResolver::new(src_path);
+        let entry_dir = src_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        match resolver.expand_module(module.items, entry_dir) {
+            Ok(items) => module.items = items,
+            Err(e) => {
+                pb2.finish_and_clear();
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // ── --emit-ir: dump IR and exit ─────────────────────────────────────────
     if emit_ir {
         let pb_ir = crate::make_spinner("Building LLVM IR…");
         let cg = hsharp_compiler::codegen::LlvmCodegen::new(&opts)
         .unwrap_or_else(|e| { eprintln!("{} {}", "Error:".red().bold(), e); std::process::exit(1); });
-        match cg.compile_to_ir(&parsed.module) {
+        match cg.compile_to_ir(&module) {
             Ok(ir) => {
                 pb_ir.finish_with_message(format!("{} IR generated", "✓".green()));
                 println!("{}", ir);
@@ -117,7 +183,7 @@ pub fn run(
     // It prints diagnostics (TYPE ERROR boxes) via print_diagnostics before
     // returning Err(Diagnostics(_)).
     let pb3 = crate::make_spinner("Compiling (LLVM)…");
-    match compile(&parsed.module, &source, &opts) {
+    match compile(&module, &source, &opts) {
         Ok(()) => {
             pb3.finish_with_message(format!("{} Compiled", "✓".green()));
         }
@@ -135,7 +201,13 @@ pub fn run(
     }
 
     // ── Summary ─────────────────────────────────────────────────────────────
-    let bin = format!("{}{}", out_path, triple.exe_suffix());
+    let artifact_suffix = match output_kind {
+        OutputKind::Binary    => triple.exe_suffix().to_string(),
+        OutputKind::Object    => ".o".to_string(),
+        OutputKind::SharedLib => output_kind.file_suffix(&triple).to_string(),
+        OutputKind::StaticLib => ".a".to_string(),
+    };
+    let bin = format!("{}{}", out_path, artifact_suffix);
     let elapsed = t0.elapsed();
 
     // Show extern link flags if any
@@ -144,7 +216,13 @@ pub fn run(
 
     println!();
     println!("{}", "─".repeat(54).dimmed());
-    println!("  {} {}", "Binary:  ".bold(), bin.cyan());
+    let artifact_label = match output_kind {
+        OutputKind::Binary    => "Binary:  ",
+        OutputKind::Object    => "Object:  ",
+        OutputKind::SharedLib => "SharedLib:",
+        OutputKind::StaticLib => "StaticLib:",
+    };
+    println!("  {} {}", artifact_label.bold(), bin.cyan());
     println!("  {} {}", "Target:  ".bold(), triple.llvm_triple);
     println!("  {} {}", "Backend: ".bold(), "LLVM (h# v0.8)".green());
     println!("  {} {}", "Mode:    ".bold(), if optimize { "release (O3 + LTO)".yellow().to_string() } else { "debug (O0)".dimmed().to_string() });
