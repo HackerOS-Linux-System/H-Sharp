@@ -29,8 +29,7 @@ pub enum ImportKind {
     Std { path: Vec<String>, alias: Option<String> },
     /// use "core -> runtime" from "alias"
     Core { path: Vec<String>, alias: Option<String> },
-    /// use "vira -> pkgname" or "vira -> pkgname/1.2" from "alias"
-    Vira { name: String, version: Option<String>, alias: Option<String> },
+
     /// use "github -> libname" from "alias"
     Github { name: String, alias: Option<String> },
     /// use "python -> numpy" from "np"
@@ -170,6 +169,55 @@ impl Expr {
             Expr::Path(_, s)                   => s,
         }
     }
+
+    /// Overwrites every span in this expression (and, recursively, every
+    /// sub-expression) with `new_span`. Used by `parse_interpolated_string`
+    /// (see parser.rs): a `{expr}` interpolation marker's contents are
+    /// parsed by re-running the whole parser on a small synthesized
+    /// snippet (`fn __interp__() is return {expr} end`) in a fake file
+    /// called `"<interp>"`, so every span in the resulting tree pointed at
+    /// that fake file and a made-up line/column relative to the snippet —
+    /// completely disconnected from where the string literal actually
+    /// lives. Any error surfaced later against one of those spans (e.g.
+    /// "undefined var" — see codegen.rs) showed `<interp>:2:12` instead of
+    /// the real file, which is close to useless for tracking the bug down
+    /// in a real multi-file project. Remapping every span in the parsed-
+    /// out sub-expression back to the original string literal's real span
+    /// isn't perfectly precise (it points at the start of the whole string
+    /// literal, not the exact character offset inside it), but "the right
+    /// file, roughly the right line" is a large improvement over "a file
+    /// that doesn't exist".
+    pub fn remap_span(&mut self, new_span: &Span) {
+        match self {
+            Expr::Literal(_, s) | Expr::Ident(_, s) | Expr::FieldAccess(_, _, s) |
+            Expr::MethodCall(_, _, _, s) | Expr::Call(_, _, s) | Expr::StructLit(_, _, s) |
+            Expr::ArrayLit(_, s) | Expr::TupleLit(_, s) | Expr::Cast(_, _, s) |
+            Expr::Unsafe(_, _, s) | Expr::Return(_, s) | Expr::SelfExpr(s) |
+            Expr::Try(_, s) | Expr::Await(_, s) | Expr::Path(_, s) => *s = new_span.clone(),
+            Expr::BinOp(l, _, r, s) => { l.remap_span(new_span); r.remap_span(new_span); *s = new_span.clone(); }
+            Expr::UnOp(_, e, s) => { e.remap_span(new_span); *s = new_span.clone(); }
+            Expr::Assign(l, r, s) | Expr::CompoundAssign(l, _, r, s) => {
+                l.remap_span(new_span); r.remap_span(new_span); *s = new_span.clone();
+            }
+            Expr::IndexAccess(a, b, s) | Expr::Range(a, b, _, s) => {
+                a.remap_span(new_span); b.remap_span(new_span); *s = new_span.clone();
+            }
+            Expr::If { condition, span, .. } => { condition.remap_span(new_span); *span = new_span.clone(); }
+            Expr::Match { subject, span, .. } => { subject.remap_span(new_span); *span = new_span.clone(); }
+            Expr::While { condition, span, .. } => { condition.remap_span(new_span); *span = new_span.clone(); }
+            Expr::For { iterable, span, .. } => { iterable.remap_span(new_span); *span = new_span.clone(); }
+            Expr::Do { span, .. } | Expr::Closure { span, .. } => { *span = new_span.clone(); }
+        }
+        // Note: nested `Vec<Expr>`/`Vec<Stmt>` bodies (function-call args,
+        // struct/array literal fields, if/while/for/match/closure bodies)
+        // are intentionally left unremapped here — interpolation content
+        // that goes this deep (a whole `if`/`match`/closure inline inside
+        // `{...}`) is already an unusual edge case, and remapping every
+        // statement in a block recursively would need a second traversal
+        // over `Stmt` too. The common case (a bare variable, a field
+        // access, a simple binary expression, a single function call —
+        // exactly what triggered this bug) is fully covered.
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,6 +318,34 @@ pub enum AttrArg {
     Lit(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MemoryMode {
+    /// No `@...` annotation written at all (or explicit `@default`): the
+    /// language's current memory behavior — plain heap allocation, no
+    /// automatic reclamation. Kept as the literal default so every
+    /// existing FnDef construction site that doesn't care about memory
+    /// modes can just use `..Default::default()`/derive without changes.
+    #[default]
+    Default,
+    /// `@safety` — reserved for a future Rust-inspired ownership/borrow
+    /// checker (a compile-time, zero-runtime-cost static analysis, not a
+    /// runtime allocation strategy). Parses today; codegen treats it
+    /// identically to `Default` and emits a heads-up that it isn't
+    /// implemented yet.
+    Safety,
+    /// `@arc` — reserved for a future atomic-refcounting mode. Parses
+    /// today; not yet implemented in codegen (behaves like `Default`).
+    Arc,
+    /// `@arena` — bump-allocates everything created during this
+    /// function's call into a single arena, freed in one shot on every
+    /// exit path. Implemented — see `compile_fn`/`build_return_coerced`.
+    Arena,
+    /// `@pointers` — reserved for a future "modern raw pointers, still
+    /// trusts the programmer" mode. Parses today; not yet implemented
+    /// (behaves like `Default`).
+    Pointers,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FnDef {
     pub attrs:       Vec<Attribute>,
@@ -281,6 +357,7 @@ pub struct FnDef {
     pub pub_:        bool,
     pub is_unsafe:   bool,
     pub is_async:    bool,
+    pub mem_mode:    MemoryMode,
     pub span:        Span,
 }
 
@@ -363,26 +440,53 @@ pub struct ImplBlock {
 
 // ─── Module ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Directive {
-    pub kind:  DirectiveKind,
-    pub value: String,
-    pub span:  Span,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum DirectiveKind {
-    Dynamic,
-    Fast,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     pub file:       String,
     pub edition:    Option<String>,
-    pub directives: Vec<Directive>,
+    /// File-level `@: safety`/`@: arc`/`@: arena`/`@: pointers`/`@: default`
+    /// directive (see `parse_module`'s handling of it, and
+    /// `apply_file_mem_mode` below) — sets the default `MemoryMode` for
+    /// every function in this file that doesn't carry its own `@mode`
+    /// annotation, instead of having to write `@mode` above every single
+    /// `fn`. A function-level `@mode` annotation always wins over this
+    /// when both are present (the file default only fills in functions
+    /// that were left at `MemoryMode::Default`, i.e. had no annotation
+    /// of their own).
+    pub file_mem_mode: Option<MemoryMode>,
     pub items:      Vec<Item>,
     pub imports:    Vec<(ImportKind, Option<String>, Span)>,
+}
+
+/// Applies `module.file_mem_mode` (see its doc comment) to every function
+/// in the module — top-level `fn`s and `impl` methods alike — that's
+/// still at `MemoryMode::Default`, i.e. wasn't given its own `@mode`.
+/// A no-op if the file has no `@: mode` directive. Called once, right
+/// after parsing, from both the LLVM pipeline (`lib.rs::compile`) and the
+/// interpreter (`interp.rs::run_module`/`run_module_register_only`) so
+/// the directive has identical effect in both backends.
+pub fn apply_file_mem_mode(module: &mut Module) {
+    let Some(mode) = module.file_mem_mode else { return; };
+    for item in &mut module.items {
+        apply_file_mem_mode_item(item, mode);
+    }
+}
+
+pub fn apply_file_mem_mode_item(item: &mut Item, mode: MemoryMode) {
+    match item {
+        Item::FnDef(f) => {
+            if f.mem_mode == MemoryMode::Default { f.mem_mode = mode; }
+        }
+        Item::ImplBlock(imp) => {
+            for method in &mut imp.methods {
+                if method.mem_mode == MemoryMode::Default { method.mem_mode = mode; }
+            }
+        }
+        Item::ModDecl { inline: Some(items), .. } => {
+            for sub in items { apply_file_mem_mode_item(sub, mode); }
+        }
+        _ => {}
+    }
 }
 
 // ─── Extern ───────────────────────────────────────────────────────────────────
@@ -404,9 +508,38 @@ pub enum ExternLang {
     /// extern [python, "numpy"] is ... end
     /// Functions declared here are called via an embedded/subprocess
     /// CPython bridge (see hsh_py_eval / hsh_py_call in the runtime).
-    /// Replaces the older `use "python -> numpy" from "np"` form, which
-    /// only installed the pip package but had no defined call ABI.
     Python,
+}
+
+impl ExternLang {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "c"                    => Some(ExternLang::C),
+            "rust"                 => Some(ExternLang::Rust),
+            "c++" | "cpp" | "cxx" => Some(ExternLang::Cpp),
+            "python" | "py"        => Some(ExternLang::Python),
+            _                      => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExternLang::C      => "c",
+            ExternLang::Rust   => "rust",
+            ExternLang::Cpp    => "c++",
+            ExternLang::Python => "python",
+        }
+    }
+
+    /// C ABI — these can be directly linked with cc/ld.
+    pub fn is_c_abi(&self) -> bool {
+        matches!(self, ExternLang::C | ExternLang::Rust | ExternLang::Cpp)
+    }
+
+    /// Python bridge — called via subprocess/CPython, not direct link.
+    pub fn is_python_bridge(&self) -> bool {
+        matches!(self, ExternLang::Python)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
