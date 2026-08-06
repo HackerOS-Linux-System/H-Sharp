@@ -4,6 +4,7 @@ members = [
     "source-code/compiler", # Requires: llvm-21-dev libpolly-21-dev (apt.llvm.org/unstable)
     "source-code/cli",
     "source-code/interpreter",
+    "source-code/playground",
 ]
 resolver = "2"
 
