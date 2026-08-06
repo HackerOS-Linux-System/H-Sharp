@@ -11,11 +11,22 @@
 #include <math.h>
 #include <netdb.h>
 #include <sys/socket.h>
+
+/* Global argc/argv storage — written by the H# main() entry point
+ * (codegen emits: _hsh_argc = argc; _hsh_argv = argv;)
+ * and read by hsh_env_args() so user code can call env::args().     */
+int   _hsh_argc = 0;
+char **_hsh_argv = NULL;
+
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 typedef const char* hsh_string;
 typedef int64_t     hsh_int;
+
+/* Forward decl: arena-aware allocator, defined down in the Arena section,
+ * but needed by hsh_strcat which comes first in the file. */
+static void* hsh_alloc(uint64_t n);
 typedef double      hsh_float;
 
 /* ── Core I/O ────────────────────────────────────────────────────────────── */
@@ -44,7 +55,7 @@ char* hsh_strcat(hsh_string a, hsh_string b) {
     if (!a) a = "";
     if (!b) b = "";
     size_t la = strlen(a), lb = strlen(b);
-    char* out = (char*)malloc(la + lb + 1);
+    char* out = (char*)hsh_alloc(la + lb + 1);
     if (!out) return (char*)"";
     memcpy(out, a, la);
     memcpy(out + la, b, lb);
@@ -71,24 +82,188 @@ void hsh_array_free(void* arr)     { if (arr) free(arr); }
 void hsh_struct_free(void* ptr)    { if (ptr) free(ptr); }
 
 /* ── Arena ────────────────────────────────────────────────────────────────── */
-typedef struct { uint8_t* base; uint64_t cap; uint64_t used; } HshArena;
+/* `kind` mirrors the parser's `ArenaKind` (see ast.rs) as a plain tag so this
+ * header doesn't need to depend on Rust enum layout:
+ *   0 = General — malloc-fallback on exhaustion, 8-byte alignment (default).
+ *   1 = Fixed   — PANICS on exhaustion instead of falling back to malloc;
+ *                 for "I know the exact upper bound and never want to
+ *                 silently degrade to a regular heap allocation" call sites.
+ *   2 = Pool    — allocations are rounded up to HSH_ARENA_POOL_CHUNK-byte
+ *                 chunks, so every allocation in the pool is a uniform
+ *                 size — good for many same-shaped small allocations.
+ *   3 = Page    — allocations are rounded up to 4096-byte page boundaries,
+ *                 for mmap/DMA/kernel-interface-style buffers.
+ *   4 = Ring    — on exhaustion, wraps back around to the start of the
+ *                 buffer instead of falling back to malloc, silently
+ *                 overwriting the oldest data — for capture buffers, ring
+ *                 logs, streaming, where "keep only the most recent N
+ *                 bytes" is exactly the desired behavior. */
+#define HSH_ARENA_KIND_GENERAL 0
+#define HSH_ARENA_KIND_FIXED   1
+#define HSH_ARENA_KIND_POOL    2
+#define HSH_ARENA_KIND_PAGE    3
+#define HSH_ARENA_KIND_RING    4
+#define HSH_ARENA_POOL_CHUNK   64
+#define HSH_ARENA_PAGE_SIZE    4096
 
-HshArena* hsh_arena_new(uint64_t cap) {
+typedef struct { uint8_t* base; uint64_t cap; uint64_t used; int64_t kind; } HshArena;
+
+/* Thread-local stack of "current" arenas, so nested @arena function calls
+ * compose correctly (LIFO): each @arena function pushes its own arena on
+ * entry and pops+frees it on every exit path, and arena-aware allocators
+ * (hsh_array_new, hsh_struct_new, hsh_strcat, ...) always allocate from
+ * whichever arena is topmost right now — or fall back to plain malloc if
+ * none is active, which is the vast majority of H# code today. */
+#define HSH_ARENA_STACK_MAX 64
+static __thread HshArena* hsh_arena_stack[HSH_ARENA_STACK_MAX];
+static __thread int       hsh_arena_stack_top = 0;
+
+/* `kind` was previously parsed (see ast.rs's `ArenaKind`) but never once
+ * read anywhere in codegen.rs or here — `arena(pool, N)`, `arena(page, N)`
+ * and `arena(ring, N)` all silently compiled to the exact same bump
+ * allocator as plain `arena(N)`, so the documented per-kind semantics
+ * (equal-size pool chunks, page alignment, overwrite-oldest ring, panic-
+ * on-overflow fixed) didn't actually exist at runtime. This constructor
+ * plus the kind-aware logic in `hsh_arena_alloc` below is what makes each
+ * kind behave differently for real. */
+HshArena* hsh_arena_new_kind(uint64_t cap, int64_t kind) {
     HshArena* a = (HshArena*)malloc(sizeof(HshArena));
     if (!a) return NULL;
     a->base = (uint8_t*)malloc(cap);
     a->cap  = cap;
     a->used = 0;
+    a->kind = kind;
     return a;
 }
+/* Plain `hsh_arena_new` is always General-kind — this is what every
+ * `@arena`-annotated *function* prologue calls (the `@arena` annotation
+ * itself has no kind syntax, only `unsafe arena(kind, N) is...end` /
+ * `unsafe pool(N) is...end`/etc *blocks* do — see codegen.rs). */
+HshArena* hsh_arena_new(uint64_t cap) {
+    return hsh_arena_new_kind(cap, HSH_ARENA_KIND_GENERAL);
+}
 void* hsh_arena_alloc(HshArena* a, uint64_t n) {
-    uint64_t aligned = (n + 7) & ~7ULL;
-    if (!a || a->used + aligned > a->cap) { fprintf(stderr, "H# arena OOM\n"); exit(1); }
+    if (!a) return malloc(n);
+    uint64_t align = 8;
+    if (a->kind == HSH_ARENA_KIND_POOL) align = HSH_ARENA_POOL_CHUNK;
+    else if (a->kind == HSH_ARENA_KIND_PAGE) align = HSH_ARENA_PAGE_SIZE;
+    uint64_t aligned = (n + (align - 1)) & ~(align - 1);
+
+    if (a->used + aligned > a->cap) {
+        if (a->kind == HSH_ARENA_KIND_FIXED) {
+            /* `arena(N)` / `arena(fixed, N)`: the whole point of asking for
+             * an exact fixed capacity is to know for certain you'll never
+             * silently spill onto the regular heap — so exceeding it is a
+             * hard error, not a graceful degrade. */
+            hsh_panic("arena(fixed) capacity exceeded — allocation would overflow the fixed-size arena");
+        }
+        if (a->kind == HSH_ARENA_KIND_RING && aligned <= a->cap) {
+            /* Wrap around and overwrite the oldest data instead of
+             * growing or falling back to malloc — this is the one kind
+             * where "exhausted" isn't an error at all, it's the normal
+             * steady state once the buffer has filled up once. */
+            a->used = 0;
+        } else {
+            /* General/Pool/Page (or a Ring request bigger than the whole
+             * buffer): degrade gracefully to a regular heap allocation
+             * rather than aborting the process. Note the returned pointer
+             * isn't necessarily arena memory even when an arena is active;
+             * see the caution on hsh_array_free etc. below about not
+             * blindly free()-ing arena-backed allocations. */
+            return malloc(n);
+        }
+    }
     void* p = a->base + a->used;
     a->used += aligned;
     return p;
 }
 void hsh_arena_free(HshArena* a) { if (a) { free(a->base); free(a); } }
+
+/* Push `a` as the current arena for this thread (emitted at the entry of
+ * every `@arena`-annotated function). Past HSH_ARENA_STACK_MAX levels of
+ * nesting this silently stops tracking (new allocations fall back to
+ * malloc) rather than overflowing the stack array — @arena nesting that
+ * deep would be unusual, and degrading gracefully beats corrupting
+ * memory. */
+void hsh_arena_push_current(HshArena* a) {
+    if (hsh_arena_stack_top < HSH_ARENA_STACK_MAX) {
+        hsh_arena_stack[hsh_arena_stack_top++] = a;
+    }
+}
+/* Pop and return the current arena (the one this @arena function pushed
+ * on entry), restoring whatever was active before it. The codegen'd
+ * epilogue is expected to hsh_arena_free() the returned pointer itself
+ * right after popping it — that single free() is what reclaims
+ * everything the function bump-allocated during its call. */
+HshArena* hsh_arena_pop_current(void) {
+    if (hsh_arena_stack_top > 0) {
+        return hsh_arena_stack[--hsh_arena_stack_top];
+    }
+    return NULL;
+}
+/* Current arena, or NULL if none is active. Internal — consulted by
+ * arena-aware allocators below via hsh_alloc(), not called directly from
+ * codegen. */
+static HshArena* hsh_arena_current(void) {
+    return hsh_arena_stack_top > 0 ? hsh_arena_stack[hsh_arena_stack_top - 1] : NULL;
+}
+/* Generic "allocate n bytes, arena-aware" — the one place that decides
+ * arena-vs-malloc, used by every allocator we've made arena-aware so far
+ * (hsh_array_new, hsh_struct_new, hsh_strcat). NOTE: because this can
+ * return either arena memory (a sub-range of one big malloc'd block) or
+ * a standalone malloc'd pointer depending on context, anything using it
+ * must NOT be free()'d individually — only hsh_arena_free() on the whole
+ * arena (for arena memory) or the matching *_free() function (for the
+ * malloc fallback case) is safe, and today's codegen never calls those
+ * per-object frees at all, so this is consistent with current behavior. */
+static void* hsh_alloc(uint64_t n) {
+    HshArena* a = hsh_arena_current();
+    return a ? hsh_arena_alloc(a, n) : malloc(n);
+}
+
+/* ── @arena checkpoint / rewind ("basic v2") ─────────────────────────────────
+ * The one thing every other arena kind was still missing: a way to reuse
+ * *part* of an arena's lifetime for a shorter-lived burst of temporary
+ * allocations without giving up the whole arena. Before this, the only
+ * granularity was "the whole function's arena, freed all at once when it
+ * returns" — perfectly fine for "do a bunch of work, throw it all away",
+ * but there was no way to say "do a bunch of *temporary* work inside a
+ * longer-lived arena, then throw away just that part" (e.g. a per-request
+ * arena in a server loop, where each request needs its own scratch space
+ * that shouldn't accumulate across requests, but the arena itself should
+ * outlive any single request).
+ *
+ * `hsh_arena_checkpoint()` returns the current arena's `used` offset —
+ * an opaque mark. `hsh_arena_rewind(mark)` resets `used` back to it,
+ * instantly "freeing" (for reuse — nothing is actually deallocated,
+ * exactly like a bump allocator's whole design) everything allocated
+ * since the checkpoint, without disturbing anything allocated before it.
+ * Both operate on whichever arena is current (`hsh_arena_current()`) —
+ * same "always affects the topmost pushed arena" convention as
+ * `hsh_alloc()` itself. A no-op (mark 0, rewind does nothing) when no
+ * arena is active, so calling these in `@default` code is harmless
+ * rather than a crash — consistent with `hsh_alloc()`'s own
+ * malloc-fallback-when-no-arena behavior. */
+int64_t hsh_arena_checkpoint(void) {
+    HshArena* a = hsh_arena_current();
+    return a ? (int64_t)a->used : 0;
+}
+void hsh_arena_rewind(int64_t mark) {
+    HshArena* a = hsh_arena_current();
+    if (!a || mark < 0 || (uint64_t)mark > a->cap) return;
+    a->used = (uint64_t)mark;
+}
+/* Introspection — how much of the current arena is used/free, mainly for
+ * diagnostics/tuning (picking a capacity that doesn't degrade to malloc
+ * fallback in practice). Returns 0 for both if no arena is active. */
+int64_t hsh_arena_used(void) {
+    HshArena* a = hsh_arena_current();
+    return a ? (int64_t)a->used : 0;
+}
+int64_t hsh_arena_capacity(void) {
+    HshArena* a = hsh_arena_current();
+    return a ? (int64_t)a->cap : 0;
+}
 
 /* ── String helpers ──────────────────────────────────────────────────────── */
 
@@ -548,3 +723,703 @@ hsh_string hsh_http_post(hsh_string url, hsh_string body) {
 
 int64_t hsh_atoll_export(hsh_string s) { return hsh_atoll(s); }
 double  hsh_atof_export(hsh_string s)  { return hsh_atof(s); }
+
+/* ── Dynamic array runtime ───────────────────────────────────────────────────
+ * H# dynamic arrays are represented as HshArray* pointers on the heap.
+ * Layout: { int64_t len; int64_t cap; int64_t data[cap]; }
+ * All elements are i64 (strings = char*, ints, bools cast to i64).
+ */
+
+typedef struct {
+    int64_t len;
+    int64_t cap;
+    int64_t data[1]; /* flexible array */
+} HshArray;
+
+static HshArray *hsh_arr_alloc(int64_t cap) {
+    if (cap < 4) cap = 4;
+    HshArray *a = (HshArray*)hsh_alloc(sizeof(int64_t)*2 + sizeof(int64_t)*(size_t)cap);
+    if (!a) return NULL;
+    a->len = 0;
+    a->cap = cap;
+    return a;
+}
+
+HshArray *hsh_array_new(void) {
+    return hsh_arr_alloc(4);
+}
+
+HshArray *hsh_array_push(HshArray *a, int64_t val) {
+    if (!a) a = hsh_array_new();
+    if (a->len >= a->cap) {
+        int64_t new_cap = a->cap * 2;
+        HshArray *b = hsh_arr_alloc(new_cap);
+        if (!b) return a;
+        b->len = a->len;
+        b->cap = new_cap;
+        for (int64_t i = 0; i < a->len; i++) b->data[i] = a->data[i];
+        free(a);
+        a = b;
+    }
+    a->data[a->len++] = val;
+    return a;
+}
+
+int64_t hsh_array_len(HshArray *a) {
+    if (!a) return 0;
+    return a->len;
+}
+
+int64_t hsh_array_get(HshArray *a, int64_t idx) {
+    if (!a || idx < 0 || idx >= a->len) return 0;
+    return a->data[idx];
+}
+
+HshArray *hsh_array_set(HshArray *a, int64_t idx, int64_t val) {
+    if (!a || idx < 0 || idx >= a->len) return a;
+    a->data[idx] = val;
+    return a;
+}
+
+HshArray *hsh_array_concat(HshArray *a, HshArray *b) {
+    if (!a) return b ? b : hsh_array_new();
+    if (!b) return a;
+    HshArray *r = hsh_arr_alloc(a->len + b->len);
+    r->len = a->len + b->len;
+    for (int64_t i = 0; i < a->len; i++) r->data[i]        = a->data[i];
+    for (int64_t i = 0; i < b->len; i++) r->data[a->len+i] = b->data[i];
+    return r;
+}
+
+HshArray *hsh_array_contains(HshArray *a, int64_t val) {
+    if (!a) return (HshArray*)0;
+    for (int64_t i = 0; i < a->len; i++) {
+        if (a->data[i] == val) return (HshArray*)1;
+    }
+    return (HshArray*)0;
+}
+
+/* ── env::args() ─────────────────────────────────────────────────────────────
+ * Returns a HshArray* of char* pointers (command-line arguments).
+ * The runtime main() in core.c stores argc/argv in globals when the
+ * compiled binary starts; this function retrieves them.
+ */
+extern int   _hsh_argc;
+extern char **_hsh_argv;
+
+HshArray *hsh_env_args(void) {
+    HshArray *a = hsh_arr_alloc(_hsh_argc > 0 ? _hsh_argc : 1);
+    for (int i = 0; i < _hsh_argc; i++) {
+        a->data[a->len++] = (int64_t)(uintptr_t)_hsh_argv[i];
+    }
+    return a;
+}
+
+/* ── struct / field access helpers ──────────────────────────────────────────
+ * H# structs are heap-allocated arrays of i64 fields (in declaration order).
+ * hsh_struct_new(n_fields)    — allocate struct with n_fields slots
+ * hsh_struct_get(ptr, index)  — read field at index
+ * hsh_struct_set(ptr, index, val) — write field; returns the struct ptr
+ */
+int64_t *hsh_struct_new(int64_t n) {
+    int64_t *s = (int64_t*)hsh_alloc((size_t)n * sizeof(int64_t));
+    if (s) memset(s, 0, (size_t)n * sizeof(int64_t));
+    return s;
+}
+
+int64_t hsh_struct_get(int64_t *s, int64_t idx) {
+    if (!s) return 0;
+    return s[idx];
+}
+
+int64_t *hsh_struct_set(int64_t *s, int64_t idx, int64_t val) {
+    if (s) s[idx] = val;
+    return s;
+}
+
+/* ── string_split ────────────────────────────────────────────────────────────
+ * Returns HshArray* of char* substrings split by sep.
+ */
+HshArray *hsh_string_split(const char *str, const char *sep) {
+    HshArray *a = hsh_array_new();
+    if (!str || !sep) return a;
+    size_t slen = strlen(sep);
+    if (slen == 0) { a = hsh_array_push(a, (int64_t)(uintptr_t)strdup(str)); return a; }
+    const char *p = str;
+    const char *found;
+    while ((found = strstr(p, sep)) != NULL) {
+        size_t part_len = (size_t)(found - p);
+        char *part = (char*)malloc(part_len + 1);
+        memcpy(part, p, part_len);
+        part[part_len] = '\0';
+        a = hsh_array_push(a, (int64_t)(uintptr_t)part);
+        p = found + slen;
+    }
+    a = hsh_array_push(a, (int64_t)(uintptr_t)strdup(p));
+    return a;
+}
+
+/* ── proc_id ─────────────────────────────────────────────────────────────────*/
+int64_t hsh_proc_id(void) { return (int64_t)getpid(); }
+
+/* ── string_at (single char as string) ──────────────────────────────────────*/
+const char *hsh_string_at(const char *s, int64_t idx) {
+    if (!s || idx < 0 || idx >= (int64_t)strlen(s)) return "";
+    static __thread char buf[4];
+    buf[0] = s[idx]; buf[1] = '\0';
+    return buf;
+}
+
+/* ── string_slice ────────────────────────────────────────────────────────────*/
+const char *hsh_string_slice(const char *s, int64_t start, int64_t end) {
+    if (!s) return "";
+    int64_t slen = (int64_t)strlen(s);
+    if (start < 0) start = 0;
+    if (end > slen) end = slen;
+    if (start >= end) return "";
+    int64_t len = end - start;
+    char *out = (char*)malloc((size_t)len + 1);
+    memcpy(out, s + start, (size_t)len);
+    out[len] = '\0';
+    return out;
+}
+
+/* ── string_find / string_rfind ─────────────────────────────────────────────*/
+int64_t hsh_string_find(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return -1;
+    const char *p = strstr(haystack, needle);
+    return p ? (int64_t)(p - haystack) : -1;
+}
+int64_t hsh_string_rfind(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return -1;
+    size_t hlen = strlen(haystack), nlen = strlen(needle);
+    if (nlen > hlen) return -1;
+    for (int64_t i = (int64_t)(hlen - nlen); i >= 0; i--) {
+        if (memcmp(haystack + i, needle, nlen) == 0) return i;
+    }
+    return -1;
+}
+
+/* ── string_pad_right ────────────────────────────────────────────────────────*/
+const char *hsh_string_pad_right(const char *s, int64_t width) {
+    if (!s) s = "";
+    int64_t slen = (int64_t)strlen(s);
+    if (slen >= width) return s;
+    char *out = (char*)malloc((size_t)width + 1);
+    memcpy(out, s, (size_t)slen);
+    memset(out + slen, ' ', (size_t)(width - slen));
+    out[width] = '\0';
+    return out;
+}
+
+/* ── string_repeat ───────────────────────────────────────────────────────────*/
+const char *hsh_string_repeat(const char *s, int64_t n) {
+    if (!s || n <= 0) return "";
+    size_t slen = strlen(s);
+    char *out = (char*)malloc(slen * (size_t)n + 1);
+    for (int64_t i = 0; i < n; i++) memcpy(out + slen*(size_t)i, s, slen);
+    out[slen*(size_t)n] = '\0';
+    return out;
+}
+
+/* ── to_int / to_float ───────────────────────────────────────────────────────*/
+int64_t hsh_to_int(const char *s) {
+    if (!s) return 0;
+    return (int64_t)strtoll(s, NULL, 10);
+}
+/* Convert a single hex-digit character ('0'-'9', 'a'-'f', 'A'-'F') to its
+ * 0-15 value. Only the first character of `s` is examined (this mirrors
+ * how callers use it: one character at a time while scanning a hex
+ * string, e.g. `to_int_from_hex(string_at(s, i))`). Returns 0 for
+ * anything that isn't a valid hex digit rather than erroring, matching
+ * the permissive style of the other hsh_to_* conversion builtins. */
+int64_t hsh_to_int_from_hex(const char *s) {
+    if (!s || !s[0]) return 0;
+    char c = s[0];
+    if (c >= '0' && c <= '9') return (int64_t)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int64_t)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (int64_t)(c - 'A' + 10);
+    return 0;
+}
+double hsh_to_float(const char *s) {
+    if (!s) return 0.0;
+    return strtod(s, NULL);
+}
+
+/* ── string_lower / string_upper ─────────────────────────────────────────────*/
+const char *hsh_string_lower(const char *s) {
+    if (!s) return "";
+    size_t len = strlen(s);
+    char *out = (char*)malloc(len + 1);
+    for (size_t i = 0; i < len; i++) out[i] = (char)tolower((unsigned char)s[i]);
+    out[len] = '\0';
+    return out;
+}
+const char *hsh_string_upper(const char *s) {
+    if (!s) return "";
+    size_t len = strlen(s);
+    char *out = (char*)malloc(len + 1);
+    for (size_t i = 0; i < len; i++) out[i] = (char)toupper((unsigned char)s[i]);
+    out[len] = '\0';
+    return out;
+}
+
+/* ── string_trim_right ───────────────────────────────────────────────────────*/
+const char *hsh_string_trim_right(const char *s) {
+    if (!s) return "";
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len-1])) len--;
+    char *out = (char*)malloc(len + 1);
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* ── file helpers ────────────────────────────────────────────────────────────*/
+int64_t hsh_file_delete(const char *path) {
+    return remove(path) == 0 ? 1 : 0;
+}
+int64_t hsh_dir_create(const char *path) {
+    return mkdir(path, 0755) == 0 ? 1 : 0;
+}
+int64_t hsh_dir_exists(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
+
+/* ── hsh_readline — read line from stdin ─────────────────────────────────────*/
+char *hsh_readline(void) {
+    char *buf = (char*)malloc(4096);
+    if (!buf) return (char*)"";
+    if (!fgets(buf, 4096, stdin)) { buf[0] = '\0'; return buf; }
+    size_t n = strlen(buf);
+    if (n > 0 && buf[n-1] == '\n') buf[n-1] = '\0';
+    return buf;
+}
+
+/* ── hsh_scan_port_net — already declared, stub if not present ───────────────*/
+#ifndef HSH_SCAN_PORT_DEFINED
+int64_t hsh_scan_port_net(const char *host, int64_t port, int64_t timeout_ms) {
+    struct sockaddr_in addr = {0};
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);
+    inet_pton(AF_INET, host, &addr.sin_addr);
+    struct timeval tv = { timeout_ms/1000, (timeout_ms%1000)*1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int rc = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+    close(fd);
+    return rc == 0 ? 1 : 0;
+}
+#endif
+
+/* ── hsh_string_chars — return HshArray* of single-char strings ──────────────*/
+HshArray *hsh_string_chars(const char *s) {
+    HshArray *a = hsh_array_new();
+    if (!s) return a;
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++) {
+        char *ch = (char*)malloc(2);
+        ch[0] = s[i]; ch[1] = '\0';
+        a = hsh_array_push(a, (int64_t)(uintptr_t)ch);
+    }
+    return a;
+}
+
+/* ── dir_remove_all — recursive delete ───────────────────────────────────────*/
+int64_t hsh_dir_remove_all(const char *path) {
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+    return system(cmd) == 0 ? 1 : 0;
+}
+
+/* ── bytes_to_string ─────────────────────────────────────────────────────────*/
+const char *hsh_bytes_to_string(HshArray *bytes, int64_t n) {
+    if (!bytes || n <= 0) return "";
+    char *out = (char*)malloc((size_t)n + 1);
+    for (int64_t i = 0; i < n && i < bytes->len; i++)
+        out[i] = (char)(bytes->data[i] & 0xFF);
+    out[n] = '\0';
+    return out;
+}
+
+/* ── string_to_bytes ─────────────────────────────────────────────────────────*/
+HshArray *hsh_string_to_bytes(const char *s) {
+    HshArray *a = hsh_array_new();
+    if (!s) return a;
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++)
+        a = hsh_array_push(a, (int64_t)(uint8_t)s[i]);
+    return a;
+}
+
+/* ── array_push for string convenience (alias) ───────────────────────────────*/
+HshArray *hsh_array_push_str(HshArray *a, const char *s) {
+    return hsh_array_push(a, (int64_t)(uintptr_t)s);
+}
+
+/* ── hsh_string_contains / hsh_string_replace (missing aliases) ──────────────*/
+int64_t hsh_string_contains(const char *h, const char *n) { return hsh_str_contains(h,n); }
+const char *hsh_string_replace(const char *s, const char *f, const char *r) { return hsh_str_replace(s,f,r); }
+const char *hsh_string_trim(const char *s) { return hsh_trim(s); }
+int64_t hsh_string_starts_with(const char *s, const char *p) { return hsh_starts_with(s,p); }
+int64_t hsh_string_ends_with(const char *s, const char *p) { return hsh_ends_with(s,p); }
+int64_t hsh_string_len(const char *s) { return s ? (int64_t)strlen(s) : 0; }
+int64_t hsh_array_remove(HshArray *a, int64_t idx) {
+    if (!a || idx < 0 || idx >= a->len) return 0;
+    for (int64_t i = idx; i < a->len-1; i++) a->data[i] = a->data[i+1];
+    a->len--;
+    return 1;
+}
+
+/* ── hsh_dns_resolve ─────────────────────────────────────────────────────────*/
+#include <netdb.h>
+const char *hsh_dns_resolve(const char *hostname) {
+    if (!hostname) return "";
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0) return "";
+    char *out = (char*)malloc(INET_ADDRSTRLEN + 1);
+    struct sockaddr_in *addr4 = (struct sockaddr_in *)res->ai_addr;
+    inet_ntop(AF_INET, &addr4->sin_addr, out, INET_ADDRSTRLEN);
+    freeaddrinfo(res);
+    return out;
+}
+
+/* ── hsh_json_get ────────────────────────────────────────────────────────────
+ * Minimal JSON string-field extractor: hsh_json_get(json, key)
+ * Finds "key":"value" and returns the value string.
+ * Not a full JSON parser — handles simple flat objects.              */
+const char *hsh_json_get(const char *json, const char *key) {
+    if (!json || !key) return "";
+    /* Build search pattern: "key":" */
+    size_t klen = strlen(key);
+    char *pattern = (char*)malloc(klen + 4);
+    pattern[0] = '"';
+    memcpy(pattern + 1, key, klen);
+    pattern[klen + 1] = '"';
+    pattern[klen + 2] = ':';
+    pattern[klen + 3] = '\0';
+    const char *p = strstr(json, pattern);
+    free(pattern);
+    if (!p) return "";
+    p += klen + 3; /* skip "key": */
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '"') {
+        p++; /* skip opening quote */
+        const char *end = strchr(p, '"');
+        if (!end) return "";
+        size_t vlen = (size_t)(end - p);
+        char *out = (char*)malloc(vlen + 1);
+        memcpy(out, p, vlen);
+        out[vlen] = '\0';
+        return out;
+    }
+    /* Numeric / bool / null value */
+    const char *end = p;
+    while (*end && *end != ',' && *end != '}' && *end != ']' && *end != '\n') end++;
+    size_t vlen = (size_t)(end - p);
+    char *out = (char*)malloc(vlen + 1);
+    memcpy(out, p, vlen);
+    out[vlen] = '\0';
+    return out;
+}
+
+/* ── @arc (basic v3) ──────────────────────────────────────────────────────
+ * Real, working refcounting primitives. Every arc-allocated block gets a
+ * leading header with an atomic *strong* refcount word (hsh_rc_alloc
+ * starts it at 1, hsh_rc_retain/_release increment/decrement) and the
+ * originally-requested size, so hsh_ptr_alloc_size (see the @pointers
+ * section below) can report it back for exactly this kind of pointer.
+ *
+ * The compiler DOES now insert automatic retain-on-assignment/release-on-
+ * scope-exit for straight-line top-level `let` bindings in an `@arc`
+ * function (see codegen.rs's `arc_owned` field and `emit_arc_epilogue`) —
+ * `arc_retain`/`arc_release` (wired up as H# builtins in codegen.rs) are
+ * still there directly too, for anything the automatic tracking doesn't
+ * reach (a value stored in a struct field, one only bound inside an
+ * if/while/match branch, etc).
+ *
+ * v3 adds a *weak* count alongside the strong one — the header (and thus
+ * the whole allocation) now survives until *both* counts hit zero, not
+ * just the strong one. This is what makes `arc_downgrade`/`arc_upgrade`
+ * safe: a weak reference alone is never enough to keep the data alive
+ * (so cyclic structures — the `@arc` gap this fixes — can break the cycle
+ * by making one direction weak), but it *is* enough to safely ask "is
+ * this still alive?" without a use-after-free, because the header itself
+ * — the thing `arc_upgrade` has to read to answer that question — is
+ * guaranteed to still be valid memory as long as any weak ref exists.
+ * Same design as Rust's `std::sync::{Arc, Weak}`.
+ */
+#include <stdatomic.h>
+typedef struct { _Atomic int64_t count; _Atomic int64_t weak; uint64_t size; } HshRcHeader;
+
+void* hsh_rc_alloc(uint64_t n) {
+    HshRcHeader* h = (HshRcHeader*)malloc(sizeof(HshRcHeader) + (size_t)n);
+    if (!h) return NULL;
+    atomic_init(&h->count, 1);
+    atomic_init(&h->weak, 0);
+    h->size = n;
+    return (void*)(h + 1);
+}
+void hsh_rc_retain(void* p) {
+    if (!p) return;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    atomic_fetch_add(&h->count, 1);
+}
+void hsh_rc_release(void* p) {
+    if (!p) return;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    if (atomic_fetch_sub(&h->count, 1) == 1) {
+        // Last *strong* ref gone — the data is logically dropped from
+        // here on (arc_upgrade will correctly start refusing it), but
+        // the allocation itself is only actually freed once no weak
+        // refs are watching it either.
+        if (atomic_load(&h->weak) == 0) free(h);
+    }
+}
+int64_t hsh_rc_count(void* p) {
+    if (!p) return 0;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    return (int64_t)atomic_load(&h->count);
+}
+
+/* ── @arc weak references ────────────────────────────────────────────────
+ * `arc_downgrade(p)` — takes a strong (or weak) pointer, returns a weak
+ * handle (same pointer value; the distinction is purely which counter
+ * governs it, not the bits themselves). Does not affect the strong count
+ * at all, so it can't keep an otherwise-dead object alive.
+ *
+ * `arc_upgrade(weak)` — tries to produce a new *strong* reference from a
+ * weak one. Returns NULL if the object's strong count has already hit
+ * zero (nothing left to upgrade to); otherwise atomically bumps the
+ * strong count and returns the same pointer, now a real owning
+ * reference the caller must eventually `arc_release`. The
+ * compare-exchange loop (rather than a plain fetch-add) is what makes
+ * this safe: a plain "load then increment" could resurrect an object
+ * whose count was legitimately at zero and being freed by another
+ * thread at that exact moment; only incrementing from a strictly-
+ * positive value, atomically, avoids that race.
+ *
+ * `arc_weak_release(weak)` — drops a weak reference. Frees the
+ * allocation if this was the last reference of *either* kind.
+ *
+ * `arc_weak_count(p)` — introspection, mainly for tests/debugging.
+ */
+void* hsh_arc_downgrade(void* p) {
+    if (!p) return NULL;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    atomic_fetch_add(&h->weak, 1);
+    return p;
+}
+void* hsh_arc_upgrade(void* p) {
+    if (!p) return NULL;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    int64_t cur = atomic_load(&h->count);
+    while (cur > 0) {
+        if (atomic_compare_exchange_weak(&h->count, &cur, cur + 1)) {
+            return p;
+        }
+        // cur was refreshed to the actual current value by a failed CAS;
+        // loop re-checks `cur > 0` with that fresh value.
+    }
+    return NULL;
+}
+void hsh_arc_weak_release(void* p) {
+    if (!p) return;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    if (atomic_fetch_sub(&h->weak, 1) == 1) {
+        if (atomic_load(&h->count) == 0) free(h);
+    }
+}
+int64_t hsh_arc_weak_count(void* p) {
+    if (!p) return 0;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    return (int64_t)atomic_load(&h->weak);
+}
+
+/* ── @pointers (basic v1) ─────────────────────────────────────────────────
+ * Raw memory access for people who want it: read/write an i64 at a byte
+ * offset from a pointer, no bounds checking at all — "modern" only in the
+ * sense of being explicit function calls instead of `*`/`&` syntax, and
+ * of not aliasing with the rest of H#'s i64-boxed-value convention by
+ * accident. It fully trusts the caller, same as raw pointers in C/C++:
+ * an out-of-range offset is undefined behavior, not a caught error. */
+int64_t hsh_ptr_read_i64(void* p, int64_t byte_offset) {
+    if (!p) return 0;
+    return *(int64_t*)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_i64(void* p, int64_t byte_offset, int64_t val) {
+    if (!p) return;
+    *(int64_t*)((uint8_t*)p + byte_offset) = val;
+}
+int64_t hsh_ptr_is_null(void* p) {
+    return p == NULL;
+}
+void* hsh_ptr_add(void* p, int64_t byte_offset) {
+    if (!p) return NULL;
+    return (void*)((uint8_t*)p + byte_offset);
+}
+
+/* ── @pointers (basic v2) — narrower/wider and floating-point variants ────
+ * Same no-bounds-checking contract as hsh_ptr_{read,write}_i64 above,
+ * just at different widths (and a raw pointer-to-pointer variant for
+ * walking arrays of pointers/structs-by-reference). Kept as one function
+ * per width, matching the i64 pair above, rather than a single generic
+ * entry point, so each stays a trivial one-line load/store that's easy
+ * to audit and impossible to get the width of confused at the call site. */
+int64_t hsh_ptr_read_i32(void* p, int64_t byte_offset) {
+    if (!p) return 0;
+    return (int64_t)*(int32_t*)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_i32(void* p, int64_t byte_offset, int64_t val) {
+    if (!p) return;
+    *(int32_t*)((uint8_t*)p + byte_offset) = (int32_t)val;
+}
+int64_t hsh_ptr_read_i16(void* p, int64_t byte_offset) {
+    if (!p) return 0;
+    return (int64_t)*(int16_t*)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_i16(void* p, int64_t byte_offset, int64_t val) {
+    if (!p) return;
+    *(int16_t*)((uint8_t*)p + byte_offset) = (int16_t)val;
+}
+int64_t hsh_ptr_read_i8(void* p, int64_t byte_offset) {
+    if (!p) return 0;
+    return (int64_t)*(int8_t*)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_i8(void* p, int64_t byte_offset, int64_t val) {
+    if (!p) return;
+    *(int8_t*)((uint8_t*)p + byte_offset) = (int8_t)val;
+}
+double hsh_ptr_read_f64(void* p, int64_t byte_offset) {
+    if (!p) return 0.0;
+    return *(double*)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_f64(void* p, int64_t byte_offset, double val) {
+    if (!p) return;
+    *(double*)((uint8_t*)p + byte_offset) = val;
+}
+double hsh_ptr_read_f32(void* p, int64_t byte_offset) {
+    if (!p) return 0.0;
+    return (double)*(float*)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_f32(void* p, int64_t byte_offset, double val) {
+    if (!p) return;
+    *(float*)((uint8_t*)p + byte_offset) = (float)val;
+}
+void* hsh_ptr_read_ptr(void* p, int64_t byte_offset) {
+    if (!p) return NULL;
+    return *(void**)((uint8_t*)p + byte_offset);
+}
+void hsh_ptr_write_ptr(void* p, int64_t byte_offset, void* val) {
+    if (!p) return;
+    *(void**)((uint8_t*)p + byte_offset) = val;
+}
+
+/* ── @pointers (basic v3) ──────────────────────────────────────────────────
+ * Fills in the gaps basic v2 left: no way to sanity-check a pointer
+ * against its allocation size, no bulk copy/compare (so anyone needing
+ * memcpy/memcmp semantics had to write a byte-at-a-time loop with
+ * ptr_read_i8/ptr_write_i8), and no way at all to check a pointer *before*
+ * touching it. None of this makes @pointers "safe" — that's still not the
+ * point of this mode — it just gives you the same handful of primitives
+ * C gives you for working with raw memory carefully by hand. */
+
+/* Only meaningful for a pointer that actually came from arc_alloc — it
+ * reads the HshRcHeader that hsh_rc_alloc wrote just before `p`. There is
+ * no universal way to know the size of an arbitrary pointer (one from
+ * `unsafe arena(...)`, or an `extern`-declared C function, carries no
+ * such header at all) — calling this on anything but an arc_alloc result
+ * reads whatever bytes happen to sit before it and returns garbage. This
+ * is exactly why it's `ptr_alloc_size`, not "ptr_size": it answers "how
+ * big was the allocation this arc pointer owns", not "how big is
+ * whatever this pointer happens to point at" in general. */
+int64_t hsh_ptr_alloc_size(void* p) {
+    if (!p) return 0;
+    HshRcHeader* h = ((HshRcHeader*)p) - 1;
+    return (int64_t)h->size;
+}
+/* memcpy/memmove semantics (overlap-safe, unlike plain memcpy) — copies
+ * `n` bytes from `src` to `dst`. */
+void hsh_ptr_copy(void* dst, void* src, int64_t n) {
+    if (!dst || !src || n <= 0) return;
+    memmove(dst, src, (size_t)n);
+}
+/* memcmp semantics: 0 if equal, negative if `a` sorts before `b`,
+ * positive if after — over the first `n` bytes of each. */
+int64_t hsh_ptr_compare(void* a, void* b, int64_t n) {
+    if (a == b) return 0;
+    if (!a || !b || n <= 0) return a ? 1 : (b ? -1 : 0);
+    return (int64_t)memcmp(a, b, (size_t)n);
+}
+/* memset semantics: fill `n` bytes starting at `p` with the low byte of
+ * `val`. `hsh_ptr_zero` is the extremely common `fill(p, 0, n)` case
+ * given its own name — zeroing a freshly-`arc_alloc`'d buffer before use
+ * is common enough (and easy enough to write `ptr_fill(p, 1, n)` by
+ * mistake, filling with 0x01 instead of clearing) that it earns a
+ * dedicated, harder-to-misuse builtin. */
+void hsh_ptr_fill(void* p, int64_t val, int64_t n) {
+    if (!p || n <= 0) return;
+    memset(p, (int)(val & 0xff), (size_t)n);
+}
+void hsh_ptr_zero(void* p, int64_t n) {
+    if (!p || n <= 0) return;
+    memset(p, 0, (size_t)n);
+}
+
+/* ── @pointers (basic v4) — opt-in bounds-checked read/write ────────────────
+ * `@pointers` stays unchecked by default — that's the whole point of the
+ * mode, and staying a thin wrapper over C-style raw access is what keeps
+ * it fast and simple. But "no safety net at all, ever" was an all-or-
+ * nothing choice: these are an *opt-in* checked path for the one case
+ * that's actually checkable — a pointer that came from `arc_alloc`, whose
+ * size `hsh_ptr_alloc_size` can read back from its header. Reach for
+ * `ptr_read_checked`/`ptr_write_checked` (width in bytes, one of
+ * 1/2/4/8) when you want the mistake caught with a clear message instead
+ * of quietly corrupting adjacent memory; reach for the unchecked
+ * `ptr_read_*`/`ptr_write_*` when you already know the access is in
+ * bounds and don't want to pay for the check (e.g. in a hot loop). Like
+ * `arena(fixed, N)`'s overflow behavior, a bounds violation here is a
+ * hard `hsh_panic` — the whole reason to opt into the checked path is to
+ * turn "silent corruption" into "loud, immediate failure", not into
+ * another quietly-ignored condition. Only meaningful for arc_alloc
+ * pointers, same caveat as `hsh_ptr_alloc_size` itself: called on a
+ * pointer without a real HshRcHeader (arena memory, an `extern` C
+ * pointer, ...) it reads a garbage "size" and the check is meaningless —
+ * this is a safety net for the one specific case it can actually verify,
+ * not a general bounds checker. */
+int64_t hsh_ptr_read_checked(void* p, int64_t offset, int64_t width) {
+    if (!p) { hsh_panic("ptr_read_checked: null pointer"); return 0; }
+    int64_t size = hsh_ptr_alloc_size(p);
+    if (offset < 0 || width <= 0 || offset + width > size) {
+        hsh_panic("ptr_read_checked: access out of bounds of the arc_alloc allocation");
+        return 0;
+    }
+    switch (width) {
+        case 1: return (int64_t)*(int8_t*)((uint8_t*)p + offset);
+        case 2: return (int64_t)*(int16_t*)((uint8_t*)p + offset);
+        case 4: return (int64_t)*(int32_t*)((uint8_t*)p + offset);
+        case 8: return *(int64_t*)((uint8_t*)p + offset);
+        default:
+            hsh_panic("ptr_read_checked: width must be 1, 2, 4, or 8 bytes");
+            return 0;
+    }
+}
+void hsh_ptr_write_checked(void* p, int64_t offset, int64_t width, int64_t val) {
+    if (!p) { hsh_panic("ptr_write_checked: null pointer"); return; }
+    int64_t size = hsh_ptr_alloc_size(p);
+    if (offset < 0 || width <= 0 || offset + width > size) {
+        hsh_panic("ptr_write_checked: access out of bounds of the arc_alloc allocation");
+        return;
+    }
+    switch (width) {
+        case 1: *(int8_t*)((uint8_t*)p + offset)  = (int8_t)val;  return;
+        case 2: *(int16_t*)((uint8_t*)p + offset) = (int16_t)val; return;
+        case 4: *(int32_t*)((uint8_t*)p + offset) = (int32_t)val; return;
+        case 8: *(int64_t*)((uint8_t*)p + offset) = val;          return;
+        default: hsh_panic("ptr_write_checked: width must be 1, 2, 4, or 8 bytes");
+    }
+}
