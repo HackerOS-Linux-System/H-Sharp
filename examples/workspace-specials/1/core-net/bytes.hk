@@ -1,9 +1,0 @@
-[package]
--> name    => core-net
--> version => 0.8.0
-
-[build]
--> lang   => c++
--> entry  => src/main.cpp
--> output => build/libcore-net.so
--> flags  => -shared -fPIC -O2 -std=c++17
