@@ -61,6 +61,7 @@ impl TraitRegistry {
                     pub_:        method.pub_,
                     is_async:    false,
                     is_unsafe:   method.is_unsafe,
+                    mem_mode:    method.mem_mode,
                     span:        method.span.clone(),
                 };
                 methods.insert(method.name.clone(), fn_def);
