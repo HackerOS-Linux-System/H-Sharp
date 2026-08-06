@@ -441,6 +441,50 @@ impl TypeChecker {
         builtin!("str_ends_with",  [str_, str_] => bool_);
         builtin!("hsh_now_unix",   []           => int);
         builtin!("hsh_now_ms",     []           => int);
+
+        // `@pointers` basic v2 raw memory builtins (see codegen.rs/core.c's
+        // hsh_ptr_{read,write}_*) and `@arc` basic v2 atomic refcounting
+        // builtins (see hsh_rc_*). Registering these here just gives
+        // `infer_expr` a real return type for them instead of falling back
+        // to `Any` — actual *reachability* enforcement (only usable from a
+        // `@pointers`/`@arc` function or an `unsafe ... end` block) is a
+        // separate pass, §13 below (`check_mem_mode_block` and friends).
+        builtin!("ptr_read_i64",  [any, int] => int);
+        builtin!("ptr_write_i64", [any, int, int] => void);
+        builtin!("ptr_read_i32",  [any, int] => int);
+        builtin!("ptr_write_i32", [any, int, int] => void);
+        builtin!("ptr_read_i16",  [any, int] => int);
+        builtin!("ptr_write_i16", [any, int, int] => void);
+        builtin!("ptr_read_i8",   [any, int] => int);
+        builtin!("ptr_write_i8",  [any, int, int] => void);
+        builtin!("ptr_read_f64",  [any, int] => f64_);
+        builtin!("ptr_write_f64", [any, int, f64_] => void);
+        builtin!("ptr_read_f32",  [any, int] => f64_);
+        builtin!("ptr_write_f32", [any, int, f64_] => void);
+        builtin!("ptr_read_ptr",  [any, int] => any);
+        builtin!("ptr_write_ptr", [any, int, any] => void);
+        builtin!("ptr_add",       [any, int] => any);
+        builtin!("ptr_is_null",   [any] => bool_);
+        builtin!("ptr_alloc_size", [any] => int);
+        builtin!("ptr_copy",      [any, any, int] => void);
+        builtin!("ptr_compare",   [any, any, int] => int);
+        builtin!("ptr_field_offset", [any, str_] => int);
+        builtin!("ptr_read_checked",  [any, int, int] => int);
+        builtin!("ptr_write_checked", [any, int, int, int] => void);
+        builtin!("ptr_fill", [any, int, int] => void);
+        builtin!("ptr_zero", [any, int] => void);
+        builtin!("arc_alloc",   [int] => any);
+        builtin!("arc_retain",  [any] => void);
+        builtin!("arc_release", [any] => void);
+        builtin!("arc_count",   [any] => int);
+        builtin!("arc_downgrade",    [any] => any);
+        builtin!("arc_upgrade",      [any] => any);
+        builtin!("arc_weak_release", [any] => void);
+        builtin!("arc_weak_count",   [any] => int);
+        builtin!("arena_checkpoint", [] => int);
+        builtin!("arena_rewind",     [int] => void);
+        builtin!("arena_used",       [] => int);
+        builtin!("arena_capacity",   [] => int);
     }
 
     /// Type-check the module, returning ALL diagnostics found (both errors
@@ -616,6 +660,9 @@ impl TypeChecker {
 
         for stmt in &f.body { self.check_stmt(stmt, &f.name); }
 
+        // §13: `@pointers`/`@arc` builtin gating — see check_mem_mode_block.
+        self.check_mem_mode_block(&f.body, f.mem_mode, false, &f.name);
+
         // §3: return-path reachability. If `f` declares a non-void return
         // type, every path through its body must end in a `return <expr>`
         // (or, for the common "implicit tail expression" style, the last
@@ -635,6 +682,154 @@ impl TypeChecker {
 
         self.pop_scope();
         self.current_fn_return = None;
+    }
+
+    // ── §13: MemoryMode enforcement ─────────────────────────────────────────
+    // `@pointers`/`@arc` gate their respective raw/manual-memory builtins so
+    // the annotations become a real, checked boundary instead of docs-only
+    // hints — previously *any* function, regardless of its `@` annotation,
+    // could call `ptr_read_i64`/`arc_retain`/etc with zero enforcement (see
+    // codegen.rs's history: these builtins were "usable in any function").
+    // This is a static, lexical check, the same spirit as Rust's `unsafe`:
+    // it doesn't re-derive control flow, it just asks "is this call
+    // textually inside the right function/mode, or inside an
+    // `unsafe ... end` block?" — enough to give the annotations real teeth
+    // without a full effect system. A separate, self-contained recursive
+    // walker (rather than folding into `infer_expr`) so it can't interact
+    // with — or regress — the existing type-inference logic.
+    const PTR_RESTRICTED_BUILTINS: &'static [&'static str] = &[
+        "ptr_read_i64", "ptr_write_i64", "ptr_add", "ptr_is_null",
+        "ptr_read_i32", "ptr_write_i32", "ptr_read_i16", "ptr_write_i16",
+        "ptr_read_i8",  "ptr_write_i8",  "ptr_read_f64", "ptr_write_f64",
+        "ptr_read_f32", "ptr_write_f32", "ptr_read_ptr", "ptr_write_ptr",
+        "ptr_alloc_size", "ptr_copy", "ptr_compare", "ptr_field_offset",
+        "ptr_read_checked", "ptr_write_checked", "ptr_fill", "ptr_zero",
+    ];
+    const ARC_RESTRICTED_BUILTINS: &'static [&'static str] =
+        &["arc_alloc", "arc_retain", "arc_release", "arc_count",
+          "arc_downgrade", "arc_upgrade", "arc_weak_release", "arc_weak_count"];
+    const ARENA_RESTRICTED_BUILTINS: &'static [&'static str] =
+        &["arena_checkpoint", "arena_rewind", "arena_used", "arena_capacity"];
+
+    /// Walks every statement in `body`, recursing into every nested block
+    /// (`if`/`match`/`while`/`for`/`do`/`unsafe`/closures — unlike
+    /// `infer_expr`, which today only looks at top-level statements), and
+    /// errors on any restricted-builtin call not permitted by `mode` or
+    /// `in_unsafe`.
+    fn check_mem_mode_block(&mut self, body: &[Stmt], mode: MemoryMode, in_unsafe: bool, fn_name: &str) {
+        for stmt in body {
+            self.check_mem_mode_stmt(stmt, mode, in_unsafe, fn_name);
+        }
+    }
+
+    fn check_mem_mode_stmt(&mut self, stmt: &Stmt, mode: MemoryMode, in_unsafe: bool, fn_name: &str) {
+        match stmt {
+            Stmt::Let { value: Some(e), .. } => self.check_mem_mode_expr(e, mode, in_unsafe, fn_name),
+            Stmt::Expr(e, _) => self.check_mem_mode_expr(e, mode, in_unsafe, fn_name),
+            Stmt::Return(Some(e), _) | Stmt::Break(Some(e), _) => {
+                self.check_mem_mode_expr(e, mode, in_unsafe, fn_name);
+            }
+            // A nested/local fn def is its own lexical scope — it does not
+            // inherit the enclosing function's `@` mode or an enclosing
+            // `unsafe` block, same as a nested `fn` in Rust isn't implicitly
+            // `unsafe` just because it's textually defined inside one.
+            Stmt::Item(Item::FnDef(nested)) => {
+                self.check_mem_mode_block(&nested.body, nested.mem_mode, false, &nested.name);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_mem_mode_expr(&mut self, e: &Expr, mode: MemoryMode, in_unsafe: bool, fn_name: &str) {
+        match e {
+            Expr::Call(callee, args, span) => {
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    self.check_mem_mode_call(name, mode, in_unsafe, fn_name, span);
+                }
+                self.check_mem_mode_expr(callee, mode, in_unsafe, fn_name);
+                for a in args { self.check_mem_mode_expr(a, mode, in_unsafe, fn_name); }
+            }
+            Expr::MethodCall(recv, _, args, _) => {
+                self.check_mem_mode_expr(recv, mode, in_unsafe, fn_name);
+                for a in args { self.check_mem_mode_expr(a, mode, in_unsafe, fn_name); }
+            }
+            Expr::BinOp(l, _, r, _) | Expr::Assign(l, r, _) | Expr::CompoundAssign(l, _, r, _) => {
+                self.check_mem_mode_expr(l, mode, in_unsafe, fn_name);
+                self.check_mem_mode_expr(r, mode, in_unsafe, fn_name);
+            }
+            Expr::UnOp(_, inner, _) | Expr::FieldAccess(inner, _, _) | Expr::Cast(inner, _, _) |
+            Expr::Try(inner, _) | Expr::Await(inner, _) => self.check_mem_mode_expr(inner, mode, in_unsafe, fn_name),
+            Expr::IndexAccess(a, b, _) => {
+                self.check_mem_mode_expr(a, mode, in_unsafe, fn_name);
+                self.check_mem_mode_expr(b, mode, in_unsafe, fn_name);
+            }
+            Expr::ArrayLit(items, _) | Expr::TupleLit(items, _) => {
+                for i in items { self.check_mem_mode_expr(i, mode, in_unsafe, fn_name); }
+            }
+            Expr::StructLit(_, fields, _) => {
+                for (_, v) in fields { self.check_mem_mode_expr(v, mode, in_unsafe, fn_name); }
+            }
+            Expr::Return(Some(inner), _) => self.check_mem_mode_expr(inner, mode, in_unsafe, fn_name),
+            Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+                self.check_mem_mode_expr(condition, mode, in_unsafe, fn_name);
+                self.check_mem_mode_block(then_body, mode, in_unsafe, fn_name);
+                for (cond, b) in elsif_branches {
+                    self.check_mem_mode_expr(cond, mode, in_unsafe, fn_name);
+                    self.check_mem_mode_block(b, mode, in_unsafe, fn_name);
+                }
+                if let Some(else_body) = else_body {
+                    self.check_mem_mode_block(else_body, mode, in_unsafe, fn_name);
+                }
+            }
+            Expr::Match { subject, arms, .. } => {
+                self.check_mem_mode_expr(subject, mode, in_unsafe, fn_name);
+                for arm in arms {
+                    if let Some(g) = &arm.guard { self.check_mem_mode_expr(g, mode, in_unsafe, fn_name); }
+                    self.check_mem_mode_block(&arm.body, mode, in_unsafe, fn_name);
+                }
+            }
+            Expr::While { condition, body, .. } => {
+                self.check_mem_mode_expr(condition, mode, in_unsafe, fn_name);
+                self.check_mem_mode_block(body, mode, in_unsafe, fn_name);
+            }
+            Expr::For { iterable, body, .. } => {
+                self.check_mem_mode_expr(iterable, mode, in_unsafe, fn_name);
+                self.check_mem_mode_block(body, mode, in_unsafe, fn_name);
+            }
+            Expr::Do { body, .. } => self.check_mem_mode_block(body, mode, in_unsafe, fn_name),
+            // Any `unsafe ... end` block — arena/manual/raw/bare — permits
+            // raw/manual memory ops inside it, same "trust me" umbrella.
+            Expr::Unsafe(body, _, _) => self.check_mem_mode_block(body, mode, true, fn_name),
+            // Closures don't have their own `@` mode; conservatively they
+            // inherit the enclosing function's mode/unsafe-ness.
+            Expr::Closure { body, .. } => self.check_mem_mode_block(body, mode, in_unsafe, fn_name),
+            _ => {}
+        }
+    }
+
+    fn check_mem_mode_call(&mut self, name: &str, mode: MemoryMode, in_unsafe: bool, fn_name: &str, span: &Span) {
+        if in_unsafe { return; }
+        if Self::PTR_RESTRICTED_BUILTINS.contains(&name) && mode != MemoryMode::Pointers {
+            self.err_hint(
+                span.clone(),
+                format!("`{}` used in `{}`, which is not `@pointers`", name, fn_name),
+                format!("mark `{}` as `@pointers`, or wrap this call in `unsafe is ... end`", fn_name),
+            );
+        }
+        if Self::ARC_RESTRICTED_BUILTINS.contains(&name) && mode != MemoryMode::Arc {
+            self.err_hint(
+                span.clone(),
+                format!("`{}` used in `{}`, which is not `@arc`", name, fn_name),
+                format!("mark `{}` as `@arc`, or wrap this call in `unsafe is ... end`", fn_name),
+            );
+        }
+        if Self::ARENA_RESTRICTED_BUILTINS.contains(&name) && mode != MemoryMode::Arena {
+            self.err_hint(
+                span.clone(),
+                format!("`{}` used in `{}`, which is not `@arena`", name, fn_name),
+                format!("mark `{}` as `@arena`, or wrap this call in `unsafe arena ... end`", fn_name),
+            );
+        }
     }
 
     fn check_stmt(&mut self, stmt: &Stmt, fn_name: &str) {
