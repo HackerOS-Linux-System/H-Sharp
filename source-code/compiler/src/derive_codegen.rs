@@ -183,6 +183,7 @@ fn make_fn(type_name: &str, method: &str, params: Vec<Param>, ret: Option<TypeEx
         pub_: true,
         is_async: false,
         is_unsafe: false,
+        mem_mode: Default::default(),
         span,
     }
 }
