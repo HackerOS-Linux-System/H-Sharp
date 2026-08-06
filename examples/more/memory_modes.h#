@@ -1,0 +1,101 @@
+;; H# `@` memory-mode annotations — @arena, @arc, @pointers, @safety.
+;;
+;; Precede a `fn` with one of these to change how *that function* manages
+;; memory. No `@` at all is exactly `@default` (ordinary heap allocation,
+;; no extra checks). These only take effect when compiled with
+;; `hsharp build` (LLVM backend) — `hsharp run` (the interpreter) executes
+;; all four the same as @default, printing a one-time note to stderr for
+;; @safety/@arena so that's visible rather than a silent divergence, and
+;; erroring clearly (rather than silently returning nil) if interpreted
+;; code actually calls an @arc/@pointers-only builtin like `arc_alloc`.
+
+;; ── @arena: fast bump-allocation, freed all at once ─────────────────────
+;; Everything this function allocates — arrays, strings, structs — comes
+;; from one arena that's freed in a single call when the function returns,
+;; on every exit path. Good for "do a bunch of allocating work, then throw
+;; it all away" functions (parsing a request, rendering a frame, ...)
+;; where you don't want per-allocation malloc/free overhead.
+@arena
+fn build_report(rows: int) -> string is
+    let mut report: string = "Report:\n"
+    let mut i: int = 0
+    while i < rows is
+        report = report + "  row " + to_string(i) + "\n"
+        i += 1
+    end
+    return report
+end
+
+;; ── @arc: manual atomic reference counting ──────────────────────────────
+;; `arc_alloc(n)` gives you a real refcounted `n`-byte block (count starts
+;; at 1). `let y = x` on an already-tracked local automatically retains;
+;; every tracked local still around at return time is automatically
+;; released — except one you return directly. Reach for `arc_retain`/
+;; `arc_release`/`arc_count` yourself for anything that isn't a plain
+;; top-level `let` (a value stored in a struct field, moved through a
+;; branch, etc.) — see codegen.rs's `arc_owned` doc comment for exactly
+;; which shapes are auto-tracked today.
+@arc
+fn make_shared_counter(start: int) -> int is
+    let counter = arc_alloc(8)          ;; owns 1 reference
+    ptr_write_i64(counter, 0, start)
+    let alias = counter                 ;; auto-retained — now 2 references
+    let bumped: int = ptr_read_i64(alias, 0) + 1
+    ptr_write_i64(counter, 0, bumped)
+    return ptr_read_i64(alias, 0)
+    ;; `counter` and `alias` are both auto-released here — the returned
+    ;; `int` isn't a pointer, so nothing needs to survive this call.
+end
+
+;; ── @pointers: raw, unchecked memory access ─────────────────────────────
+;; `ptr_read_*`/`ptr_write_*` at every common width (i8/i16/i32/i64/f32/
+;; f64/ptr), plus `ptr_add` (byte-offset pointer arithmetic) and
+;; `ptr_is_null`. No bounds checking at all, by design — this is the
+;; "you asked for it" escape hatch, same trust model as C. Only callable
+;; from a `@pointers`/`@arc` function, or inside an `unsafe ... end` block
+;; (see below) — the typechecker rejects it anywhere else.
+@pointers
+fn pack_two_i32(a: int, b: int) -> string is
+    let buf = arc_alloc(8)
+    ptr_write_i32(buf, 0, a)
+    ptr_write_i32(buf, 4, b)
+    let packed: string =
+        to_string(ptr_read_i32(buf, 0)) + "," + to_string(ptr_read_i32(buf, 4))
+    arc_release(buf)
+    return packed
+end
+
+;; You don't have to annotate the whole function — `unsafe is ... end`
+;; opens the same access for just that block, in an otherwise-ordinary
+;; @default function.
+fn scoped_raw_access() -> int is
+    let mut value: int = 0
+    unsafe is
+        let buf = arc_alloc(8)
+        ptr_write_i64(buf, 0, 7)
+        value = ptr_read_i64(buf, 0) * 6
+        arc_release(buf)
+    end
+    return value
+end
+
+;; ── @safety: basic move-after-use linting ───────────────────────────────
+;; Warns (to stderr, never blocks compilation) when a string/array-typed
+;; local is read again after a plain `let y = x` moved it into another
+;; name — including across if/while/for/match/do/unsafe now, not just a
+;; flat run of statements. Still a heuristic, not a full borrow checker;
+;; see codegen.rs's `check_moves_basic` doc comment for exactly what it
+;; does and doesn't catch.
+@safety
+fn describe(name: string) -> string is
+    let owner: string = name          ;; moves `name` into `owner`
+    return "owner: " + owner          ;; fine — reads `owner`, not `name`
+end
+
+fn main() is
+    println(build_report(3))
+    println("shared counter -> " + to_string(make_shared_counter(10)))
+    println("packed -> " + pack_two_i32(11, 22))
+    println("scoped unsafe -> " + to_string(scoped_raw_access()))
+    println(describe("H#"))
+end
