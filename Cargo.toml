@@ -4,12 +4,12 @@ members = [
     "source-code/compiler", # Requires: llvm-21-dev libpolly-21-dev (apt.llvm.org/unstable)
     "source-code/cli",
     "source-code/interpreter",
-    "source-code/playground",
+    "source-code/playground", # WASM playground for hsharp-lang.org — pure Rust, no LLVM. See its own Cargo.toml/lib.rs doc comments.
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "MPL-2.0"
