@@ -1,0 +1,37 @@
+[package]
+name = "hsharp-playground"
+version = "0.1.0"
+edition = "2021"
+description = "In-browser H# playground — WASM bindings around the H# parser + tree-walking interpreter, for hsharp-lang.org's documentation site."
+
+[lib]
+name = "hsharp_playground"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hsharp-parser      = { path = "../parser" }
+hsharp-interpreter = { path = "../interpreter" }
+wasm-bindgen        = "0.2"
+serde               = { version = "=1.0.195", features = ["derive"] }
+serde_json          = "=1.0.108"
+
+# Panics from deep inside the interpreter (e.g. an `.unwrap()` on a
+# process-spawn error — expected on wasm32, where there's no OS to spawn
+# anything) are caught via `catch_unwind` in `lib.rs` and turned into a
+# normal error message instead of crashing the whole page. That requires
+# unwinding to actually happen instead of aborting the process outright.
+[profile.release]
+panic = "unwind"
+opt-level = "s"   # favor download size over raw speed for a browser-loaded .wasm
+lto = true
+
+# console_error_panic_hook is deliberately NOT a hard dependency: it's
+# opt-in via the `console_error_panic_hook` feature (see lib.rs) so a
+# consumer who doesn't want the extra ~1kB of gzip'd wasm for nicer panic
+# messages in devtools isn't forced to take it.
+[dependencies.console_error_panic_hook]
+version = "0.1"
+optional = true
+
+[features]
+default = ["console_error_panic_hook"]
