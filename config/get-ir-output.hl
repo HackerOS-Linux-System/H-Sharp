@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/hl
 
 OUTPUT_FILE="ir_output.txt"
 > "$OUTPUT_FILE"
