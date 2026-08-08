@@ -1,0 +1,22 @@
+#!/usr/bin/hl
+set -e
+
+echo "==> Ustawianie ścieżek dla Rusta..."
+if [ -f "/home/mkaczmarzyk/.cargo/env" ]; then
+    source "/home/mkaczmarzyk/.cargo/env"
+fi
+
+export PATH="/home/mkaczmarzyk/.cargo/bin:$PATH"
+
+if ! command -v rustup &> /dev/null; then
+    echo "BŁĄD: Narzędzie rustup nadal nie jest dostępne w PATH." >&2
+    exit 1
+fi
+
+echo "==> Ustawianie domyślnego toolchaina (stable)..."
+rustup default stable
+
+echo "==> Dodawanie targetu wasm32-unknown-unknown..."
+rustup target add wasm32-unknown-unknown
+
+echo "==> Gotowe! Możesz teraz uruchomić kompilację projektu."
