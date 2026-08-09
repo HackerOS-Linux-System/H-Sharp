@@ -1,12 +1,18 @@
 #!/usr/bin/hl
+/// Generowanie IR z kompilacji H#
+using <gen 2>
 
-OUTPUT_FILE="ir_output.txt"
-> "$OUTPUT_FILE"
+% OUTPUT_FILE: str = ir_output.txt
 
-echo "=== Kompilacja: bytes_final ===" >> "$OUTPUT_FILE"
-./target/release/hsharp compile bytes-and-hacker/bytes_final/src/main.h# --emit-ir >> "$OUTPUT_FILE" 2>&1
+;; Wyczyść plik wyjściowy
+> : > @OUTPUT_FILE
 
-echo -e "\n\n=== Kompilacja: hacker_hsharp ===" >> "$OUTPUT_FILE"
-./target/release/hsharp compile bytes-and-hacker/hacker_hsharp/src/main.h# --emit-ir >> "$OUTPUT_FILE" 2>&1
+;; Nagłówek + kompilacja bytes_final
+> printf '%s\n' "=== Kompilacja: bytes_final ===" >> @OUTPUT_FILE
+> ./target/release/hsharp compile bytes-and-hacker/bytes_final/src/main.h# --emit-ir >> @OUTPUT_FILE 2>&1
 
-echo "Gotowe! Wyniki kompilacji zostały zapisane w pliku $OUTPUT_FILE"
+;; Nagłówek + kompilacja hacker_hsharp
+> printf '\n\n%s\n' "=== Kompilacja: hacker_hsharp ===" >> @OUTPUT_FILE
+> ./target/release/hsharp compile bytes-and-hacker/hacker_hsharp/src/main.h# --emit-ir >> @OUTPUT_FILE 2>&1
+
+~> Gotowe! Wyniki kompilacji zostały zapisane w pliku @OUTPUT_FILE
