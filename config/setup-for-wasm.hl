@@ -1,22 +1,37 @@
 #!/usr/bin/hl
-set -e
+/// Ustawianie środowiska Rusta (rustup + wasm target)
+using <gen 2>
 
-echo "==> Ustawianie ścieżek dla Rusta..."
-if [ -f "/home/mkaczmarzyk/.cargo/env" ]; then
-    source "/home/mkaczmarzyk/.cargo/env"
-fi
+~> ==> Ustawianie ścieżek dla Rusta...
 
-export PATH="/home/mkaczmarzyk/.cargo/bin:$PATH"
+;; Załaduj cargo env jeśli istnieje
+> test -f /home/mkaczmarzyk/.cargo/env
+? ok
+    > . /home/mkaczmarzyk/.cargo/env
+done
 
-if ! command -v rustup &> /dev/null; then
-    echo "BŁĄD: Narzędzie rustup nadal nie jest dostępne w PATH." >&2
-    exit 1
-fi
+;; Dodaj cargo do PATH
+=> PATH = /home/mkaczmarzyk/.cargo/bin:$PATH
 
-echo "==> Ustawianie domyślnego toolchaina (stable)..."
-rustup default stable
+;; Sprawdź czy rustup jest dostępny
+::which rustup
+? err
+    ~> BŁĄD: Narzędzie rustup nadal nie jest dostępne w PATH.
+    > exit 1
+done
 
-echo "==> Dodawanie targetu wasm32-unknown-unknown..."
-rustup target add wasm32-unknown-unknown
+~> ==> Ustawianie domyślnego toolchaina (stable)...
+> rustup default stable
+? err
+    ~> Błąd podczas ustawiania toolchaina stable
+    > exit 1
+done
 
-echo "==> Gotowe! Możesz teraz uruchomić kompilację projektu."
+~> ==> Dodawanie targetu wasm32-unknown-unknown...
+> rustup target add wasm32-unknown-unknown
+? err
+    ~> Błąd podczas dodawania targetu wasm32-unknown-unknown
+    > exit 1
+done
+
+~> ==> Gotowe! Możesz teraz uruchomić kompilację projektu.
