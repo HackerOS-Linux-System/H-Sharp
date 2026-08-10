@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "source-code/parser",
+    "source-code/typecheck",  # pure Rust, zero LLVM — shared by hsharp-compiler, hsharp-lsp, hsharp-playground
     "source-code/compiler", # Requires: llvm-21-dev libpolly-21-dev (apt.llvm.org/unstable)
     "source-code/cli",
     "source-code/interpreter",
     "source-code/playground", # WASM playground for hsharp-lang.org — pure Rust, no LLVM. See its own Cargo.toml/lib.rs doc comments.
+    "source-code/lsp", # Language Server — pure Rust, no LLVM, ships independently of the compiler.
 ]
 resolver = "2"
 
