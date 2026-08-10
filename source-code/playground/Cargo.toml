@@ -1,6 +1,6 @@
 [package]
 name = "hsharp-playground"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 description = "In-browser H# playground — WASM bindings around the H# parser + tree-walking interpreter, for hsharp-lang.org's documentation site."
 
@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 hsharp-parser      = { path = "../parser" }
+hsharp-typecheck   = { path = "../typecheck" }
 hsharp-interpreter = { path = "../interpreter" }
 wasm-bindgen        = "0.2"
 serde               = { version = "=1.0.195", features = ["derive"] }
