@@ -171,7 +171,15 @@ impl Parser {
         {
             self.advance(); // @
             self.advance(); // :
-            match self.expect_ident() {
+            // Same keyword-collision fix as `parse_mem_mode` below — accept
+            // the `Arena`/`Manual` keyword tokens here too, not just a
+            // plain `Ident`.
+            let ident_result = match &self.current().kind {
+                TokenKind::Arena  => { let s = self.current().span.clone(); self.advance(); Ok(("arena".to_string(), s)) }
+                TokenKind::Manual => { let s = self.current().span.clone(); self.advance(); Ok(("manual".to_string(), s)) }
+                _ => self.expect_ident(),
+            };
+            match ident_result {
                 Ok((name, name_span)) => {
                     match name.as_str() {
                         "default"  => file_mem_mode = Some(MemoryMode::Default),
@@ -306,7 +314,24 @@ impl Parser {
         if !matches!(self.current().kind, TokenKind::At) { return Ok(None); }
         let start = self.current().span.clone();
         self.advance(); // @
-        let (name, name_span) = self.expect_ident()?;
+        // BUG FIX: `arena` (and `manual`) are lexed as dedicated keyword
+        // tokens (`TokenKind::Arena`/`TokenKind::Manual`), not
+        // `TokenKind::Ident` — needed so `unsafe arena(...)`/`unsafe
+        // manual(...)` blocks can be recognized without a lookahead. But
+        // that meant `@arena fn foo() is ... end` (this per-function
+        // annotation, a *different* feature from the `unsafe arena(...)`
+        // block — see `MemoryMode::Arena` in ast.rs) could never parse:
+        // `expect_ident()` only accepts `TokenKind::Ident`, so it saw the
+        // `Arena` keyword token and failed with "expected identifier,
+        // found `arena`" every single time, regardless of what followed.
+        // `@arena` was effectively dead syntax. Accept the keyword tokens
+        // that collide with a mode name here, in addition to a plain
+        // identifier, instead of only ever calling `expect_ident()`.
+        let (name, name_span) = match &self.current().kind {
+            TokenKind::Arena  => { let s = self.current().span.clone(); self.advance(); ("arena".to_string(), s) }
+            TokenKind::Manual => { let s = self.current().span.clone(); self.advance(); ("manual".to_string(), s) }
+            _ => self.expect_ident()?,
+        };
         let mode = match name.as_str() {
             "default"  => MemoryMode::Default,
             "safety"   => MemoryMode::Safety,
@@ -1474,6 +1499,44 @@ impl Parser {
                 }
                 if matches!(self.current().kind, TokenKind::Else) {
                     self.advance();
+                    self.skip_newlines();
+                    // `else if cond then expr` — treat as `elsif` (two-token
+                    // form), exactly like the block (`is`/`end`) form
+                    // already does a few dozen lines below (see its own
+                    // "v0.7 fix: handle both `elsif` and `else if`"
+                    // comment). This shorthand form never got that same
+                    // fix: without it, `else` immediately followed by `if`
+                    // falls straight to `self.parse_expr(0)` below, which
+                    // happily parses the whole `if cond2 then b else c` as
+                    // one big *nested* `Expr::If` — syntactically valid,
+                    // but semantically wrong for a value-producing chain.
+                    // A nested If sitting alone as an else-body's only
+                    // statement gets routed through `stmts_with_value`'s
+                    // void-control-flow path (the same exclusion that
+                    // makes `if`-as-a-void-statement work correctly at the
+                    // end of an ordinary block) instead of being evaluated
+                    // as this ternary's actual value — silently discarding
+                    // the real branch value in favor of a dummy zero. That
+                    // was a real, user-visible bug in `bytes_final`'s own
+                    // `config.h#` (`hk_parse_value`, which uses exactly
+                    // this `else if ... then ...` shape): every value
+                    // reaching that fallback path came back wrong,
+                    // including a stray `cut = 0` that made a downstream
+                    // `string_slice` call read out of bounds — the actual
+                    // segfault this fix resolves. Chaining into
+                    // `elsif_branches` here instead avoids ever producing
+                    // that nested-If shape in the first place.
+                    if matches!(self.current().kind, TokenKind::If) {
+                        self.advance();
+                        let cond = self.parse_expr(0)?;
+                        self.skip_newlines();
+                        self.expect(&TokenKind::Then)?;
+                        let e = self.parse_expr(0)?;
+                        let sp = e.span().clone();
+                        elsif_branches.push((cond, vec![Stmt::Expr(e, sp)]));
+                        self.skip_newlines();
+                        continue;
+                    }
                     // Support both `else then expr` and bare `else expr`
                     if matches!(self.current().kind, TokenKind::Then) { self.advance(); }
                     let e = self.parse_expr(0)?;
