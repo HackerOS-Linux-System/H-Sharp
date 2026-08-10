@@ -1,0 +1,66 @@
+{
+  "name": "hsharp",
+  "displayName": "H# Language Support",
+  "description": "Syntax highlighting, diagnostics, hover, and completion for H# (.h#) — powered by hsharp-lsp.",
+  "version": "0.1.0",
+  "publisher": "hackeros-linux-system",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HackerOS-Linux-System/H-Sharp"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": [
+    "onLanguage:hsharp"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "hsharp",
+        "aliases": ["H#", "hsharp"],
+        "extensions": [".h#"],
+        "configuration": "./language-configuration/language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "hsharp",
+        "scopeName": "source.hsharp",
+        "path": "./syntaxes/hsharp.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "H#",
+      "properties": {
+        "hsharp.serverPath": {
+          "type": "string",
+          "default": "hsharp-lsp",
+          "description": "Path to the hsharp-lsp binary. Defaults to 'hsharp-lsp', resolved via $PATH — install it with the same toolchain used to build the hsharp compiler (see source-code/lsp/README.md), or point this at an absolute path if it's not on $PATH."
+        },
+        "hsharp.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Logs the raw LSP traffic between this extension and hsharp-lsp, in the 'H#' Output panel — useful for debugging the extension itself, not something an ordinary user needs."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}
