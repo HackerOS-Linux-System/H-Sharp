@@ -16,6 +16,8 @@ impl Interpreter {
             captured_output: false,
             reactor: runtime_async::Reactor::new(),
             mem_mode_notes_given: std::collections::HashSet::new(),
+            step_count: 0,
+            step_limit: None,
         }
     }
 
@@ -97,6 +99,15 @@ impl Interpreter {
     }
 
     pub fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
+        if let Some(limit) = self.step_limit {
+            self.step_count += 1;
+            if self.step_count > limit {
+                return Err(RuntimeError::Panic(format!(
+                    "step limit exceeded ({} statements) — program did not finish in time; this is usually an infinite or runaway loop",
+                    limit
+                )));
+            }
+        }
         match stmt {
             Stmt::Let { name, mutable, value, .. } => {
                 let val = if let Some(expr) = value {
