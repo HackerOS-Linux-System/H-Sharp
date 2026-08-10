@@ -1,0 +1,141 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "H#",
+  "scopeName": "source.hsharp",
+  "fileTypes": ["h#"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#attributes" },
+    { "include": "#mem-mode" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#function-def" },
+    { "include": "#struct-enum-def" },
+    { "include": "#function-call" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.semicolon.hsharp",
+          "match": ";;.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.hsharp",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.hsharp",
+              "match": "\\\\(n|t|r|\\\\|\"|0|x[0-9a-fA-F]{2})"
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hsharp",
+          "match": "\\b(0x[0-9a-fA-F_]+|0b[01_]+|[0-9][0-9_]*(\\.[0-9_]+)?)\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "comment": "Per-function memory-mode annotation, e.g. @arena, @arc, @pointers, @safety, @default — see MemoryMode in ast.rs",
+          "name": "storage.modifier.hsharp",
+          "match": "@(arena|arc|pointers|safety|default|manual)\\b"
+        },
+        {
+          "comment": "#[test], #[derive(...)] etc.",
+          "name": "meta.attribute.hsharp",
+          "match": "#\\[[^\\]]*\\]"
+        }
+      ]
+    },
+    "mem-mode": {
+      "patterns": [
+        {
+          "name": "keyword.control.unsafe.hsharp",
+          "match": "\\bunsafe\\s+(arena|manual|write|using)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.hsharp",
+          "match": "\\b(if|is|then|else|elsif|end|match|while|for|in|loop|do|break|continue|return|unsafe|async|await)\\b"
+        },
+        {
+          "name": "keyword.other.hsharp",
+          "match": "\\b(fn|let|mut|struct|enum|trait|impl|pub|extern|mod|use|from|as|new|self|type|arena|manual|using|write)\\b"
+        },
+        {
+          "name": "constant.language.hsharp",
+          "match": "\\b(true|false|nil)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.hsharp",
+          "match": "\\b(int|uint|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f32|f64|bool|string|bytes|void|any)\\b"
+        },
+        {
+          "comment": "A capitalized identifier used as a type — e.g. `Colors` in `c: Colors` — heuristic (H# has no case-based keyword rule, this is a display convenience matching common style).",
+          "name": "support.type.hsharp",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "function-def": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.hsharp" },
+            "2": { "name": "entity.name.function.hsharp" }
+          }
+        }
+      ]
+    },
+    "struct-enum-def": {
+      "patterns": [
+        {
+          "match": "\\b(struct|enum|trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.hsharp" },
+            "2": { "name": "entity.name.type.hsharp" }
+          }
+        }
+      ]
+    },
+    "function-call": {
+      "patterns": [
+        {
+          "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "name": "entity.name.function.call.hsharp"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.hsharp",
+          "match": "(\\+|-|\\*|/|%|==|!=|<=|>=|<|>|&&|\\|\\||!|=|\\+=|-=|\\*=|/=|\\?|::|->|=>|\\.\\.)"
+        }
+      ]
+    }
+  }
+}
