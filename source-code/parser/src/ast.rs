@@ -327,22 +327,42 @@ pub enum MemoryMode {
     /// modes can just use `..Default::default()`/derive without changes.
     #[default]
     Default,
-    /// `@safety` — reserved for a future Rust-inspired ownership/borrow
-    /// checker (a compile-time, zero-runtime-cost static analysis, not a
-    /// runtime allocation strategy). Parses today; codegen treats it
-    /// identically to `Default` and emits a heads-up that it isn't
-    /// implemented yet.
+    /// `@safety` — a control-flow-aware move-after-use heuristic
+    /// (`Self::check_moves_basic` + `region_drop_audit` in codegen.rs),
+    /// **not** a full ownership/borrow checker and **not** a soundness
+    /// guarantee. Codegen itself is identical to `Default` — this mode
+    /// only adds a static analysis pass, no runtime behavior difference —
+    /// and a `note:` is printed at compile time saying exactly that, every
+    /// time a `@safety` function is compiled, so this is a documented,
+    /// visible limitation rather than a silent one. See the
+    /// `MemoryMode::Safety` arm in `compile_fn` for the exact wording.
     Safety,
-    /// `@arc` — reserved for a future atomic-refcounting mode. Parses
-    /// today; not yet implemented in codegen (behaves like `Default`).
+    /// `@arc` — real atomic refcounting, not a stub: `arc_alloc`/
+    /// `arc_retain`/`arc_release`/`arc_count` are genuine builtins, gated
+    /// by the typechecker so they're only callable from an `@arc`/
+    /// `@pointers` function or an `unsafe ... end` block (see
+    /// typechecker.rs). What *isn't* covered: `let`-bindings only reach
+    /// automatic retain/release when bound at the function's top level
+    /// (not inside `if`/`while`/`for`/`match`/`do`/`unsafe`), and an ARC
+    /// pointer stashed inside a struct field or array element instead of
+    /// held as a bare local still needs manual `arc_retain`/`arc_release`.
+    /// Both boundaries are printed as a compile-time `note:` on every
+    /// `@arc` function, not left for the programmer to discover the hard
+    /// way — see the `MemoryMode::Arc` arm in `compile_fn`.
     Arc,
     /// `@arena` — bump-allocates everything created during this
     /// function's call into a single arena, freed in one shot on every
-    /// exit path. Implemented — see `compile_fn`/`build_return_coerced`.
+    /// exit path. Fully implemented — see `compile_fn`/`build_return_coerced`.
     Arena,
-    /// `@pointers` — reserved for a future "modern raw pointers, still
-    /// trusts the programmer" mode. Parses today; not yet implemented
-    /// (behaves like `Default`).
+    /// `@pointers` — typed, unchecked-by-design `ptr_read_*`/`ptr_write_*`/
+    /// `ptr_add`/`ptr_is_null` builtins (i8/i16/i32/i64/f32/f64/ptr), gated
+    /// by the typechecker exactly like `@arc`'s builtins (only reachable
+    /// from a `@pointers`/`@arc` function or `unsafe ... end`) — a real,
+    /// checked boundary, not a doc-only convention. "Unchecked by design"
+    /// here means what it says: these builtins trust the caller (no bounds
+    /// checking, no alignment checking) *by design*, same as `unsafe` raw
+    /// pointer arithmetic in Rust — that is the feature, not a limitation
+    /// to fix later.
     Pointers,
 }
 
