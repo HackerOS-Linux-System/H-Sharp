@@ -209,7 +209,8 @@ impl Interpreter {
                 let mut grep_m = std::process::Command::new("grep")
                     .args(["-qP", &pattern])
                     .stdin(std::process::Stdio::piped())
-                    .spawn().unwrap_or_else(|_| panic!("grep not found"));
+                    .spawn()
+                    .map_err(|_| RuntimeError::TypeError("regex_match: `grep` not found on this system".to_string()))?;
                 if let Some(stdin) = grep_m.stdin.as_mut() {
                     let _ = stdin.write_all(text.as_bytes());
                 }
@@ -220,13 +221,29 @@ impl Interpreter {
                 let pattern = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let text    = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 use std::io::Write;
+                // SAFETY/ROBUSTNESS FIX: every one of these used to fall
+                // back to `std::process::exit(1)` (or, worse, a second
+                // spawn of the `true` binary that itself `.unwrap()`s) when
+                // `grep`/`sed` couldn't be spawned. On a normal machine
+                // that's merely abrupt; on `wasm32-unknown-unknown`
+                // (the WASM playground) `std::process::exit` compiles to
+                // an *uncatchable* WASM trap — not even `catch_unwind` can
+                // intercept it — so a program calling `regex_find` in a
+                // browser tab that has no `grep` to spawn (always, there's
+                // no OS under a browser tab) would crash the whole page
+                // with an uncaught JS exception instead of getting a
+                // normal H# runtime error. Returning `Err` here goes
+                // through the same `Result` channel as every other runtime
+                // error, on every target, with no special-casing needed.
                 let mut gf = std::process::Command::new("grep")
                     .args(["-oP", &pattern])
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .spawn().unwrap_or_else(|_| { eprintln!("grep not found"); std::process::exit(1); });
+                    .spawn()
+                    .map_err(|_| RuntimeError::TypeError("regex_find: `grep` not found on this system".to_string()))?;
                 if let Some(s) = gf.stdin.as_mut() { let _ = s.write_all(text.as_bytes()); }
-                let gfo = gf.wait_with_output().unwrap_or_else(|_| std::process::Command::new("true").output().unwrap());
+                let gfo = gf.wait_with_output()
+                    .map_err(|_| RuntimeError::TypeError("regex_find: failed to read `grep`'s output".to_string()))?;
                 return Ok(Value::Str(String::from_utf8_lossy(&gfo.stdout).trim().to_string()));
             }
             "re_find_all" | "regex_find_all" => {
@@ -237,9 +254,11 @@ impl Interpreter {
                     .args(["-oP", &pattern])
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .spawn().unwrap_or_else(|_| { eprintln!("grep not found"); std::process::exit(1); });
+                    .spawn()
+                    .map_err(|_| RuntimeError::TypeError("regex_find_all: `grep` not found on this system".to_string()))?;
                 if let Some(s) = gfa.stdin.as_mut() { let _ = s.write_all(text.as_bytes()); }
-                let gfao = gfa.wait_with_output().unwrap_or_else(|_| std::process::Command::new("true").output().unwrap());
+                let gfao = gfa.wait_with_output()
+                    .map_err(|_| RuntimeError::TypeError("regex_find_all: failed to read `grep`'s output".to_string()))?;
                 let results: Vec<Value> = String::from_utf8_lossy(&gfao.stdout)
                     .lines().filter(|l| !l.is_empty())
                     .map(|l| Value::Str(l.to_string())).collect();
@@ -250,19 +269,56 @@ impl Interpreter {
                 let repl    = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 let text    = args.get(2).map(|v| v.to_string()).unwrap_or_default();
                 use std::io::Write;
-                let sed_script = format!("s|{}|{}|g", pattern, repl);
+                // SECURITY FIX: this used to always splice `pattern`/`repl`
+                // into the sed script with a hardcoded `|` delimiter —
+                // `format!("s|{}|{}|g", pattern, repl)`. Two real problems,
+                // not just cosmetic ones:
+                //   1. If `pattern`/`repl` happened to contain a literal
+                //      `|`, the resulting script has the wrong number of
+                //      delimiters — at best a sed syntax error, at worst
+                //      (depending on exactly where the extra `|` lands)
+                //      sed parses the tail as a *second* command appended
+                //      to the first.
+                //   2. sed's `s///` supports an `e` flag that runs the
+                //      substitution result as a shell command. Since
+                //      nothing here validated that `repl` couldn't itself
+                //      supply that flag (e.g. `repl = "x/e"` turning
+                //      `s|pat|x/e|g` into a script sed reads differently
+                //      than intended), a caller building `pattern`/`repl`
+                //      from untrusted input had a real command-injection
+                //      surface here, not merely "unexpected behavior".
+                // Fixed by (a) picking a delimiter guaranteed absent from
+                // *both* strings instead of hardcoding one, and (b)
+                // refusing to proceed at all if `pattern`/`repl` contain a
+                // newline or NUL — either can inject an additional sed
+                // script line/command regardless of which delimiter is
+                // chosen, so no delimiter choice alone makes those safe.
+                if pattern.contains(['\n', '\0']) || repl.contains(['\n', '\0']) {
+                    return Err(RuntimeError::TypeError(
+                        "regex_replace: pattern/replacement may not contain a newline or NUL byte".to_string()
+                    ));
+                }
+                const DELIM_CANDIDATES: &[char] = &['|', '#', '~', '\u{1}', '\u{2}', '\u{3}'];
+                let delim = DELIM_CANDIDATES.iter().find(|&&d| {
+                    !pattern.contains(d) && !repl.contains(d)
+                });
+                let delim = match delim {
+                    Some(d) => *d,
+                    None => return Err(RuntimeError::TypeError(
+                        "regex_replace: couldn't find a safe delimiter character not present in the pattern or replacement".to_string()
+                    )),
+                };
+                let sed_script = format!("s{d}{p}{d}{r}{d}g", d = delim, p = pattern, r = repl);
                 let mut sed_c = std::process::Command::new("sed")
                     .args(["-E", &sed_script])
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .spawn().unwrap_or_else(|_| { eprintln!("sed not found"); std::process::exit(1); });
+                    .spawn()
+                    .map_err(|_| RuntimeError::TypeError("regex_replace: `sed` not found on this system".to_string()))?;
                 if let Some(s) = sed_c.stdin.as_mut() { let _ = s.write_all(text.as_bytes()); }
-                let sed_out = sed_c.wait_with_output().unwrap_or_else(|_| std::process::Command::new("true").output().unwrap());
-                let out = Ok::<_, std::io::Error>(sed_out);
-                return Ok(Value::Str(match out {
-                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
-                    Err(_) => text.to_string(),
-                }));
+                let sed_out = sed_c.wait_with_output()
+                    .map_err(|_| RuntimeError::TypeError("regex_replace: failed to read `sed`'s output".to_string()))?;
+                return Ok(Value::Str(String::from_utf8_lossy(&sed_out.stdout).trim_end().to_string()));
             }
             // ── (text, pattern) argument-order wrappers ───────────────────────
             // std/regex.h#'s documented H# API takes the subject text first
@@ -444,7 +500,7 @@ impl Interpreter {
                     Some(Value::Int(n)) => *n as i32,
                     _ => 0,
                 };
-                std::process::exit(code);
+                return Err(RuntimeError::Exit(code));
             }
             "len" => {
                 return Ok(match args.first() {
