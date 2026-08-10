@@ -39,6 +39,12 @@ pub enum CodegenError {
     #[error("undefined fn: {name} ({span})")]  UndefinedFn { name: String, span: Span },
     #[error("io: {0}")]            Io(#[from] std::io::Error),
     #[error("link: {0}")]          Link(String),
+    /// `@safety`'s move-after-use check escalated from a warning to a
+    /// real compile error — see `check_moves_basic`'s doc comment for why
+    /// `@safety` (and only `@safety`; `@default` still just warns) treats
+    /// this as fatal.
+    #[error("@safety violation in `{fn_name}`:\n{}", .violations.join("\n"))]
+    SafetyViolation { fn_name: String, violations: Vec<String> },
 }
 type R<T> = Result<T, CodegenError>;
 
@@ -296,8 +302,10 @@ impl LlvmCodegen {
     /// variable is still flagged as a use". Good enough to catch real
     /// cross-branch and cross-iteration move bugs that v1 missed
     /// entirely; not a soundness guarantee.
-    fn check_moves_basic(body: &[Stmt], fn_name: &str) {
-        Self::check_moves_block(body, HashMap::new(), fn_name, false);
+    fn check_moves_basic(body: &[Stmt], fn_name: &str) -> Vec<String> {
+        let violations = std::cell::RefCell::new(Vec::new());
+        Self::check_moves_block(body, HashMap::new(), fn_name, false, &violations);
+        violations.into_inner()
     }
 
     /// Checks `body` given the set of variables already known-moved on
@@ -311,12 +319,13 @@ impl LlvmCodegen {
         moved_in: HashMap<String, Span>,
         fn_name: &str,
         silent: bool,
+        violations: &std::cell::RefCell<Vec<String>>,
     ) -> HashMap<String, Span> {
         let mut moved = moved_in;
         for s in body {
             match s {
                 Stmt::Let { name, ty, value: Some(e), span, .. } => {
-                    Self::check_moves_expr(e, &mut moved, fn_name, silent);
+                    Self::check_moves_expr(e, &mut moved, fn_name, silent, violations);
                     let sensitive = ty.as_ref().map(Self::is_move_sensitive_type).unwrap_or(false);
                     if sensitive {
                         if let Expr::Ident(src, _) = e {
@@ -346,9 +355,9 @@ impl LlvmCodegen {
                     Self::check_moves_basic(&nested.body, &nested.name);
                 }
                 Stmt::Item(_) => {}
-                Stmt::Expr(e, _) => Self::check_moves_expr(e, &mut moved, fn_name, silent),
+                Stmt::Expr(e, _) => Self::check_moves_expr(e, &mut moved, fn_name, silent, violations),
                 Stmt::Return(Some(e), _) | Stmt::Break(Some(e), _) => {
-                    Self::check_moves_expr(e, &mut moved, fn_name, silent);
+                    Self::check_moves_expr(e, &mut moved, fn_name, silent, violations);
                 }
                 Stmt::Return(None, _) | Stmt::Break(None, _) => {}
             }
@@ -377,67 +386,71 @@ impl LlvmCodegen {
     /// control-flow construct used as a statement) and the same
     /// constructs appearing as a plain sub-expression (e.g. inside
     /// `let x = if cond { a } else { b }`), since both route through here.
-    fn check_moves_expr(e: &Expr, moved: &mut HashMap<String, Span>, fn_name: &str, silent: bool) {
+    fn check_moves_expr(e: &Expr, moved: &mut HashMap<String, Span>, fn_name: &str, silent: bool, violations: &std::cell::RefCell<Vec<String>>) {
         match e {
             Expr::Ident(name, span) => {
                 if silent { return; }
                 if let Some(move_span) = moved.get(name) {
-                    eprintln!(
-                        "warning: {}: `{}` used here after being moved (moved at {}) in `{}` — move-after-use check (@default/@safety)",
+                    let msg = format!(
+                        "{}: `{}` used here after being moved (moved at {}) in `{}`",
                         span, name, move_span, fn_name
                     );
+                    eprintln!("warning: {} — move-after-use check (@default/@safety)", msg);
+                    violations.borrow_mut().push(msg);
                 }
             }
             Expr::BinOp(l, _, r, _) | Expr::Assign(l, r, _) | Expr::CompoundAssign(l, _, r, _) => {
-                Self::check_moves_expr(l, moved, fn_name, silent);
-                Self::check_moves_expr(r, moved, fn_name, silent);
+                Self::check_moves_expr(l, moved, fn_name, silent, violations);
+                Self::check_moves_expr(r, moved, fn_name, silent, violations);
             }
             Expr::UnOp(_, inner, _) | Expr::Cast(inner, _, _) |
-            Expr::Try(inner, _) | Expr::Await(inner, _) => Self::check_moves_expr(inner, moved, fn_name, silent),
+            Expr::Try(inner, _) | Expr::Await(inner, _) => Self::check_moves_expr(inner, moved, fn_name, silent, violations),
             Expr::FieldAccess(obj, field, span) => {
                 if !silent {
                     if let Some(key) = Self::field_move_key(e) {
                         if let Some(move_span) = moved.get(&key) {
-                            eprintln!(
-                                "warning: {}: `{}` used here after being moved (moved at {}) in `{}` — move-after-use check (@default/@safety)",
+                            let msg = format!(
+                                "{}: `{}` used here after being moved (moved at {}) in `{}`",
                                 span, key, move_span, fn_name
                             );
+                            eprintln!("warning: {} — move-after-use check (@default/@safety)", msg);
+                            violations.borrow_mut().push(msg);
                         }
                     }
                     let _ = field; // field name itself never needs its own move-check
                 }
-                Self::check_moves_expr(obj, moved, fn_name, silent);
+                Self::check_moves_expr(obj, moved, fn_name, silent, violations);
             }
             Expr::IndexAccess(a, b, _) => {
-                Self::check_moves_expr(a, moved, fn_name, silent);
-                Self::check_moves_expr(b, moved, fn_name, silent);
+                Self::check_moves_expr(a, moved, fn_name, silent, violations);
+                Self::check_moves_expr(b, moved, fn_name, silent, violations);
             }
             Expr::Call(callee, args, _) => {
-                Self::check_moves_expr(callee, moved, fn_name, silent);
-                for a in args { Self::check_moves_expr(a, moved, fn_name, silent); }
+                Self::check_moves_expr(callee, moved, fn_name, silent, violations);
+                for a in args { Self::check_moves_expr(a, moved, fn_name, silent, violations); }
             }
             Expr::MethodCall(recv, _, args, _) => {
-                Self::check_moves_expr(recv, moved, fn_name, silent);
-                for a in args { Self::check_moves_expr(a, moved, fn_name, silent); }
+                Self::check_moves_expr(recv, moved, fn_name, silent, violations);
+                for a in args { Self::check_moves_expr(a, moved, fn_name, silent, violations); }
             }
             Expr::ArrayLit(items, _) | Expr::TupleLit(items, _) => {
-                for i in items { Self::check_moves_expr(i, moved, fn_name, silent); }
+                for i in items { Self::check_moves_expr(i, moved, fn_name, silent, violations); }
             }
             Expr::StructLit(_, fields, _) => {
-                for (_, v) in fields { Self::check_moves_expr(v, moved, fn_name, silent); }
+                for (_, v) in fields { Self::check_moves_expr(v, moved, fn_name, silent, violations); }
             }
-            Expr::Return(Some(inner), _) => Self::check_moves_expr(inner, moved, fn_name, silent),
+            Expr::Return(Some(inner), _) => Self::check_moves_expr(inner, moved, fn_name, silent, violations),
 
             Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
-                Self::check_moves_expr(condition, moved, fn_name, silent);
-                let then_out = Self::check_moves_block(then_body, moved.clone(), fn_name, silent);
+                Self::check_moves_expr(condition, moved, fn_name, silent, violations);
+                let then_out = Self::check_moves_block(then_body, moved.clone(), fn_name, silent, violations);
                 let mut branch_outs = vec![then_out];
                 for (cond, b) in elsif_branches {
-                    Self::check_moves_expr(cond, moved, fn_name, silent);
-                    branch_outs.push(Self::check_moves_block(b, moved.clone(), fn_name, silent));
+                    Self::check_moves_expr(cond, moved, fn_name, silent, violations);
+                    branch_outs.push(Self::check_moves_block(b, moved.clone(), fn_name, silent, violations));
                 }
                 *moved = if let Some(else_body) = else_body {
-                    branch_outs.push(Self::check_moves_block(else_body, moved.clone(), fn_name, silent));
+                    branch_outs.push(Self::check_moves_block(else_body, moved.clone(), fn_name, silent, violations));
                     Self::intersect_moved(branch_outs)
                 } else {
                     // No `else` ⇒ an implicit no-op path exists, which
@@ -446,20 +459,20 @@ impl LlvmCodegen {
                 };
             }
             Expr::Match { subject, arms, .. } => {
-                Self::check_moves_expr(subject, moved, fn_name, silent);
+                Self::check_moves_expr(subject, moved, fn_name, silent, violations);
                 if !arms.is_empty() {
                     let mut arm_outs = Vec::with_capacity(arms.len());
                     for arm in arms {
-                        if let Some(g) = &arm.guard { Self::check_moves_expr(g, moved, fn_name, silent); }
-                        arm_outs.push(Self::check_moves_block(&arm.body, moved.clone(), fn_name, silent));
+                        if let Some(g) = &arm.guard { Self::check_moves_expr(g, moved, fn_name, silent, violations); }
+                        arm_outs.push(Self::check_moves_block(&arm.body, moved.clone(), fn_name, silent, violations));
                     }
                     *moved = Self::intersect_moved(arm_outs);
                 }
             }
             Expr::While { condition, body, .. } => {
-                Self::check_moves_expr(condition, moved, fn_name, silent);
+                Self::check_moves_expr(condition, moved, fn_name, silent, violations);
                 // Pass 1 (silent): just discover what the body itself moves.
-                let collected = Self::check_moves_block(body, moved.clone(), fn_name, true);
+                let collected = Self::check_moves_block(body, moved.clone(), fn_name, true, violations);
                 // Pass 2 (real): re-check with those folded in as if
                 // already moved on entry, catching "moved near the end of
                 // one iteration, read again near the top of the next" —
@@ -467,27 +480,27 @@ impl LlvmCodegen {
                 // bodies at all.
                 let mut seed = moved.clone();
                 seed.extend(collected);
-                Self::check_moves_block(body, seed, fn_name, silent);
+                Self::check_moves_block(body, seed, fn_name, silent, violations);
                 // Loop may run zero times — nothing new guaranteed after it.
             }
             Expr::For { iterable, body, .. } => {
-                Self::check_moves_expr(iterable, moved, fn_name, silent);
-                let collected = Self::check_moves_block(body, moved.clone(), fn_name, true);
+                Self::check_moves_expr(iterable, moved, fn_name, silent, violations);
+                let collected = Self::check_moves_block(body, moved.clone(), fn_name, true, violations);
                 let mut seed = moved.clone();
                 seed.extend(collected);
-                Self::check_moves_block(body, seed, fn_name, silent);
+                Self::check_moves_block(body, seed, fn_name, silent, violations);
             }
             Expr::Do { body, .. } => {
                 // Always runs exactly once — folds straight into the flow.
-                *moved = Self::check_moves_block(body, moved.clone(), fn_name, silent);
+                *moved = Self::check_moves_block(body, moved.clone(), fn_name, silent, violations);
             }
             Expr::Unsafe(body, _, _) => {
-                *moved = Self::check_moves_block(body, moved.clone(), fn_name, silent);
+                *moved = Self::check_moves_block(body, moved.clone(), fn_name, silent, violations);
             }
             Expr::Closure { body, .. } => {
                 // May run later, any number of times — check in isolation,
                 // don't feed its effects back into the surrounding flow.
-                Self::check_moves_block(body, moved.clone(), fn_name, silent);
+                Self::check_moves_block(body, moved.clone(), fn_name, silent, violations);
             }
             _ => {}
         }
@@ -736,6 +749,7 @@ impl LlvmCodegen {
         let mut var_types: HashMap<String, String> = HashMap::new();
         let mut array_elem_types: HashMap<String, String> = HashMap::new();
         let mut array_elem_llvm_ty: HashMap<String, BasicTypeEnum<'ctx>> = HashMap::new();
+        let mut array_elem_type_expr: HashMap<String, TypeExpr> = HashMap::new();
         let mut pidx = 0u32;
         for p in &f.params {
             if p.name == "self" { continue; }
@@ -753,6 +767,7 @@ impl LlvmCodegen {
                 if let Some(elem_llvm) = htype_to_llvm(ctx, elem) {
                     array_elem_llvm_ty.insert(p.name.clone(), elem_llvm);
                 }
+                array_elem_type_expr.insert(p.name.clone(), elem.as_ref().clone());
             }
             if let Some(llvm_ty) = htype_to_llvm(ctx, &p.ty) {
                 let param_val = fv.get_nth_param(pidx).unwrap();
@@ -774,23 +789,38 @@ impl LlvmCodegen {
         let mut cx = FnCx {
             ctx, module, builder, builtins, func_vals, str_globals,
             vars, fn_name: f.name.clone(), ret_type: f.return_type.clone(),
-            structs, var_types, array_elem_types, array_elem_llvm_ty, mem_mode: f.mem_mode,
+            structs, var_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
             arc_owned: std::cell::RefCell::new(Vec::new()),
             branch_depth: std::cell::Cell::new(0),
+            loop_stack: Vec::new(),
         };
 
         match f.mem_mode {
             MemoryMode::Safety => {
+                // BUG FIX / real expansion: `@safety` used to be purely
+                // advisory — the move-after-use check ran and printed
+                // warnings, but nothing about marking a function `@safety`
+                // actually *enforced* anything; a violation and a clean
+                // function compiled identically. That's backwards for an
+                // annotation whose entire point is opting into stricter
+                // checking. `@default` keeps the old warn-only behavior
+                // (a function that never asked for scrutiny shouldn't
+                // suddenly fail to build), but `@safety` now means what it
+                // says: a real move-after-use is a compile *error* here,
+                // not a note easily lost in build output.
                 eprintln!(
-                    "note: {}: `@safety` on `{}` doesn't change codegen yet (compiling as `@default`) — a real ownership/move checker is future work; running a control-flow-aware straight-line move-after-use check now (recurses into if/while/match/for/do/unsafe; still a heuristic, not a soundness guarantee)",
+                    "note: {}: `@safety` on `{}` runs a control-flow-aware straight-line move-after-use check (recurses into if/while/match/for/do/unsafe) and treats any violation as a hard compile error — not just a warning like `@default` gets. Still a heuristic (no real scoping, no borrow understanding beyond \"a reference to an already-moved variable is a use\"), not a full ownership/borrow checker or a soundness guarantee",
                     f.span, f.name
                 );
-                Self::check_moves_basic(&f.body, &f.name);
+                let violations = Self::check_moves_basic(&f.body, &f.name);
+                if !violations.is_empty() {
+                    return Err(CodegenError::SafetyViolation { fn_name: f.name.clone(), violations });
+                }
                 Self::region_drop_audit(f);
             }
             MemoryMode::Arc => {
                 eprintln!(
-                    "note: {}: `@arc` on `{}` — basic v2: `arc_alloc`/`arc_retain`/`arc_release`/`arc_count` are available (real atomic refcounting), and plain `let x = arc_alloc(n)` / `let y = x` bindings at the function's top level (not inside if/while/for/match/do/unsafe) are now retained/released for you automatically. Locals only bound inside a branch, or an arc pointer returned inside a struct/array instead of as a bare `x`, still need manual `arc_retain`/`arc_release`",
+                    "note: {}: `@arc` on `{}` — basic v2: `arc_alloc`/`arc_retain`/`arc_release`/`arc_count` are available (real atomic refcounting), and plain `let x = arc_alloc(n)` / `let y = x` bindings at the function's top level (not inside if/while/for/match/do/unsafe) are now retained/released for you automatically, including on reassignment (`x = ...` releases whatever `x` held before, not just at return). Locals only bound inside a branch, or an arc pointer returned inside a struct/array instead of as a bare `x`, still need manual `arc_retain`/`arc_release`",
                     f.span, f.name
                 );
             }
@@ -1566,6 +1596,14 @@ struct FnCx<'ctx, 'a> {
     /// `inttoptr` (pointer-shaped element) or can be used as-is
     /// (numeric element, already stored as a raw i64 slot).
     array_elem_llvm_ty: HashMap<String, BasicTypeEnum<'ctx>>,
+    /// Full-fidelity companion to `array_elem_llvm_ty`: the element's
+    /// declared `TypeExpr` rather than its flattened LLVM form. Needed to
+    /// handle *nested* arrays (`[[string]]`, i.e. `cmds[i][0]`) — resolving
+    /// the outer `cmds[i]` needs to know its element type is itself
+    /// `[string]` (another array, to recurse into for the `[0]`), which a
+    /// bare `BasicTypeEnum` (just "this is a pointer") can't express; only
+    /// the source-level type can.
+    array_elem_type_expr: HashMap<String, TypeExpr>,
     /// This function's `@arena`/`@safety`/`@arc`/`@pointers`/`@default`
     /// annotation. `Arena` and `Arc` change codegen behavior (see
     /// `compile_fn`'s prologue and `build_return_coerced`'s epilogue);
@@ -1607,6 +1645,30 @@ struct FnCx<'ctx, 'a> {
     /// inside a branch/arm yet" (still requires a manual `arc_release`
     /// there) for "never releases a pointer that was never allocated".
     branch_depth: std::cell::Cell<u32>,
+    /// Stack of enclosing loops' `(continue_target, break_target)` basic
+    /// blocks — pushed on entering a `while`/`for` loop's body, popped on
+    /// leaving it. `Stmt::Continue`/`Stmt::Break` consult
+    /// `.last()` to know which block to actually branch to.
+    ///
+    /// BUG FIX: before this existed, `Stmt::Break`/`Stmt::Continue` had no
+    /// way to know *which* loop (if any) they were inside, so they always
+    /// emitted a bare `unreachable` instruction — telling LLVM this code
+    /// path can never execute at runtime. That's true for a `break`/
+    /// `continue` genuinely outside any loop (a real program never has
+    /// one; the typechecker rejects it), but `continue`/`break` *inside* a
+    /// real, running loop are the opposite of unreachable — they're
+    /// executed constantly, by design. Marking reachable code as
+    /// `unreachable` is a direct request for undefined behavior: the
+    /// optimizer is free to assume execution never reaches there and
+    /// delete/misorder surrounding code on that assumption, which is
+    /// exactly what produced hard-to-explain segfaults in any nontrivial
+    /// loop containing an early `continue` followed by more loop-body
+    /// code (`bytes_final`'s own `config::parse`, which has exactly that
+    /// shape, crashed from this). `while_stmt`/`for_stmt` now push their
+    /// real continue/break targets here before compiling their body, so
+    /// `break`/`continue` branch to the correct block like every other
+    /// working compiler's loop lowering.
+    loop_stack: Vec<(inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
 }
 
 impl<'ctx, 'a> FnCx<'ctx, 'a> {
@@ -1702,6 +1764,55 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         }
     }
 
+    /// Resolves the `TypeExpr` of what indexing `e` produces (i.e. `e`'s
+    /// *element* type — `e` itself must be an array-valued expression).
+    /// Unlike `infer_array_elem_type` (struct names only, for
+    /// `infer_struct_name`'s benefit) this handles *any* element type, and
+    /// — critically — recurses through `IndexAccess` so nested arrays
+    /// (`cmds: [[string]]`, i.e. `cmds[i][0]`) resolve correctly: the
+    /// outer `[0]` needs to know `cmds[i]`'s type is `[string]`, which
+    /// means first resolving what indexing `cmds` produces one level down.
+    fn infer_elem_type_expr(&self, e: &Expr) -> Option<TypeExpr> {
+        match e {
+            Expr::Ident(name, _) => self.array_elem_type_expr.get(name).cloned(),
+            Expr::FieldAccess(inner, field, _) => {
+                let inner_struct = self.infer_struct_name(inner)?;
+                let bare = inner_struct.rsplit("::").next().unwrap_or(&inner_struct);
+                let fields = self.structs.get(bare).or_else(|| self.structs.get(&inner_struct))?;
+                let field_def = fields.iter().find(|f| &f.name == field)?;
+                match &field_def.ty {
+                    TypeExpr::Array(elem) => Some(elem.as_ref().clone()),
+                    _ => None,
+                }
+            }
+            Expr::IndexAccess(inner, _, _) => {
+                // `e` = `inner[idx]`; its own element type is one level
+                // deeper than `inner`'s element type, so first find what
+                // indexing `inner` produces, then check whether *that* is
+                // itself an array.
+                match self.infer_elem_type_expr(inner)? {
+                    TypeExpr::Array(elem) => Some(elem.as_ref().clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// General counterpart to `infer_array_elem_type`: resolves the
+    /// *LLVM* type of an array-valued expression's elements, for *any*
+    /// element type (not just structs), including through nested arrays
+    /// and struct fields — see `infer_elem_type_expr`, which does the
+    /// actual resolution; this just converts the result to its LLVM form.
+    /// Used to un-box `hsh_array_get`'s generic `i64` slot back to the
+    /// real element type — see the `IndexAccess` fix in `expr()`, which
+    /// needs this for shapes like `t.entries[i]` (a struct field) and
+    /// `cmds[i][0]` (a nested array) that a bare `array_elem_llvm_ty`
+    /// variable lookup alone can't resolve.
+    fn infer_array_elem_llvm_ty(&self, e: &Expr) -> Option<BasicTypeEnum<'ctx>> {
+        self.infer_elem_type_expr(e).and_then(|t| htype_to_llvm(self.ctx, &t))
+    }
+
     // ── Match lowering ────────────────────────────────────────────────────────
     // Compiles `match subject is pat => body ... end` into an if-else chain.
 
@@ -1709,13 +1820,21 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         &mut self,
         subject: &Expr,
         arms:    &[MatchArm],
-        _hint:    Option<BasicTypeEnum<'ctx>>,
+        hint:    Option<BasicTypeEnum<'ctx>>,
     ) -> R<BasicValueEnum<'ctx>> {
         let subj_val = self.expr(subject, None)?;
         let i64t     = self.ctx.i64_type();
         let func     = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let merge_bb = self.ctx.append_basic_block(func, "match_merge");
         let mut phi_incoming: Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        // Value-join machinery (`join_branch_values`/`compile_branch_value`)
+        // is shared with `compile_if_expr` — see that pair's doc comments
+        // for why: this exact "did every arm/branch actually get a real
+        // value onto the phi, and does merge_bb end up with a real
+        // terminator either way" logic was independently duplicated (and
+        // independently buggy) between `if`-as-expression and
+        // `match`-as-expression before being pulled out here.
+        let result_ty: BasicTypeEnum<'ctx> = hint.unwrap_or_else(|| i64t.into());
 
         for (arm_idx, arm) in arms.iter().enumerate() {
             let then_bb = self.ctx.append_basic_block(func, &format!("match_arm{}", arm_idx));
@@ -1748,14 +1867,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 self.builder.position_at_end(guard_body_bb);
             }
 
-            self.enter_branch();
-            let terminated = self.stmts(&arm.body)?;
-            self.exit_branch();
-            let arm_end_bb = self.builder.get_insert_block().unwrap();
-            if !terminated {
-                self.builder.build_unconditional_branch(merge_bb).unwrap();
-                phi_incoming.push((i64t.const_zero().into(), arm_end_bb));
-            }
+            self.compile_branch_value(&arm.body, result_ty, merge_bb, &mut phi_incoming)?;
 
             self.builder.position_at_end(else_bb);
         }
@@ -1767,13 +1879,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         // `merge_bb`.
         let fallthrough_bb = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge_bb).unwrap();
-        phi_incoming.push((i64t.const_zero().into(), fallthrough_bb));
+        phi_incoming.push((self.zero(result_ty), fallthrough_bb));
 
-        self.builder.position_at_end(merge_bb);
-        if phi_incoming.is_empty() { return Ok(i64t.const_zero().into()); }
-        let phi = self.builder.build_phi(i64t, "match_res").unwrap();
-        for (val, bb) in &phi_incoming { phi.add_incoming(&[(val, *bb)]); }
-        Ok(phi.as_basic_value())
+        Ok(self.join_branch_values(merge_bb, result_ty, &phi_incoming))
     }
 
     /// Build (or reuse a cached) global string constant, returning a pointer
@@ -2192,6 +2300,10 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     Some(llvm_ty) => { self.array_elem_llvm_ty.insert(name.clone(), llvm_ty); }
                     None => { self.array_elem_llvm_ty.remove(name); }
                 }
+                match elem_ty {
+                    Some(t) => { self.array_elem_type_expr.insert(name.clone(), t.clone()); }
+                    None    => { self.array_elem_type_expr.remove(name); }
+                }
                 Ok(false)
             }
             Stmt::Return(e, _) => {
@@ -2207,23 +2319,28 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     Expr::For { pattern, iterable, body, .. } =>
                     self.for_stmt(pattern, iterable, body),
                     Expr::Assign(lhs, rhs, _) => {
-                        if let Expr::Ident(name, _) = lhs.as_ref() {
-                            if let Some(&(ptr, ty)) = self.vars.get(name.as_str()) {
-                                let v = self.expr(rhs, Some(ty))?;
-                                self.builder.build_store(ptr, v).unwrap();
-                            }
-                        }
+                        let target_ty = match lhs.as_ref() {
+                            Expr::Ident(name, _) => self.vars.get(name.as_str()).map(|&(_, ty)| ty),
+                            _ => None,
+                        };
+                        let v = self.expr(rhs, target_ty)?;
+                        self.assign_lvalue(lhs, v)?;
                         Ok(false)
                     }
                     Expr::CompoundAssign(lhs, op, rhs, _) => {
-                        if let Expr::Ident(name, _) = lhs.as_ref() {
-                            if let Some(&(ptr, ty)) = self.vars.get(name.as_str()) {
-                                let lv  = self.builder.build_load(ty, ptr, "lv").unwrap();
-                                let rv  = self.expr(rhs, Some(ty))?;
-                                let res = self.binop(op, lv, rv)?;
-                                self.builder.build_store(ptr, res).unwrap();
-                            }
-                        }
+                        // BUG FIX: same gap as plain `Assign` (see
+                        // `assign_lvalue`'s doc comment) — this used to
+                        // only handle a bare `Expr::Ident` on the left,
+                        // silently doing nothing for `c.count += 1` or
+                        // `arr[i] += 1`. Reads the current value through
+                        // the same general path `expr()` already uses for
+                        // any lvalue, then writes back through
+                        // `assign_lvalue` — one read/modify/write instead
+                        // of duplicating field/index resolution a third time.
+                        let lv  = self.expr(lhs, None)?;
+                        let rv  = self.expr(rhs, None)?;
+                        let res = self.binop(op, lv, rv)?;
+                        self.assign_lvalue(lhs, res)?;
                         Ok(false)
                     }
                     Expr::Return(val, _) => {
@@ -2280,8 +2397,42 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     _ => { self.expr(e, None)?; Ok(false) }
                 }
             }
-            Stmt::Break(..) | Stmt::Continue(_) => {
-                self.builder.build_unreachable().unwrap();
+            Stmt::Continue(_) => {
+                match self.loop_stack.last() {
+                    Some(&(continue_target, _)) => {
+                        self.builder.build_unconditional_branch(continue_target).unwrap();
+                    }
+                    None => {
+                        // No enclosing loop — the typechecker should
+                        // reject a `continue` outside any loop before
+                        // codegen ever sees one. `unreachable` here is a
+                        // defensive fallback for that "should be
+                        // impossible" case, not the general-case behavior
+                        // it used to be unconditionally (see `loop_stack`'s
+                        // doc comment for why that was a real bug).
+                        self.builder.build_unreachable().unwrap();
+                    }
+                }
+                Ok(true)
+            }
+            Stmt::Break(_value, _) => {
+                // `break <value>` (loop-as-expression) parses today but
+                // the value isn't wired to anything yet — no codegen path
+                // makes a `while`/`for` loop itself produce a value the
+                // way `if`/`match` now do (see `compile_if_expr`/
+                // `compile_match`). Branching to the correct exit block
+                // (fixing the crash) is independent of that and worth
+                // doing now regardless; a future `loop { ... break x }`
+                // expression form would need its own phi-join at the
+                // loop's exit block, same pattern as `join_branch_values`.
+                match self.loop_stack.last() {
+                    Some(&(_, break_target)) => {
+                        self.builder.build_unconditional_branch(break_target).unwrap();
+                    }
+                    None => {
+                        self.builder.build_unreachable().unwrap();
+                    }
+                }
                 Ok(true)
             }
             Stmt::Item(_) | Stmt::Import(..) => Ok(false),
@@ -2386,6 +2537,92 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                /// (statement) sibling of this function and intentionally
                /// shares none of its value-tracking, since a void `if` has
                /// no value to join.
+               /// Shared machinery behind *every* value-producing multi-way
+               /// branch in this compiler (`if`-as-expression,
+               /// `match`-as-expression — and, going forward, whatever's
+               /// next: a future `loop { ... break value }` or similar).
+               ///
+               /// # Why this exists
+               /// `if`-as-expression and `match`-as-expression used to each
+               /// hand-roll their own "compile each branch, coerce its
+               /// value, wire it into a phi at a shared merge block, and —
+               /// if literally every branch terminated its own block
+               /// instead of falling through — give the merge block a real
+               /// `unreachable` terminator instead of leaving it as
+               /// predecessor-less invalid IR" logic, independently, at
+               /// different times. Both copies had the exact same bug
+               /// shape at different points in this codebase's history:
+               /// `if`-as-expression once just discarded its branches'
+               /// values and returned a hardcoded zero; `match`-as-
+               /// expression had that *same* bug independently, well after
+               /// the first one was already fixed and documented as the
+               /// pattern to follow. Two independent copies of one
+               /// mechanism drifting out of sync with each other is exactly
+               /// how that class of bug keeps recurring — this function is
+               /// the fix for the *pattern*, not just the two known
+               /// instances of it: any future value-producing branch
+               /// construct calls this instead of writing a third copy.
+               ///
+               /// Callers build their own basic blocks and drive their own
+               /// pattern-matching/condition logic (an `if`'s boolean
+               /// condition and a `match`'s pattern conditions have nothing
+               /// in common structurally) — this only owns the part that
+               /// *was* duplicated: turning a list of `(value, block)`
+               /// pairs, one per branch that didn't terminate, into a
+               /// single joined value at `merge_bb`. Positions the builder
+               /// at `merge_bb` before returning either way.
+               fn join_branch_values(
+                   &mut self,
+                   merge_bb: inkwell::basic_block::BasicBlock<'ctx>,
+                   result_ty: BasicTypeEnum<'ctx>,
+                   incoming: &[(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)],
+               ) -> BasicValueEnum<'ctx> {
+                   self.builder.position_at_end(merge_bb);
+                   if incoming.is_empty() {
+                       // Every branch terminated its own block (e.g. every
+                       // arm of a `match` ends in `return`) — merge_bb has
+                       // no predecessors. Give it a real terminator instead
+                       // of leaving invalid IR; the returned value is
+                       // unreachable at runtime so its exact bit pattern
+                       // doesn't matter, only that *some* well-typed value
+                       // is returned to keep this function's signature honest.
+                       self.builder.build_unreachable().unwrap();
+                       return self.zero(result_ty);
+                   }
+                   let phi = self.builder.build_phi(result_ty, "branch_val").unwrap();
+                   for (v, bb) in incoming { phi.add_incoming(&[(v, *bb)]); }
+                   phi.as_basic_value()
+               }
+
+               /// Compiles one branch body (an `if`/`elsif`/`else` body, or
+               /// a `match` arm's body) at the current insertion point for
+               /// `join_branch_values` above: evaluates it via
+               /// `stmts_with_value`, and — if it didn't terminate its own
+               /// block — coerces its value to `result_ty`, branches to
+               /// `merge_bb`, and appends the `(value, block)` pair to
+               /// `incoming` for the eventual phi. Returns whether the
+               /// branch terminated, so callers with their own control
+               /// flow around this (e.g. `if_stmt`'s elsif recursion) know
+               /// whether to keep going.
+               fn compile_branch_value(
+                   &mut self,
+                   body: &[Stmt],
+                   result_ty: BasicTypeEnum<'ctx>,
+                   merge_bb: inkwell::basic_block::BasicBlock<'ctx>,
+                   incoming: &mut Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
+               ) -> R<bool> {
+                   self.enter_branch();
+                   let (terminated, val) = self.stmts_with_value(body, Some(result_ty))?;
+                   self.exit_branch();
+                   if !terminated {
+                       let coerced = self.coerce_basic_value(val, result_ty);
+                       let end_bb  = self.builder.get_insert_block().unwrap();
+                       self.builder.build_unconditional_branch(merge_bb).unwrap();
+                       incoming.push((coerced, end_bb));
+                   }
+                   Ok(terminated)
+               }
+
                fn compile_if_expr(
                    &mut self,
                    condition: &Expr,
@@ -2396,7 +2633,6 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                ) -> R<BasicValueEnum<'ctx>> {
                    let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                    let result_ty: BasicTypeEnum<'ctx> = hint.unwrap_or_else(|| self.ctx.i64_type().into());
-                   let zero = self.zero(result_ty);
 
                    let cv        = self.as_bool(condition)?;
                    let then_bb   = self.ctx.append_basic_block(parent, "if_then");
@@ -2407,15 +2643,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    let mut incoming: Vec<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
 
                    self.builder.position_at_end(then_bb);
-                   self.enter_branch();
-                   let (t1, v1) = self.stmts_with_value(then_body, Some(result_ty))?;
-                   self.exit_branch();
-                   if !t1 {
-                       let v1c    = self.coerce_basic_value(v1, result_ty);
-                       let end_bb = self.builder.get_insert_block().unwrap();
-                       self.builder.build_unconditional_branch(merge_bb).unwrap();
-                       incoming.push((v1c, end_bb));
-                   }
+                   self.compile_branch_value(then_body, result_ty, merge_bb, &mut incoming)?;
 
                    self.builder.position_at_end(else_bb);
                    if !elsif_branches.is_empty() {
@@ -2429,47 +2657,45 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            }
                        }
                    } else if let Some(eb) = else_body {
-                       self.enter_branch();
-                       let (t2, v2) = self.stmts_with_value(eb, Some(result_ty))?;
-                       self.exit_branch();
-                       if !t2 {
-                           let v2c    = self.coerce_basic_value(v2, result_ty);
-                           let end_bb = self.builder.get_insert_block().unwrap();
-                           self.builder.build_unconditional_branch(merge_bb).unwrap();
-                           incoming.push((v2c, end_bb));
-                       }
+                       self.compile_branch_value(eb, result_ty, merge_bb, &mut incoming)?;
                    } else {
                        // No `else` on a value-producing `if` — nothing
                        // meaningful to hand back on this path; fall through
                        // with the result type's zero rather than leaving
                        // this edge unaccounted for.
+                       let zero   = self.zero(result_ty);
                        let end_bb = self.builder.get_insert_block().unwrap();
                        self.builder.build_unconditional_branch(merge_bb).unwrap();
                        incoming.push((zero, end_bb));
                    }
 
-                   self.builder.position_at_end(merge_bb);
-                   if incoming.is_empty() {
-                       // Both/all arms terminated their own block (e.g.
-                       // every arm ends in return/exit/panic) — same fix as
-                       // `if_stmt`: merge_bb has no predecessors, so give it
-                       // a real terminator instead of leaving invalid IR.
-                       self.builder.build_unreachable().unwrap();
-                       return Ok(zero);
-                   }
-                   let phi = self.builder.build_phi(result_ty, "if_val").unwrap();
-                   for (v, bb) in &incoming { phi.add_incoming(&[(v, *bb)]); }
-                   Ok(phi.as_basic_value())
+                   Ok(self.join_branch_values(merge_bb, result_ty, &incoming))
                }
 
                /// Statement-list helper for value contexts: runs every
                /// statement except the last normally, then — if the last
                /// statement is a bare value expression (not a void control
-               /// construct like `if`/`while`/`for`/assignment/`return`) —
+               /// construct like `while`/`for`/assignment/`return`) —
                /// evaluates it as the tail *value* of the block, Rust-block
                /// style, instead of routing it through `stmt()` (which
                /// always discards expression values). Returns
                /// `(terminated, value)`.
+               ///
+               /// `Expr::If`/`Expr::Match` are deliberately *not* excluded
+               /// here (unlike `While`/`For`) — this function is only ever
+               /// called on the body of an `if`/`elsif`/`else` branch or a
+               /// `match` arm (its one call site is `compile_branch_value`,
+               /// shared by `compile_if_expr`/`compile_match`), never on a
+               /// whole function body, so a *nested* `if`/`match` in tail
+               /// position here really is this branch's value — exactly
+               /// the shape `else if cond then a else b` desugars to (see
+               /// `parse_if`'s ternary-shorthand elsif handling). Treating
+               /// it as void instead (the previous behavior) silently
+               /// discarded the real value of every `else if`-chained
+               /// branch in a value-producing `if`, in favor of a dummy
+               /// zero — a real, user-visible bug in `bytes_final`'s own
+               /// `config.h#` (`hk_parse_value`), not just a hypothetical
+               /// one.
                fn stmts_with_value(&mut self, stmts: &[Stmt], hint: Option<BasicTypeEnum<'ctx>>) -> R<(bool, BasicValueEnum<'ctx>)> {
                    let zero: BasicValueEnum<'ctx> = self.zero(hint.unwrap_or_else(|| self.ctx.i64_type().into()));
                    if stmts.is_empty() { return Ok((false, zero)); }
@@ -2479,16 +2705,127 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    }
                    match &last[0] {
                        Stmt::Expr(e, _) if !matches!(e,
-                           Expr::If{..} | Expr::While{..} | Expr::For{..} |
+                           Expr::While{..} | Expr::For{..} |
                            Expr::Assign(..) | Expr::CompoundAssign(..) | Expr::Return(..)) =>
                        {
                            let v = self.expr(e, hint)?;
-                           Ok((false, v))
+                           // A nested `Expr::If`/`Expr::Match` in tail
+                           // position can itself terminate every path it
+                           // contains (e.g. every arm ends in `return`) —
+                           // in which case `compile_if_expr`/`compile_match`
+                           // already gave *their own* merge block a real
+                           // `unreachable` terminator and left the builder
+                           // positioned there. Detect that and report
+                           // `terminated = true` instead of `(false, v)`;
+                           // `v` is unreachable at runtime either way, but
+                           // the caller (`compile_branch_value`) must not
+                           // try to add a *second* terminator on top of the
+                           // `unreachable` that's already in this block —
+                           // that's invalid IR, the same class of bug this
+                           // whole file's `join_branch_values` mechanism
+                           // exists to prevent elsewhere.
+                           let already_terminated = self.builder.get_insert_block()
+                               .map(|b| b.get_terminator().is_some()).unwrap_or(false);
+                           Ok((already_terminated, v))
                        }
                        s => {
                            let terminated = self.stmt(s)?;
                            Ok((terminated, zero))
                        }
+                   }
+               }
+
+               /// Stores `value` into the storage location `lhs` refers
+               /// to — the write-side counterpart to how `expr()` already
+               /// reads `Expr::Ident`/`Expr::FieldAccess`/`Expr::IndexAccess`.
+               ///
+               /// # BUG FIX — this capability didn't exist at all before
+               /// Both `Expr::Assign` codegen sites (statement form and
+               /// value-expression form) only ever handled `lhs` being a
+               /// bare `Expr::Ident` — `if let Expr::Ident(name, _) =
+               /// lhs.as_ref() { ... }` with **no `else` branch at all**.
+               /// Assigning through a field or an index —
+               /// `proj.package.name = val`, `c.bold = "..."`,
+               /// `arr[i] = x` — silently compiled to a complete no-op:
+               /// no error, no warning, the assignment just didn't
+               /// happen. This is what made `bytes_final`'s own
+               /// `config::parse()` always report `name=unnamed`: every
+               /// `proj.package.NAME = val` assignment in that function
+               /// silently did nothing.
+               ///
+               /// Mirrors the read-side logic exactly (see
+               /// `Expr::FieldAccess`/`Expr::IndexAccess` in `expr()`):
+               /// resolve the field index the same way, box `value` down
+               /// to the generic `i64` slot this runtime stores every
+               /// field/element as (via `call_coerced`, which already
+               /// auto-coerces call arguments to the callee's declared
+               /// parameter types), and call `hsh_struct_set`/
+               /// `hsh_array_set` — both already existed in the runtime
+               /// and were simply never called from here.
+               fn assign_lvalue(&mut self, lhs: &Expr, value: BasicValueEnum<'ctx>) -> R<()> {
+                   match lhs {
+                       Expr::Ident(name, _) => {
+                           if let Some(&(ptr, ty)) = self.vars.get(name.as_str()) {
+                               // BUG FIX (extending `@arc`): reassigning an
+                               // `arc_owned` variable — `x = arc_alloc(n)`
+                               // a second time, or `x = other_arc_var` —
+                               // used to just overwrite the pointer with
+                               // no release of what it held before,
+                               // because `arc_owned` tracking only ever
+                               // ran inside the `Let` handler (a *new*
+                               // binding), never on plain assignment to an
+                               // *existing* one. Every reassignment of an
+                               // `@arc`-tracked local was a guaranteed
+                               // leak of whatever it held previously — the
+                               // epilogue only ever sees (and releases)
+                               // the *final* value at return, not
+                               // whatever was overwritten along the way.
+                               // Release the old value first, mirroring
+                               // `emit_arc_epilogue`'s own
+                               // load-then-`hsh_rc_release` pattern,
+                               // whenever this name is one `@arc` is
+                               // actually tracking.
+                               if self.mem_mode == MemoryMode::Arc && self.arc_owned.borrow().contains(name) {
+                                   let old = self.builder.build_load(ty, ptr, "arc_realloc_old").unwrap();
+                                   self.call_coerced(self.builtins.hsh_rc_release, &[old], "");
+                               }
+                               let v = self.coerce_basic_value(value, ty);
+                               self.builder.build_store(ptr, v).unwrap();
+                           }
+                           Ok(())
+                       }
+                       Expr::FieldAccess(obj_e, field_name, _span) => {
+                           let obj = self.expr(obj_e, None)?;
+                           let field_idx = match self.infer_struct_name(obj_e) {
+                               Some(struct_name) => self.resolve_struct_field_index(&struct_name, field_name),
+                               None => {
+                                   // Same "can't statically determine the
+                                   // struct type" fallback the read side
+                                   // uses — scan every struct for a
+                                   // matching field name. Same ambiguity
+                                   // caveat applies; kept consistent with
+                                   // the read path rather than silently
+                                   // diverging from it.
+                                   let mut found = 0usize;
+                                   'outer: for fields in self.structs.values() {
+                                       for (i, f) in fields.iter().enumerate() {
+                                           if &f.name == field_name { found = i; break 'outer; }
+                                       }
+                                   }
+                                   found
+                               }
+                           };
+                           let idx_v = self.ctx.i64_type().const_int(field_idx as u64, false);
+                           self.call_coerced(self.builtins.hsh_struct_set, &[obj.into(), idx_v.into(), value.into()], "fset");
+                           Ok(())
+                       }
+                       Expr::IndexAccess(arr_e, idx_e, _) => {
+                           let arr = self.expr(arr_e, None)?;
+                           let idx = self.expr(idx_e, None)?;
+                           self.call_coerced(self.builtins.hsh_array_set, &[arr.into(), idx.into(), value.into()], "aset");
+                           Ok(())
+                       }
+                       _ => Ok(()), // Not a valid assignment target — the typechecker should reject this before codegen sees it.
                    }
                }
 
@@ -2503,7 +2840,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    self.builder.build_conditional_branch(cv, body_b, exit).unwrap();
                    self.builder.position_at_end(body_b);
                    self.enter_branch();
+                   // `continue` re-checks the condition (branches to
+                   // `header`); `break` exits the loop (branches to
+                   // `exit`) — see `loop_stack`'s doc comment for why this
+                   // needs to be explicit rather than left to a bare
+                   // `unreachable`.
+                   self.loop_stack.push((header, exit));
                    let t = self.stmts(body)?;
+                   self.loop_stack.pop();
                    self.exit_branch();
                    if !t { self.builder.build_unconditional_branch(header).unwrap(); }
                    self.builder.position_at_end(exit);
@@ -2522,6 +2866,16 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                        let header = self.ctx.append_basic_block(parent, "for_hdr");
                        let body_b = self.ctx.append_basic_block(parent, "for_body");
+                       // `continue`'s target is *not* `header` directly —
+                       // `header` only checks the loop condition against
+                       // the current counter value, it doesn't advance it.
+                       // Jumping straight there from `continue` would skip
+                       // the increment below and spin forever on the same
+                       // value. `for_continue` does the increment, *then*
+                       // re-checks via `header` — the natural end-of-body
+                       // fallthrough and an explicit `continue` both need
+                       // to go through it, not around it.
+                       let continue_b = self.ctx.append_basic_block(parent, "for_continue");
                        let exit   = self.ctx.append_basic_block(parent, "for_exit");
                        self.builder.build_unconditional_branch(header).unwrap();
                        self.builder.position_at_end(header);
@@ -2536,15 +2890,17 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        self.builder.build_conditional_branch(cond, body_b, exit).unwrap();
                        self.builder.position_at_end(body_b);
                        self.enter_branch();
+                       self.loop_stack.push((continue_b, exit));
                        let t = self.stmts(body)?;
+                       self.loop_stack.pop();
                        self.exit_branch();
-                       if !t {
-                           let c2  = self.builder.build_load(i64t, loop_ptr, "c2").unwrap().into_int_value();
-                           let one = i64t.const_int(1, false);
-                           let nxt = self.builder.build_int_add(c2, one, "nxt").unwrap();
-                           self.builder.build_store(loop_ptr, nxt).unwrap();
-                           self.builder.build_unconditional_branch(header).unwrap();
-                       }
+                       if !t { self.builder.build_unconditional_branch(continue_b).unwrap(); }
+                       self.builder.position_at_end(continue_b);
+                       let c2  = self.builder.build_load(i64t, loop_ptr, "c2").unwrap().into_int_value();
+                       let one = i64t.const_int(1, false);
+                       let nxt = self.builder.build_int_add(c2, one, "nxt").unwrap();
+                       self.builder.build_store(loop_ptr, nxt).unwrap();
+                       self.builder.build_unconditional_branch(header).unwrap();
                        self.builder.position_at_end(exit);
                    } else {
                        // ── Array iteration (`for x in arr is ... end`) ────
@@ -2582,11 +2938,8 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        // value rather than silently doing nothing, which
                        // is strictly better than this branch's previous
                        // behavior regardless.
-                       let elem_ty: BasicTypeEnum = match iter {
-                           Expr::Ident(name, _) => self.array_elem_llvm_ty.get(name).copied()
-                               .unwrap_or_else(|| self.ctx.ptr_type(inkwell::AddressSpace::default()).into()),
-                           _ => self.ctx.ptr_type(inkwell::AddressSpace::default()).into(),
-                       };
+                       let elem_ty: BasicTypeEnum = self.infer_array_elem_llvm_ty(iter)
+                           .unwrap_or_else(|| self.ctx.ptr_type(inkwell::AddressSpace::default()).into());
 
                        let len_call = self.call_coerced(self.builtins.hsh_array_len, &[arr_v], "flen");
                        let len_v    = self.unwrap_call(len_call).into_int_value();
@@ -2599,6 +2952,11 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                        let header = self.ctx.append_basic_block(parent, "forarr_hdr");
                        let body_b = self.ctx.append_basic_block(parent, "forarr_body");
+                       // Same reasoning as the range-based `for` above:
+                       // `continue` must go through the index increment,
+                       // not straight to `header` (which would skip it and
+                       // spin forever re-checking the same index).
+                       let continue_b = self.ctx.append_basic_block(parent, "forarr_continue");
                        let exit   = self.ctx.append_basic_block(parent, "forarr_exit");
                        self.builder.build_unconditional_branch(header).unwrap();
 
@@ -2616,18 +2974,55 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        self.builder.build_store(elem_ptr, unboxed).unwrap();
 
                        self.enter_branch();
+                       self.loop_stack.push((continue_b, exit));
                        let t = self.stmts(body)?;
+                       self.loop_stack.pop();
                        self.exit_branch();
-                       if !t {
-                           let idx_c2 = self.builder.build_load(i64t, idx_ptr, "idx_c2").unwrap().into_int_value();
-                           let one    = i64t.const_int(1, false);
-                           let nxt    = self.builder.build_int_add(idx_c2, one, "idx_nxt").unwrap();
-                           self.builder.build_store(idx_ptr, nxt).unwrap();
-                           self.builder.build_unconditional_branch(header).unwrap();
-                       }
+                       if !t { self.builder.build_unconditional_branch(continue_b).unwrap(); }
+                       self.builder.position_at_end(continue_b);
+                       let idx_c2 = self.builder.build_load(i64t, idx_ptr, "idx_c2").unwrap().into_int_value();
+                       let one    = i64t.const_int(1, false);
+                       let nxt    = self.builder.build_int_add(idx_c2, one, "idx_nxt").unwrap();
+                       self.builder.build_store(idx_ptr, nxt).unwrap();
+                       self.builder.build_unconditional_branch(header).unwrap();
                        self.builder.position_at_end(exit);
                    }
                    Ok(false)
+               }
+
+               /// Normalizes an already-evaluated value to a genuine LLVM
+               /// `i1` boolean (`icmp ne 0`), without re-evaluating the
+               /// source expression (unlike `as_bool`, which takes an
+               /// `&Expr` and evaluates it itself — calling that a second
+               /// time on an expression already evaluated once would
+               /// duplicate side effects and waste work). Needed because
+               /// H#'s builtins/comparisons don't uniformly return `i1`:
+               /// `binop`'s `==`/`<`/etc. do (via LLVM `icmp`, which is
+               /// always `i1`), but plain-boolean-returning builtins like
+               /// `string_contains`/`string_starts_with` return a full
+               /// `i64` (0 or 1) — both are valid "truthy ints" at the
+               /// language level, but LLVM requires an exact `i1` for a
+               /// branch condition or a phi typed `i1`.
+               fn to_i1(&mut self, v: BasicValueEnum<'ctx>) -> R<inkwell::values::IntValue<'ctx>> {
+                   Ok(match v {
+                       BasicValueEnum::IntValue(i) if i.get_type().get_bit_width() == 1 => i,
+                       BasicValueEnum::IntValue(i) => {
+                           let z = i.get_type().const_zero();
+                           self.builder.build_int_compare(inkwell::IntPredicate::NE, i, z, "toi1").unwrap()
+                       }
+                       BasicValueEnum::FloatValue(f) => {
+                           let z = f.get_type().const_float(0.0);
+                           self.builder.build_float_compare(inkwell::FloatPredicate::ONE, f, z, "ftoi1").unwrap()
+                       }
+                       BasicValueEnum::PointerValue(p) => {
+                           let z = p.get_type().const_null();
+                           self.builder.build_int_compare(inkwell::IntPredicate::NE,
+                               self.builder.build_ptr_to_int(p, self.ctx.i64_type(), "p2i").unwrap(),
+                               self.builder.build_ptr_to_int(z, self.ctx.i64_type(), "z2i").unwrap(),
+                               "ptoi1").unwrap()
+                       }
+                       _ => self.ctx.bool_type().const_int(1, false),
+                   })
                }
 
                fn expr(&mut self, e: &Expr, hint: Option<BasicTypeEnum<'ctx>>) -> R<BasicValueEnum<'ctx>> {
@@ -2640,6 +3035,64 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            Ok(self.builder.build_load(ty, ptr, name).unwrap())
                        }
                        Expr::BinOp(l, op, r, _) => {
+                           // BUG FIX: `&&`/`||` used to fall straight
+                           // through to the generic path below — evaluate
+                           // *both* operands unconditionally, then combine
+                           // them with a plain bitwise `and`/`or` LLVM
+                           // instruction. That's wrong: `&&`/`||` are
+                           // supposed to short-circuit, and real code
+                           // throughout this project's own example
+                           // programs depends on that — e.g. `if argc == 0
+                           // || args[0] == "help" is ...` (unpack.h#) is
+                           // only safe to write *because* a short-
+                           // circuiting `||` guarantees `args[0]` is never
+                           // touched once `argc == 0` is already true.
+                           // Without short-circuiting, that `args[0]`
+                           // still gets evaluated on an empty array —
+                           // reading garbage/out-of-bounds memory and
+                           // handing it to `strcmp`, which is exactly the
+                           // segfault this fix resolves (`hacker unpack`
+                           // with no arguments). Compile these as real
+                           // branches instead: for `a || b`, only
+                           // evaluate `b` when `a` was false; for `a &&
+                           // b`, only evaluate `b` when `a` was true.
+                           if matches!(op, BinOp::And | BinOp::Or) {
+                               let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                               let lv_raw = self.expr(l, None)?;
+                               let lv = self.to_i1(lv_raw)?;
+                               let rhs_bb  = self.ctx.append_basic_block(parent, "sc_rhs");
+                               let merge_bb = self.ctx.append_basic_block(parent, "sc_merge");
+                               let short_circuit_bb = self.ctx.append_basic_block(parent, "sc_skip");
+                               // `||`: skip straight to `true` if `lv` is
+                               // already true, otherwise evaluate `r`.
+                               // `&&`: skip straight to `false` if `lv` is
+                               // already false, otherwise evaluate `r`.
+                               match op {
+                                   BinOp::Or  => self.builder.build_conditional_branch(lv, short_circuit_bb, rhs_bb).unwrap(),
+                                   _          => self.builder.build_conditional_branch(lv, rhs_bb, short_circuit_bb).unwrap(),
+                               };
+                               let entry_bb = self.builder.get_insert_block().unwrap();
+
+                               self.builder.position_at_end(short_circuit_bb);
+                               self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                               self.builder.position_at_end(rhs_bb);
+                               let rv_raw = self.expr(r, None)?;
+                               let rv = self.to_i1(rv_raw)?;
+                               let rhs_end_bb = self.builder.get_insert_block().unwrap();
+                               self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                               self.builder.position_at_end(merge_bb);
+                               let i1t = self.ctx.bool_type();
+                               let phi = self.builder.build_phi(i1t, "sc_result").unwrap();
+                               let short_circuit_val = match op {
+                                   BinOp::Or => i1t.const_int(1, false),
+                                   _         => i1t.const_int(0, false),
+                               };
+                               phi.add_incoming(&[(&short_circuit_val, short_circuit_bb), (&rv, rhs_end_bb)]);
+                               let _ = entry_bb;
+                               return Ok(phi.as_basic_value());
+                           }
                            let lv = self.expr(l, hint)?;
                            let rv = self.expr(r, hint)?;
                            // String concat for pointer + pointer
@@ -2714,12 +3167,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            }
                        }
                        Expr::Assign(lhs, rhs, _) => {
-                           if let Expr::Ident(name, _) = lhs.as_ref() {
-                               if let Some(&(ptr, ty)) = self.vars.get(name.as_str()) {
-                                   let v = self.expr(rhs, Some(ty))?;
-                                   self.builder.build_store(ptr, v).unwrap();
-                               }
-                           }
+                           let target_ty = match lhs.as_ref() {
+                               Expr::Ident(name, _) => self.vars.get(name.as_str()).map(|&(_, ty)| ty),
+                               _ => None,
+                           };
+                           let v = self.expr(rhs, target_ty)?;
+                           self.assign_lvalue(lhs, v)?;
                            Ok(self.ctx.i64_type().const_zero().into())
                        }
                        Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
@@ -2826,7 +3279,34 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let call = self.call_coerced(
                                self.builtins.hsh_array_get,
                                &[arr.into(), idx.into()], "aget");
-                           Ok(self.unwrap_call(call))
+                           let raw = self.unwrap_call(call);
+                           // BUG FIX: this used to return `raw` straight
+                           // from `hsh_array_get` — which, exactly like
+                           // `hsh_struct_get` (see the `FieldAccess` fix
+                           // just below), always hands back a generic
+                           // boxed `i64` slot regardless of the array's
+                           // real element type. `for_stmt`'s array-loop
+                           // already had to solve this exact problem (see
+                           // `array_elem_llvm_ty` below) to unbox each
+                           // element correctly — this is the same fix,
+                           // applied to a plain `arr[i]` *expression*
+                           // (not just the implicit unboxing inside a
+                           // `for x in arr` loop). Without it, `arr[i]`
+                           // for a `[string]` came back looking like a
+                           // bare integer with no LLVM-level indication it
+                           // was ever a pointer: `"prefix " + arr[i]`
+                           // landed in `binop`'s int+int (or mismatched)
+                           // arm instead of the pointer+pointer
+                           // `hsh_strcat` arm, silently producing garbage
+                           // or an empty string instead of a crash — the
+                           // exact bug behind `translations::get()`
+                           // always returning what looked like an empty
+                           // value in `hacker_hsharp`/`bytes_final`.
+                           let elem_ty: Option<BasicTypeEnum> = self.infer_array_elem_llvm_ty(arr_e);
+                           match elem_ty {
+                               Some(target) => Ok(self.coerce_basic_value(raw, target)),
+                               None => Ok(raw),
+                           }
                        }
 
                        // ── FieldAccess expr.field ─────────────────────────
