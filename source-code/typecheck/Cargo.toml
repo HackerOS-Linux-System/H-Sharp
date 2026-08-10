@@ -1,0 +1,13 @@
+[package]
+name = "hsharp-typecheck"
+version = "0.9.0"
+edition = "2021"
+description = "H# type checker — pure Rust, zero LLVM/native dependencies. Extracted from hsharp-compiler so it can be shared by hsharp-lsp and hsharp-playground (both wasm32-unknown-unknown-compatible) without dragging in inkwell/LLVM."
+
+[lib]
+name = "hsharp_typecheck"
+path = "src/lib.rs"
+
+[dependencies]
+hsharp-parser = { path = "../parser" }
+thiserror     = "=1.0.56"
