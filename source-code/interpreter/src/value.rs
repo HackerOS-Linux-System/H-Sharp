@@ -225,6 +225,28 @@ pub enum RuntimeError {
     UndefinedFn(String),
     #[error("undefined field `{0}`")]
     UndefinedField(String),
+    /// The H# program called `exit(code)`. This is a **controlled**
+    /// termination request, not a failure — it's routed through the
+    /// normal `Result` error channel instead of calling
+    /// `std::process::exit` directly from deep inside `call_fn` for one
+    /// specific, load-bearing reason: `std::process::exit` compiles to an
+    /// **uncatchable WASM trap** (`unreachable`) on `wasm32-unknown-unknown`,
+    /// not a normal process exit and not even a catchable Rust panic —
+    /// `std::panic::catch_unwind` cannot intercept it. A H# program using
+    /// the completely ordinary `if bad is exit(1) end` idiom (see e.g.
+    /// `unpack.h#`'s own argument validation) would otherwise crash the
+    /// WASM playground with an uncaught JS exception instead of
+    /// terminating cleanly. Every caller of `run_module`/`exec_block` gets
+    /// this back through the same `Result` path as any other error and
+    /// decides for itself what "the program asked to exit" should mean —
+    /// the native CLI (`hsharp preview`/`run`) calls the real
+    /// `std::process::exit` at its own top level (a safe place: nothing
+    /// is unwinding through wasm there), while the playground crate
+    /// treats `Exit(0)` as a normal, successful completion and `Exit(n)`
+    /// (n != 0) as "the program exited with a non-zero status" — neither
+    /// is a panic or a bug.
+    #[error("exit({0})")]
+    Exit(i32),
 }
 
 pub struct Interpreter {
@@ -250,4 +272,26 @@ pub struct Interpreter {
     /// function called many times (e.g. in a loop or recursively) only
     /// gets the note once instead of flooding stderr.
     pub mem_mode_notes_given: std::collections::HashSet<String>,
+    /// Statements executed so far, incremented once per `exec_stmt` call —
+    /// i.e. once per loop iteration, once per function call's body entry,
+    /// etc. Exists so an *embedder* (the WASM playground; conceivably a
+    /// future `hsharp run --max-steps N` too) can bound runaway execution
+    /// deterministically, in terms the interpreter itself understands,
+    /// rather than only via a wall-clock timeout from the outside.
+    ///
+    /// Why this matters beyond "just use a JS `setTimeout`"/Worker
+    /// deadline: a wall-clock-only timeout can't preempt *inside* a single
+    /// synchronous `run_module()` call — if one `exec_stmt` (e.g. building
+    /// a huge array literal, or a single non-looping allocation) takes
+    /// long enough on its own, nothing outside gets a chance to intervene
+    /// until it returns. A step limit checked *between* statements bounds
+    /// the amount of interpreter work that can happen without a check,
+    /// independent of how long any single statement takes to execute.
+    /// It's a complement to an outer timeout, not a replacement for one —
+    /// see `source-code/playground/src/lib.rs`'s `run_with_limits`.
+    pub step_count: u64,
+    /// `None` = unlimited (the CLI's `preview`/`run` never sets this).
+    /// `Some(n)` = `exec_stmt` returns `RuntimeError::Panic("step limit
+    /// exceeded")` once `step_count` would exceed `n`.
+    pub step_limit: Option<u64>,
 }
