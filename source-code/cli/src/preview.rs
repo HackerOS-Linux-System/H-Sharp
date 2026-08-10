@@ -61,6 +61,20 @@ pub fn run(file: Option<PathBuf>) {
             println!("{}", "─".repeat(50).dimmed());
             println!("{} Preview completed.", "✓".green().bold());
         }
+        // `exit(code)` inside the H# program itself now comes back as a
+        // dedicated `RuntimeError::Exit` instead of the interpreter
+        // calling `std::process::exit` directly from deep inside
+        // `call_fn` — see that variant's doc comment in
+        // hsharp-interpreter's value.rs for why (short version: it's an
+        // uncatchable WASM trap on wasm32-unknown-unknown, which the CLI
+        // doesn't target, but the interpreter crate is shared with the
+        // WASM playground, which does). Here at the top of the native
+        // CLI's own call stack is exactly the right place to actually
+        // exit the process — preserves the exact previous behavior for
+        // `hsharp preview`/`run`.
+        Err(hsharp_interpreter::RuntimeError::Exit(code)) => {
+            std::process::exit(code);
+        }
         Err(e) => {
             println!("{}", "─".repeat(50).dimmed());
             eprintln!("{} Runtime error: {}", "✗".red().bold(), e);
