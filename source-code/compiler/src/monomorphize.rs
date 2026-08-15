@@ -8,6 +8,103 @@ pub struct MonoStats {
     pub instances_generated: usize,
     pub call_sites_rewritten: usize,
     pub unresolved: Vec<(String, Span)>,
+    /// A generic call site where a concrete type argument was
+    /// successfully inferred, but that type doesn't actually implement
+    /// one of the type parameter's declared bounds (`fn f<T: Trait>`).
+    /// Previously this went completely unchecked — see this module's
+    /// doc comment on `check_bounds` for why that matters — so a
+    /// mismatched call typechecked cleanly and only surfaced as a
+    /// confusing "undefined fn" deep in LLVM codegen (the mangled
+    /// method-call target, e.g. `NotAVisitor_visit_num`, simply doesn't
+    /// exist because no such `impl` was ever written).
+    pub bound_violations: Vec<BoundViolation>,
+}
+
+pub struct BoundViolation {
+    pub fn_name:    String,
+    pub type_param: String,
+    pub trait_name: String,
+    pub concrete_ty: String,
+    pub span: Span,
+}
+
+/// type name -> set of trait names it has an `impl Type : Trait is ... end`
+/// block for. Built once per `monomorphize()` call from the module's own
+/// `Item::ImplBlock`s — the only source of truth for "does X implement
+/// Y" in this compiler (there's no separate trait-registry anywhere
+/// else; `typecheck`'s lib.rs doesn't track this at all, per the
+/// `check_bounds` doc comment below).
+fn build_impls_table(module: &Module) -> HashMap<String, HashSet<String>> {
+    let mut table: HashMap<String, HashSet<String>> = HashMap::new();
+    for item in &module.items {
+        if let Item::ImplBlock(imp) = item {
+            if let Some(trait_name) = &imp.trait_name {
+                table.entry(imp.type_name.clone()).or_default().insert(trait_name.clone());
+            }
+        }
+    }
+    table
+}
+
+/// Checks `generic_fn`'s declared bounds (`fn f<T: Trait1 + Trait2>`)
+/// against the concrete `type_args` inferred at a call site, pushing a
+/// `BoundViolation` into `stats` for anything unsatisfied.
+///
+/// This is deliberately *name-based* (checks `impls_table` for an exact
+/// `Item::ImplBlock` match), not a full trait-coherence system — no
+/// blanket impls, no supertraits, no associated types. That's enough to
+/// catch the concrete failure mode this exists for (passing a type that
+/// plainly never implemented the required trait at all — the
+/// `NotAVisitor` case) without trying to build a complete trait solver
+/// in one pass. A type that *does* implement the trait but only found
+/// via some mechanism this table doesn't model would incorrectly be
+/// flagged — there's no such mechanism in this compiler today (single,
+/// flat `impl Type : Trait` blocks are the only way to implement
+/// anything — see `ast.rs`'s `ImplBlock`), so that gap is currently
+/// theoretical, not real.
+fn check_bounds(
+    generic_fn: &FnDef,
+    type_args: &[HType],
+    impls_table: &HashMap<String, HashSet<String>>,
+    span: &Span,
+    stats: &mut MonoStats,
+) {
+    for (tp, ty) in generic_fn.type_params.iter().zip(type_args.iter()) {
+        if tp.bounds.is_empty() { continue; }
+        // Fail-open on `Any`/unresolved types — see this module's
+        // `check_bounds` doc comment update below: `infer_type_args`
+        // calls `checker.infer_expr_pub(arg_expr)` on each call-site
+        // argument, but by the time monomorphization runs (a separate
+        // pass, after `check_module` has already finished and unwound
+        // its scope stack), a plain local-variable argument like `ev`
+        // often can't be resolved anymore and falls back to `HType::Any`
+        // — not because the call is actually wrong, but because this
+        // second pass has less context than the first one did. Treating
+        // `Any` as "violates every bound" produced false positives on
+        // completely correct programs (confirmed: a real, working
+        // `eval_with(ev, tree)` call was flagged here during testing).
+        // Better a missed violation (falls through to today's status
+        // quo: an opaque codegen error) than rejecting correct code —
+        // matches the "lenient — don't error on unknown idents"
+        // philosophy `typecheck`'s own `infer_expr` already documents
+        // for the exact same reason.
+        let concrete_name = match htype_to_type_expr(ty) {
+            TypeExpr::Named(n) if n != "any" => n,
+            _ => continue,
+        };
+        let implemented = impls_table.get(&concrete_name).cloned().unwrap_or_default();
+        for bound in &tp.bounds {
+            if !implemented.contains(bound) {
+                stats.bound_violations.push(BoundViolation {
+                    fn_name: generic_fn.name.clone(),
+                    type_param: tp.name.clone(),
+                    trait_name: bound.clone(),
+                    concrete_ty: concrete_name.clone(),
+                    span: span.clone(),
+                });
+            }
+        }
+    }
 }
 
 /// Entry point: monomorphize `module` in place, returning stats.
@@ -21,6 +118,12 @@ pub fn monomorphize(module: &mut Module, checker: &mut TypeChecker) -> MonoStats
     let mut generic_fns: HashMap<String, FnDef> = HashMap::new();
     let mut generic_structs: HashMap<String, StructDef> = HashMap::new();
     let mut concrete_items: Vec<Item> = Vec::new();
+
+    // Built once, up front, from the module as originally written — impl
+    // blocks are always concrete items (an `impl` itself never has type
+    // params of its own in this language), so draining generic fns/
+    // structs out of `module.items` below doesn't affect this table.
+    let impls_table = build_impls_table(module);
 
     for item in module.items.drain(..) {
         match item {
@@ -43,11 +146,11 @@ pub fn monomorphize(module: &mut Module, checker: &mut TypeChecker) -> MonoStats
     // generate, so we discover it only after generating the instance.
     let mut worklist: VecDeque<(String, Vec<HType>)> = VecDeque::new();
     let mut seen: HashSet<(String, String)> = HashSet::new(); // (name, mangled-suffix)
-    let mut stats = MonoStats { instances_generated: 0, call_sites_rewritten: 0, unresolved: Vec::new() };
+    let mut stats = MonoStats { instances_generated: 0, call_sites_rewritten: 0, unresolved: Vec::new(), bound_violations: Vec::new() };
 
     // Seed the worklist from concrete items.
     for item in &concrete_items {
-        collect_generic_uses(item, &generic_fns, checker, &mut worklist, &mut stats);
+        collect_generic_uses(item, &generic_fns, &impls_table, checker, &mut worklist, &mut stats);
     }
 
     // 3 & 4. SUBSTITUTION + emission, processing the worklist. Generated
@@ -66,7 +169,7 @@ pub fn monomorphize(module: &mut Module, checker: &mut TypeChecker) -> MonoStats
             // Scan the new instance's body for further generic calls
             // (e.g. it calls another generic fn with a now-concrete type).
             let inst_item = Item::FnDef(instance);
-            collect_generic_uses(&inst_item, &generic_fns, checker, &mut worklist, &mut stats);
+            collect_generic_uses(&inst_item, &generic_fns, &impls_table, checker, &mut worklist, &mut stats);
             concrete_items.push(inst_item);
         } else if let Some(generic_struct) = generic_structs.get(&name) {
             let mangled_name = format!("{}__{}", name, suffix);
@@ -94,14 +197,51 @@ pub fn monomorphize(module: &mut Module, checker: &mut TypeChecker) -> MonoStats
 fn collect_generic_uses(
     item: &Item,
     generic_fns: &HashMap<String, FnDef>,
+    impls_table: &HashMap<String, HashSet<String>>,
     checker: &mut TypeChecker,
     worklist: &mut VecDeque<(String, Vec<HType>)>,
                         stats: &mut MonoStats,
 ) {
     match item {
-        Item::FnDef(f) => collect_in_block(&f.body, generic_fns, checker, worklist, stats),
-        Item::ImplBlock(imp) => for m in &imp.methods { collect_in_block(&m.body, generic_fns, checker, worklist, stats); },
-        Item::ModDecl { inline: Some(items), .. } => for it in items { collect_generic_uses(it, generic_fns, checker, worklist, stats); },
+        Item::FnDef(f) => {
+            // BUG FIX (found while testing trait-bounded generics):
+            // `collect_in_block`/`collect_in_expr` run as a *second*
+            // pass over the AST, after `check_module` has already
+            // finished and popped every local scope it pushed while
+            // typechecking this same function body — so a plain
+            // `checker.infer_expr_pub(&Expr::Ident("x"))` call for a
+            // local variable `x` finds nothing and silently falls back
+            // to `HType::Any`. Confirmed via direct testing: a call like
+            // `identity(some_box_value)` was monomorphizing into
+            // `identity__any` instead of `identity__Box` — a real
+            // *correctness* bug (the wrong specialization gets
+            // generated), not just a missing diagnostic, for what is
+            // the single most common way to call a generic function.
+            //
+            // Fix: track local `let` types ourselves in a flat map as
+            // we walk each function body (seeded with parameter types
+            // here, extended on every `Stmt::Let` in `collect_in_block`)
+            // and consult it before falling back to the checker. Not a
+            // full scope stack (a `let` inside a nested block that
+            // shadows an outer binding will incorrectly "leak" its type
+            // to the same name after the block ends) — a real but minor
+            // imprecision, hugely preferable to every local variable
+            // resolving to `Any` unconditionally.
+            let mut local_types: HashMap<String, HType> = HashMap::new();
+            for p in &f.params {
+                local_types.insert(p.name.clone(), HType::from_type_expr(&p.ty));
+            }
+            collect_in_block(&f.body, generic_fns, impls_table, checker, worklist, stats, &mut local_types);
+        }
+        Item::ImplBlock(imp) => for m in &imp.methods {
+            let mut local_types: HashMap<String, HType> = HashMap::new();
+            local_types.insert("self".to_string(), HType::Named(imp.type_name.clone()));
+            for p in &m.params {
+                local_types.insert(p.name.clone(), HType::from_type_expr(&p.ty));
+            }
+            collect_in_block(&m.body, generic_fns, impls_table, checker, worklist, stats, &mut local_types);
+        },
+        Item::ModDecl { inline: Some(items), .. } => for it in items { collect_generic_uses(it, generic_fns, impls_table, checker, worklist, stats); },
         _ => {}
     }
 }
@@ -109,14 +249,32 @@ fn collect_generic_uses(
 fn collect_in_block(
     stmts: &[Stmt],
     generic_fns: &HashMap<String, FnDef>,
+    impls_table: &HashMap<String, HashSet<String>>,
     checker: &mut TypeChecker,
     worklist: &mut VecDeque<(String, Vec<HType>)>,
                     stats: &mut MonoStats,
+    local_types: &mut HashMap<String, HType>,
 ) {
     for stmt in stmts {
+        if let Stmt::Let { name, ty, value, .. } = stmt {
+            // Explicit annotation wins outright; otherwise infer from
+            // the RHS. `infer_expr_pub` is reliable here even though
+            // it's "cold" (see the doc comment above): a struct
+            // literal's type is syntactically apparent, a call's type
+            // comes from the callee's own declared return type, a
+            // literal's type is its own — none of those need scope
+            // context, only a bare `Ident` reference does, and that's
+            // exactly the case this whole `local_types` map exists to
+            // shortcut around instead.
+            let inferred = ty.as_ref().map(HType::from_type_expr)
+                .or_else(|| value.as_ref().map(|e| checker.infer_expr_pub(e)));
+            if let Some(t) = inferred {
+                local_types.insert(name.clone(), t);
+            }
+        }
         match stmt {
             Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) | Stmt::Expr(e, _) =>
-            collect_in_expr(e, generic_fns, checker, worklist, stats),
+            collect_in_expr(e, generic_fns, impls_table, checker, worklist, stats, local_types),
             _ => {}
         }
     }
@@ -125,24 +283,43 @@ fn collect_in_block(
 fn collect_in_expr(
     expr: &Expr,
     generic_fns: &HashMap<String, FnDef>,
+    impls_table: &HashMap<String, HashSet<String>>,
     checker: &mut TypeChecker,
     worklist: &mut VecDeque<(String, Vec<HType>)>,
                    stats: &mut MonoStats,
+    local_types: &HashMap<String, HType>,
 ) {
     if let Expr::Call(callee, args, span) = expr {
         if let Expr::Ident(name, _) = callee.as_ref() {
             if let Some(generic_fn) = generic_fns.get(name) {
-                match infer_type_args(generic_fn, args, checker) {
-                    Some(type_args) => worklist.push_back((name.clone(), type_args)),
+                match infer_type_args(generic_fn, args, checker, local_types) {
+                    Some(type_args) => {
+                        // See `check_bounds`'s doc comment: this is the
+                        // point where a concrete type argument is known
+                        // for every one of `generic_fn`'s type params —
+                        // the natural place to also verify it actually
+                        // satisfies any `T: Trait` bound declared on
+                        // that param, instead of silently accepting any
+                        // type and letting a mismatch surface later as
+                        // an opaque "undefined fn" in LLVM codegen.
+                        check_bounds(generic_fn, &type_args, impls_table, span, stats);
+                        worklist.push_back((name.clone(), type_args));
+                    }
                     None => stats.unresolved.push((name.clone(), span.clone())),
                 }
             }
         }
     }
     // Recurse into all sub-expressions (best-effort generic coverage,
-    // including nested blocks).
-    walk_sub_exprs(expr, &mut |e| collect_in_expr(e, generic_fns, checker, worklist, stats));
-    walk_sub_blocks(expr, &mut |b| collect_in_block(b, generic_fns, checker, worklist, stats));
+    // including nested blocks). `local_types` is read-only from here
+    // down (nested blocks can only ever *add* more local bindings on
+    // top of what's already known — see the shadowing caveat on
+    // `collect_generic_uses`'s doc comment — so a plain shared
+    // reference is enough; no need to thread a fresh mutable copy per
+    // nested scope for this best-effort pass).
+    let mut local_types_owned = local_types.clone();
+    walk_sub_exprs(expr, &mut |e| collect_in_expr(e, generic_fns, impls_table, checker, worklist, stats, &local_types_owned));
+    walk_sub_blocks(expr, &mut |b| collect_in_block(b, generic_fns, impls_table, checker, worklist, stats, &mut local_types_owned));
 }
 
 /// Infer concrete `HType`s for each of `generic_fn.type_params`, by matching
@@ -153,11 +330,17 @@ fn collect_in_expr(
 /// Returns `None` if any type parameter couldn't be pinned down from the
 /// arguments (e.g. it only appears in the return type) — the caller records
 /// this as `unresolved` for `features.rs` to report.
-fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChecker) -> Option<Vec<HType>> {
+fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChecker, local_types: &HashMap<String, HType>) -> Option<Vec<HType>> {
     let mut resolved: HashMap<String, HType> = HashMap::new();
 
     for (param, arg_expr) in generic_fn.params.iter().zip(call_args.iter()) {
-        let arg_ty = checker.infer_expr_pub(arg_expr);
+        // `local_types` first — see `collect_generic_uses`'s doc comment
+        // on why `checker.infer_expr_pub` alone gives the wrong answer
+        // (`Any`) for a bare local-variable argument.
+        let arg_ty = match arg_expr {
+            Expr::Ident(n, _) if local_types.contains_key(n) => local_types[n].clone(),
+            _ => checker.infer_expr_pub(arg_expr),
+        };
         bind_type_param(&param.ty, &arg_ty, &mut resolved);
     }
 
@@ -346,29 +529,58 @@ fn sanitize_ident(s: &str) -> String {
 
 fn rewrite_item_calls(item: &mut Item, generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats) {
     match item {
-        Item::FnDef(f) => rewrite_block_calls(&mut f.body, generic_fns, checker, stats),
-        Item::ImplBlock(imp) => for m in &mut imp.methods { rewrite_block_calls(&mut m.body, generic_fns, checker, stats); },
+        // Same `local_types` tracking as `collect_generic_uses` above,
+        // for the same reason: `infer_type_args` needs to agree with
+        // what the collection pass already decided, or a call site gets
+        // renamed to a specialization (e.g. `identity__Box`) that
+        // collection never actually generated (it generated
+        // `identity__any` instead, from the same cold-checker miss) —
+        // turning a silent wrong-specialization bug into a hard
+        // "undefined fn" one. Both passes must resolve the exact same
+        // way, so this mirrors `collect_generic_uses` line for line.
+        Item::FnDef(f) => {
+            let mut local_types: HashMap<String, HType> = HashMap::new();
+            for p in &f.params {
+                local_types.insert(p.name.clone(), HType::from_type_expr(&p.ty));
+            }
+            rewrite_block_calls(&mut f.body, generic_fns, checker, stats, &mut local_types);
+        }
+        Item::ImplBlock(imp) => for m in &mut imp.methods {
+            let mut local_types: HashMap<String, HType> = HashMap::new();
+            local_types.insert("self".to_string(), HType::Named(imp.type_name.clone()));
+            for p in &m.params {
+                local_types.insert(p.name.clone(), HType::from_type_expr(&p.ty));
+            }
+            rewrite_block_calls(&mut m.body, generic_fns, checker, stats, &mut local_types);
+        },
         Item::ModDecl { inline: Some(items), .. } => for it in items { rewrite_item_calls(it, generic_fns, checker, stats); },
         _ => {}
     }
 }
 
-fn rewrite_block_calls(stmts: &mut [Stmt], generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats) {
+fn rewrite_block_calls(stmts: &mut [Stmt], generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats, local_types: &mut HashMap<String, HType>) {
     for stmt in stmts.iter_mut() {
+        if let Stmt::Let { name, ty, value, .. } = stmt {
+            let inferred = ty.as_ref().map(HType::from_type_expr)
+                .or_else(|| value.as_ref().map(|e| checker.infer_expr_pub(e)));
+            if let Some(t) = inferred {
+                local_types.insert(name.clone(), t);
+            }
+        }
         match stmt {
             Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) |
             Stmt::Expr(e, _) | Stmt::Break(Some(e), _) =>
-            rewrite_expr_calls(e, generic_fns, checker, stats),
+            rewrite_expr_calls(e, generic_fns, checker, stats, local_types),
             _ => {}
         }
     }
 }
 
-fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats) {
+fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats, local_types: &mut HashMap<String, HType>) {
     if let Expr::Call(callee, args, _) = expr {
         if let Expr::Ident(name, ident_span) = callee.as_mut() {
             if let Some(generic_fn) = generic_fns.get(name.as_str()) {
-                if let Some(type_args) = infer_type_args(generic_fn, args, checker) {
+                if let Some(type_args) = infer_type_args(generic_fn, args, checker, local_types) {
                     let suffix = mangle_suffix(&type_args);
                     *name = format!("{}__{}", name, suffix);
                     let _ = ident_span; // span preserved as-is
@@ -380,8 +592,9 @@ fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, che
             }
         }
     }
-    walk_sub_exprs_mut(expr, &mut |e| rewrite_expr_calls(e, generic_fns, checker, stats));
-    walk_sub_blocks_mut(expr, &mut |b| rewrite_block_calls(b, generic_fns, checker, stats));
+    let mut local_types_owned = local_types.clone();
+    walk_sub_exprs_mut(expr, &mut |e| rewrite_expr_calls(e, generic_fns, checker, stats, &mut local_types_owned));
+    walk_sub_blocks_mut(expr, &mut |b| rewrite_block_calls(b, generic_fns, checker, stats, &mut local_types_owned));
 }
 
 // ── Generic AST walkers (shared) ────────────────────────────────────────────
