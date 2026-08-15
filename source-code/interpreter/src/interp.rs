@@ -57,6 +57,18 @@ impl Interpreter {
                 _ => {}
             }
         }
+        // `const`/top-level `let` bindings: evaluated once, here, after
+        // every fn/struct/enum is already registered above (so a const
+        // initializer can call a top-level fn) but before `main` runs.
+        // Stored in the outermost env scope via `define`, same place
+        // function-body `let`s live, so `Expr::Ident` lookup finds them
+        // through the exact same path with no special-casing needed.
+        for item in &module.items {
+            if let Item::ConstDef { name, value, .. } = item {
+                let v = self.eval_expr(value)?;
+                self.env.define(name, v, false);
+            }
+        }
         Ok(())
     }
 
@@ -259,6 +271,25 @@ impl Interpreter {
             }
             Stmt::Item(Item::ModDecl { name, inline: Some(items), .. }) => {
                 self.register_mod_items(name, items);
+                Ok(None)
+            }
+            // A function body — or a REPL line (see cli/src/repl.rs) —
+            // can contain a local `const`/struct/enum def just like it can
+            // contain a local `fn`. These previously fell through to the
+            // wildcard arm below and silently did nothing; now they
+            // register the same way the top-level versions do in
+            // `run_module_register_only`.
+            Stmt::Item(Item::ConstDef { name, value, .. }) => {
+                let v = self.eval_expr(value)?;
+                self.env.define(name, v, false);
+                Ok(None)
+            }
+            Stmt::Item(Item::StructDef(s)) => {
+                self.structs.insert(s.name.clone(), s.clone());
+                Ok(None)
+            }
+            Stmt::Item(Item::EnumDef(e)) => {
+                self.enums.insert(e.name.clone(), e.clone());
                 Ok(None)
             }
             _ => Ok(None),
