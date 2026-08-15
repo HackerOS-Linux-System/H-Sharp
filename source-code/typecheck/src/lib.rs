@@ -286,6 +286,11 @@ pub struct TypeChecker {
     structs: HashMap<String, Vec<(String, HType)>>,
     /// enum name -> list of variant names (for §3 match exhaustiveness)
     enums: HashMap<String, Vec<String>>,
+    /// top-level `const`/`pub let` bindings: name -> declared/inferred type,
+    /// so `Expr::Ident` resolution finds them the same way it finds locals
+    /// (see the `Expr::Ident` arm in `infer_expr`, which checks `lookup`
+    /// then falls through here before giving up to the lenient `HType::Any`).
+    consts: HashMap<String, HType>,
     current_fn_return: Option<HType>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -297,6 +302,7 @@ impl TypeChecker {
             fns:               HashMap::new(),
             structs:           HashMap::new(),
             enums:             HashMap::new(),
+            consts:            HashMap::new(),
             current_fn_return: None,
             diagnostics:       Vec::new(),
             derived_impls:     HashMap::new(),
@@ -596,6 +602,10 @@ impl TypeChecker {
             Item::ModDecl { name, inline: Some(items), .. } => {
                 self.collect_mod_signatures(name, items);
             }
+            Item::ConstDef { name, ty, value, .. } => {
+                let inferred = ty.as_ref().map(HType::from_type_expr).unwrap_or_else(|| self.infer_expr(value));
+                self.consts.insert(name.clone(), inferred);
+            }
             _ => {}
         }
     }
@@ -625,6 +635,10 @@ impl TypeChecker {
                 Item::ModDecl { name: sub_name, inline: Some(sub_items), .. } => {
                     let nested = format!("{}::{}", mod_name, sub_name);
                     self.collect_mod_signatures(&nested, sub_items);
+                }
+                Item::ConstDef { name, ty, value, .. } => {
+                    let inferred = ty.as_ref().map(HType::from_type_expr).unwrap_or_else(|| self.infer_expr(value));
+                    self.consts.insert(name.clone(), inferred);
                 }
                 _ => {}
             }
@@ -899,9 +913,28 @@ impl TypeChecker {
             Expr::Ident(name, _) => {
                 if name.starts_with("__bind:") || name.starts_with("__closure_") { return HType::Any; }
                 if let Some(v) = self.lookup(name) { v.ty.clone() }
+                else if let Some(t) = self.consts.get(name) { t.clone() }
                 else if self.fns.contains_key(name) { HType::Any }
                 else { HType::Any } // lenient — don't error on unknown idents
             }
+            // BUG FIX: `infer_expr` had no arm for `Expr::StructLit` at
+            // all, so `Foo { field: val, ... }` fell through to the
+            // catch-all `_ => HType::Any` far below — even though a
+            // struct literal's type is unambiguous, right there as its
+            // own first field. Found while testing generics: this
+            // starves any *other* code that calls `infer_expr`/
+            // `infer_expr_pub` outside of `check_module`'s own live
+            // traversal — most concretely `monomorphize.rs`, whose
+            // whole job is re-inferring call-site argument types in a
+            // second pass, of ever getting a real struct type back for
+            // `let x = Foo { ... }`. That in turn caused every generic
+            // function called with a struct-typed local variable to
+            // silently monomorphize against `Any` instead of the real
+            // struct — see `monomorphize.rs`'s `collect_generic_uses`
+            // doc comment for the full chain and a confirmed repro
+            // (`identity(some_box)` was instantiating `identity__any`,
+            // not `identity__Box`).
+            Expr::StructLit(name, _, _) => HType::Named(name.clone()),
             Expr::BinOp(lhs, op, rhs, _) => {
                 let lt = self.infer_expr(lhs);
                 let rt = self.infer_expr(rhs);
@@ -1215,6 +1248,18 @@ fn block_always_returns(stmts: &[Stmt]) -> bool {
 fn stmt_always_returns(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_, _) => true,
+        // BUG FIX: a match arm written in the terse single-expression
+        // form (`Pattern => return n`, no `is ... end`) parses its body
+        // as `Stmt::Expr(Expr::Return(...))`, *not* `Stmt::Return(...)`
+        // — `parse_match` treats `return n` there as an ordinary
+        // expression (H# allows `return` as an expression, not just a
+        // statement) wrapped in a one-element `Stmt::Expr` body, per
+        // `parse_match`'s "Single expression arm" branch. Without this
+        // arm, a function whose only body is a `match` where every arm
+        // uses this terse `=> return ...` form (the natural, idiomatic
+        // way to write it) was flagged as "does not return on all
+        // paths" even though it provably does.
+        Stmt::Expr(Expr::Return(_, _), _) => true,
         Stmt::Expr(Expr::If { then_body, elsif_branches, else_body, .. }, _) => {
             let Some(else_body) = else_body else { return false }; // no else => can fall through
             block_always_returns(then_body)
@@ -1251,6 +1296,7 @@ fn item_span(item: &Item) -> Span {
         Item::TraitDef(t)  => t.span.clone(),
         Item::ImplBlock(i) => i.span.clone(),
         Item::TypeAlias { span, .. } => span.clone(),
+        Item::ConstDef { span, .. } => span.clone(),
         Item::Extern(e)    => e.span.clone(),
         Item::ModDecl { span, .. } => span.clone(),
     }
