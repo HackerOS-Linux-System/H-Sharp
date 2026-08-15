@@ -7,6 +7,9 @@ mod compile;
 mod check;
 mod new;
 mod preview;
+mod repl;
+mod fmt;
+mod lsp_cmd;
 
 #[derive(Parser)]
 #[command(
@@ -101,13 +104,41 @@ pub enum Command {
     /// List available cross-compilation targets
     Targets,
 
+    /// Start an interactive H# REPL (read-eval-print loop)
+    Repl,
+
+    /// Reformat H# source file(s) (indentation only — see fmt.rs)
+    Fmt {
+        /// Files to format. If none given, formats every .h#/.hsp/.h-sharp
+        /// file found under the current directory (like `hsharp check`).
+        files: Vec<std::path::PathBuf>,
+
+        /// Report which files would change, without writing them (exits
+        /// non-zero if any would) — for CI, mirrors `rustfmt --check`.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Run the H# language server over stdio (for editor integration)
+    ///
+    /// Not a separate binary — statically linked into this one. Point
+    /// your editor's LSP client at `hsharp lsp` (or `h# lsp`).
+    Lsp,
+
     /// Open the H# documentation in your browser
     Docs,
 }
 
 fn main() {
-    print_banner();
     let cli = Cli::parse();
+    // `hsharp lsp` speaks JSON-RPC over stdout — any stray print (the
+    // banner included) corrupts the protocol stream and breaks every
+    // editor client. `hsharp repl` prints its own banner instead (see
+    // repl.rs) so it isn't duplicated. Every other command gets the
+    // normal banner.
+    if !matches!(cli.command, Command::Lsp | Command::Repl) {
+        print_banner();
+    }
     match cli.command {
         Command::Compile { file, output, target, release, no_opt, debug, dynamic, emit_ir, emit_kind, verbose, mem_mode } =>
         compile::run(file, output, target, release, no_opt, debug, dynamic, emit_ir, emit_kind, verbose, mem_mode),
@@ -122,6 +153,9 @@ fn main() {
             println!("\n{}", "Usage: h# compile --target linux-aarch64 src/main.h#".dimmed());
         }
         Command::Docs => open_docs(),
+        Command::Repl => repl::run(),
+        Command::Fmt { files, check } => fmt::run(files, check),
+        Command::Lsp => lsp_cmd::run(),
     }
 }
 
