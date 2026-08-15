@@ -34,6 +34,10 @@ fn item_to_symbol(item: &Item) -> Option<DocumentSymbol> {
         }
         Item::EnumDef(e) => (e.name.clone(), SymbolKind::ENUM, &e.span, None, vec![]),
         Item::TraitDef(t) => (t.name.clone(), SymbolKind::INTERFACE, &t.span, None, vec![]),
+        Item::ConstDef { name, ty, span, .. } => {
+            let detail = ty.as_ref().map(type_name);
+            (name.clone(), SymbolKind::CONSTANT, span, detail, vec![])
+        }
         Item::ImplBlock(_) | Item::TypeAlias { .. } | Item::Extern(_) | Item::ModDecl { .. } => return None,
     };
 
