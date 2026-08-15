@@ -23,6 +23,10 @@ walkdir    = "=2.4.0"
 hsharp-parser      = { path = "../parser" }
 hsharp-compiler    = { path = "../compiler" }
 hsharp-interpreter = { path = "../interpreter" }
+# LSP ships as a lib statically linked into THIS binary (`hsharp lsp` /
+# `h# lsp`), not as its own `hsharp-lsp` executable — see lsp/Cargo.toml
+# and cli/src/lsp_cmd.rs.
+hsharp-lsp         = { path = "../lsp" }
 
 [profile.release]
 opt-level     = 3
