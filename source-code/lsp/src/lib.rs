@@ -1,8 +1,8 @@
-mod diagnostics;
-mod symbols;
-mod hover;
-mod completion;
-mod docstore;
+pub mod diagnostics;
+pub mod symbols;
+pub mod hover;
+pub mod completion;
+pub mod docstore;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -15,7 +15,12 @@ use lsp_types::{
 
 use docstore::DocStore;
 
-fn main() -> anyhow::Result<()> {
+/// Run the H# language server over stdio. This is the entire former
+/// `hsharp-lsp` binary's `main()`, exposed as a plain library function
+/// so it can be statically linked into the main `hsharp` binary instead
+/// of shipping as a separate executable — see `cli/src/lsp_cmd.rs`,
+/// invoked as `hsharp lsp` / `h# lsp`.
+pub fn run() -> anyhow::Result<()> {
     // stdio is the transport every LSP client speaks by default — no
     // socket/port configuration needed on the editor side at all, which
     // is exactly why LSP servers conventionally default to it.
