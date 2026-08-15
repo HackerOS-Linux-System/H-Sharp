@@ -27,6 +27,11 @@ pub fn hover_at(text: &str, pos: Position) -> Option<Hover> {
                 let sig = format!("struct {} is\n{}\nend", s.name, fields);
                 return Some(make_hover(sig));
             }
+            Item::ConstDef { name, ty, span, .. } if span_contains(span, line, col) => {
+                let ty_str = ty.as_ref().map(crate::symbols::type_name).unwrap_or_else(|| "?".to_string());
+                let sig = format!("const {}: {}", name, ty_str);
+                return Some(make_hover(sig));
+            }
             _ => {}
         }
     }
