@@ -27,6 +27,20 @@ impl Parser {
         self.tokens.get(self.pos + offset).unwrap_or_else(|| self.tokens.last().unwrap())
     }
 
+    /// True if the parser is looking at `use ...` or `dynamic use ...`.
+    /// Centralizes the one-token lookahead so both the top-level import
+    /// loop and in-function `use` statements recognize the `dynamic`
+    /// prefix identically instead of duplicating the check.
+    fn at_use_import(&self) -> bool {
+        if matches!(self.current().kind, TokenKind::Use) { return true; }
+        if let TokenKind::Ident(ref s) = self.current().kind {
+            if s == "dynamic" && matches!(self.peek_at(1).kind, TokenKind::Use) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn advance(&mut self) -> &Token {
         let t = &self.tokens[self.pos];
         if self.pos < self.tokens.len() - 1 { self.pos += 1; }
@@ -215,8 +229,8 @@ impl Parser {
                 continue;
             }
 
-            // `use` imports
-            if matches!(self.current().kind, TokenKind::Use) {
+            // `use` imports (optionally `dynamic use ...`)
+            if self.at_use_import() {
                 match self.parse_import() {
                     Ok((kind, alias, span)) => imports.push((kind, alias, span)),
                     Err(e) => { self.errors.report(e); self.recover(); }
@@ -238,6 +252,21 @@ impl Parser {
 
     fn parse_import(&mut self) -> Result<(ImportKind, Option<String>, Span), ParseError> {
         let start = self.current().span.clone();
+
+        // Optional `dynamic` modifier right before `use`: `dynamic use "bytes -> pkg"`.
+        // Only meaningful for `bytes -> pkg` imports — `std`/`core` always ship
+        // baked into the compiler and are rejected below if tagged dynamic.
+        let dynamic = if let TokenKind::Ident(ref s) = self.current().kind {
+            s == "dynamic"
+        } else { false };
+        if dynamic { self.advance(); }
+        if dynamic && !matches!(self.current().kind, TokenKind::Use) {
+            return Err(self.error(
+                "expected `use` after `dynamic`",
+                vec![r#"write: dynamic use "bytes -> pkgname""#.to_string()],
+            ));
+        }
+
         self.advance(); // consume 'use'
 
         let path_tok = if let TokenKind::StringLit(s) = &self.current().kind.clone() {
@@ -257,7 +286,21 @@ impl Parser {
         } else { None };
 
         let span = start.merge(&self.current().span);
-        let kind = parse_use_path(&path_tok, alias.clone())
+
+        if dynamic && !path_tok.trim_start().starts_with("bytes") {
+            return Err(ParseError::new(
+                ParseErrorKind::Custom("dynamic use is only valid for bytes imports".into()),
+                span.clone(),
+                format!("`dynamic use \"{}\"` is not allowed", path_tok),
+                vec![
+                    "std and core are always statically linked into the compiler".to_string(),
+                    r#"only "bytes -> pkgname" imports may be dynamic"#.to_string(),
+                ],
+            ));
+        }
+
+        let link = if dynamic { ImportLinkKind::Dynamic } else { ImportLinkKind::Static };
+        let kind = parse_use_path(&path_tok, alias.clone(), link)
         .ok_or_else(|| ParseError::new(
             ParseErrorKind::Custom("invalid use path".into()),
                                        span.clone(),
@@ -366,6 +409,16 @@ impl Parser {
             TokenKind::Trait  => self.parse_trait(pub_).map(Item::TraitDef),
             TokenKind::Impl   => self.parse_impl().map(Item::ImplBlock),
             TokenKind::Type   => self.parse_type_alias(pub_),
+            // `const NAME: Type = expr` — the canonical spelling for a
+            // top-level constant. `let`/`pub let` (below) is accepted as
+            // an alias so code written before `const` existed, or by
+            // habit from function-body `let`, still compiles unchanged.
+            TokenKind::Const  => self.parse_const_item(pub_),
+            // Top-level `let`/`pub let NAME: Type = expr`. Global `let`
+            // has no notion of mutation (there is no "top-level
+            // reassignment" statement), so this is semantically identical
+            // to `const` — just routed through the same ConstDef item.
+            TokenKind::Let    => self.parse_const_item(pub_),
             TokenKind::Async  => {
                 self.advance();
                 let fn_def = self.parse_fn_with_attrs(pub_, attrs)?;
@@ -618,6 +671,14 @@ impl Parser {
         let start = self.current().span.clone();
         self.advance(); // trait
         let (name, _) = self.expect_ident()?;
+        // `trait Visitor<T> is ...` — was previously never parsed here at
+        // all (hardcoded `type_params: vec![]` below, even though
+        // `TraitDef` itself always had the field, and `fn`/`struct`/
+        // `enum` already call this exact same helper), so any trait
+        // wanting a type parameter — the norm for a real visitor-pattern
+        // trait like `Visitor<T>` — hit a flat "unexpected token `<`"
+        // syntax error before even reaching a semantic check.
+        let type_params = self.parse_generics_decl()?;
         self.skip_newlines();
         let mut methods = Vec::new();
         if matches!(self.current().kind, TokenKind::Is) {
@@ -649,7 +710,7 @@ impl Parser {
             self.expect(&TokenKind::End)?;
         }
         let span = start.merge(&self.current().span);
-        Ok(TraitDef { attrs: vec![], type_params: vec![], name, methods, pub_, span })
+        Ok(TraitDef { attrs: vec![], type_params, name, methods, pub_, span })
     }
 
     fn parse_impl(&mut self) -> Result<ImplBlock, ParseError> {
@@ -696,6 +757,27 @@ impl Parser {
         let ty = self.parse_type()?;
         let span = start.merge(&self.current().span);
         Ok(Item::TypeAlias { name, ty, pub_, span })
+    }
+
+    /// `const NAME: Type = expr` and the `let`/`pub let` alias for it.
+    /// Consumes whichever of `const`/`let` got us here, then requires a
+    /// name, an initializer (top-level bindings can't be left
+    /// uninitialized — there's no later point where they'd get assigned),
+    /// and accepts an optional `: Type` annotation same as local `let`.
+    fn parse_const_item(&mut self, pub_: bool) -> Result<Item, ParseError> {
+        let start = self.current().span.clone();
+        self.advance(); // `const` or `let`
+        let (name, _) = self.expect_path_segment()?;
+        let ty = if matches!(self.current().kind, TokenKind::Colon) {
+            self.advance(); Some(self.parse_type()?)
+        } else { None };
+        self.expect(&TokenKind::Assign).map_err(|_| self.error(
+            format!("top-level `{}` requires an initializer", name),
+            vec![format!("write: const {} = <expr>   (or `let`/`pub let`)", name)],
+        ))?;
+        let value = self.parse_expr(0)?;
+        let span = start.merge(&self.current().span);
+        Ok(Item::ConstDef { name, ty, value, pub_, span })
     }
 
     fn parse_extern_block_inline(&mut self) -> Result<Item, ParseError> {
@@ -913,6 +995,16 @@ impl Parser {
 
     pub fn parse_stmt(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.skip_newlines();
+        // `dynamic use "bytes -> pkg"` inside a function body — same import
+        // statement as top-level, just checked here first since `dynamic`
+        // lexes as a plain identifier and would otherwise fall through to
+        // the expression-statement arm below.
+        if matches!(self.current().kind, TokenKind::Ident(ref s) if s == "dynamic")
+            && matches!(self.peek_at(1).kind, TokenKind::Use)
+        {
+            let (kind, alias, span) = self.parse_import()?;
+            return Ok(vec![Stmt::Import(kind, alias, span)]);
+        }
         match &self.current().kind {
             TokenKind::Let    => self.parse_let(),
             TokenKind::Return => {
@@ -939,7 +1031,15 @@ impl Parser {
                 Ok(vec![Stmt::Continue(span)])
             }
             TokenKind::Fn | TokenKind::Struct | TokenKind::Enum |
-            TokenKind::Trait | TokenKind::Impl | TokenKind::Type | TokenKind::Pub => {
+            TokenKind::Trait | TokenKind::Impl | TokenKind::Type | TokenKind::Pub |
+            // Local `const NAME = expr` inside a function body / REPL line:
+            // routed through the same `parse_item`/`Item::ConstDef` path as
+            // top-level const, then wrapped as a statement. The interpreter
+            // handles `Stmt::Item(Item::ConstDef { .. })` directly (see
+            // interp.rs) so it evaluates immediately in place rather than
+            // needing const-lowering's whole-module thunk rewrite, which
+            // only runs on top-level items during `hsharp compile`.
+            TokenKind::Const => {
                 let item = self.parse_item()?;
                 Ok(vec![Stmt::Item(item)])
             }
@@ -2277,13 +2377,13 @@ fn token_kind_name(kind: &TokenKind) -> &'static str {
     }
 }
 
-fn parse_use_path(path: &str, alias: Option<String>) -> Option<ImportKind> {
+fn parse_use_path(path: &str, alias: Option<String>, link: ImportLinkKind) -> Option<ImportKind> {
     let arrow = " -> ";
 
     if path.starts_with("bytes") && path.contains(arrow) {
         let rest = path.splitn(2, arrow).nth(1)?.trim();
         let (name, ver) = split_name_ver(rest);
-        return Some(ImportKind::BytesRepo { name, version: ver, alias });
+        return Some(ImportKind::BytesRepo { name, version: ver, alias, link });
     }
     if path.starts_with("python") && path.contains(arrow) {
         let rest = path.splitn(2, arrow).nth(1)?.trim();
