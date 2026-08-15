@@ -108,6 +108,17 @@ pub struct LlvmBuiltins<'ctx> {
     // System
     pub hsh_shell:         FunctionValue<'ctx>,
     pub hsh_shell_escape:  FunctionValue<'ctx>,
+    // proc::run_cmd / proc::run_cmd_live — see runtime/core.c's doc
+    // comment above hsh_run_cmd_exec for why this is 3 plain-scalar
+    // functions instead of one struct-returning one.
+    pub hsh_run_cmd_exec:         FunctionValue<'ctx>,
+    pub hsh_run_cmd_last_stdout:  FunctionValue<'ctx>,
+    pub hsh_run_cmd_last_stderr:  FunctionValue<'ctx>,
+    // str::split — see runtime/core.c's doc comment above
+    // hsh_str_split_count for why this is two scalar-return functions
+    // instead of one that hands back an array.
+    pub hsh_str_split_count: FunctionValue<'ctx>,
+    pub hsh_str_split_part:  FunctionValue<'ctx>,
     pub hsh_exec1:         FunctionValue<'ctx>,
     pub hsh_exec2:         FunctionValue<'ctx>,
     pub hsh_exec3:         FunctionValue<'ctx>,
@@ -133,6 +144,57 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_write_file:    FunctionValue<'ctx>,
     pub hsh_mkdir_all:     FunctionValue<'ctx>,
     pub hsh_file_size:     FunctionValue<'ctx>,
+    // Both hsh_remove_file/hsh_rename already existed in core.c but were
+    // never wired to a callable H# name — fs::remove/fs::rename mangle
+    // to "fs_remove"/"fs_rename", which resolved to neither a user fn
+    // nor a builtin. Zero new C code, just plumbing.
+    pub hsh_remove_file:   FunctionValue<'ctx>,
+    pub hsh_rename:        FunctionValue<'ctx>,
+    pub hsh_remove_dir_recursive: FunctionValue<'ctx>,
+    pub hsh_int_to_str:    FunctionValue<'ctx>,
+    pub hsh_str_to_int:    FunctionValue<'ctx>,
+    pub hsh_env_get:       FunctionValue<'ctx>,
+    pub hsh_env_read_line: FunctionValue<'ctx>,
+    pub hsh_json_set_str:  FunctionValue<'ctx>,
+    // math:: — wrappers around libm, already implemented in core.c but
+    // never wired to a callable name until now.
+    pub hsh_tan: FunctionValue<'ctx>,
+    pub hsh_pow: FunctionValue<'ctx>,
+    pub hsh_floor: FunctionValue<'ctx>,
+    pub hsh_ceil: FunctionValue<'ctx>,
+    pub hsh_abs_f: FunctionValue<'ctx>,
+    pub hsh_abs_i: FunctionValue<'ctx>,
+    pub hsh_min_i: FunctionValue<'ctx>,
+    pub hsh_max_i: FunctionValue<'ctx>,
+    pub hsh_min_f: FunctionValue<'ctx>,
+    pub hsh_max_f: FunctionValue<'ctx>,
+    // os:: / time:: — same story: hsh_hostname/hsh_getpid/hsh_sleep_ms/
+    // hsh_now_unix/hsh_now_ms already existed in core.c AND were
+    // already declared here, unwired to a callable name (see
+    // codegen.rs). hsh_getcwd/hsh_username/hsh_platform/hsh_setenv are
+    // newly declared.
+    pub hsh_getcwd: FunctionValue<'ctx>,
+    pub hsh_username: FunctionValue<'ctx>,
+    pub hsh_platform: FunctionValue<'ctx>,
+    pub hsh_setenv: FunctionValue<'ctx>,
+    // encoding:: base64 / url — new in core.c, gcc-tested (see
+    // docs/CHANGES-I-MADE.md's stdlib audit section).
+    pub hsh_base64_encode: FunctionValue<'ctx>,
+    pub hsh_base64_decode: FunctionValue<'ctx>,
+    pub hsh_url_encode: FunctionValue<'ctx>,
+    pub hsh_url_decode: FunctionValue<'ctx>,
+    // HashMap — see runtime/core.c's doc comment above HshMap's typedef.
+    // `hsh_map_new(string_keys: i64)`: 0 = int64 keys, 1 = string keys
+    // (content hash/eq) — see codegen.rs's "map_new" dispatch for how the
+    // H# caller's declared key type selects which to pass.
+    pub hsh_map_new:    FunctionValue<'ctx>,
+    pub hsh_map_set:    FunctionValue<'ctx>,
+    pub hsh_map_get:    FunctionValue<'ctx>,
+    pub hsh_map_has:    FunctionValue<'ctx>,
+    pub hsh_map_remove: FunctionValue<'ctx>,
+    pub hsh_map_len:    FunctionValue<'ctx>,
+    pub hsh_map_keys:   FunctionValue<'ctx>,
+    pub hsh_map_clear:  FunctionValue<'ctx>,
     pub hsh_is_dir:        FunctionValue<'ctx>,
     // ANSI / Terminal
     pub hsh_bold:          FunctionValue<'ctx>,
@@ -300,6 +362,14 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             // System
             hsh_shell:         pp("hsh_shell"),
             hsh_shell_escape:  pp("hsh_shell_escape"),
+            hsh_run_cmd_exec:        decl("hsh_run_cmd_exec",
+                i64t.fn_type(&[ptr.into(), i64t.into()], false)),
+            hsh_run_cmd_last_stdout: np("hsh_run_cmd_last_stdout"),
+            hsh_run_cmd_last_stderr: np("hsh_run_cmd_last_stderr"),
+            hsh_str_split_count: decl("hsh_str_split_count",
+                i64t.fn_type(&[ptr.into(), ptr.into()], false)),
+            hsh_str_split_part: decl("hsh_str_split_part",
+                ptr.fn_type(&[ptr.into(), ptr.into(), i64t.into()], false)),
             hsh_exec1:         pp("hsh_exec1"),
             hsh_exec2:         ppp("hsh_exec2"),
             hsh_exec3:         pppp("hsh_exec3"),
@@ -325,6 +395,41 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_write_file:    decl("hsh_write_file", i64t.fn_type(&[ptr.into(), ptr.into()], false)),
             hsh_mkdir_all:     pi("hsh_mkdir_all"),
             hsh_file_size:     pi("hsh_file_size"),
+            hsh_remove_file:   pi("hsh_remove_file"),
+            hsh_rename:        ppi("hsh_rename"),
+            hsh_remove_dir_recursive: pi("hsh_remove_dir_recursive"),
+            hsh_int_to_str:    ip("hsh_int_to_str"),
+            hsh_str_to_int:    pi("hsh_str_to_int"),
+            hsh_env_get:       pp("hsh_env_get"),
+            hsh_env_read_line: np("hsh_env_read_line"),
+            hsh_json_set_str:  decl("hsh_json_set_str",
+                ptr.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false)),
+            hsh_tan: ff("hsh_tan"),
+            hsh_pow: decl("hsh_pow", f64t.fn_type(&[f64t.into(), f64t.into()], false)),
+            hsh_floor: ff("hsh_floor"),
+            hsh_ceil: ff("hsh_ceil"),
+            hsh_abs_f: ff("hsh_abs_f"),
+            hsh_abs_i: decl("hsh_abs_i", i64t.fn_type(&[i64t.into()], false)),
+            hsh_min_i: decl("hsh_min_i", i64t.fn_type(&[i64t.into(), i64t.into()], false)),
+            hsh_max_i: decl("hsh_max_i", i64t.fn_type(&[i64t.into(), i64t.into()], false)),
+            hsh_min_f: decl("hsh_min_f", f64t.fn_type(&[f64t.into(), f64t.into()], false)),
+            hsh_max_f: decl("hsh_max_f", f64t.fn_type(&[f64t.into(), f64t.into()], false)),
+            hsh_getcwd: np("hsh_getcwd"),
+            hsh_username: np("hsh_username"),
+            hsh_platform: np("hsh_platform"),
+            hsh_setenv: ppi("hsh_setenv"),
+            hsh_base64_encode: pp("hsh_base64_encode"),
+            hsh_base64_decode: pp("hsh_base64_decode"),
+            hsh_url_encode: pp("hsh_url_encode"),
+            hsh_url_decode: pp("hsh_url_decode"),
+            hsh_map_new:    ip("hsh_map_new"),
+            hsh_map_set:    decl("hsh_map_set", void.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false)),
+            hsh_map_get:    decl("hsh_map_get", i64t.fn_type(&[ptr.into(), i64t.into()], false)),
+            hsh_map_has:    decl("hsh_map_has", i64t.fn_type(&[ptr.into(), i64t.into()], false)),
+            hsh_map_remove: decl("hsh_map_remove", i64t.fn_type(&[ptr.into(), i64t.into()], false)),
+            hsh_map_len:    pi("hsh_map_len"),
+            hsh_map_keys:   pp("hsh_map_keys"),
+            hsh_map_clear:  decl("hsh_map_clear", void.fn_type(&[ptr.into()], false)),
             hsh_is_dir:        pi("hsh_is_dir"),
             // ANSI
             hsh_bold:          pp("hsh_bold"),
