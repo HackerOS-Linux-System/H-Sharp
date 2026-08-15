@@ -2,11 +2,11 @@
 name = "hsharp-lsp"
 version = "0.9.0"
 edition = "2021"
-description = "H# Language Server (LSP) — diagnostics, hover, go-to-definition, completion. Pure Rust, no LLVM dependency (see hsharp-typecheck's doc comment)."
+description = "H# Language Server (LSP) — diagnostics, hover, go-to-definition, completion. Pure Rust, no LLVM dependency (see hsharp-typecheck's doc comment). Ships as a lib, statically linked into the `hsharp` binary (`hsharp lsp` / `h# lsp`) rather than as its own executable — see cli/src/lsp_cmd.rs."
 
-[[bin]]
-name = "hsharp-lsp"
-path = "src/main.rs"
+[lib]
+name = "hsharp_lsp"
+path = "src/lib.rs"
 
 [dependencies]
 hsharp-parser    = { path = "../parser" }
