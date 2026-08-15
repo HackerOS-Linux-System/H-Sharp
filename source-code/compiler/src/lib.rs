@@ -14,6 +14,8 @@ pub mod optimize_ast;
 pub mod builtins_registry;
 pub mod features;
 pub mod monomorphize;
+pub mod const_lowering;
+pub mod stdlib_shims;
 
 // LLVM codegen + its support modules (merged from the former
 // `hsharp-llvm-compiler` crate).
@@ -116,6 +118,23 @@ pub enum CompileError {
     Diagnostics(Vec<Diagnostic>),
     Codegen(codegen::CodegenError),
     Io(std::io::Error),
+    /// `--target wasm32` + a standalone binary (or static/shared lib)
+    /// requested. Only `--emit object` is supported for wasm32: this
+    /// compiler's one C runtime (`runtime/core.c`) is a single
+    /// translation unit that `#include`s `<unistd.h>`/`<sys/wait.h>`/
+    /// `FILE*`-based stdio throughout — none of which exist under a
+    /// freestanding `wasm32-unknown-unknown` target, so the runtime
+    /// **cannot be compiled for wasm32 at all**, regardless of which
+    /// specific functions a given H# program happens to call. (An
+    /// earlier version of this check tried to scan for *which* POSIX
+    /// builtins a program used and only block those — that doesn't
+    /// hold up: the blocker is at the C-compilation level, one file,
+    /// not the H#-call level.) An object file sidesteps this entirely:
+    /// LLVM emits H#'s own generated functions with every runtime call
+    /// left as an unresolved external symbol, for whoever links it to
+    /// supply their own wasm-side implementations (e.g. via wasm-bindgen
+    /// host imports) — see `TargetTriple::wasm32()`'s doc comment.
+    WasmIncompatible,
 }
 
 impl std::fmt::Display for CompileError {
@@ -124,6 +143,19 @@ impl std::fmt::Display for CompileError {
             CompileError::Diagnostics(d) => write!(f, "{} error(s)", d.iter().filter(|x| x.severity == Severity::Error).count()),
             CompileError::Codegen(e)     => write!(f, "codegen: {}", e),
             CompileError::Io(e)          => write!(f, "io: {}", e),
+            CompileError::WasmIncompatible => write!(
+                f,
+                "target wasm32 only supports `--emit object` — this compiler's C runtime \
+(runtime/core.c) uses POSIX headers throughout and cannot be compiled for a freestanding \
+wasm32 target at all, regardless of which functions your program calls.\n  \
+hint: `hsharp compile --target wasm32 --emit object your.h#` emits a .o with every runtime \
+call left as an unresolved external symbol, for you to supply your own wasm-side \
+implementations of (e.g. via wasm-bindgen host imports) at link time.\n  \
+hint: to run arbitrary H# (including programs using fs::/proc::/env::) in a browser with \
+zero extra work, use the hsharp-playground WASM interpreter instead (see the docs site's \
+Playground section) — it wraps the pure-Rust interpreter, which has no POSIX dependency \
+in the first place."
+            ),
         }
     }
 }
@@ -144,6 +176,16 @@ impl From<codegen::CodegenError>   for CompileError { fn from(e: codegen::Codege
 ///   4. AST-level optimisations (constant folding, string concat, DCE, #[inline])
 ///   5. LLVM codegen → object → link → binary
 pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(), CompileError> {
+    // ── Pass -1: wasm32 compatibility gate ──────────────────────────────────
+    // See `CompileError::WasmIncompatible`'s doc comment: only an object
+    // file is supported for wasm32, full stop — not conditional on what
+    // the program does, since the blocker (core.c's POSIX headers) is at
+    // the C-compilation level, not the H#-call level.
+    if opts.target.is_wasm() && opts.output_kind != OutputKind::Object {
+        return Err(CompileError::WasmIncompatible);
+    }
+    let _ = source; // no longer scanned — kept as a param for API stability
+
     // ── Pass 0: trait registration + #[derive] expansion ──────────────────
     let mut trait_registry = traits::TraitRegistry::new();
     for item in &module.items {
@@ -186,6 +228,24 @@ pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(
         }
     }
 
+    // ── Pass 0.5: lower top-level const/let bindings ────────────────────────
+    // See const_lowering.rs's module doc for why this runs as an AST
+    // rewrite before typecheck rather than as new codegen: every
+    // `Item::ConstDef` becomes a zero-arg thunk fn, and every reference to
+    // its name becomes a call to that thunk — so everything downstream
+    // (typecheck, monomorphize, codegen) only ever sees ordinary functions
+    // and calls, features it already fully supports.
+    const_lowering::lower_consts(&mut module);
+
+    // ── Pass 0.6: inject stdlib shims (proc::run_cmd / run_cmd_live) ───────
+    // See stdlib_shims.rs's module doc. Must run *after* const_lowering
+    // (so a user's own top-level `const ProcResult = ...`, unlikely as
+    // that is, has already been lowered and can't collide with the
+    // struct name below) and before typecheck (so the injected
+    // `ProcResult`/`proc_run_cmd`/`proc_run_cmd_live` items are
+    // typechecked exactly like any other item in the program).
+    stdlib_shims::inject_stdlib_shims(&mut module);
+
     // ── Pass 1+2: typecheck + feature/capability check ─────────────────────
     let mut tc = typechecker::TypeChecker::new();
     let mut diags = tc.check_module(&module);
@@ -214,7 +274,32 @@ pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(
     }
 
     // ── Pass 3: monomorphize generics ──────────────────────────────────────
-    let _mono_stats = monomorphize::monomorphize(&mut module, &mut tc);
+    let mono_stats = monomorphize::monomorphize(&mut module, &mut tc);
+    if !mono_stats.bound_violations.is_empty() {
+        // See `monomorphize.rs`'s `check_bounds` doc comment: without
+        // this, calling a generic function with a type that doesn't
+        // actually implement a required trait bound typechecked
+        // cleanly and only surfaced later as an opaque "undefined fn"
+        // deep in LLVM codegen (the mangled method-call target, e.g.
+        // `NotAVisitor_visit_num`, simply doesn't exist). Reported here
+        // as a real diagnostic instead, through the same
+        // `print_diagnostics`/`CompileError::Diagnostics` path as every
+        // other type error, so it looks and behaves like one.
+        let diags: Vec<Diagnostic> = mono_stats.bound_violations.iter().map(|v| {
+            Diagnostic::error(
+                v.span.clone(),
+                format!(
+                    "type `{}` does not implement trait `{}` (required by `{}: {}` on `{}`)",
+                    v.concrete_ty, v.trait_name, v.type_param, v.trait_name, v.fn_name
+                ),
+            ).with_hint(format!(
+                "add `impl {} : {} is ... end` with the methods `{}` declares, or pass a different type here",
+                v.concrete_ty, v.trait_name, v.trait_name
+            ))
+        }).collect();
+        print_diagnostics(&diags, source, &module.file);
+        return Err(CompileError::Diagnostics(diags));
+    }
 
     // ── Pass 4: AST-level optimisations ────────────────────────────────────
     let (module, _opt_stats) = optimize_ast::OptimizeContext::new().run(module);
