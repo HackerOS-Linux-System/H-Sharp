@@ -69,6 +69,14 @@ pub fn completions(text: &str) -> Vec<CompletionItem> {
                         ..Default::default()
                     });
                 }
+                Item::ConstDef { name, ty, .. } => {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        detail: ty.as_ref().map(crate::symbols::type_name),
+                        kind: Some(CompletionItemKind::CONSTANT),
+                        ..Default::default()
+                    });
+                }
                 _ => {}
             }
         }
