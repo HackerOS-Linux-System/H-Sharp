@@ -5,9 +5,11 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <math.h>
 #include <netdb.h>
 #include <sys/socket.h>
@@ -396,6 +398,173 @@ hsh_string hsh_getenv(hsh_string key) {
     return v ? v : "";
 }
 
+/* os::username — $USER/$LOGNAME first (works even under contexts where
+ * getpwuid's NSS lookup might not, e.g. some minimal containers), falls
+ * back to the real passwd-database lookup. */
+hsh_string hsh_username(void) {
+    const char* v = getenv("USER");
+    if (v && v[0]) return v;
+    v = getenv("LOGNAME");
+    if (v && v[0]) return v;
+    struct passwd* pw = getpwuid(getuid());
+    return (pw && pw->pw_name) ? pw->pw_name : "";
+}
+
+/* os::platform — matches Rust's std::env::consts::OS naming
+ * ("linux"/"macos"/"windows") since that's the most common convention
+ * an H# programmer coming from Rust would expect. */
+hsh_string hsh_platform(void) {
+#if defined(__APPLE__)
+    return "macos";
+#elif defined(_WIN32)
+    return "windows";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "unknown";
+#endif
+}
+
+/* env::set(name, value) — setenv() wrapper; affects this process (and
+ * anything it later shell()s/run_cmd()s) only, same scope as every
+ * other language's env::set. */
+int64_t hsh_setenv(hsh_string name, hsh_string value) {
+    if (!name) return 0;
+    return (setenv(name, value ? value : "", 1) == 0) ? 1 : 0;
+}
+
+/* encoding::base64 (standard alphabet, with '=' padding — matches every
+ * other language's default base64 codec, so output round-trips through
+ * `base64`/`openssl base64` on the command line without a --url-safe
+ * flag). */
+static const char HSH_B64_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+hsh_string hsh_base64_encode(hsh_string s) {
+    if (!s) return "";
+    size_t n = strlen(s);
+    size_t out_len = ((n + 2) / 3) * 4;
+    char* out = (char*)hsh_alloc(out_len + 1);
+    size_t i = 0, w = 0;
+    while (i + 2 < n) {
+        uint32_t v = ((unsigned char)s[i] << 16) | ((unsigned char)s[i+1] << 8) | (unsigned char)s[i+2];
+        out[w++] = HSH_B64_CHARS[(v >> 18) & 0x3F];
+        out[w++] = HSH_B64_CHARS[(v >> 12) & 0x3F];
+        out[w++] = HSH_B64_CHARS[(v >> 6) & 0x3F];
+        out[w++] = HSH_B64_CHARS[v & 0x3F];
+        i += 3;
+    }
+    size_t rem = n - i;
+    if (rem == 1) {
+        uint32_t v = (unsigned char)s[i] << 16;
+        out[w++] = HSH_B64_CHARS[(v >> 18) & 0x3F];
+        out[w++] = HSH_B64_CHARS[(v >> 12) & 0x3F];
+        out[w++] = '='; out[w++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((unsigned char)s[i] << 16) | ((unsigned char)s[i+1] << 8);
+        out[w++] = HSH_B64_CHARS[(v >> 18) & 0x3F];
+        out[w++] = HSH_B64_CHARS[(v >> 12) & 0x3F];
+        out[w++] = HSH_B64_CHARS[(v >> 6) & 0x3F];
+        out[w++] = '=';
+    }
+    out[w] = '\0';
+    return out;
+}
+
+static int hsh_b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1; /* padding or invalid — treated as end of data */
+}
+
+hsh_string hsh_base64_decode(hsh_string s) {
+    if (!s) return "";
+    size_t n = strlen(s);
+    char* out = (char*)hsh_alloc(n + 1); /* decoded is always <= input length */
+    size_t w = 0;
+    int buf[4]; int bn = 0;
+    for (size_t i = 0; i < n; i++) {
+        int v = hsh_b64_val(s[i]);
+        if (v < 0) continue; /* skip padding/whitespace/invalid chars */
+        buf[bn++] = v;
+        if (bn == 4) {
+            out[w++] = (char)((buf[0] << 2) | (buf[1] >> 4));
+            out[w++] = (char)(((buf[1] & 0xF) << 4) | (buf[2] >> 2));
+            out[w++] = (char)(((buf[2] & 0x3) << 6) | buf[3]);
+            bn = 0;
+        }
+    }
+    if (bn == 2) {
+        out[w++] = (char)((buf[0] << 2) | (buf[1] >> 4));
+    } else if (bn == 3) {
+        out[w++] = (char)((buf[0] << 2) | (buf[1] >> 4));
+        out[w++] = (char)(((buf[1] & 0xF) << 4) | (buf[2] >> 2));
+    }
+    out[w] = '\0';
+    return out;
+}
+
+/* encoding::url — percent-encoding. `hsh_url_encode` leaves the
+ * standard "unreserved" RFC 3986 characters (letters, digits, -_.~)
+ * untouched and percent-encodes everything else, matching every
+ * mainstream language's default `encodeURIComponent`-style behavior
+ * (space becomes %20, not '+' — the older application/x-www-form-
+ * urlencoded convention is deliberately not what this implements,
+ * since URL paths and query values are the far more common use case). */
+static int hsh_url_safe_char(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~';
+}
+
+hsh_string hsh_url_encode(hsh_string s) {
+    if (!s) return "";
+    size_t n = strlen(s);
+    char* out = (char*)hsh_alloc(n * 3 + 1);
+    size_t w = 0;
+    static const char hexd[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (hsh_url_safe_char(c)) {
+            out[w++] = (char)c;
+        } else {
+            out[w++] = '%';
+            out[w++] = hexd[(c >> 4) & 0xF];
+            out[w++] = hexd[c & 0xF];
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
+static int hsh_hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+hsh_string hsh_url_decode(hsh_string s) {
+    if (!s) return "";
+    size_t n = strlen(s);
+    char* out = (char*)hsh_alloc(n + 1);
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n) {
+            int hi = hsh_hex_val(s[i+1]), lo = hsh_hex_val(s[i+2]);
+            if (hi >= 0 && lo >= 0) {
+                out[w++] = (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out[w++] = (s[i] == '+') ? ' ' : s[i];
+    }
+    out[w] = '\0';
+    return out;
+}
+
 hsh_string hsh_shell(hsh_string cmd) {
     if (!cmd) return "";
     FILE* fp = popen(cmd, "r");
@@ -467,6 +636,324 @@ static hsh_string hsh_exec_argv(char* const argv[]) {
     if (!buf) return "";
     buf[total] = '\0';
     return buf;
+}
+
+/* Read every byte currently available from `fd` into a heap buffer
+ * (non-blocking use: caller only calls this once the child is known to
+ * have exited or been killed, so a plain blocking read-to-EOF is fine —
+ * same pattern as hsh_shell/hsh_exec_argv above). */
+static char* hsh_drain_fd(int fd) {
+    char* buf = NULL; size_t total = 0, cap = 0; char chunk[4096]; ssize_t n;
+    while ((n = read(fd, chunk, sizeof(chunk))) > 0) {
+        if (total + (size_t)n + 1 > cap) {
+            cap = (cap + (size_t)n + 1) * 2;
+            char* nb = (char*)realloc(buf, cap);
+            if (!nb) { free(buf); return strdup(""); }
+            buf = nb;
+        }
+        memcpy(buf + total, chunk, (size_t)n); total += (size_t)n;
+    }
+    if (!buf) return strdup("");
+    buf[total] = '\0';
+    return buf;
+}
+
+/* proc::run_cmd(cmd, timeout_secs) / proc::run_cmd_live(cmd, timeout_secs)
+ * — run `cmd` through /bin/sh, capturing stdout and stderr *separately*
+ * (unlike hsh_shell above, which only gives combined stdout and
+ * silently drops the child's real exit status).
+ *
+ * ABI shape, deliberately simple: `hsh_run_cmd_exec` takes the command
+ * + timeout and returns just the exit code (a plain i64 — no struct-
+ * return or out-params, so codegen only needs the same "declare a C
+ * function, call it" pattern already used for every other builtin
+ * here); stdout/stderr are stashed in the two globals below and read
+ * back by the separate zero-arg getters `hsh_run_cmd_last_stdout` /
+ * `hsh_run_cmd_last_stderr`. The H# side (see
+ * compiler/src/stdlib_shims.rs) calls all three back-to-back and packs
+ * the results into a real `ProcResult` struct via an ordinary struct
+ * literal — so the *only* new runtime ABI surface is three functions
+ * with plain scalar/string args and returns, each independently as
+ * simple as `hsh_shell` already is.
+ *
+ * Caveat that comes with the "last call" global-storage design: not
+ * reentrant/thread-safe (a second run_cmd before reading the first's
+ * result would clobber it). Fine for H#'s current single-threaded
+ * runtime and for how getit actually calls it (always read
+ * immediately, sequentially) — flagged here for whoever adds real
+ * threading later.
+ *
+ * Timeout: `timeout_secs <= 0` means "no timeout". On timeout the
+ * child gets SIGKILL and the returned exit code is -2. If the command
+ * can't even be started (fork/pipe failure), the returned exit code is
+ * -1 and both stdout/stderr read back as "".
+ */
+static char* g_hsh_run_cmd_stdout = NULL;
+static char* g_hsh_run_cmd_stderr = NULL;
+
+int64_t hsh_run_cmd_exec(hsh_string cmd, int64_t timeout_secs) {
+    free(g_hsh_run_cmd_stdout); g_hsh_run_cmd_stdout = strdup("");
+    free(g_hsh_run_cmd_stderr); g_hsh_run_cmd_stderr = strdup("");
+    if (!cmd) return -1;
+
+    int out_pipe[2], err_pipe[2];
+    if (pipe(out_pipe) != 0) return -1;
+    if (pipe(err_pipe) != 0) { close(out_pipe[0]); close(out_pipe[1]); return -1; }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(err_pipe[1], STDERR_FILENO);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+
+    int status = 0;
+    int64_t exit_code;
+    if (timeout_secs <= 0) {
+        waitpid(pid, &status, 0);
+        exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    } else {
+        time_t deadline = time(NULL) + (time_t)timeout_secs;
+        int killed = 0;
+        for (;;) {
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) break;
+            if (time(NULL) >= deadline) {
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                killed = 1;
+                break;
+            }
+            struct timespec ts = { 0, 50 * 1000 * 1000 }; /* 50ms poll */
+            nanosleep(&ts, NULL);
+        }
+        exit_code = killed ? -2 : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+
+    free(g_hsh_run_cmd_stdout);
+    free(g_hsh_run_cmd_stderr);
+    g_hsh_run_cmd_stdout = hsh_drain_fd(out_pipe[0]);
+    g_hsh_run_cmd_stderr = hsh_drain_fd(err_pipe[0]);
+    close(out_pipe[0]);
+    close(err_pipe[0]);
+    return exit_code;
+}
+
+hsh_string hsh_run_cmd_last_stdout(void) {
+    return g_hsh_run_cmd_stdout ? g_hsh_run_cmd_stdout : "";
+}
+
+hsh_string hsh_run_cmd_last_stderr(void) {
+    return g_hsh_run_cmd_stderr ? g_hsh_run_cmd_stderr : "";
+}
+
+/* str::split(s, sep) — `hsh_str_split_count` returns how many parts `s`
+ * splits into on `sep`, `hsh_str_split_part` returns the i-th part
+ * (0-indexed). Deliberately two simple scalar-return functions instead
+ * of one that returns an array — same reasoning as `hsh_run_cmd_exec`
+ * above: constructing a runtime `HshArray` correctly from C means
+ * matching its exact boxing/tagging layout, which I can't verify against
+ * the real LLVM-side array codegen without LLVM in this environment. See
+ * `stdlib_shims.rs`'s `str_split` for the H# wrapper that loops these
+ * into a real `[string]` using the *already-existing, already-verified*
+ * `.push()` array-building codegen instead.
+ *
+ * Recomputes the split from scratch on every `_part` call — O(n) per
+ * call, O(n^2) for a full loop over all parts. Deliberately fine: every
+ * real call site in getit splits short strings (URLs, HTTP header
+ * lines, file paths), not megabyte payloads.
+ *
+ * Empty `sep` splits between every byte (mirrors Rust's `str::split`
+ * behavior, which is what the interpreter's `"split"` arm in
+ * `interpreter/src/call.rs` uses under the hood — kept consistent so a
+ * program behaves the same whether run via `hsharp compile` or
+ * `hsharp preview`/`hsharp repl`). Not hit by any getit call site
+ * (every separator there is non-empty: "?", "/", "\n", ":", " ").
+ */
+int64_t hsh_str_split_count(hsh_string s, hsh_string sep) {
+    if (!s) return 0;
+    if (!sep || sep[0] == '\0') {
+        size_t n = strlen(s);
+        return (int64_t)(n == 0 ? 1 : n);
+    }
+    size_t seplen = strlen(sep);
+    int64_t count = 1;
+    const char* p = s;
+    const char* hit;
+    while ((hit = strstr(p, sep)) != NULL) {
+        count++;
+        p = hit + seplen;
+    }
+    return count;
+}
+
+hsh_string hsh_str_split_part(hsh_string s, hsh_string sep, int64_t index) {
+    if (!s || index < 0) return "";
+    if (!sep || sep[0] == '\0') {
+        size_t n = strlen(s);
+        if ((size_t)index >= n) return "";
+        char* out = (char*)hsh_alloc(2);
+        out[0] = s[index];
+        out[1] = '\0';
+        return out;
+    }
+    size_t seplen = strlen(sep);
+    const char* p = s;
+    int64_t cur = 0;
+    for (;;) {
+        const char* hit = strstr(p, sep);
+        const char* part_end = hit ? hit : p + strlen(p);
+        if (cur == index) {
+            size_t len = (size_t)(part_end - p);
+            char* out = (char*)hsh_alloc(len + 1);
+            memcpy(out, p, len);
+            out[len] = '\0';
+            return out;
+        }
+        if (!hit) return ""; /* index out of range */
+        p = hit + seplen;
+        cur++;
+    }
+}
+
+/* fs::remove_dir(path) — recursive directory removal. Deliberately shells
+ * out to `rm -rf` (via the already-existing, already-tested
+ * hsh_shell_escape for safe quoting) rather than hand-rolling a
+ * recursive nftw()-based walk-and-unlink in C: `rm -rf` is a single,
+ * extremely well-tested syscall-sequence that's much less likely to
+ * have an edge-case bug (symlinks, permission-denied subdirs, ENOTEMPTY
+ * races) than a from-scratch reimplementation would be — the same
+ * "prefer battle-tested existing tools over new risky C" reasoning as
+ * hsh_run_cmd_exec using `/bin/sh -c` instead of trying to reimplement
+ * shell parsing.
+ */
+int64_t hsh_remove_dir_recursive(hsh_string path) {
+    if (!path || path[0] == '\0') return 0;
+    char* quoted = (char*)hsh_shell_escape(path);
+    size_t cmdlen = strlen(quoted) + 16;
+    char* cmd = (char*)malloc(cmdlen);
+    if (!cmd) { free(quoted); return 0; }
+    snprintf(cmd, cmdlen, "rm -rf %s", quoted);
+    int rc = system(cmd);
+    free(cmd);
+    free(quoted);
+    return (rc == 0) ? 1 : 0;
+}
+
+/* conv::int_to_str / conv::str_to_int */
+hsh_string hsh_int_to_str(int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%lld", (long long)n);
+    char* out = (char*)hsh_alloc((size_t)len + 1);
+    memcpy(out, buf, (size_t)len + 1);
+    return out;
+}
+
+int64_t hsh_str_to_int(hsh_string s) {
+    if (!s) return 0;
+    /* strtoll skips leading whitespace and stops at the first non-digit
+     * (matches how getit always calls this after str::trim anyway), and
+     * returns 0 on a string with no valid digits — never crashes on
+     * garbage input, unlike atoll's undefined behavior on overflow. */
+    return (int64_t)strtoll(s, NULL, 10);
+}
+
+/* env::get(name) — "" if unset, matching every other "absent value"
+ * convention in this runtime (hsh_json_get, hsh_run_cmd_last_stdout, …
+ * all return "" rather than a null pointer H# code would have to
+ * null-check). */
+hsh_string hsh_env_get(hsh_string name) {
+    if (!name) return "";
+    const char* v = getenv(name);
+    return v ? v : "";
+}
+
+/* env::read_line() — one line from stdin, newline stripped (matches
+ * every interactive y/n prompt getit uses this for — see
+ * `str::to_lower(answer) != "y"`, which would never match "y\n"). EOF
+ * or a read error returns "". */
+hsh_string hsh_env_read_line(void) {
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), stdin)) return "";
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+    char* out = (char*)hsh_alloc(n + 1);
+    memcpy(out, buf, n + 1);
+    return out;
+}
+
+/* json::set_str(json, key, val) — insert-or-replace a `"key":"value"`
+ * entry in a *flat* JSON object string (same "not a full JSON parser,
+ * handles simple flat objects" scope as hsh_json_get above — getit only
+ * ever uses this for a single-level etag cache, see stdlib_shims.rs's
+ * `json` type-alias doc comment for the full design rationale). Always
+ * returns well-formed flat JSON: `{}` in, `{"k":"v"}` out; `{"a":"1"}`
+ * + set b→2 → `{"a":"1","b":"2"}`; `{"a":"1"}` + set a→2 →
+ * `{"a":"2"}`. Values are stored as JSON strings (quoted) regardless of
+ * their H# type, matching `json_get_str`'s name — this is a
+ * string-keyed string-value cache, not a general JSON value store. */
+hsh_string hsh_json_set_str(hsh_string json, hsh_string key, hsh_string val) {
+    if (!key) key = "";
+    if (!val) val = "";
+    if (!json || json[0] == '\0') json = "{}";
+
+    size_t klen = strlen(key);
+    char* pattern = (char*)malloc(klen + 4);
+    pattern[0] = '"'; memcpy(pattern + 1, key, klen);
+    pattern[klen+1] = '"'; pattern[klen+2] = ':'; pattern[klen+3] = '\0';
+    const char* hit = strstr(json, pattern);
+    free(pattern);
+
+    size_t jlen = strlen(json);
+    size_t vlen = strlen(val);
+    /* room for: existing object + new entry + quotes/commas/braces,
+     * generously over-allocated (exact accounting isn't worth the risk
+     * of an off-by-one here — a few extra bytes of slack is free). */
+    char* out = (char*)hsh_alloc(jlen + klen + vlen + 32);
+    size_t w = 0;
+
+    if (hit) {
+        /* Replace existing "key":"...value..." span with the new value. */
+        size_t prefix_len = (size_t)(hit - json);
+        memcpy(out + w, json, prefix_len); w += prefix_len;
+        w += (size_t)snprintf(out + w, klen + vlen + 8, "\"%s\":\"%s\"", key, val);
+        const char* after_key = hit + klen + 3; /* skip "key": */
+        while (*after_key == ' ' || *after_key == '\t') after_key++;
+        const char* value_end;
+        if (*after_key == '"') {
+            value_end = strchr(after_key + 1, '"');
+            value_end = value_end ? value_end + 1 : after_key + strlen(after_key);
+        } else {
+            value_end = after_key;
+            while (*value_end && *value_end != ',' && *value_end != '}') value_end++;
+        }
+        size_t suffix_len = strlen(value_end);
+        memcpy(out + w, value_end, suffix_len + 1); w += suffix_len;
+    } else {
+        /* Insert a new entry just before the closing '}'. */
+        const char* close = strrchr(json, '}');
+        size_t body_len = close ? (size_t)(close - json) : jlen;
+        int is_empty = 1;
+        for (size_t i = 1; i < body_len; i++) {
+            if (json[i] != ' ' && json[i] != '\t' && json[i] != '\n') { is_empty = 0; break; }
+        }
+        memcpy(out + w, json, body_len); w += body_len;
+        if (!is_empty) { out[w++] = ','; }
+        w += (size_t)snprintf(out + w, klen + vlen + 8, "\"%s\":\"%s\"", key, val);
+        out[w++] = '}';
+        out[w] = '\0';
+    }
+    return out;
 }
 
 hsh_string hsh_exec1(hsh_string cmd) {
@@ -1422,4 +1909,225 @@ void hsh_ptr_write_checked(void* p, int64_t offset, int64_t width, int64_t val) 
         case 8: *(int64_t*)((uint8_t*)p + offset) = val;          return;
         default: hsh_panic("ptr_write_checked: width must be 1, 2, 4, or 8 bytes");
     }
+}
+
+/* ── HashMap ──────────────────────────────────────────────────────────────
+ * Open addressing (linear probing) hash table, generic over int64_t keys
+ * *and* string keys (the overwhelming majority of real use — config maps,
+ * caches, JSON-like structures) — selected at construction time via
+ * `string_keys` so one implementation serves both `HashMap<int, V>` and
+ * `HashMap<string, V>` without duplicating the probing/resize logic.
+ *
+ * String keys are stored as *owned copies* (strdup'd on insert, freed on
+ * overwrite/removal/table free) and compared/hashed by *content*, not by
+ * pointer identity — critical correctness point: two equal strings at
+ * different addresses (the normal case — nothing in this runtime interns
+ * strings) must hash equal and compare equal, or every lookup with a
+ * freshly-built key string would silently miss. Int keys are hashed and
+ * compared as plain 64-bit values (pointer-identity is fine there — an int
+ * key's bit pattern *is* its value, unlike a string key's pointer).
+ *
+ * Values are always a plain `int64_t` slot — same "everything is one i64
+ * slot; strings are a pointer cast to i64" convention `HshArray` already
+ * uses throughout this runtime (see the comment above `HshArray`'s
+ * typedef) — so a `HashMap<K, string>` stores each value as a `char*`
+ * reinterpreted as `int64_t`, exactly like an array of strings does.
+ *
+ * Tombstones (a `deleted` flag per slot, distinct from `occupied=0`) are
+ * needed for correct open-addressing removal: a linear probe sequence must
+ * keep scanning *through* a deleted slot to find keys that were inserted
+ * after it and probed past it, which stopping at "first empty-looking
+ * slot" would incorrectly break.
+ */
+typedef struct {
+    int64_t key;        /* int64 key value, OR a strdup'd `char*` cast to int64_t when string_keys */
+    int64_t value;
+    uint8_t occupied;
+    uint8_t deleted;     /* tombstone — see doc comment above */
+} HshMapEntry;
+
+typedef struct {
+    int64_t count;        /* live entries (excludes tombstones) */
+    int64_t cap;
+    int     string_keys;  /* 0 = int64 keys (identity hash/eq), 1 = string keys (content hash/eq) */
+    HshMapEntry* entries;
+} HshMap;
+
+/* FNV-1a — same well-known, non-cryptographic string hash used all over
+ * (git, many language runtimes' default string hashers). Fast, simple,
+ * good-enough distribution for a general-purpose hash table; deliberately
+ * *not* claimed anywhere as suitable for anything security-sensitive
+ * (HashDoS resistance, content hashing) — just table bucketing. */
+static uint64_t hsh_fnv1a(const char* s) {
+    uint64_t h = 1469598103934665603ULL; /* offset basis */
+    while (*s) {
+        h ^= (unsigned char)(*s++);
+        h *= 1099511628211ULL; /* prime */
+    }
+    return h;
+}
+
+static uint64_t hsh_map_hash(HshMap* m, int64_t key) {
+    if (m->string_keys) return hsh_fnv1a((const char*)(intptr_t)key);
+    /* int64 identity hash — Fibonacci/multiplicative hashing (Knuth's
+     * constant) so sequential integer keys (very common: IDs, indices)
+     * spread across buckets instead of clustering in the low bits. */
+    uint64_t k = (uint64_t)key;
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    return k;
+}
+
+static int hsh_map_keys_eq(HshMap* m, int64_t a, int64_t b) {
+    if (m->string_keys) {
+        const char* sa = (const char*)(intptr_t)a;
+        const char* sb = (const char*)(intptr_t)b;
+        if (!sa || !sb) return sa == sb;
+        return strcmp(sa, sb) == 0;
+    }
+    return a == b;
+}
+
+HshMap* hsh_map_new(int64_t string_keys) {
+    HshMap* m = (HshMap*)malloc(sizeof(HshMap));
+    if (!m) return NULL;
+    m->count = 0;
+    m->cap = 16;
+    m->string_keys = string_keys ? 1 : 0;
+    m->entries = (HshMapEntry*)calloc((size_t)m->cap, sizeof(HshMapEntry));
+    return m;
+}
+
+static void hsh_map_grow(HshMap* m) {
+    int64_t old_cap = m->cap;
+    HshMapEntry* old_entries = m->entries;
+    m->cap *= 2;
+    m->entries = (HshMapEntry*)calloc((size_t)m->cap, sizeof(HshMapEntry));
+    m->count = 0;
+    for (int64_t i = 0; i < old_cap; i++) {
+        if (old_entries[i].occupied && !old_entries[i].deleted) {
+            /* Reinsert — can't just memcpy the slots, probe positions
+             * depend on `cap`, which just changed. */
+            uint64_t h = hsh_map_hash(m, old_entries[i].key);
+            int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+            while (m->entries[idx].occupied) idx = (idx + 1) % m->cap;
+            m->entries[idx] = old_entries[i];
+            m->count++;
+        }
+    }
+    free(old_entries);
+}
+
+/* Returns the slot index for `key`: an existing occupied match if present,
+ * otherwise the first free-or-tombstoned slot along the probe sequence
+ * (where a fresh insert should go). Callers distinguish "found" from
+ * "insert point" by checking `.occupied && !.deleted` themselves. */
+static int64_t hsh_map_probe(HshMap* m, int64_t key) {
+    uint64_t h = hsh_map_hash(m, key);
+    int64_t idx = (int64_t)(h % (uint64_t)m->cap);
+    int64_t first_free = -1;
+    for (int64_t i = 0; i < m->cap; i++) {
+        HshMapEntry* e = &m->entries[idx];
+        if (!e->occupied) {
+            return (first_free >= 0) ? first_free : idx;
+        }
+        if (e->deleted) {
+            if (first_free < 0) first_free = idx;
+        } else if (hsh_map_keys_eq(m, e->key, key)) {
+            return idx;
+        }
+        idx = (idx + 1) % m->cap;
+    }
+    return first_free; /* table full of tombstones — reuse one */
+}
+
+void hsh_map_set(HshMap* m, int64_t key, int64_t value) {
+    if (!m) return;
+    if (m->count * 2 >= m->cap) hsh_map_grow(m); /* keep load factor <= 0.5 for short probe chains */
+
+    int64_t idx = hsh_map_probe(m, key);
+    HshMapEntry* e = &m->entries[idx];
+    int is_new = !(e->occupied && !e->deleted);
+
+    if (m->string_keys) {
+        if (!is_new) free((void*)(intptr_t)e->key); /* replacing: drop the old owned copy */
+        const char* s = (const char*)(intptr_t)key;
+        e->key = (int64_t)(intptr_t)(s ? strdup(s) : strdup(""));
+    } else {
+        e->key = key;
+    }
+    e->value = value;
+    e->occupied = 1;
+    e->deleted = 0;
+    if (is_new) m->count++;
+}
+
+/* Returns 1 and writes *out if found, else returns 0 (leaves *out
+ * untouched) — the has/get split (see hsh_map_get below) exists because a
+ * stored value of 0 is completely legitimate and must be distinguishable
+ * from "key absent". */
+static int hsh_map_find(HshMap* m, int64_t key, int64_t* out) {
+    if (!m || m->count == 0) return 0;
+    int64_t idx = hsh_map_probe(m, key);
+    HshMapEntry* e = &m->entries[idx];
+    if (e->occupied && !e->deleted) {
+        if (out) *out = e->value;
+        return 1;
+    }
+    return 0;
+}
+
+int64_t hsh_map_get(HshMap* m, int64_t key) {
+    int64_t out = 0;
+    hsh_map_find(m, key, &out);
+    return out; /* 0 on miss — see hsh_map_has for a real presence check */
+}
+
+int64_t hsh_map_has(HshMap* m, int64_t key) {
+    return hsh_map_find(m, key, NULL);
+}
+
+int64_t hsh_map_remove(HshMap* m, int64_t key) {
+    if (!m || m->count == 0) return 0;
+    int64_t idx = hsh_map_probe(m, key);
+    HshMapEntry* e = &m->entries[idx];
+    if (!(e->occupied && !e->deleted)) return 0;
+    if (m->string_keys) free((void*)(intptr_t)e->key);
+    e->deleted = 1;
+    m->count--;
+    return 1;
+}
+
+int64_t hsh_map_len(HshMap* m) {
+    return m ? m->count : 0;
+}
+
+/* Returns an HshArray* of the map's keys (int64 values, or char* cast to
+ * int64 for string_keys — same convention as everywhere else). Order is
+ * unspecified (bucket order) — same caveat as literally every hash table
+ * in every language without an explicit "ordered map" variant. */
+HshArray* hsh_map_keys(HshMap* m) {
+    HshArray* a = hsh_arr_alloc(m && m->count > 0 ? m->count : 1);
+    if (!m) return a;
+    for (int64_t i = 0; i < m->cap; i++) {
+        HshMapEntry* e = &m->entries[i];
+        if (e->occupied && !e->deleted) {
+            a = hsh_array_push(a, e->key);
+        }
+    }
+    return a;
+}
+
+void hsh_map_clear(HshMap* m) {
+    if (!m) return;
+    if (m->string_keys) {
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (m->entries[i].occupied && !m->entries[i].deleted) {
+                free((void*)(intptr_t)m->entries[i].key);
+            }
+        }
+    }
+    memset(m->entries, 0, (size_t)m->cap * sizeof(HshMapEntry));
+    m->count = 0;
 }
