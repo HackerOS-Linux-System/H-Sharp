@@ -26,7 +26,7 @@ pub enum TokenKind {
     Return, Use, From, Pub, Struct, Enum, Impl, Trait,
     Match, Is, End, Then, Type, As, Self_, New,
     Break, Continue, Unsafe, Extern, Mod, Async, Await,
-    Arena, Manual, Write, Using,
+    Arena, Manual, Write, Using, Const,
     // Doc / block comments
     DocComment(String),
     BlockCommentStart,
@@ -425,6 +425,7 @@ impl Lexer {
         let kind = match s.as_str() {
             "fn"       => TokenKind::Fn,
             "let"      => TokenKind::Let,
+            "const"    => TokenKind::Const,
             "mut"      => TokenKind::Mut,
             "if"       => TokenKind::If,
             "else"     => TokenKind::Else,
