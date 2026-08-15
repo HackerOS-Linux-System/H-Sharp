@@ -11,6 +11,7 @@ pub enum Arch {
     X86_64,
     Aarch64,
     Riscv64,
+    Wasm32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +19,12 @@ pub enum Os {
     Linux,
     Windows,
     MacOS,
+    /// wasm32-unknown-unknown: no OS at all — no processes, no
+    /// filesystem, no environment variables, nothing `core.c`'s POSIX
+    /// runtime (fork/popen/getenv/mkdir/...) can call into. See
+    /// `TargetTriple::wasm32()`'s doc comment for what that means for
+    /// which H# programs can actually target it.
+    Freestanding,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +117,35 @@ impl TargetTriple {
         }
     }
 
+    /// `wasm32-unknown-unknown` — no OS, no libc, no filesystem, no
+    /// processes. **Not** general-purpose H# codegen the way every other
+    /// target above is: `core.c`'s runtime (this whole compiler's only
+    /// C runtime — see `runtime/core.c`) is built entirely on POSIX
+    /// (`fork`, `popen`, `getenv`, `mkdir`, `fgets` from a real stdin,
+    /// ...), none of which exist under this target. See `CompileOptions
+    /// ::validate_wasm_compat` (in `lib.rs`) for the compile-time check
+    /// this implies: a program using `fs::`/`proc::`/`env::`/
+    /// `shell()`/`cmd()` gets a clear error naming the offending call
+    /// instead of a binary that links (or doesn't) into something
+    /// broken. Pure-computation H# (arithmetic, strings, structs,
+    /// control flow, `write()`) targets this fine.
+    ///
+    /// For running *arbitrary* H# (including `fs::`/`proc::`-using
+    /// programs like getit) inside a browser, use the `hsharp-playground`
+    /// crate instead (`playground/`, wired up on the docs site's
+    /// Playground section) — it wraps the pure-Rust *interpreter*, which
+    /// has no POSIX dependency in the first place, rather than trying to
+    /// make this LLVM/C-runtime pipeline target a freestanding
+    /// environment it wasn't designed for.
+    pub fn wasm32() -> Self {
+        Self {
+            arch: Arch::Wasm32,
+            os: Os::Freestanding,
+            abi: Abi::None,
+            llvm_triple: "wasm32-unknown-unknown".to_string(),
+        }
+    }
+
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "linux-x86_64" | "linux" => Some(Self::linux_x86_64_musl()),
@@ -119,13 +155,19 @@ impl TargetTriple {
             "windows-aarch64" => Some(Self::windows_aarch64()),
             "macos" | "macos-x86_64" => Some(Self::macos_x86_64()),
             "macos-aarch64" => Some(Self::macos_aarch64()),
+            "wasm32" | "wasm" => Some(Self::wasm32()),
             _ => None,
         }
+    }
+
+    pub fn is_wasm(&self) -> bool {
+        self.arch == Arch::Wasm32
     }
 
     pub fn exe_suffix(&self) -> &'static str {
         match self.os {
             Os::Windows => ".exe",
+            Os::Freestanding => ".wasm",
             _ => "",
         }
     }
@@ -139,6 +181,7 @@ impl TargetTriple {
             ("windows-aarch64", "Windows ARM64"),
             ("macos-x86_64", "macOS Intel"),
             ("macos-aarch64", "macOS Apple Silicon"),
+            ("wasm32", "WebAssembly (wasm32-unknown-unknown) — pure-computation H# only, see TargetTriple::wasm32()'s doc comment"),
         ]
     }
 }
