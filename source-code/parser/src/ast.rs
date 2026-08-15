@@ -23,6 +23,27 @@ pub enum TypeExpr {
 
 // ─── Import paths ─────────────────────────────────────────────────────────────
 
+/// How a `use` import gets linked into the final binary.
+///
+/// `Static` (the default — no keyword needed, mirrors Rust's default of
+/// statically linking crates.io deps) bakes the imported package's code
+/// directly into the compiled binary at build time: nothing extra needs to
+/// exist on the machine that later runs the binary.
+///
+/// `Dynamic` (written as `dynamic use "..."`) instead records the package as
+/// a *runtime* dependency: the binary expects the `bytes` package manager to
+/// have already run `bytes install <name>` on the host machine before the
+/// binary is executed. Only valid for `bytes -> pkg` imports — `std` and
+/// `core` are always statically linked, since they ship with the compiler
+/// itself and dynamically resolving them would defeat the point of a
+/// batteries-included standard library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ImportLinkKind {
+    #[default]
+    Static,
+    Dynamic,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ImportKind {
     /// use "std -> module -> sub" from "alias"
@@ -35,7 +56,8 @@ pub enum ImportKind {
     /// use "python -> numpy" from "np"
     Python { name: String, version: Option<String>, alias: Option<String> },
     /// use "bytes -> pkgname" from "alias"
-    BytesRepo { name: String, version: Option<String>, alias: Option<String> },
+    /// dynamic use "bytes -> pkgname" from "alias" → `link: Dynamic`
+    BytesRepo { name: String, version: Option<String>, alias: Option<String>, link: ImportLinkKind },
     /// use "mod -> name" — deprecated, use `mod name` syntax
     #[allow(deprecated)]
     ModFile { path: String, alias: Option<String> },
@@ -288,6 +310,12 @@ pub enum Item {
     TraitDef(TraitDef),
     ImplBlock(ImplBlock),
     TypeAlias { name: String, ty: TypeExpr, pub_: bool, span: Span },
+    /// Top-level immutable binding: `const NAME: Type = expr` or the
+    /// `let`/`pub let` spelling accepted as an alias (see `parse_item`'s
+    /// `TokenKind::Let` arm for why both forms exist). Always evaluated
+    /// once, before `main` runs, and lowered to a global constant/static
+    /// in codegen — never re-evaluated per use like a local `let`.
+    ConstDef { name: String, ty: Option<TypeExpr>, value: Expr, pub_: bool, span: Span },
     Extern(ExternBlock),
     ModDecl {
         name:   String,
