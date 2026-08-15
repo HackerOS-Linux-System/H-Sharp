@@ -213,32 +213,89 @@ impl LlvmCodegen {
             func_vals.insert(f.name.clone(), fv);
         }
 
+        // Function name -> declared return type, so `let x = some_fn()`
+        // can resolve `x`'s struct type from `some_fn`'s own signature
+        // (see `infer_struct_name`'s new `Expr::Call` arm) instead of
+        // falling back to the "guess by scanning every struct for a
+        // matching field name" warning at every `.field` access on `x`
+        // afterward — the gap that produced dozens of "cannot statically
+        // determine the struct type" warnings compiling getit (every
+        // `let result = proc::run_cmd(...)` — the injected
+        // `proc_run_cmd`'s own `-> ProcResult` return type was right
+        // there, just never consulted).
+        let mut fn_ret_types: HashMap<String, TypeExpr> = HashMap::new();
+        for f in &fns {
+            if let Some(rt) = &f.return_type {
+                fn_ret_types.insert(f.name.clone(), rt.clone());
+            }
+        }
+
         // Pass 2: compile bodies
         for f in &fns {
             let fv = func_vals[&f.name];
             self.compile_fn(ctx, &module, &builder, &builtins, f, fv,
-                            &func_vals, &mut str_globals, &structs)?;
+                            &func_vals, &mut str_globals, &structs, &fn_ret_types)?;
         }
 
-        // Target machine — tuned for the HOST CPU (native -march=native
-        // equivalent) so generated binaries use AVX2/BMI2/etc when
-        // available, matching the performance goal of this pass.
-        Target::initialize_native(&InitializationConfig::default())
-        .map_err(CodegenError::Llvm)?;
-        let triple  = TargetMachine::get_default_triple();
+        // Target machine. Cross-compiling (`--target ...` naming
+        // anything other than the host) needs the *requested* triple
+        // fed to LLVM, not the host's — `self.opts.target.llvm_triple`,
+        // set from `crate::target::TargetTriple` (see target.rs),
+        // carries exactly that. Previously this always called
+        // `TargetMachine::get_default_triple()` unconditionally,
+        // silently ignoring `--target` for codegen purposes entirely
+        // (it only affected the *linker* invocation/exe suffix further
+        // down) — every `--target aarch64`/`--target windows`/etc.
+        // build was actually emitting host-native code inside a
+        // differently-named output file. wasm32 is what surfaced this,
+        // since a host x86_64/aarch64 object trivially fails to link as
+        // wasm32, but the same fix benefits every cross target.
+        //
+        // Host builds keep the exact same tuned-for-this-CPU behavior
+        // as before (AVX2/BMI2/etc via `-march=native` equivalent) —
+        // only an explicit, non-host `--target` changes behavior here.
+        let is_wasm = self.opts.target.is_wasm();
+        if is_wasm {
+            // Unlike `initialize_native`, inkwell's per-architecture
+            // `initialize_*` functions (this one included) return `()`,
+            // not `Result` — there's no fallible step to propagate here.
+            Target::initialize_webassembly(&InitializationConfig::default());
+        } else {
+            Target::initialize_native(&InitializationConfig::default())
+            .map_err(CodegenError::Llvm)?;
+        }
+        let is_cross = self.opts.target.llvm_triple != TargetMachine::get_default_triple().as_str().to_string_lossy();
+        let triple = if is_wasm || is_cross {
+            inkwell::targets::TargetTriple::create(&self.opts.target.llvm_triple)
+        } else {
+            TargetMachine::get_default_triple()
+        };
         let target  = Target::from_triple(&triple)
         .map_err(|e| CodegenError::Llvm(e.to_string()))?;
         let opt_lvl = if self.opts.optimize { OptimizationLevel::Aggressive }
         else                   { OptimizationLevel::Default };
 
-        let cpu_name     = TargetMachine::get_host_cpu_name();
-        let cpu_features = TargetMachine::get_host_cpu_features();
-        let cpu_str  = cpu_name.to_str().unwrap_or("x86-64");
-        let feat_str = cpu_features.to_str().unwrap_or("+avx2,+bmi,+bmi2,+sse4.1,+sse4.2,+popcnt");
+        // Host CPU tuning only makes sense when actually targeting the
+        // host — a cross/wasm32 target has no "host CPU features" to
+        // ask for (and asking anyway would make LLVM either error out
+        // or, worse, silently bake in host-only instructions into a
+        // binary meant to run somewhere else entirely).
+        let (cpu_str, feat_str): (String, String) = if is_wasm || is_cross {
+            (String::new(), String::new())
+        } else {
+            let cpu_name     = TargetMachine::get_host_cpu_name();
+            let cpu_features = TargetMachine::get_host_cpu_features();
+            (
+                cpu_name.to_str().unwrap_or("x86-64").to_string(),
+                cpu_features.to_str().unwrap_or("+avx2,+bmi,+bmi2,+sse4.1,+sse4.2,+popcnt").to_string(),
+            )
+        };
 
         let machine = target.create_target_machine(
-            &triple, cpu_str, feat_str,
-            opt_lvl, RelocMode::PIC, CodeModel::Small,
+            &triple, &cpu_str, &feat_str,
+            opt_lvl,
+            if is_wasm { RelocMode::Default } else { RelocMode::PIC },
+            if is_wasm { CodeModel::Default } else { CodeModel::Small },
         ).ok_or_else(|| CodegenError::Llvm("cannot create target machine".into()))?;
 
         if let Err(e) = module.verify() {
@@ -741,6 +798,7 @@ impl LlvmCodegen {
         func_vals:   &HashMap<String, FunctionValue<'ctx>>,
         str_globals: &mut HashMap<String, PointerValue<'ctx>>,
         structs:     &HashMap<String, Vec<StructField>>,
+        fn_ret_types: &HashMap<String, TypeExpr>,
     ) -> R<()> {
         let entry = ctx.append_basic_block(fv, "entry");
         builder.position_at_end(entry);
@@ -790,6 +848,7 @@ impl LlvmCodegen {
             ctx, module, builder, builtins, func_vals, str_globals,
             vars, fn_name: f.name.clone(), ret_type: f.return_type.clone(),
             structs, var_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
+            fn_ret_types,
             arc_owned: std::cell::RefCell::new(Vec::new()),
             branch_depth: std::cell::Cell::new(0),
             loop_stack: Vec::new(),
@@ -1159,14 +1218,28 @@ impl LlvmCodegen {
         // ── Compile each runtime C file → object file ────────────────────────
         let mut rt_objects: Vec<String> = Vec::new();
 
-        let rt_files: &[(&str, bool, &[&str])] = &[
+        // wasm32: skip compiling core.c/regex.c/sqlite.c/async_rt.c
+        // entirely. `compile()` in lib.rs already refuses every
+        // OutputKind except Object for wasm32 (see
+        // `CompileError::WasmIncompatible`), and Object output doesn't
+        // use rt_objects at all (they'd just be deleted unused a few
+        // lines below) — so there's nothing that actually needs these
+        // compiled here, and attempting to would fail anyway: core.c's
+        // POSIX headers (`<unistd.h>`, `<sys/wait.h>`, `FILE*`-based
+        // stdio) don't exist for a freestanding wasm32 target,
+        // regardless of which functions in it a given program calls.
+        let rt_files: &[(&str, bool, &[&str])] = if self.opts.target.is_wasm() {
+            &[]
+        } else {
+        &[
             // (filename, always_include, extra_packages_for_pkg_config)
             ("core.c",     true,         &[]),
             ("regex.c",    needs_regex,  &["libpcre2-8"]),
             ("sqlite.c",   needs_db,     &["sqlite3"]),
             // async runtime — always included; links -lpthread
             ("async_rt.c", true,         &[]),
-        ];
+        ]
+        };
 
         for (fname, include, pkgs) in rt_files {
             if !include { continue; }
@@ -1604,6 +1677,14 @@ struct FnCx<'ctx, 'a> {
     /// bare `BasicTypeEnum` (just "this is a pointer") can't express; only
     /// the source-level type can.
     array_elem_type_expr: HashMap<String, TypeExpr>,
+    /// Function name -> declared return type. Lets `infer_struct_name`
+    /// resolve `let x = some_fn().field` (a `Call`, not a bare `Ident`
+    /// or `StructLit`) by checking whether `some_fn` itself declares a
+    /// known-struct return type — see `build_module`'s doc comment on
+    /// where this map is built, and this struct's own `var_types` doc
+    /// comment for the broader "avoid the scan-every-struct guess" goal
+    /// this and `array_elem_types` are both part of.
+    fn_ret_types: &'a HashMap<String, TypeExpr>,
     /// This function's `@arena`/`@safety`/`@arc`/`@pointers`/`@default`
     /// annotation. `Arena` and `Arc` change codegen behavior (see
     /// `compile_fn`'s prologue and `build_return_coerced`'s epilogue);
@@ -1734,6 +1815,52 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
             // matter how clearly `arr` was annotated — fell through to
             // the guess-by-scanning-every-struct fallback.
             Expr::IndexAccess(arr, _, _) => self.infer_array_elem_type(arr),
+            // `let x = some_fn(...)` (or `x.method_field.stuff` where the
+            // inner expression is itself a call) — resolve via the
+            // callee's own declared return type instead of falling
+            // through to the scan-every-struct guess. Only handles a
+            // plain `Ident` callee (not `module::function` `Path` calls,
+            // nor method calls) — those go through separate call-
+            // resolution logic this function doesn't have access to, and
+            // a missed case here just means falling back to the
+            // (correct, if noisier) old guessing behavior, never a wrong
+            // answer.
+            Expr::Call(callee, _, _) => {
+                // Mirrors the *actual* call-resolution mangling in the
+                // `Expr::Call`/`Expr::Path` codegen arm below (search
+                // this file for `segments.join("_")`): a plain `Ident`
+                // callee resolves directly by name, but a `module::fn`
+                // call — e.g. `proc::run_cmd(...)`, which is how
+                // `stdlib_shims.rs`'s injected `proc_run_cmd`/
+                // `proc_run_cmd_live` actually get called from H# source
+                // — parses as `Expr::Path(["proc","run_cmd"], _)`, not
+                // `Expr::Ident`. The first version of this fix only
+                // handled `Ident`, so `let result = proc::run_cmd(...)`
+                // still fell through to the scan-every-struct guess
+                // (confirmed: `.exit_code`/`.stdout`/`.stderr` warnings
+                // persisted after that fix while `.user`/`.repo`/
+                // `.branch`/`.folder` — from the plain-`Ident`-called
+                // `parse_github_url` — correctly went away). Same
+                // snake_case-join-then-last-segment-fallback lookup as
+                // the real call resolution, so this always agrees with
+                // whatever name actually got called.
+                let fn_name = match callee.as_ref() {
+                    Expr::Ident(n, _) => Some(n.clone()),
+                    Expr::Path(segments, _) => {
+                        let snake = segments.join("_");
+                        if self.fn_ret_types.contains_key(&snake) {
+                            Some(snake)
+                        } else {
+                            segments.last().cloned()
+                        }
+                    }
+                    _ => None,
+                };
+                match fn_name.and_then(|n| self.fn_ret_types.get(&n)) {
+                    Some(TypeExpr::Named(n)) if self.structs.contains_key(n) => Some(n.clone()),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -2198,17 +2325,35 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 let annotated_ty = ty.as_ref().and_then(|t| htype_to_llvm(self.ctx, t));
                 let (ptr, llvm_ty) = if let Some(e) = value {
                     let v = self.expr(e, annotated_ty)?;
+                    // BUG FIX — "Terminator found in the middle of a basic
+                    // block": if `e` is (or ends in tail position with) a
+                    // value-producing `if`/`match` where *every* arm
+                    // terminates its own block (e.g. `let x = if c is
+                    // return 1 else return 2 end`), `compile_if_expr`/
+                    // `compile_match` already gave the merge block a real
+                    // `unreachable` terminator via `join_branch_values`
+                    // and left the builder positioned there. Everything
+                    // below this point (alloca/store, var bookkeeping)
+                    // would then be dead code appended *after* that
+                    // terminator, which LLVM's verifier rejects outright.
+                    // `stmts_with_value` already detects and propagates
+                    // this exact situation for statements *inside* a
+                    // branch body (see its own doc comment) — this is the
+                    // same check, needed here too since a `let`'s RHS
+                    // expression is evaluated via plain `self.expr()`,
+                    // not through `stmts_with_value`.
+                    if self.builder.get_insert_block().map(|b| b.get_terminator().is_some()).unwrap_or(true) {
+                        return Ok(true);
+                    }
                     // Prefer the explicit annotation when present (it's
                     // authoritative — e.g. picks a specific int width or a
                     // struct type a bare value might not carry). Otherwise
-                    // use the *actual* type of the computed value — this is
-                    // the fix: unannotated `let x = some_string_expr()`
-                    // used to always allocate an `i64` slot regardless of
-                    // what `some_string_expr()` actually returned, so
-                    // string/struct/array values got silently stored into
-                    // (and later loaded back out of, see `Expr::Ident`) an
-                    // `i64`-typed slot — which produces exactly-wrong LLVM
-                    // types at every subsequent use of that variable.
+                    // use the *actual* type of the computed value — an
+                    // unannotated `let x = some_string_expr()` needs the
+                    // real returned type, not a hardcoded default, or
+                    // string/struct/array values get silently stored into
+                    // (and later loaded back out of, see `Expr::Ident`) a
+                    // wrongly-typed slot.
                     let vty = annotated_ty.unwrap_or_else(|| v.get_type());
                     let p = self.builder.build_alloca(vty, name).unwrap();
                     self.builder.build_store(p, v).unwrap();
@@ -2324,6 +2469,16 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                             _ => None,
                         };
                         let v = self.expr(rhs, target_ty)?;
+                        // BUG FIX — same "Terminator found in the middle
+                        // of a basic block" class as `Stmt::Let` above:
+                        // `x = if c is return 1 else return 2 end` can
+                        // leave the builder positioned past a real
+                        // terminator that `compile_if_expr` already
+                        // emitted. Bail out before `assign_lvalue` tries
+                        // to append a store after it.
+                        if self.builder.get_insert_block().map(|b| b.get_terminator().is_some()).unwrap_or(true) {
+                            return Ok(true);
+                        }
                         self.assign_lvalue(lhs, v)?;
                         Ok(false)
                     }
@@ -2339,6 +2494,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                         // of duplicating field/index resolution a third time.
                         let lv  = self.expr(lhs, None)?;
                         let rv  = self.expr(rhs, None)?;
+                        // Same already-terminated guard as plain `Assign`
+                        // just above — `rhs` (or even `lhs`, if it's a
+                        // read through a terminating if-expression, however
+                        // unusual that would be) can leave a real
+                        // terminator behind it.
+                        if self.builder.get_insert_block().map(|b| b.get_terminator().is_some()).unwrap_or(true) {
+                            return Ok(true);
+                        }
                         let res = self.binop(op, lv, rv)?;
                         self.assign_lvalue(lhs, res)?;
                         Ok(false)
@@ -2394,7 +2557,19 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                         self.expr(e, None)?;
                         Ok(true)
                     }
-                    _ => { self.expr(e, None)?; Ok(false) }
+                    _ => {
+                        self.expr(e, None)?;
+                        // Same already-terminated guard as the arms
+                        // above — covers any other expression-statement
+                        // shape (e.g. a bare `match` used as a statement)
+                        // that can itself fully terminate every path
+                        // through it.
+                        if self.builder.get_insert_block().map(|b| b.get_terminator().is_some()).unwrap_or(true) {
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    }
                 }
             }
             Stmt::Continue(_) => {
@@ -3686,6 +3861,45 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "shell" | "cmd" => call1!(self.builtins.hsh_shell, "sh"),
                        // ── §0 SECURITY: shell-injection mitigations ──────────────────
                        "shell_escape" | "shquote" => call1!(self.builtins.hsh_shell_escape, "shq"),
+                       // proc::run_cmd / proc::run_cmd_live desugar (see
+                       // stdlib_shims.rs) to these three internal calls —
+                       // not meant to be typed directly by users, same
+                       // spirit as e.g. `hsh_val_to_str` above.
+                       "run_cmd_exec" => {
+                           let cmd = str_arg!(0);
+                           let timeout = if let Some(e) = args.get(1) {
+                               let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                               match v { BasicValueEnum::IntValue(i) => i, _ => self.ctx.i64_type().const_zero() }
+                           } else { self.ctx.i64_type().const_zero() };
+                           let r = self.call_coerced(self.builtins.hsh_run_cmd_exec, &[cmd.into(), timeout.into()], "run_cmd_exec");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "run_cmd_last_stdout" => {
+                           let r = self.call_coerced(self.builtins.hsh_run_cmd_last_stdout, &[], "run_cmd_stdout");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "run_cmd_last_stderr" => {
+                           let r = self.call_coerced(self.builtins.hsh_run_cmd_last_stderr, &[], "run_cmd_stderr");
+                           Ok(self.unwrap_call(r))
+                       }
+                       // str::split desugar (see stdlib_shims.rs) — not
+                       // meant to be typed directly by users.
+                       "str_split_count" => {
+                           let s = str_arg!(0);
+                           let sep = str_arg!(1);
+                           let r = self.call_coerced(self.builtins.hsh_str_split_count, &[s.into(), sep.into()], "split_count");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "str_split_part" => {
+                           let s = str_arg!(0);
+                           let sep = str_arg!(1);
+                           let idx = if let Some(e) = args.get(2) {
+                               let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                               match v { BasicValueEnum::IntValue(i) => i, _ => self.ctx.i64_type().const_zero() }
+                           } else { self.ctx.i64_type().const_zero() };
+                           let r = self.call_coerced(self.builtins.hsh_str_split_part, &[s.into(), sep.into(), idx.into()], "split_part");
+                           Ok(self.unwrap_call(r))
+                       }
                        // exec(cmd[,a1[,a2[,a3]]]) — direct fork+execve, no shell.
                        // Resolved by call arity to hsh_exec1..4.
                        "exec" => match args.len() {
@@ -3710,8 +3924,27 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "fs_write" | "write_file" | "file_write" => call2!(self.builtins.hsh_write_file, "fw"),
                        "fs_read"  | "read_file" | "file_read" => call1!(self.builtins.hsh_read_file, "fr"),
                        "file_exists" | "fs_exists" => call1!(self.builtins.hsh_file_exists, "fexists"),
-                       "fs_mkdir_all" | "mkdir_all" => call1!(self.builtins.hsh_mkdir_all, "mkdirall"),
-                       "file_size_bytes" | "file_size" => call1!(self.builtins.hsh_file_size, "fsize"),
+                       "fs_mkdir_all" | "mkdir_all" | "fs_mkdir" | "mkdir" => call1!(self.builtins.hsh_mkdir_all, "mkdirall"),
+                       "file_size_bytes" | "file_size" | "fs_size" => call1!(self.builtins.hsh_file_size, "fsize"),
+                       "fs_remove" | "remove_file" => call1!(self.builtins.hsh_remove_file, "frm"),
+                       "fs_rename" => call2!(self.builtins.hsh_rename, "fren"),
+                       "fs_remove_dir" | "remove_dir_recursive" => call1!(self.builtins.hsh_remove_dir_recursive, "frmdir"),
+                       "conv_int_to_str" | "int_to_str" => {
+                           let n = if let Some(e) = args.first() {
+                               let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                               match v { BasicValueEnum::IntValue(i) => i, _ => self.ctx.i64_type().const_zero() }
+                           } else { self.ctx.i64_type().const_zero() };
+                           let r = self.call_coerced(self.builtins.hsh_int_to_str, &[n.into()], "i2s");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "conv_str_to_int" | "str_to_int" => call1!(self.builtins.hsh_str_to_int, "s2i"),
+                       "env_get" => call1!(self.builtins.hsh_env_get, "envget"),
+                       "env_read_line" | "read_line" => {
+                           let r = self.call_coerced(self.builtins.hsh_env_read_line, &[], "readline");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "json_set_str" => call3!(self.builtins.hsh_json_set_str, "jsonset"),
+                       "json_get_str" => call2!(self.builtins.hsh_json_get, "jsongetstr"),
                        "is_dir" => call1!(self.builtins.hsh_is_dir, "isdir"),
                        "bold"        => call1!(self.builtins.hsh_bold, "bold"),
                        "green_text" | "green" => call1!(self.builtins.hsh_green_text, "grn"),
@@ -3843,6 +4076,230 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "env_args" => {
                            let call = self.call_coerced(self.builtins.hsh_env_args, &[], "args");
                            Ok(self.unwrap_call(call))
+                       }
+                       // ── env::set / os:: / time:: ─────────────────────────
+                       // Stdlib audit round: hostname/getpid/sleep_ms/
+                       // now_unix/now_ms already had C implementations
+                       // (core.c) and LLVM declarations (builtins.rs)
+                       // but were never reachable by any H# call name —
+                       // dead code until this match arm. getcwd/
+                       // username/platform/setenv are newly implemented
+                       // end-to-end (see core.c + docs/CHANGES-I-MADE.md).
+                       "env_set" => {
+                           let name = str_arg!(0);
+                           let val  = str_arg!(1);
+                           let call = self.call_coerced(self.builtins.hsh_setenv, &[name.into(), val.into()], "envset");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "env_cwd" | "os_cwd" | "cwd" | "getcwd" => {
+                           let call = self.call_coerced(self.builtins.hsh_getcwd, &[], "cwd");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "os_hostname" | "hostname" => {
+                           let call = self.call_coerced(self.builtins.hsh_hostname, &[], "hostn");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "os_username" | "username" => {
+                           let call = self.call_coerced(self.builtins.hsh_username, &[], "usern");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "os_platform" | "platform" => {
+                           let call = self.call_coerced(self.builtins.hsh_platform, &[], "platf");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "os_pid" | "getpid" => {
+                           let call = self.call_coerced(self.builtins.hsh_getpid, &[], "pid");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "time_now_unix" | "now_unix" => {
+                           let call = self.call_coerced(self.builtins.hsh_now_unix, &[], "nowu");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "time_now_ms" | "now_ms" => {
+                           let call = self.call_coerced(self.builtins.hsh_now_ms, &[], "nowm");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "time_sleep_ms" | "sleep_ms" => {
+                           let ms = if let Some(e) = args.first() {
+                               let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                               match v { BasicValueEnum::IntValue(i) => i, _ => self.ctx.i64_type().const_zero() }
+                           } else { self.ctx.i64_type().const_zero() };
+                           self.call_coerced(self.builtins.hsh_sleep_ms, &[ms.into()], "");
+                           Ok(self.ctx.i64_type().const_zero().into())
+                       }
+                       // ── math:: ────────────────────────────────────────────
+                       "math_sin" | "sin" | "math_cos" | "cos" | "math_tan" | "tan" |
+                       "math_sqrt" | "sqrt" | "math_floor" | "floor" | "math_ceil" | "ceil" => {
+                           let f = match name {
+                               "math_sin" | "sin" => self.builtins.hsh_sin,
+                               "math_cos" | "cos" => self.builtins.hsh_cos,
+                               "math_tan" | "tan" => self.builtins.hsh_tan,
+                               "math_sqrt" | "sqrt" => self.builtins.hsh_sqrt,
+                               "math_floor" | "floor" => self.builtins.hsh_floor,
+                               _ => self.builtins.hsh_ceil,
+                           };
+                           let x = if let Some(e) = args.first() {
+                               let v = self.expr(e, Some(self.ctx.f64_type().into()))?;
+                               self.coerce_basic_value(v, self.ctx.f64_type().into())
+                           } else { self.ctx.f64_type().const_zero().into() };
+                           let call = self.call_coerced(f, &[x.into()], "mathf");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "math_pow" | "pow" => {
+                           // Split into separate statements (not chained
+                           // as `self.coerce_basic_value(self.expr(...)?, ...)`)
+                           // — Rust's borrow checker rejects two
+                           // overlapping `&mut self` calls as arguments
+                           // to a third `&mut self` call, since the
+                           // outer call's argument list borrows `self`
+                           // for the whole expression, not just each
+                           // argument individually.
+                           let xv = self.expr(&args[0], Some(self.ctx.f64_type().into()))?;
+                           let x  = self.coerce_basic_value(xv, self.ctx.f64_type().into());
+                           let yv = self.expr(&args[1], Some(self.ctx.f64_type().into()))?;
+                           let y  = self.coerce_basic_value(yv, self.ctx.f64_type().into());
+                           let call = self.call_coerced(self.builtins.hsh_pow, &[x.into(), y.into()], "powf");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "math_abs" | "abs" => {
+                           // Dispatch on the argument's own runtime type
+                           // (int vs float) rather than requiring the
+                           // caller to know which C symbol to hit —
+                           // `abs(-5)` and `abs(-5.0)` should both just
+                           // work, matching how `+`/`-` already handle
+                           // both numeric kinds elsewhere in this file.
+                           let v = self.expr(&args[0], None)?;
+                           match v {
+                               BasicValueEnum::IntValue(_) => {
+                                   let call = self.call_coerced(self.builtins.hsh_abs_i, &[v.into()], "absi");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               _ => {
+                                   let fv = self.coerce_basic_value(v, self.ctx.f64_type().into());
+                                   let call = self.call_coerced(self.builtins.hsh_abs_f, &[fv.into()], "absf");
+                                   Ok(self.unwrap_call(call))
+                               }
+                           }
+                       }
+                       "math_min" | "min" | "math_max" | "max" => {
+                           let a = self.expr(&args[0], None)?;
+                           let b = self.expr(&args[1], None)?;
+                           let is_max = matches!(name, "math_max" | "max");
+                           match (a, b) {
+                               (BasicValueEnum::IntValue(_), BasicValueEnum::IntValue(_)) => {
+                                   let f = if is_max { self.builtins.hsh_max_i } else { self.builtins.hsh_min_i };
+                                   let call = self.call_coerced(f, &[a.into(), b.into()], "mmi");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               _ => {
+                                   let fa = self.coerce_basic_value(a, self.ctx.f64_type().into());
+                                   let fb = self.coerce_basic_value(b, self.ctx.f64_type().into());
+                                   let f = if is_max { self.builtins.hsh_max_f } else { self.builtins.hsh_min_f };
+                                   let call = self.call_coerced(f, &[fa.into(), fb.into()], "mmf");
+                                   Ok(self.unwrap_call(call))
+                               }
+                           }
+                       }
+                       // ── encoding::base64 / encoding::url ─────────────────
+                       "base64_encode" | "encoding_base64_encode" => call1!(self.builtins.hsh_base64_encode, "b64e"),
+                       "base64_decode" | "encoding_base64_decode" => call1!(self.builtins.hsh_base64_decode, "b64d"),
+                       "url_encode" | "encoding_url_encode" => call1!(self.builtins.hsh_url_encode, "urle"),
+                       "url_decode" | "encoding_url_decode" => call1!(self.builtins.hsh_url_decode, "urld"),
+                       // ── HashMap ───────────────────────────────────────────
+                       // `map_new(is_string_keys)`: explicit bool at the call
+                       // site (`map_new(true)` for `HashMap<string, V>`,
+                       // `map_new(false)` for `HashMap<int, V>`) rather than
+                       // inferred from a declared generic type — this
+                       // compiler's generics don't yet track a param all the
+                       // way through to a builtin's dispatch (see
+                       // monomorphize.rs's own doc comments on the current
+                       // limits of type-argument inference), so an explicit
+                       // flag is the honest, unambiguous option today. A
+                       // real `Map<K, V>` type with `.get()`/`.set()` method
+                       // sugar is the natural follow-up — see
+                       // docs/CHANGES-I-MADE.md's HashMap section.
+                       //
+                       // Every arm below evaluates each sub-expression into
+                       // its own `let` *before* passing it to
+                       // `coerce_basic_value`/`call_coerced` — never chained
+                       // as `self.coerce_basic_value(self.expr(...)?, ...)`.
+                       // That chained form is a real borrow-checker error
+                       // (two overlapping `&mut self` calls in one
+                       // expression) already hit and fixed once this session
+                       // in the `math::pow` arm above; every map arm here
+                       // was originally written the same broken way and
+                       // fixed the same way, all at once, before ever
+                       // reaching a real build.
+                       "map_new" => {
+                           let flag = if let Some(e) = args.first() {
+                               let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                               self.value_to_i64_bits(v)
+                           } else { self.ctx.i64_type().const_zero() };
+                           let call = self.call_coerced(self.builtins.hsh_map_new, &[flag.into()], "mapnew");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "map_set" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let vv = self.expr(&args[2], None)?;
+                           let v = self.value_to_i64_bits(vv);
+                           self.call_coerced(self.builtins.hsh_map_set, &[m.into(), k.into(), v.into()], "");
+                           Ok(self.ctx.i64_type().const_zero().into())
+                       }
+                       "map_get" | "map_get_int" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_get, &[m.into(), k.into()], "mapget");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "map_get_str" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_get, &[m.into(), k.into()], "mapgets");
+                           let raw = self.unwrap_call(call);
+                           let iv = self.value_to_i64_bits(raw);
+                           let pt = self.ctx.ptr_type(AddressSpace::default());
+                           Ok(self.builder.build_int_to_ptr(iv, pt, "i2p_mapget").unwrap().into())
+                       }
+                       "map_has" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_has, &[m.into(), k.into()], "maphas");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "map_remove" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_remove, &[m.into(), k.into()], "maprm");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "map_len" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let call = self.call_coerced(self.builtins.hsh_map_len, &[m.into()], "maplen");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "map_keys" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let call = self.call_coerced(self.builtins.hsh_map_keys, &[m.into()], "mapkeys");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "map_clear" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           self.call_coerced(self.builtins.hsh_map_clear, &[m.into()], "");
+                           Ok(self.ctx.i64_type().const_zero().into())
                        }
                        // ── Struct helpers ───────────────────────────────────
                        "hsh_struct_new" => {
@@ -4582,6 +5039,15 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    match (val, actual_ret_ty) {
                        (Some(expr), Some(target)) => {
                            let v = self.expr(expr, Some(target))?;
+                           // Same already-terminated guard as `Stmt::Let`/
+                           // `Assign` above — `return (if c is return 1
+                           // else return 2 end)` is unusual but not
+                           // impossible, and without this check it would
+                           // try to build a second terminator on top of
+                           // the first.
+                           if self.builder.get_insert_block().map(|b| b.get_terminator().is_some()).unwrap_or(true) {
+                               return Ok(());
+                           }
                            let v = self.coerce_basic_value(v, target);
                            self.emit_arena_epilogue(matches!(target, BasicTypeEnum::PointerType(_)));
                            self.emit_arc_epilogue(returned_ident);
