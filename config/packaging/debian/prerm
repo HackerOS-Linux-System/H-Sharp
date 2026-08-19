@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs before files are removed. Nothing custom to clean up — dpkg
+# already removes /usr/bin/hsharp and the /usr/bin/h# symlink on its own
+# since both are tracked package files.
+set -e
+exit 0
