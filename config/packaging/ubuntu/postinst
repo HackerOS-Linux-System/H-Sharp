@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs after files are unpacked. Nothing to configure today (no config
+# files, no system user, no service) — this exists as a placeholder so
+# future package versions have somewhere to add e.g. shell-completion
+# registration without needing a whole new packaging pass.
+set -e
+
+case "$1" in
+    configure)
+        if command -v update-alternatives >/dev/null 2>&1; then
+            : # nothing to register yet — h# ships as a symlink, not an alternative
+        fi
+        ;;
+esac
+
+exit 0
