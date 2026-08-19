@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: hsharp
+Source: https://github.com/HackerOS-Linux-System/H-Sharp
+
+Files: *
+Copyright: HackerOS Team <hackeros068@gmail.com>
+License: MPL-2.0
+
+License: MPL-2.0
+ This Source Code Form is subject to the terms of the Mozilla Public
+ License, v. 2.0. A full copy is available at
+ https://www.mozilla.org/en-US/MPL/2.0/ and, on most Debian systems, at
+ /usr/share/common-licenses/MPL-2.0.
