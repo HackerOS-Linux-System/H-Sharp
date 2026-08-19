@@ -1,0 +1,17 @@
+Package: hsharp
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: @ARCH@
+Maintainer: HackerOS Team <hackeros068@gmail.com>
+Homepage: https://github.com/HackerOS-Linux-System/H-Sharp
+Depends: libc6 (>= 2.35)
+Description: H# programming language compiler and interpreter
+ H# (h-sharp) is a compiled/interpreted programming language with an
+ LLVM 21 backend for release builds and a tree-walking interpreter for
+ `h# preview`/REPL use. This package installs the `hsharp` binary
+ (also available as `h#`), providing compile, preview, check, fmt,
+ repl, lsp, and new subcommands.
+ .
+ This is the Ubuntu build; see the separate Debian package for a build
+ against Debian's own base library versions.
