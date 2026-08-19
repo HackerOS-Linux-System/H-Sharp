@@ -1,0 +1,67 @@
+# Maintainer: HackerOS Team <hackeros068@gmail.com>
+#
+# NOTE ON VERIFICATION: `makepkg` only runs on Arch (or an Arch container/
+# chroot) — it isn't packaged for Debian/Ubuntu-family sandboxes, so
+# unlike config/packaging/debian, ubuntu, and fedora/opensuse's .spec
+# files (all built and verified for real against dpkg-deb/rpmbuild in
+# this repo's dev environment), this PKGBUILD is written to the
+# documented Arch packaging standard (`makepkg`/`namcap` conventions,
+# PKGBUILD(5)) but has *not* been run through real `makepkg` here. Please
+# sanity-check with `makepkg --printsrcinfo > .SRCINFO && namcap PKGBUILD`
+# on an actual Arch box (or `archlinux:latest` container — see
+# .github/workflows/build.yml's `arch` job, which does exactly that) at
+# least once before publishing to the AUR.
+#
+# Unlike the Fedora/openSUSE specs, this package DOES build from source
+# rather than staging a prebuilt binary — the AUR's own convention is
+# "build from source, always" (binary AUR packages are frowned upon /
+# against AUR rules for anything that isn't itself a redistribution of
+# someone else's already-built proprietary binary), and Arch's rolling-
+# release `extra` repo tracks LLVM closely enough that `pacman -S llvm`
+# giving LLVM 21 (or whatever's current when this is built) is a
+# reasonable bet, unlike Debian-stable/Fedora-GA's older/pinned LLVM
+# versions which motivated the "stage a prebuilt binary" approach for
+# those two.
+
+pkgname=hsharp
+pkgver=0.9.0
+pkgrel=1
+pkgdesc="H# programming language compiler and interpreter"
+arch=('x86_64' 'aarch64')
+url="https://github.com/HackerOS-Linux-System/H-Sharp"
+license=('MPL-2.0')
+depends=('gcc-libs' 'llvm-libs')
+makedepends=('cargo' 'llvm' 'clang')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/HackerOS-Linux-System/H-Sharp/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # replace with the real tarball checksum before publishing — see build.yml's release step, which computes and injects it automatically
+
+build() {
+    cd "H-Sharp-$pkgver" || exit
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    # --locked: build exactly against the committed Cargo.lock, same
+    # reasoning as every other packaging target in this directory —
+    # reproducibility over picking up whatever's newest on crates.io the
+    # day the AUR package happens to get (re)built.
+    cargo build --release --locked -p hsharp-cli
+}
+
+check() {
+    cd "H-Sharp-$pkgver" || exit
+    # Only the LLVM-independent crates — see this repo's root Cargo.toml
+    # comments on which workspace members need LLVM vs. don't. A full
+    # `cargo test --workspace` here would also try to build/test
+    # hsharp-compiler, which needs LLVM 21 dev headers beyond just
+    # `llvm-libs`/`llvm` (specifically also needs the '-devel'/full
+    # toolchain that `makedepends=('llvm')` above already covers via
+    # Arch's single unified llvm package, so this is really just about
+    # keeping `check()` fast, not about missing dependencies).
+    cargo test --locked -p hsharp-parser -p hsharp-typecheck -p hsharp-interpreter
+}
+
+package() {
+    cd "H-Sharp-$pkgver" || exit
+    install -Dm755 "target/release/hsharp" "$pkgdir/usr/bin/hsharp"
+    ln -sf hsharp "$pkgdir/usr/bin/h#"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
