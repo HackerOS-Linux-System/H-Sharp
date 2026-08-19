@@ -1,1 +1,306 @@
+name: Build
 
+# Builds the `hsharp` binary (and, on release tags, packages) across a
+# broad matrix of platforms. Split into three logically-separate job
+# groups because the LLVM-21 requirement (source-of-truth: this repo's
+# root Cargo.toml comment on source-code/compiler) is satisfied very
+# differently per platform family:
+#
+#   1. `build-native` — platforms with a GitHub-hosted runner and a
+#      reasonably direct way to get LLVM 21 (Ubuntu via apt.llvm.org,
+#      Windows/macOS via their own package managers).
+#   2. `build-container` — everything else (Fedora, Arch, openSUSE) via
+#      that distro's own official Docker image, since there's no hosted
+#      GitHub runner for them.
+#   3. `package` — takes build-native/build-container's raw binaries and
+#      runs the matching config/packaging/<distro>/ script against them.
+#
+# Triggers: every push/PR to main (build+test only, fast feedback, no
+# packaging), and every `v*` tag (full build+package+release-asset
+# upload).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {} # manual trigger, e.g. to re-run packaging after a config/packaging/ fix without a new tag
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pinned so every job in the matrix builds against the exact same
+  # dependency versions — see the various verify_* sessions in this
+  # repo's history for why (indexmap >=2.7 needs Rust's edition2024
+  # Cargo feature, which isn't available on several of these matrix
+  # entries' distro-packaged Rust toolchains).
+  LOCKED_FLAG: "--locked"
+
+jobs:
+  # ── 1. Native runners (Ubuntu, Windows, macOS) ────────────────────────
+  build-native:
+    strategy:
+      fail-fast: false # a failure on one platform shouldn't cancel the others — we want the full matrix's results
+      matrix:
+        include:
+          - name: ubuntu-22.04
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: ubuntu-24.04
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: ubuntu-24.04-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos-x86_64
+            os: macos-13 # last Intel-based hosted runner image
+            target: x86_64-apple-darwin
+          - name: macos-arm64
+            os: macos-latest # Apple Silicon
+            target: aarch64-apple-darwin
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # ── LLVM 21 setup, per OS ──────────────────────────────────────
+      - name: Install LLVM 21 (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y libpolly-21-dev
+          echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 21 (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm --version=21.0.0 --allow-downgrade -y
+          echo "LLVM_SYS_211_PREFIX=C:\Program Files\LLVM" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Install LLVM 21 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21
+          echo "LLVM_SYS_211_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+
+      - name: cargo build --release
+        run: cargo build --release ${{ env.LOCKED_FLAG }} -p hsharp-cli --target ${{ matrix.target }}
+
+      - name: Smoke test (h# --version)
+        # Cross-compiled targets (arm64 on an x86 host, etc.) can't run
+        # their own output — only test when the target matches the host.
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/hsharp"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" --version
+
+      - name: Upload raw binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsharp-${{ matrix.name }}
+          path: |
+            target/${{ matrix.target }}/release/hsharp
+            target/${{ matrix.target }}/release/hsharp.exe
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── 2. Container-based distros (no hosted GitHub runner) ─────────────
+  build-container:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fedora-40
+            image: fedora:40
+            install: dnf install -y gcc gcc-c++ make cargo rust llvm21-devel llvm21-static polly-devel
+          - name: fedora-41
+            image: fedora:41
+            install: dnf install -y gcc gcc-c++ make cargo rust llvm21-devel llvm21-static polly-devel
+          - name: arch
+            image: archlinux:latest
+            install: pacman -Syu --noconfirm base-devel rust llvm clang
+          - name: opensuse-tumbleweed
+            image: opensuse/tumbleweed:latest
+            install: zypper --non-interactive install gcc gcc-c++ make cargo rust llvm21-devel
+          - name: debian-12
+            image: debian:12
+            install: apt-get update && apt-get install -y build-essential curl wget gnupg lsb-release software-properties-common && wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && ./llvm.sh 21 && apt-get install -y libpolly-21-dev && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    name: build (${{ matrix.name }}, container)
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install build dependencies
+        run: ${{ matrix.install }}
+
+      - uses: actions/checkout@v4
+
+      - name: Configure cargo PATH (rustup-based installs)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: cargo build --release
+        run: cargo build --release --locked -p hsharp-cli
+        env:
+          # Debian's LLVM 21 (from the llvm.sh script) installs under
+          # /usr/lib/llvm-21, matching the Ubuntu native job above.
+          # Fedora/openSUSE package it under the standard /usr prefix
+          # with a versioned llvm-config-21 binary llvm-sys locates on
+          # its own — no override needed there, only Debian/Arch (whose
+          # `llvm` package is *always* "whatever's current," so building
+          # against it is a rolling-release bet noted in PKGBUILD's own
+          # comments) need it spelled out.
+          LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+
+      - name: Smoke test (h# --version)
+        run: ./target/release/hsharp --version
+
+      - name: Upload raw binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsharp-${{ matrix.name }}
+          path: target/release/hsharp
+          retention-days: 7
+
+  # ── 3. Packaging (only on release tags) ───────────────────────────────
+  package:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-native, build-container]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debian-12
+            artifact: hsharp-debian-12
+            packager: debian
+            ext: deb
+          - name: ubuntu-22.04
+            artifact: hsharp-ubuntu-22.04
+            packager: ubuntu
+            ext: deb
+          - name: ubuntu-24.04
+            artifact: hsharp-ubuntu-24.04
+            packager: ubuntu
+            ext: deb
+          - name: fedora-40
+            artifact: hsharp-fedora-40
+            packager: fedora
+            ext: rpm
+          - name: fedora-41
+            artifact: hsharp-fedora-41
+            packager: fedora
+            ext: rpm
+          - name: opensuse-tumbleweed
+            artifact: hsharp-opensuse-tumbleweed
+            packager: opensuse
+            ext: rpm
+    name: package (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: chmod binary
+        run: chmod +x dist/hsharp
+
+      - name: Build .deb
+        if: matrix.ext == 'deb'
+        run: |
+          chmod +x config/packaging/${{ matrix.packager }}/build.sh
+          bash config/packaging/${{ matrix.packager }}/build.sh dist/hsharp ${{ steps.ver.outputs.version }} amd64
+
+      - name: Build .rpm
+        if: matrix.ext == 'rpm'
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SRPMS
+          cp dist/hsharp ~/rpmbuild/SOURCES/hsharp
+          cp LICENSE ~/rpmbuild/SOURCES/LICENSE
+          sed -i "s/^Version:.*/Version:        ${{ steps.ver.outputs.version }}/" config/packaging/${{ matrix.packager }}/hsharp.spec
+          cp config/packaging/${{ matrix.packager }}/hsharp.spec ~/rpmbuild/SPECS/
+          rpmbuild -bb ~/rpmbuild/SPECS/hsharp.spec
+          cp ~/rpmbuild/RPMS/x86_64/*.rpm .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.name }}
+          path: |
+            *.deb
+            *.rpm
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.deb
+            *.rpm
+
+  package-windows:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-native]
+    name: package (windows installer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: hsharp-windows-x86_64
+          path: dist
+      - name: Install NSIS
+        run: choco install nsis -y
+      - name: Extract version from tag
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build installer
+        shell: pwsh
+        run: |
+          makensis /DVERSION=${{ steps.ver.outputs.version }} /DSRCDIR=dist config/packaging/windows/installer.nsi
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsharp-windows-installer
+          path: config/packaging/windows/hsharp-setup-*.exe
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: config/packaging/windows/hsharp-setup-*.exe
+
+  package-macos:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-native]
+    name: verify (homebrew formula)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: brew install --build-from-source
+        run: brew install --build-from-source config/packaging/macos/hsharp.rb
+      - name: brew test
+        run: brew test hsharp
