@@ -1,1 +1,18 @@
+package {
+  name        = "hsharp"
+  version     = "0.9.0"
+  arch        = ["x86_64", "aarch64"]
+  description = "H# (h-sharp) -- jezyk programowania z backendem LLVM 21 (kompilacja) i interpreterem drzewa skladni (h# preview/REPL)"
+  depends_on  = ["gcc-libs", "llvm-libs"]
+}
 
+recipe {
+  file = "recipe.janet"
+  lang = "janet"
+}
+
+release {
+  repo       = "https://github.com/Zenit-Linux/own-repository"
+  repo_file  = "repo/own-repository.json"
+  asset_name = "hsharp"
+}
