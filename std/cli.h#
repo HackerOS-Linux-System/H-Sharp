@@ -1,36 +1,244 @@
-;; H# Standard Library — std -> cli
-;; CLI argument parsing, TUI helpers
+use "std -> env" from "env"
+use "std -> collections" from "col"
 
 struct ArgParser is
-    pub name:    string
-    pub version: string
+    pub name:            string
+    pub version:         string
+    pub flag_names:      [string]
+    pub option_names:    [string]
+    pub option_defaults: [string]
+    pub arg_names:       [string]
+end
+
+;; The result of `parse()`: flags/options/positional args as three
+;; hashmaps (all string-keyed; flags map to "true"/"false").
+struct ParsedArgs is
+    pub flags:   any
+    pub options: any
+    pub args:    any
 end
 
 pub fn new_parser(name: string, version: string) -> ArgParser is
-    return ArgParser { name: name, version: version }
+    return ArgParser {
+        name: name, version: version,
+        flag_names: [], option_names: [], option_defaults: [], arg_names: [],
+    }
 end
 
-pub fn add_flag(p: ArgParser, name: string, help: string) -> ArgParser is return p end
-pub fn add_arg(p: ArgParser, name: string, help: string) -> ArgParser is return p end
-pub fn add_option(p: ArgParser, name: string, default: string, help: string) -> ArgParser is return p end
-pub fn parse(p: ArgParser) -> string is return "{{}}" end
-pub fn get_flag(parsed: string, name: string) -> bool is return false end
-pub fn get_arg(parsed: string, name: string) -> string is return "" end
-pub fn get_option(parsed: string, name: string) -> string is return "" end
+pub fn add_flag(p: ArgParser, name: string, help: string) -> ArgParser is
+    let mut names = p.flag_names
+    names.push(name)
+    return ArgParser {
+        name: p.name, version: p.version,
+        flag_names: names, option_names: p.option_names,
+        option_defaults: p.option_defaults, arg_names: p.arg_names,
+    }
+end
+
+pub fn add_arg(p: ArgParser, name: string, help: string) -> ArgParser is
+    let mut names = p.arg_names
+    names.push(name)
+    return ArgParser {
+        name: p.name, version: p.version,
+        flag_names: p.flag_names, option_names: p.option_names,
+        option_defaults: p.option_defaults, arg_names: names,
+    }
+end
+
+pub fn add_option(p: ArgParser, name: string, default: string, help: string) -> ArgParser is
+    let mut names = p.option_names
+    let mut defaults = p.option_defaults
+    names.push(name)
+    defaults.push(default)
+    return ArgParser {
+        name: p.name, version: p.version,
+        flag_names: p.flag_names, option_names: names,
+        option_defaults: defaults, arg_names: p.arg_names,
+    }
+end
+
+fn contains_str(arr: [string], v: string) -> bool is
+    let mut i = 0
+    while i < arr.len() is
+        if arr[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+fn option_default(p: ArgParser, name: string) -> string is
+    let mut i = 0
+    while i < p.option_names.len() is
+        if p.option_names[i] == name is return p.option_defaults[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; Parse `env::args()[1..]` against the declarations made via
+;; `add_flag`/`add_option`/`add_arg`.
+pub fn parse(p: ArgParser) -> ParsedArgs is
+    let mut flags   = col::hashmap_new()
+    let mut options = col::hashmap_new()
+    let mut args    = col::hashmap_new()
+
+    ;; defaults first, so `get_option` never has to fall back itself
+    let mut oi = 0
+    while oi < p.option_names.len() is
+        options = col::hashmap_insert(options, p.option_names[oi], p.option_defaults[oi])
+        oi += 1
+    end
+
+    let argv = env::args()
+    let mut next_positional = 0
+    let mut i = 1 ;; skip argv[0] (the program path)
+    while i < argv.len() is
+        let raw = argv[i]
+        if raw.len() > 2 && raw[0..2] == "--" is
+            let body = raw[2..raw.len()]
+            let eq = strings_index_of(body, "=")
+            if eq >= 0 is
+                let key = body[0..eq]
+                let val = body[eq + 1..body.len()]
+                options = col::hashmap_insert(options, key, val)
+            else is
+                if contains_str(p.flag_names, body) is
+                    flags = col::hashmap_insert(flags, body, "true")
+                else is
+                    if contains_str(p.option_names, body) && i + 1 < argv.len() is
+                        i += 1
+                        options = col::hashmap_insert(options, body, argv[i])
+                    else is
+                        flags = col::hashmap_insert(flags, body, "true")
+                    end
+                end
+            end
+        else is
+            if next_positional < p.arg_names.len() is
+                args = col::hashmap_insert(args, p.arg_names[next_positional], raw)
+                next_positional += 1
+            end
+        end
+        i += 1
+    end
+
+    return ParsedArgs { flags: flags, options: options, args: args }
+end
+
+pub fn get_flag(parsed: ParsedArgs, name: string) -> bool is
+    return col::hashmap_contains(parsed.flags, name)
+end
+
+pub fn get_arg(parsed: ParsedArgs, name: string) -> string is
+    let v = col::hashmap_get(parsed.args, name)
+    if v == nil is return "" end
+    return v
+end
+
+pub fn get_option(parsed: ParsedArgs, name: string) -> string is
+    let v = col::hashmap_get(parsed.options, name)
+    if v == nil is return "" end
+    return v
+end
+
 pub fn print_help(p: ArgParser) is
-    write("Usage: " + p.name + " [OPTIONS]")
-    write("Version: " + p.version)
+    write(p.name + " " + p.version)
+    write("")
+    write("Usage: " + p.name + " [OPTIONS]" + args_usage(p))
 end
 
-pub fn confirm(prompt: string) -> bool is return false end
-pub fn prompt_input(prompt: string) -> string is return "" end
-pub fn prompt_password(prompt: string) -> string is return "" end
-pub fn select(prompt: string, options: string) -> string is return "" end
-pub fn multiselect(prompt: string, options: string) -> string is return "" end
-pub fn spinner(msg: string) is write(msg + "...") end
+fn args_usage(p: ArgParser) -> string is
+    let mut out = ""
+    let mut i = 0
+    while i < p.arg_names.len() is
+        out = out + " <" + p.arg_names[i] + ">"
+        i += 1
+    end
+    return out
+end
+
+;; ── interactive prompts (real stdin, via std -> io) ──────────────────
+pub fn confirm(prompt: string) -> bool is
+    let ans = io_read_line(prompt + " [y/N] ")
+    let lower = strings_to_lower(strings_trim(ans))
+    return lower == "y" || lower == "yes"
+end
+
+pub fn prompt_input(prompt: string) -> string is
+    return io_read_line(prompt + " ")
+end
+
+;; No real terminal-echo suppression (would need raw-mode termios, which
+;; std/term.h# also documents as not implemented yet) — this is
+;; honestly the same as `prompt_input`, not a fake masked read.
+pub fn prompt_password(prompt: string) -> string is
+    return io_read_line(prompt + " ")
+end
+
+;; Numbered-choice select: prints options, reads a 1-based index.
+;; Returns "" on invalid input rather than guessing.
+pub fn select(prompt: string, options: [string]) -> string is
+    write(prompt)
+    let mut i = 0
+    while i < options.len() is
+        write("  " + to_string(i + 1) + ") " + options[i])
+        i += 1
+    end
+    let ans = io_read_line("> ")
+    let idx = __builtin_conv_str_to_int(strings_trim(ans))
+    if idx >= 1 && idx <= options.len() is
+        return options[idx - 1]
+    end
+    return ""
+end
+
+pub fn spinner(msg: string) is
+    write(msg + "...")
+end
+
 pub fn progress(current: int, total: int, msg: string) is
     write(msg + " " + to_string(current) + "/" + to_string(total))
 end
-pub fn table(headers: string, rows: string) is write("[table]") end
-pub fn clear_screen() is end
-pub fn move_cursor(x: int, y: int) is end
+
+pub fn table(headers: [string], rows: [[string]]) is
+    write(strings_join(headers, " | "))
+    let mut r = 0
+    while r < rows.len() is
+        write(strings_join(rows[r], " | "))
+        r += 1
+    end
+end
+
+pub fn clear_screen() is
+    write("\x1b[2J\x1b[H")
+end
+
+pub fn move_cursor(x: int, y: int) is
+    write("\x1b[" + to_string(y) + ";" + to_string(x) + "H")
+end
+
+;; ── private helpers (avoid a hard `use "std -> strings"` for a
+;; ── handful of one-line calls) ───────────────────────────────────────
+;; [FIXED] `strings_join` used to call `__builtin_str_join` directly,
+;; which the LLVM (`--release`) backend does not implement. `iter_join`
+;; is a real function auto-injected into every compiled H# program by
+;; the compiler itself (see stdlib_shims.rs) built entirely from
+;; already-working array/string primitives — call it directly instead.
+fn strings_index_of(s: string, sub: string) -> int is
+    ;; [FIXED] `__builtin_str_index_of` is interpreter-only on this
+    ;; backend. `str_split_count`/`str_split_part` (both LLVM-backed —
+    ;; see runtime/core.c) give the same answer a different way: split
+    ;; `s` on `sub`; if that yields more than one part, the first
+    ;; occurrence starts exactly where part 0 ends.
+    let n: int = str_split_count(s, sub)
+    if n <= 1 is return -1 end
+    return str_split_part(s, sub, 0).len()
+end
+fn strings_trim(s: string) -> string is return __builtin_str_trim(s) end
+fn strings_to_lower(s: string) -> string is return __builtin_str_to_lower(s) end
+fn strings_join(parts: [string], sep: string) -> string is return iter_join(parts, sep) end
+fn io_read_line(prompt: string) -> string is
+    write_no_nl_priv(prompt)
+    return __builtin_io_read_line()
+end
+fn write_no_nl_priv(s: string) is __builtin_io_write_no_nl(s) end
