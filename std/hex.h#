@@ -1,4 +1,17 @@
-;; H# Standard Library — std -> crypto -> hex
-pub fn encode(data: string) -> string is return "" end
-pub fn decode(hex: string) -> string is return "" end
-pub fn xor(a: string, b: string) -> string is return a end
+pub fn encode(data: string) -> string is
+    return __builtin_hex_encode(data)
+end
+
+;; Decode a hex string back to text. Malformed input pairs are skipped
+;; (see call.rs's `hex_decode`) rather than raising — treat the result
+;; as best-effort for untrusted input.
+pub fn decode(hex: string) -> string is
+    return __builtin_hex_decode(hex)
+end
+
+;; XOR two hex-encoded byte strings together (the second is cycled if
+;; shorter, as in a repeating-key XOR cipher), returning the result as
+;; a hex string.
+pub fn xor(a: string, b: string) -> string is
+    return __builtin_hex_xor(a, b)
+end
