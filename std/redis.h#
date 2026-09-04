@@ -1,12 +1,116 @@
-;; H# Standard Library — std -> redis
-pub fn connect(host: string, port: int) -> string is return "" end
-pub fn set(r: string, key: string, val: string) is end
-pub fn get(r: string, key: string) -> string is return "" end
-pub fn del(r: string, key: string) is end
-pub fn exists(r: string, key: string) -> bool is return false end
-pub fn incr(r: string, key: string) -> int is return 0 end
-pub fn expire(r: string, key: string, secs: int) is end
-pub fn hset(r: string, hash: string, field: string, val: string) is end
-pub fn hget(r: string, hash: string, field: string) -> string is return "" end
-pub fn lpush(r: string, list: string, val: string) is end
-pub fn rpop(r: string, list: string) -> string is return "" end
+use "std -> tcp" from "tcp"
+
+struct Redis is
+    pub conn: tcp::TcpStream
+end
+
+pub fn connect(host: string, port: int) -> Redis is
+    return Redis { conn: tcp::connect(host, port) }
+end
+
+pub fn is_connected(r: Redis) -> bool is
+    return tcp::is_connected(r.conn)
+end
+
+pub fn close(r: Redis) is
+    tcp::close(r.conn)
+end
+
+;; ── RESP encoding ────────────────────────────────────────────────────
+fn encode_command(parts: [string]) -> string is
+    let mut out = "*" + to_string(parts.len()) + "\r\n"
+    let mut i = 0
+    while i < parts.len() is
+        out = out + "$" + to_string(parts[i].len()) + "\r\n" + parts[i] + "\r\n"
+        i += 1
+    end
+    return out
+end
+
+;; Parses exactly one RESP reply from the front of `raw`, returning its
+;; string value (bulk/simple strings), "" for nil, or the error message
+;; for error replies. Doesn't handle nested arrays beyond one level —
+;; real gap, documented rather than silently mishandled: `command`
+;; returns the raw first-line-parsed value; use `command_array` for a
+;; flat array reply.
+fn parse_reply(raw: string) -> string is
+    if raw.len() == 0 is return "" end
+    let kind = raw[0..1]
+    let rest = raw[1..raw.len()]
+    let line_end = __builtin_str_index_of(rest, "\r\n")
+    if line_end < 0 is return "" end
+    let line = rest[0..line_end]
+    if kind == "+" is return line end
+    if kind == "-" is return "ERR " + line end
+    if kind == ":" is return line end
+    if kind == "$" is
+        let n = __builtin_conv_str_to_int(line)
+        if n < 0 is return "" end
+        let body_start = line_end + 2
+        return rest[body_start..body_start + n]
+    end
+    return line
+end
+
+;; Send a raw command (e.g. `["SET", "key", "val"]`) and get back the
+;; decoded reply as a string.
+pub fn command(r: Redis, parts: [string]) -> string is
+    tcp::send(r.conn, encode_command(parts))
+    let raw = tcp::recv(r.conn, 65536)
+    return parse_reply(raw)
+end
+
+pub fn set(r: Redis, key: string, val: string) -> bool is
+    return command(r, ["SET", key, val]) == "OK"
+end
+
+pub fn get(r: Redis, key: string) -> string is
+    return command(r, ["GET", key])
+end
+
+pub fn del(r: Redis, key: string) -> bool is
+    return command(r, ["DEL", key]) == "1"
+end
+
+pub fn exists(r: Redis, key: string) -> bool is
+    return command(r, ["EXISTS", key]) == "1"
+end
+
+pub fn expire(r: Redis, key: string, seconds: int) -> bool is
+    return command(r, ["EXPIRE", key, to_string(seconds)]) == "1"
+end
+
+pub fn incr(r: Redis, key: string) -> int is
+    return __builtin_conv_str_to_int(command(r, ["INCR", key]))
+end
+
+pub fn ping(r: Redis) -> bool is
+    return command(r, ["PING"]) == "PONG"
+end
+
+pub fn auth(r: Redis, password: string) -> bool is
+    return command(r, ["AUTH", password]) == "OK"
+end
+
+pub fn select_db(r: Redis, index: int) -> bool is
+    return command(r, ["SELECT", to_string(index)]) == "OK"
+end
+
+pub fn hset(r: Redis, key: string, field: string, val: string) -> bool is
+    command(r, ["HSET", key, field, val])
+    return true
+end
+
+pub fn hget(r: Redis, key: string, field: string) -> string is
+    return command(r, ["HGET", key, field])
+end
+
+pub fn lpush(r: Redis, key: string, val: string) -> bool is
+    command(r, ["LPUSH", key, val])
+    return true
+end
+
+pub fn rpush(r: Redis, key: string, val: string) -> bool is
+    command(r, ["RPUSH", key, val])
+    return true
+end
