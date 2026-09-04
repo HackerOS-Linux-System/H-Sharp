@@ -1,22 +1,47 @@
-;; H# Standard Library — std -> net -> tcp
-
 struct TcpStream is
-    pub host: string
-    pub port: int
+    pub handle: int
+    pub host:   string
+    pub port:   int
 end
 
+;; Open a TCP connection. `stream.handle` is -1 on failure — check it
+;; before calling send/recv.
 pub fn connect(host: string, port: int) -> TcpStream is
-    return TcpStream { host: host, port: port }
+    let h = __builtin_tcp_connect(host, port)
+    return TcpStream { handle: h, host: host, port: port }
 end
 
-pub fn send(stream: TcpStream, data: string) is end
+;; Whether `connect` actually succeeded.
+pub fn is_connected(stream: TcpStream) -> bool is
+    return stream.handle >= 0
+end
+
+;; Write a string's bytes to the socket. Returns whether the write
+;; succeeded.
+pub fn send(stream: TcpStream, data: string) -> bool is
+    return __builtin_tcp_send(stream.handle, data)
+end
+
+;; Read up to `size` bytes from the socket (blocking). Returns "" both
+;; on a clean EOF and on a read error — there's currently no way to
+;; distinguish the two from this call alone.
 pub fn recv(stream: TcpStream, size: int) -> string is
-    return ""
+    return __builtin_tcp_recv(stream.handle, size)
 end
-pub fn close(stream: TcpStream) is end
+
+pub fn close(stream: TcpStream) is
+    __builtin_tcp_close(stream.handle)
+end
+
+;; Check whether `host:port` accepts a connection within `timeout_ms`.
 pub fn scan_port(host: string, port: int, timeout_ms: int) -> bool is
-    return false
+    return __builtin_tcp_scan_port(host, port, timeout_ms)
 end
+
+;; `listen(host, port)` — TCP *server* support is not implemented in
+;; this runtime yet (see module doc comment above). Calling this
+;; currently just returns a disconnected handle rather than silently
+;; pretending to listen.
 pub fn listen(host: string, port: int) -> TcpStream is
-    return TcpStream { host: host, port: port }
+    return TcpStream { handle: -1, host: host, port: port }
 end
