@@ -1,41 +1,63 @@
-;; H# Standard Library — std -> sec
-;; Narzędzia cybersecurity: XOR, hex, rot13, scan_port
-
-;; XOR dwa ciągi hex
 pub fn xor_hex(a: string, b: string) -> string is
-    ;; runtime: bytewise XOR of hex strings
-    return "xored:" + a
+    return __builtin_hex_xor(a, b)
 end
 
-;; ROT13 encoding
 pub fn rot13(s: string) -> string is
-    ;; runtime: rotate each letter by 13
-    return s
+    return caesar(s, 13)
 end
 
-;; Caesar cipher
+;; Caesar-shift ASCII letters by `shift` positions, wrapping within
+;; their case; non-letters pass through unchanged.
 pub fn caesar(s: string, shift: int) -> string is
-    return s
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() is
+        let c = s[i..i+1]
+        let code = __builtin_str_to_char_code(c)
+        let mut new_code = code
+        if code >= 65 && code <= 90 is
+            new_code = 65 + ((code - 65 + shift) % 26 + 26) % 26
+        else is
+            if code >= 97 && code <= 122 is
+                new_code = 97 + ((code - 97 + shift) % 26 + 26) % 26
+            end
+        end
+        out = out + __builtin_char_code_to_str(new_code)
+        i += 1
+    end
+    return out
 end
 
-;; FNV-1a hash
+;; FNV-1a 32-bit hash.
 pub fn fnv1a(s: string) -> int is
-    return 0
+    let mut hash: int = 2166136261
+    let mut i = 0
+    while i < s.len() is
+        let byte = __builtin_str_to_char_code(s[i..i+1])
+        hash = (hash % 16777216) ;; keep it in a well-behaved 24-bit-ish
+                                   ;; range before the multiply below, so
+                                   ;; this stays inside H#'s int range
+                                   ;; instead of silently overflowing —
+                                   ;; NOT a bitwise-correct 32-bit FNV-1a,
+                                   ;; a real, documented deviation from
+                                   ;; the spec.
+        hash = hash ^ byte
+        hash = (hash * 16777619) % 2147483647
+        i += 1
+    end
+    return hash
 end
 
-;; Skanuj port TCP — true jeśli otwarty
-;; timeout_ms: maksymalny czas oczekiwania w ms
+;; Check whether `host:port` accepts a TCP connection within
+;; `timeout_ms`. Real implementation via std -> tcp.
 pub fn scan_port(host: string, port: int, timeout_ms: int) -> bool is
-    ;; runtime: TCP connect with timeout
-    return false
+    return __builtin_tcp_scan_port(host, port, timeout_ms)
 end
 
-;; Hex encode bytes
 pub fn hex_encode(data: bytes) -> string is
-    return ""
+    return __builtin_hex_encode_bytes(data)
 end
 
-;; Hex decode string
 pub fn hex_decode(s: string) -> string is
-    return ""
+    return __builtin_hex_decode(s)
 end
