@@ -1,0 +1,148 @@
+struct Version is
+    pub major:      int
+    pub minor:      int
+    pub patch:      int
+    pub prerelease: string  ;; "" if none
+    pub build:      string  ;; "" if none
+end
+
+;; Parse a version string like "1.2.3", "1.2.3-beta.1", or
+;; "1.2.3-rc.1+build.5". Unparseable input returns 0.0.0 rather than
+;; raising — check `is_valid` first if you need to distinguish that
+;; from a real "0.0.0".
+pub fn parse(s: string) -> Version is
+    let mut rest = s
+    let mut build = ""
+    let plus = __builtin_str_index_of(rest, "+")
+    if plus >= 0 is
+        build = rest[plus + 1..rest.len()]
+        rest = rest[0..plus]
+    end
+    let mut prerelease = ""
+    let dash = __builtin_str_index_of(rest, "-")
+    if dash >= 0 is
+        prerelease = rest[dash + 1..rest.len()]
+        rest = rest[0..dash]
+    end
+    let parts = __builtin_str_split(rest, ".")
+    if parts.len() != 3 is
+        return Version { major: 0, minor: 0, patch: 0, prerelease: "", build: "" }
+    end
+    return Version {
+        major: __builtin_conv_str_to_int(parts[0]),
+        minor: __builtin_conv_str_to_int(parts[1]),
+        patch: __builtin_conv_str_to_int(parts[2]),
+        prerelease: prerelease,
+        build: build,
+    }
+end
+
+pub fn is_valid(s: string) -> bool is
+    let rest_no_build = if __builtin_str_index_of(s, "+") >= 0 is s[0..__builtin_str_index_of(s, "+")] else s end
+    let rest = if __builtin_str_index_of(rest_no_build, "-") >= 0 is rest_no_build[0..__builtin_str_index_of(rest_no_build, "-")] else rest_no_build end
+    let parts = __builtin_str_split(rest, ".")
+    if parts.len() != 3 is return false end
+    return is_digits(parts[0]) && is_digits(parts[1]) && is_digits(parts[2])
+end
+
+fn is_digits(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let mut i = 0
+    while i < s.len() is
+        let c = s[i..i+1]
+        if c < "0" || c > "9" is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn to_string_semver(v: Version) -> string is
+    let mut out = to_string(v.major) + "." + to_string(v.minor) + "." + to_string(v.patch)
+    if v.prerelease != "" is out = out + "-" + v.prerelease end
+    if v.build != "" is out = out + "+" + v.build end
+    return out
+end
+
+pub fn is_prerelease(v: Version) -> bool is
+    return v.prerelease != ""
+end
+
+;; -1 if a < b, 0 if equal precedence, 1 if a > b — per SemVer 2.0.0
+;; precedence rules (build metadata ignored; a version WITH a
+;; prerelease tag has lower precedence than the same MAJOR.MINOR.PATCH
+;; WITHOUT one).
+pub fn compare(a: Version, b: Version) -> int is
+    if a.major != b.major is return sign(a.major - b.major) end
+    if a.minor != b.minor is return sign(a.minor - b.minor) end
+    if a.patch != b.patch is return sign(a.patch - b.patch) end
+    if a.prerelease == "" && b.prerelease == "" is return 0 end
+    if a.prerelease == "" is return 1 end  ;; no prerelease > has prerelease
+    if b.prerelease == "" is return -1 end
+    return compare_prerelease(a.prerelease, b.prerelease)
+end
+
+fn sign(n: int) -> int is
+    if n < 0 is return -1 end
+    if n > 0 is return 1 end
+    return 0
+end
+
+fn compare_prerelease(a: string, b: string) -> int is
+    let ai = __builtin_str_split(a, ".")
+    let bi = __builtin_str_split(b, ".")
+    let n = if ai.len() < bi.len() is ai.len() else bi.len() end
+    let mut i = 0
+    while i < n is
+        let c = compare_identifier(ai[i], bi[i])
+        if c != 0 is return c end
+        i += 1
+    end
+    return sign(ai.len() - bi.len())
+end
+
+fn compare_identifier(a: string, b: string) -> int is
+    if is_digits(a) && is_digits(b) is
+        return sign(__builtin_conv_str_to_int(a) - __builtin_conv_str_to_int(b))
+    end
+    if is_digits(a) is return -1 end  ;; numeric identifiers have lower precedence than alphanumeric
+    if is_digits(b) is return 1 end
+    if a < b is return -1 end
+    if a > b is return 1 end
+    return 0
+end
+
+pub fn equals(a: Version, b: Version) -> bool is
+    return compare(a, b) == 0
+end
+
+pub fn less_than(a: Version, b: Version) -> bool is
+    return compare(a, b) < 0
+end
+
+pub fn greater_than(a: Version, b: Version) -> bool is
+    return compare(a, b) > 0
+end
+
+pub fn satisfies_caret(v: Version, base: Version) -> bool is
+    ;; ^1.2.3 := >=1.2.3 <2.0.0 (matches npm/cargo caret semantics)
+    if v.major != base.major is return false end
+    return !less_than(v, base)
+end
+
+pub fn satisfies_tilde(v: Version, base: Version) -> bool is
+    ;; ~1.2.3 := >=1.2.3 <1.3.0
+    if v.major != base.major || v.minor != base.minor is return false end
+    return !less_than(v, base)
+end
+
+pub fn bump_major(v: Version) -> Version is
+    return Version { major: v.major + 1, minor: 0, patch: 0, prerelease: "", build: "" }
+end
+
+pub fn bump_minor(v: Version) -> Version is
+    return Version { major: v.major, minor: v.minor + 1, patch: 0, prerelease: "", build: "" }
+end
+
+pub fn bump_patch(v: Version) -> Version is
+    return Version { major: v.major, minor: v.minor, patch: v.patch + 1, prerelease: "", build: "" }
+end
