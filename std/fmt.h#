@@ -1,23 +1,120 @@
-;; H# Standard Library — std -> fmt
-;; Formatowanie stringów
+pub fn format(template: string, args: [string]) -> string is
+    let mut out = template
+    let mut i = 0
+    while i < args.len() is
+        let pos = __builtin_str_index_of(out, "{}")
+        if pos < 0 is return out end
+        out = out[0..pos] + args[i] + out[pos + 2..out.len()]
+        i += 1
+    end
+    return out
+end
 
-pub fn format(template: string, args: string) -> string is return template end
-pub fn sprintf(fmt: string, val: int) -> string is return to_string(val) end
-pub fn sprintf_f(fmt: string, val: f64) -> string is return to_string(val) end
-pub fn pad_left(s: string, width: int) -> string is return s end
-pub fn pad_right(s: string, width: int) -> string is return s end
-pub fn center(s: string, width: int) -> string is return s end
-pub fn truncate(s: string, max: int) -> string is return s end
-pub fn repeat(s: string, n: int) -> string is return s end
-pub fn wrap(s: string, width: int) -> string is return s end
-pub fn indent(s: string, spaces: int) -> string is return s end
-pub fn strip_ansi(s: string) -> string is return s end
+pub fn sprintf(fmt: string, val: int) -> string is
+    return format(fmt, [to_string(val)])
+end
 
-;; ANSI colors
-pub fn red(s: string)    -> string is return "[red]" + s + "[/]" end
-pub fn green(s: string)  -> string is return "[green]" + s + "[/]" end
-pub fn yellow(s: string) -> string is return "[yellow]" + s + "[/]" end
-pub fn blue(s: string)   -> string is return "[blue]" + s + "[/]" end
-pub fn bold(s: string)   -> string is return "[bold]" + s + "[/]" end
-pub fn dim(s: string)    -> string is return "[dim]" + s + "[/]" end
-pub fn underline(s: string) -> string is return "[underline]" + s + "[/]" end
+pub fn sprintf_f(fmt: string, val: f64) -> string is
+    return format(fmt, [to_string(val)])
+end
+
+pub fn pad_left(s: string, width: int) -> string is
+    let mut out = s
+    while out.len() < width is out = " " + out end
+    return out
+end
+
+pub fn pad_right(s: string, width: int) -> string is
+    let mut out = s
+    while out.len() < width is out = out + " " end
+    return out
+end
+
+pub fn center(s: string, width: int) -> string is
+    let total = width - s.len()
+    if total <= 0 is return s end
+    let left = total / 2
+    let right = total - left
+    return repeat(" ", left) + s + repeat(" ", right)
+end
+
+pub fn truncate(s: string, max: int) -> string is
+    if s.len() <= max is return s end
+    if max <= 3 is return s[0..max] end
+    return s[0..max - 3] + "..."
+end
+
+pub fn repeat(s: string, n: int) -> string is
+    let mut out = ""
+    let mut i = 0
+    while i < n is
+        out = out + s
+        i += 1
+    end
+    return out
+end
+
+;; Word-wrap at `width` columns (breaks on spaces; a single word longer
+;; than `width` is not itself split).
+pub fn wrap(s: string, width: int) -> string is
+    let words = __builtin_str_split_whitespace(s)
+    let mut out = ""
+    let mut line_len = 0
+    let mut i = 0
+    while i < words.len() is
+        let w = words[i]
+        if line_len > 0 && line_len + 1 + w.len() > width is
+            out = out + "\n"
+            line_len = 0
+        else is
+            if line_len > 0 is
+                out = out + " "
+                line_len += 1
+            end
+        end
+        out = out + w
+        line_len += w.len()
+        i += 1
+    end
+    return out
+end
+
+pub fn indent(s: string, spaces: int) -> string is
+    let prefix = repeat(" ", spaces)
+    let lines = __builtin_str_split(s, "\n")
+    let mut out: [string] = []
+    let mut i = 0
+    while i < lines.len() is
+        out.push(prefix + lines[i])
+        i += 1
+    end
+    return __builtin_str_join(out, "\n")
+end
+
+;; Strip ANSI escape sequences (`\x1b[...m` SGR codes). Doesn't handle
+;; every ANSI sequence type (cursor movement, etc.) — just the common
+;; color/style ones this module itself emits below.
+pub fn strip_ansi(s: string) -> string is
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() is
+        if s[i..i+1] == "\x1b" && i + 1 < s.len() && s[i+1..i+2] == "[" is
+            let mut j = i + 2
+            while j < s.len() && s[j..j+1] != "m" is j += 1 end
+            i = j + 1
+        else is
+            out = out + s[i..i+1]
+            i += 1
+        end
+    end
+    return out
+end
+
+;; ── ANSI colors (real escape codes) ──────────────────────────────────
+pub fn red(s: string)    -> string is return "\x1b[31m" + s + "\x1b[0m" end
+pub fn green(s: string)  -> string is return "\x1b[32m" + s + "\x1b[0m" end
+pub fn yellow(s: string) -> string is return "\x1b[33m" + s + "\x1b[0m" end
+pub fn blue(s: string)   -> string is return "\x1b[34m" + s + "\x1b[0m" end
+pub fn bold(s: string)   -> string is return "\x1b[1m" + s + "\x1b[0m" end
+pub fn dim(s: string)    -> string is return "\x1b[2m" + s + "\x1b[0m" end
+pub fn underline(s: string) -> string is return "\x1b[4m" + s + "\x1b[0m" end
