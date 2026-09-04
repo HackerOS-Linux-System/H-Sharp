@@ -1,57 +1,95 @@
-;; std -> strings — String utilities
-;; H# Standard Library v0.6
-
-/// Trim whitespace from both ends.
 pub fn trim(s: string) -> string is
     return __builtin_str_trim(s)
 end
 
-/// Trim leading whitespace.
+fn is_ws(ch: string) -> bool is
+    return ch == " " || ch == "\t" || ch == "\n" || ch == "\r"
+end
+
+;; [FIXED] `__builtin_str_trim_start`/`_end` are interpreter-only.
+;; Scans for the first/last non-whitespace character directly.
 pub fn trim_start(s: string) -> string is
-    return __builtin_str_trim_start(s)
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n && is_ws(s[i..i + 1]) is
+        i = i + 1
+    end
+    return s[i..n]
 end
 
-/// Trim trailing whitespace.
 pub fn trim_end(s: string) -> string is
-    return __builtin_str_trim_end(s)
+    let n: int = s.len()
+    let mut i: int = n
+    while i > 0 && is_ws(s[i - 1..i]) is
+        i = i - 1
+    end
+    return s[0..i]
 end
 
-/// Split string by delimiter. Returns array of strings.
+;; Split string by delimiter. Returns array of strings.
+;; [FIXED] delegates to the compiler's own auto-injected `str_split`
+;; (real, LLVM-backed array-returning split — see stdlib_shims.rs)
+;; instead of the interpreter-only `__builtin_str_split`.
 pub fn split(s: string, delim: string) -> [string] is
-    return __builtin_str_split(s, delim)
+    return str_split(s, delim)
 end
 
-/// Split by whitespace (any run of spaces/tabs/newlines).
+;; [FIXED] `__builtin_str_split_whitespace` is interpreter-only, and
+;; there is no split/join-shaped equivalent (the separator isn't a
+;; fixed string). Scanned by hand: walk the string, accumulating a
+;; token between runs of whitespace.
 pub fn split_whitespace(s: string) -> [string] is
-    return __builtin_str_split_whitespace(s)
+    let n: int = s.len()
+    let mut result: [string] = []
+    let mut token: string = ""
+    let mut i: int = 0
+    while i < n is
+        let ch: string = s[i..i + 1]
+        if is_ws(ch) is
+            if token.len() > 0 is
+                result.push(token)
+                token = ""
+            end
+        else is
+            token = token + ch
+        end
+        i = i + 1
+    end
+    if token.len() > 0 is result.push(token) end
+    return result
 end
 
-/// Join an array of strings with a separator.
+;; Join an array of strings with a separator.
+;; [FIXED] delegates to the compiler's own auto-injected `iter_join`
+;; instead of the interpreter-only `__builtin_str_join`.
 pub fn join(parts: [string], sep: string) -> string is
-    return __builtin_str_join(parts, sep)
+    return iter_join(parts, sep)
 end
 
-/// Replace first occurrence of `from` with `to`.
+;; Replace first occurrence of `from` with `to`.
 pub fn replace(s: string, from: string, to: string) -> string is
     return __builtin_str_replace(s, from, to)
 end
 
-/// Replace all occurrences of `from` with `to`.
+;; Replace all occurrences of `from` with `to`.
+;; [FIXED] `__builtin_str_replace_all` is interpreter-only. "Split on
+;; `from`, join with `to`" gives the exact same result with zero new
+;; runtime surface — the same trick stdlib_shims.rs uses for `str_count`.
 pub fn replace_all(s: string, from: string, to: string) -> string is
-    return __builtin_str_replace_all(s, from, to)
+    if from.len() == 0 is return s end
+    return iter_join(str_split(s, from), to)
 end
 
-/// Convert to uppercase.
+;; Convert to uppercase / lowercase — core intrinsics, unaffected.
 pub fn to_upper(s: string) -> string is
     return __builtin_str_to_upper(s)
 end
 
-/// Convert to lowercase.
 pub fn to_lower(s: string) -> string is
     return __builtin_str_to_lower(s)
 end
 
-/// Repeat a string n times.
+;; Repeat a string n times.
 pub fn repeat(s: string, n: int) -> string is
     let mut result: string = ""
     let mut i: int = 0
@@ -62,60 +100,117 @@ pub fn repeat(s: string, n: int) -> string is
     return result
 end
 
-/// Reverse a string.
+;; Reverse a string.
+;; [FIXED] `__builtin_str_reverse` is interpreter-only. Built one
+;; character at a time via indexing, which is itself a core, always-
+;; available operation.
 pub fn reverse(s: string) -> string is
-    return __builtin_str_reverse(s)
+    let n: int = s.len()
+    let mut result: string = ""
+    let mut i: int = n
+    while i > 0 is
+        result = result + s[i - 1..i]
+        i = i - 1
+    end
+    return result
 end
 
-/// Pad start with a character to reach target length.
+;; Pad start with a character to reach target length.
 pub fn pad_start(s: string, len: int, ch: string) -> string is
     let diff = len - s.len()
     if diff <= 0 is return s end
     return repeat(ch, diff) + s
 end
 
-/// Pad end with a character to reach target length.
+;; Pad end with a character to reach target length.
 pub fn pad_end(s: string, len: int, ch: string) -> string is
     let diff = len - s.len()
     if diff <= 0 is return s end
     return s + repeat(ch, diff)
 end
 
-/// Check if string is empty or only whitespace.
+;; Check if string is empty or only whitespace.
 pub fn is_blank(s: string) -> bool is
     return trim(s).len() == 0
 end
 
-/// Count occurrences of a substring.
+;; Count occurrences of a substring.
+;; [FIXED] `__builtin_str_count` is interpreter-only. The compiler's own
+;; auto-injected `str_count` (see stdlib_shims.rs) computes exactly this
+;; via `str_split_count(s, sub) - 1`, which is LLVM-backed.
 pub fn count(s: string, sub: string) -> int is
     if sub.len() == 0 is return 0 end
-    return __builtin_str_count(s, sub)
+    return str_count(s, sub)
 end
 
-/// Get a slice of the string.
+;; Get a slice of the string.
 pub fn slice(s: string, start: int, end_: int) -> string is
     return s[start..end_]
 end
 
-/// Find index of first occurrence. Returns -1 if not found.
+;; Find index of first occurrence. Returns -1 if not found.
+;; [FIXED] `__builtin_str_index_of` is interpreter-only.
+;; `str_split_count`/`str_split_part` (both LLVM-backed) give the same
+;; answer a different way: split `s` on `sub`; if that yields more than
+;; one part, the first occurrence starts exactly where part 0 ends.
 pub fn index_of(s: string, sub: string) -> int is
-    return __builtin_str_index_of(s, sub)
+    if sub.len() == 0 is return -1 end
+    let n: int = str_split_count(s, sub)
+    if n <= 1 is return -1 end
+    return str_split_part(s, sub, 0).len()
 end
 
-/// Check if string contains only digits.
+;; Check if string contains only digits.
+;; [FIXED] `__builtin_str_is_numeric` is interpreter-only. Scanned by
+;; hand — an empty string is not numeric, same as the original.
 pub fn is_numeric(s: string) -> bool is
-    return __builtin_str_is_numeric(s)
+    let n: int = s.len()
+    if n == 0 is return false end
+    let digits: string = "0123456789"
+    let mut i: int = 0
+    while i < n is
+        if !digits.contains(s[i..i + 1]) is return false end
+        i = i + 1
+    end
+    return true
 end
 
-/// Remove a prefix if present.
+;; Split into at most `n` parts — the first `n - 1` splits happen
+;; normally, and everything after that (including any further
+;; occurrences of `delim`) becomes the final part verbatim. [ADDED] not
+;; in the original module; several HCO callers need "split off the
+;; first couple of fields, keep the rest of the line intact" (e.g. a
+;; `host:container:options` mount spec, where `options` itself might
+;; legitimately contain ":").
+pub fn splitn(s: string, delim: string, n: int) -> [string] is
+    if n <= 1 is return [s] end
+    let all: [string] = str_split(s, delim)
+    if all.len() <= n is return all end
+    let mut head: [string] = []
+    let mut i: int = 0
+    while i < n - 1 is
+        head.push(all[i])
+        i += 1
+    end
+    let mut tail: [string] = []
+    let mut j: int = n - 1
+    while j < all.len() is
+        tail.push(all[j])
+        j += 1
+    end
+    head.push(iter_join(tail, delim))
+    return head
+end
+
+;; Remove a prefix if present.
 pub fn remove_prefix(s: string, prefix: string) -> string is
     if s.starts_with(prefix) is
-        return s[prefix.len()..]
+        return s[prefix.len()..s.len()]
     end
     return s
 end
 
-/// Remove a suffix if present.
+;; Remove a suffix if present.
 pub fn remove_suffix(s: string, suffix: string) -> string is
     if s.ends_with(suffix) is
         return s[0..s.len() - suffix.len()]
