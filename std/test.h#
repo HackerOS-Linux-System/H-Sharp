@@ -1,7 +1,3 @@
-;; std -> test — Test framework
-;; H# Standard Library v0.6
-
-/// Assert two values are equal. Panics with a message if not.
 pub fn assert_eq(actual: any, expected: any) is
     if actual != expected is
         let msg = "assert_eq failed:\n  expected: " + to_string(expected) +
@@ -10,7 +6,7 @@ pub fn assert_eq(actual: any, expected: any) is
     end
 end
 
-/// Assert two values are NOT equal.
+;; Assert two values are NOT equal.
 pub fn assert_ne(actual: any, unexpected: any) is
     if actual == unexpected is
         let msg = "assert_ne failed: both equal " + to_string(actual)
@@ -18,21 +14,21 @@ pub fn assert_ne(actual: any, unexpected: any) is
     end
 end
 
-/// Assert a boolean condition is true.
+;; Assert a boolean condition is true.
 pub fn assert_true(cond: bool) is
     if !cond is
         __builtin_test_fail("assert_true failed: condition was false")
     end
 end
 
-/// Assert a boolean condition is false.
+;; Assert a boolean condition is false.
 pub fn assert_false(cond: bool) is
     if cond is
         __builtin_test_fail("assert_false failed: condition was true")
     end
 end
 
-/// Assert value is nil.
+;; Assert value is nil.
 pub fn assert_nil(val: any) is
     if val != nil is
         let msg = "assert_nil failed: got " + to_string(val)
@@ -40,14 +36,14 @@ pub fn assert_nil(val: any) is
     end
 end
 
-/// Assert value is not nil.
+;; Assert value is not nil.
 pub fn assert_not_nil(val: any) is
     if val == nil is
         __builtin_test_fail("assert_not_nil failed: value was nil")
     end
 end
 
-/// Assert a result is an error / nil (for ? operator results).
+;; Assert a result is an error / nil (for ? operator results).
 pub fn assert_err(val: any) is
     if val != nil is
         let msg = "assert_err failed: expected error but got " + to_string(val)
@@ -55,7 +51,7 @@ pub fn assert_err(val: any) is
     end
 end
 
-/// Assert two floats are within delta of each other.
+;; Assert two floats are within delta of each other.
 pub fn assert_approx(actual: f64, expected: f64, delta: f64) is
     let diff = actual - expected
     let abs_diff = if diff < 0.0 is -diff else is diff end
@@ -67,7 +63,7 @@ pub fn assert_approx(actual: f64, expected: f64, delta: f64) is
     end
 end
 
-/// Assert a string contains a substring.
+;; Assert a string contains a substring.
 pub fn assert_contains(s: string, sub: string) is
     if !s.contains(sub) is
         let msg = "assert_contains failed:\n  string:    " + s +
@@ -76,7 +72,7 @@ pub fn assert_contains(s: string, sub: string) is
     end
 end
 
-/// Assert a string starts with a prefix.
+;; Assert a string starts with a prefix.
 pub fn assert_starts_with(s: string, prefix: string) is
     if !s.starts_with(prefix) is
         let msg = "assert_starts_with failed:\n  string: " + s +
@@ -85,7 +81,7 @@ pub fn assert_starts_with(s: string, prefix: string) is
     end
 end
 
-/// Assert array length.
+;; Assert array length.
 pub fn assert_len(arr: [any], expected: int) is
     let actual = arr.len()
     if actual != expected is
@@ -95,12 +91,12 @@ pub fn assert_len(arr: [any], expected: int) is
     end
 end
 
-/// Explicitly fail a test with a message.
+;; Explicitly fail a test with a message.
 pub fn fail(msg: string) is
     __builtin_test_fail("test failed: " + msg)
 end
 
-/// Skip a test with a reason (marks as skipped, not failed).
+;; Skip a test with a reason (marks as skipped, not failed).
 pub fn skip(reason: string) is
     __builtin_test_skip(reason)
 end
