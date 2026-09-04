@@ -1,4 +1,53 @@
-;; H# Standard Library — std -> rate_limit
-pub fn new(max: int, window_ms: int) -> string is return "" end
-pub fn check(limiter: string, key: string) -> bool is return true end
-pub fn remaining(limiter: string, key: string) -> int is return 0 end
+use "std -> time" from "time"
+
+struct Limiter is
+    pub max:        int
+    pub window_ms:  int
+    pub hits:       [int]  ;; timestamps (ms) of recent hits, oldest first
+end
+
+pub fn new(max: int, window_ms: int) -> Limiter is
+    return Limiter { max: max, window_ms: window_ms, hits: [] }
+end
+
+fn prune(hits: [int], now_ms: int, window_ms: int) -> [int] is
+    let cutoff = now_ms - window_ms
+    let mut out: [int] = []
+    let mut i = 0
+    while i < hits.len() is
+        if hits[i] > cutoff is out.push(hits[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Check + record a hit. Returns whether it was allowed under the
+;; limit — call sites should reassign: `l = check(l)` then look at the
+;; returned bool via `check_bool`/inspect `l.hits.len()`, since H#'s
+;; value semantics mean this can't both mutate `l` in place and hand
+;; back a bool in one call the way a reference-based language could.
+pub fn check(l: Limiter) -> Limiter is
+    let now = time::now_ms()
+    let hits = prune(l.hits, now, l.window_ms)
+    if hits.len() >= l.max is
+        return Limiter { max: l.max, window_ms: l.window_ms, hits: hits }
+    end
+    let mut updated = hits
+    updated.push(now)
+    return Limiter { max: l.max, window_ms: l.window_ms, hits: updated }
+end
+
+;; Whether a hit right now would be allowed, without recording it.
+pub fn would_allow(l: Limiter) -> bool is
+    let now = time::now_ms()
+    let hits = prune(l.hits, now, l.window_ms)
+    return hits.len() < l.max
+end
+
+pub fn remaining(l: Limiter) -> int is
+    let now = time::now_ms()
+    let hits = prune(l.hits, now, l.window_ms)
+    let r = l.max - hits.len()
+    if r < 0 is return 0 end
+    return r
+end
