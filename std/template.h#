@@ -1,5 +1,84 @@
-;; H# Standard Library — std -> template
-pub fn render(tmpl: string, vars: string) -> string is return "" end
-pub fn load_file(path: string) -> string is return "" end
-pub fn register(name: string, tmpl: string) is end
-pub fn render_named(name: string, vars: string) -> string is return "" end
+use "std -> collections" from "col"
+
+pub fn new_context() -> any is
+    return col::hashmap_new()
+end
+
+pub fn set_var(ctx: any, key: string, val: string) -> any is
+    return col::hashmap_insert(ctx, key, val)
+end
+
+fn get_var(ctx: any, key: string) -> string is
+    let v = col::hashmap_get(ctx, key)
+    if v == nil is return "" end
+    return v
+end
+
+;; Render `tpl` against `ctx`. Sections (`{{#key}}...{{/key}}`) repeat
+;; their body once per line stored under `key` in `ctx` as a
+;; newline-joined list (set via `set_list`), or exactly once if `key`
+;; is a non-empty scalar, or zero times if `key` is unset/"".
+pub fn render(tpl: string, ctx: any) -> string is
+    return render_sections(tpl, ctx)
+end
+
+pub fn set_list(ctx: any, key: string, items: [string]) -> any is
+    return col::hashmap_insert(ctx, key, __builtin_str_join(items, "\n"))
+end
+
+fn render_sections(tpl: string, ctx: any) -> string is
+    let mut out = tpl
+    ;; sections first (so their inner {{var}} tags get substituted per-
+    ;; iteration below, not once globally)
+    let mut i = 0
+    while true is
+        let open_tag = "{{#"
+        let start = __builtin_str_index_of(out, open_tag)
+        if start < 0 is break end
+        let name_end = __builtin_str_index_of(out[start..out.len()], "}}")
+        if name_end < 0 is break end
+        let key = out[start + 3..start + name_end]
+        let close_tag = "{{/" + key + "}}"
+        let close_pos = __builtin_str_index_of(out, close_tag)
+        if close_pos < 0 is break end
+        let body_start = start + name_end + 2
+        let body = out[body_start..close_pos]
+        let rendered = render_section_body(body, ctx, key)
+        out = out[0..start] + rendered + out[close_pos + close_tag.len()..out.len()]
+        i += 1
+        if i > 10000 is break end ;; safety valve against a malformed template looping forever
+    end
+    return substitute_vars(out, ctx)
+end
+
+fn render_section_body(body: string, ctx: any, key: string) -> string is
+    let raw = get_var(ctx, key)
+    if raw == "" is return "" end
+    let items = __builtin_str_split(raw, "\n")
+    let mut out = ""
+    let mut i = 0
+    while i < items.len() is
+        out = out + substitute_vars(body, set_var(ctx, "item", items[i]))
+        i += 1
+    end
+    return out
+end
+
+fn substitute_vars(s: string, ctx: any) -> string is
+    let mut out = s
+    let mut i = 0
+    while true is
+        let start = __builtin_str_index_of(out, "{{")
+        if start < 0 is break end
+        let end_rel = __builtin_str_index_of(out[start..out.len()], "}}")
+        if end_rel < 0 is break end
+        let key = strings_trim(out[start + 2..start + end_rel])
+        let val = get_var(ctx, key)
+        out = out[0..start] + val + out[start + end_rel + 2..out.len()]
+        i += 1
+        if i > 100000 is break end
+    end
+    return out
+end
+
+fn strings_trim(s: string) -> string is return __builtin_str_trim(s) end
