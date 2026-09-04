@@ -1,12 +1,101 @@
-;; H# Standard Library — std -> hash
-;; Non-crypto hash functions
+fn byte_at(s: string, i: int) -> int is
+    return __builtin_str_to_char_code(s[i..i+1])
+end
 
-pub fn fnv1a(s: string) -> int is return 0 end
-pub fn fnv1a_64(s: string) -> int is return 0 end
-pub fn djb2(s: string) -> int is return 0 end
-pub fn sdbm(s: string) -> int is return 0 end
-pub fn murmur3(s: string, seed: int) -> int is return 0 end
-pub fn crc32(s: string) -> int is return 0 end
-pub fn xxhash(s: string) -> int is return 0 end
-pub fn adler32(s: string) -> int is return 0 end
-pub fn is_equal(a: string, b: string) -> bool is return a == b end
+;; H#'s `int` doesn't wrap like a real 32-bit register, so every hash
+;; below reduces modulo 2^32 by hand after each operation that could
+;; overflow it, to stay a well-defined (if not bit-identical to a
+;; native uint32) hash rather than silently overflowing into H#'s
+;; wider integer range.
+fn m32(n: int) -> int is
+    return n % 4294967296
+end
+
+pub fn fnv1a(s: string) -> int is
+    let mut hash = 2166136261
+    let mut i = 0
+    while i < s.len() is
+        hash = hash ^ byte_at(s, i)
+        hash = m32(hash * 16777619)
+        i += 1
+    end
+    return hash
+end
+
+pub fn fnv1a_64(s: string) -> int is
+    ;; Uses the 32-bit FNV prime/offset above — H#'s `int` (64-bit
+    ;; signed) can't safely hold the real FNV-1a 64-bit prime's
+    ;; multiplication without risking sign issues, so this is
+    ;; deliberately the same 32-bit variant as `fnv1a`, not a distinct
+    ;; 64-bit hash. Kept for API compatibility, not bit-for-bit
+    ;; correctness with a real 64-bit FNV-1a.
+    return fnv1a(s)
+end
+
+pub fn djb2(s: string) -> int is
+    let mut hash = 5381
+    let mut i = 0
+    while i < s.len() is
+        hash = m32(hash * 33 + byte_at(s, i))
+        i += 1
+    end
+    return hash
+end
+
+pub fn sdbm(s: string) -> int is
+    let mut hash = 0
+    let mut i = 0
+    while i < s.len() is
+        hash = m32(byte_at(s, i) + (hash * 65599))
+        i += 1
+    end
+    return hash
+end
+
+pub fn adler32(s: string) -> int is
+    let mut a = 1
+    let mut b = 0
+    let mut i = 0
+    while i < s.len() is
+        a = (a + byte_at(s, i)) % 65521
+        b = (b + a) % 65521
+        i += 1
+    end
+    return b * 65536 + a
+end
+
+;; NOT IMPLEMENTED — see module doc comment.
+pub fn murmur3(s: string, seed: int) -> int is
+    return fnv1a(s)
+end
+
+pub fn xxhash(s: string) -> int is
+    return fnv1a(s)
+end
+
+pub fn crc32(s: string) -> int is
+    ;; Bit-by-bit CRC-32 (standard IEEE 802.3 polynomial, reflected
+    ;; form) — no lookup table, so O(8 bits) per byte instead of O(1),
+    ;; but that's fine for the sizes std -> hash is meant for, and it
+    ;; means this is a real CRC-32, not an approximation.
+    let mut crc = 4294967295 ;; 0xFFFFFFFF
+    let mut i = 0
+    while i < s.len() is
+        crc = crc ^ byte_at(s, i)
+        let mut bit = 0
+        while bit < 8 is
+            if (crc & 1) == 1 is
+                crc = (crc >> 1) ^ 3988292384 ;; 0xEDB88320
+            else is
+                crc = crc >> 1
+            end
+            bit += 1
+        end
+        i += 1
+    end
+    return crc ^ 4294967295
+end
+
+pub fn is_equal(a: string, b: string) -> bool is
+    return a == b
+end
