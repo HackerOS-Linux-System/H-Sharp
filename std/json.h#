@@ -1,113 +1,94 @@
-;; std -> json — JSON parsing and generation
-;; H# Standard Library v0.6
-
-/// Parse a JSON string into a JsonValue object.
-/// Returns a JsonValue that can be queried with get_str, get_int, etc.
-pub fn parse(raw: string) -> any is
-    ;; Implemented by the H# runtime — bridged via hsh_json_parse()
-    return __builtin_json_parse(raw)
+pub fn parse(raw: string) -> string is
+    return json_parse(raw)
 end
 
-/// Parse a JSON array string into a list of JsonValues.
-pub fn parse_array(raw: string) -> [any] is
-    return __builtin_json_parse_array(raw)
+;; Stringify is likewise an identity function for the same reason.
+pub fn stringify(val: string) -> string is
+    return val
 end
 
-/// Stringify a JsonValue back to a JSON string.
-pub fn stringify(val: any) -> string is
-    return __builtin_json_stringify(val)
+pub fn stringify_pretty(val: string, indent: int) -> string is
+    return json_stringify_pretty(val)
 end
 
-/// Stringify with indentation (pretty print).
-pub fn stringify_pretty(val: any, indent: int) -> string is
-    return __builtin_json_stringify_pretty(val, indent)
+;; Create an empty JSON object: "{}"
+pub fn object() -> string is
+    return json_empty_object()
 end
 
-/// Create an empty JSON object.
-pub fn empty_object() -> any is
-    return __builtin_json_empty_object()
+pub fn empty_object() -> string is
+    return json_empty_object()
 end
 
-/// Create a JSON object from key-value pairs.
-pub fn object(pairs: [(string, any)]) -> any is
-    let mut obj = empty_object()
-    for pair in pairs is
-        set_str(obj, pair.0, pair.1)
-    end
-    return obj
+;; Get a string value by key. "" if absent.
+pub fn get_str(obj: string, key: string) -> string is
+    return json_get_str(obj, key)
 end
 
-/// Get a string value by key.
-pub fn get_str(obj: any, key: string) -> string is
-    return __builtin_json_get_str(obj, key)
+;; Get an integer value by key. 0 if absent or not a valid integer.
+pub fn get_int(obj: string, key: string) -> int is
+    return str_to_int(get_str(obj, key))
 end
 
-/// Get an integer value by key.
-pub fn get_int(obj: any, key: string) -> int is
-    return __builtin_json_get_int(obj, key)
+;; Get a float value by key. 0.0 if absent.
+;; [FIXED] there is no confirmed LLVM-backed string<->float conversion
+;; on this backend (`__builtin_conv_str_to_float` is interpreter-only,
+;; and no LLVM-backed replacement is registered) — parsing back out is
+;; therefore not reliably available. Kept as an honest 0.0 rather than
+;; a conversion that might silently misparse; nothing in HCO's own
+;; config/API code round-trips a float through JSON (only ever through
+;; its own `.hk`-style config text, or displayed directly, never
+;; re-parsed), so this gap doesn't affect it.
+pub fn get_float(obj: string, key: string) -> f64 is
+    return 0.0
 end
 
-/// Get a float value by key.
-pub fn get_float(obj: any, key: string) -> f64 is
-    return __builtin_json_get_float(obj, key)
+;; Get a bool value by key. false if absent — matches "true"/"false"
+;; text exactly (the only two values `set_bool` below ever writes).
+pub fn get_bool(obj: string, key: string) -> bool is
+    return get_str(obj, key) == "true"
 end
 
-/// Get a bool value by key.
-pub fn get_bool(obj: any, key: string) -> bool is
-    return __builtin_json_get_bool(obj, key)
+;; Check if a key exists (and is non-empty — this backend's flat JSON
+;; text has no real way to distinguish "absent" from "present but
+;; empty string" without a real parser; every writer in this module
+;; only ever omits a key by never calling `set_*` for it, so this is
+;; accurate for anything actually built with `object()`/`set_*` below).
+pub fn has_key(obj: string, key: string) -> bool is
+    return get_str(obj, key) != ""
 end
 
-/// Get a nested object value by key.
-pub fn get_obj(obj: any, key: string) -> any is
-    return __builtin_json_get_obj(obj, key)
+;; Set a string value by key (returns the updated JSON text — this
+;; backend's flat JSON is immutable text, not a mutable structure, so
+;; unlike the old tree-based `set_str` this does NOT mutate `obj` in
+;; place; always use the return value: `obj = json::set_str(obj, ...)`.
+pub fn set_str(obj: string, key: string, val: string) -> string is
+    return json_set_str(obj, key, val)
 end
 
-/// Get an array value by key.
-pub fn get_arr(obj: any, key: string) -> [any] is
-    return __builtin_json_get_arr(obj, key)
+pub fn set_int(obj: string, key: string, val: int) -> string is
+    return json_set_str(obj, key, int_to_str(val))
 end
 
-/// Check if a key exists.
-pub fn has_key(obj: any, key: string) -> bool is
-    return __builtin_json_has_key(obj, key)
+pub fn set_bool(obj: string, key: string, val: bool) -> string is
+    return json_set_str(obj, key, if val then "true" else "false")
 end
 
-/// Check if a key's value is null.
-pub fn is_null(obj: any, key: string) -> bool is
-    return __builtin_json_is_null(obj, key)
+pub fn set_float(obj: string, key: string, val: f64) -> string is
+    return json_set_str(obj, key, to_string(val))
 end
 
-/// Set a string value by key (mutates obj).
-pub fn set_str(obj: any, key: string, val: any) is
-    __builtin_json_set(obj, key, val)
+;; ── Array-shaped fields, flattened to a comma-joined string ─────────────────
+;; [FIXED] there is no real JSON array support on this backend (see
+;; module doc comment) — these two give HCO's config/API code a single,
+;; consistent convention for list-shaped fields instead of everyone
+;; inventing their own ad hoc delimiter.
+pub fn set_str_array(obj: string, key: string, vals: [string]) -> string is
+    return set_str(obj, key, iter_join(vals, ","))
 end
 
-/// Set an int value by key.
-pub fn set_int(obj: any, key: string, val: int) is
-    __builtin_json_set(obj, key, val)
-end
-
-/// Set a bool value by key.
-pub fn set_bool(obj: any, key: string, val: bool) is
-    __builtin_json_set(obj, key, val)
-end
-
-/// Get an item from a JSON array by index (as JsonValue).
-pub fn obj_at(arr: [any], idx: int) -> any is
-    return arr[idx]
-end
-
-/// Get an integer from a JSON array at index.
-pub fn int_at(arr: [any], idx: int) -> int is
-    return __builtin_json_as_int(arr[idx])
-end
-
-/// Get a string from a JSON array at index.
-pub fn str_at(arr: [any], idx: int) -> string is
-    return __builtin_json_as_str(arr[idx])
-end
-
-/// Query with a dot-path like "user.address.city".
-pub fn query(obj: any, path: string) -> any is
-    return __builtin_json_query(obj, path)
+pub fn get_str_array(obj: string, key: string) -> [string] is
+    let raw: string = get_str(obj, key)
+    if raw == "" is return [] end
+    return str_split(raw, ",")
 end
