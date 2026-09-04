@@ -1,6 +1,3 @@
-;; std -> math — Mathematical functions
-;; H# Standard Library v0.8
-
 pub fn sin(x: f64) -> f64 is
     return __builtin_math_sin(x)
 end
@@ -29,18 +26,18 @@ pub fn atan2(y: f64, x: f64) -> f64 is
     return __builtin_math_atan2(y, x)
 end
 
-/// Square root of a float.
+;; Square root of a float.
 pub fn sqrt(x: f64) -> f64 is
     return __builtin_math_sqrt(x)
 end
 
-/// Absolute value of an integer.
+;; Absolute value of an integer.
 pub fn abs(x: int) -> int is
     if x < 0 is return -x end
     return x
 end
 
-/// Absolute value of a float.
+;; Absolute value of a float.
 pub fn fabs(x: f64) -> f64 is
     if x < 0.0 is return -x end
     return x
@@ -50,7 +47,7 @@ pub fn pow(base: f64, exp: f64) -> f64 is
     return __builtin_math_pow(base, exp)
 end
 
-/// Integer power (repeated multiplication).
+;; Integer power (repeated multiplication).
 pub fn ipow(base: int, exp: int) -> int is
     let mut result: int = 1
     let mut i: int = 0
@@ -93,45 +90,45 @@ pub fn exp(x: f64) -> f64 is
     return __builtin_math_exp(x)
 end
 
-/// Minimum of two integers.
+;; Minimum of two integers.
 pub fn min(a: int, b: int) -> int is
     if a < b is return a end
     return b
 end
 
-/// Maximum of two integers.
+;; Maximum of two integers.
 pub fn max(a: int, b: int) -> int is
     if a > b is return a end
     return b
 end
 
-/// Minimum of two floats.
+;; Minimum of two floats.
 pub fn fmin(a: f64, b: f64) -> f64 is
     if a < b is return a end
     return b
 end
 
-/// Maximum of two floats.
+;; Maximum of two floats.
 pub fn fmax(a: f64, b: f64) -> f64 is
     if a > b is return a end
     return b
 end
 
-/// Clamp an integer to [lo, hi].
+;; Clamp an integer to [lo, hi].
 pub fn clamp(v: int, lo: int, hi: int) -> int is
     if v < lo is return lo end
     if v > hi is return hi end
     return v
 end
 
-/// Clamp a float to [lo, hi].
+;; Clamp a float to [lo, hi].
 pub fn fclamp(v: f64, lo: f64, hi: f64) -> f64 is
     if v < lo is return lo end
     if v > hi is return hi end
     return v
 end
 
-/// Greatest common divisor.
+;; Greatest common divisor.
 pub fn gcd(a: int, b: int) -> int is
     let mut x: int = abs(a)
     let mut y: int = abs(b)
@@ -143,7 +140,7 @@ pub fn gcd(a: int, b: int) -> int is
     return x
 end
 
-/// Least common multiple.
+;; Least common multiple.
 pub fn lcm(a: int, b: int) -> int is
     if a == 0 || b == 0 is return 0 end
     return abs(a / gcd(a, b) * b)
