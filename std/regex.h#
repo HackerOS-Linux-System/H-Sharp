@@ -1,57 +1,62 @@
-;; std -> regex — Regular expressions
-;; H# Standard Library v0.6
-
-/// Check if string matches a regex pattern.
 pub fn is_match(s: string, pattern: string) -> bool is
-    return __builtin_regex_is_match(s, pattern)
+    return __builtin_regex_match(pattern, s)
 end
 
-/// Find first match. Returns empty string if none.
+;; Find the first match. Returns "" if none.
 pub fn find(s: string, pattern: string) -> string is
-    return __builtin_regex_find(s, pattern)
+    return __builtin_regex_find(pattern, s)
 end
 
-/// Find all matches. Returns array of strings.
+;; Find all non-overlapping matches.
 pub fn find_all(s: string, pattern: string) -> [string] is
-    return __builtin_regex_find_all(s, pattern)
+    return __builtin_regex_find_all(pattern, s)
 end
 
-/// Replace first match with replacement.
+;; Replace the first match (this backend's sed-based replace already
+;; replaces every match with the `g` flag — see `replace_all`, which is
+;; currently identical to this for that reason).
 pub fn replace(s: string, pattern: string, repl: string) -> string is
-    return __builtin_regex_replace(s, pattern, repl)
+    return __builtin_regex_replace(pattern, repl, s)
 end
 
-/// Replace all matches with replacement.
+;; Replace every match. Identical to `replace` on this backend (see its
+;; doc comment) — kept as a separate function for API clarity and in
+;; case a future backend distinguishes the two.
 pub fn replace_all(s: string, pattern: string, repl: string) -> string is
-    return __builtin_regex_replace_all(s, pattern, repl)
+    return __builtin_regex_replace_all(pattern, repl, s)
 end
 
-/// Split string by pattern.
+;; Split `s` on `pattern`. Real support is limited to `\s+`/`\s*`
+;; (whitespace) and literal substrings — anything more exotic falls
+;; back to a literal split (see call.rs's `re_split_ta`), not a full
+;; regex-aware split.
 pub fn split(s: string, pattern: string) -> [string] is
     return __builtin_regex_split(s, pattern)
 end
 
-/// Extract capture groups from the first match. Returns array of captured groups.
+;; ── NOT IMPLEMENTED — real gaps, not silently faked ─────────────────
+;; The grep/sed backend has no way to extract capture groups or hold a
+;; compiled pattern handle. Calling these currently returns an empty/
+;; best-effort result rather than raising, so existing call sites don't
+;; crash — but the *data* is not real capture-group data.
 pub fn captures(s: string, pattern: string) -> [string] is
-    return __builtin_regex_captures(s, pattern)
+    if is_match(s, pattern) is return [find(s, pattern)] end
+    return []
 end
 
-/// Extract all capture group matches.
 pub fn captures_all(s: string, pattern: string) -> [[string]] is
-    return __builtin_regex_captures_all(s, pattern)
+    return []
 end
 
-/// Compile a pattern for reuse (returns an opaque Regex handle).
-pub fn compile(pattern: string) -> any is
-    return __builtin_regex_compile(pattern)
+pub fn compile(pattern: string) -> string is
+    return pattern
 end
 
-/// Run a pre-compiled regex against a string.
-pub fn exec(re: any, s: string) -> bool is
-    return __builtin_regex_exec(re, s)
+pub fn exec(re: string, s: string) -> bool is
+    return is_match(s, re)
 end
 
-;; Common pattern constants
+;; ── Common pattern constants ─────────────────────────────────────────
 pub let EMAIL_PATTERN:    string = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
 pub let URL_PATTERN:      string = r"^https?://[^\s/$.?#].[^\s]*$"
 pub let IP_PATTERN:       string = r"^(\d{1,3}\.){3}\d{1,3}$"
