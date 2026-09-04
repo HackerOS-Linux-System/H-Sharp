@@ -1,21 +1,99 @@
-;; H# Standard Library — std -> config
-;; Zarządzanie konfiguracją aplikacji (env + file)
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "std -> collections" from "col"
 
 struct Config is
-    pub path: string
+    pub path:   string
+    pub values: any
 end
 
 pub fn load(path: string) -> Config is
-    return Config { path: path }
+    let values = col::hashmap_new()
+    if !fs::exists(path) is
+        return Config { path: path, values: values }
+    end
+    let lines = fs::read_lines(path)
+    let mut result = values
+    let mut i = 0
+    while i < lines.len() is
+        let line = strings_trim(lines[i])
+        i += 1
+        if line == "" is continue end
+        if line.len() > 0 && line[0..1] == "#" is continue end
+        let eq = strings_index_of(line, "=")
+        if eq < 0 is continue end
+        let key = strings_trim(line[0..eq])
+        let val = strings_trim(line[eq + 1..line.len()])
+        result = col::hashmap_insert(result, key, val)
+    end
+    return Config { path: path, values: result }
 end
+
 pub fn load_env() -> Config is
-    return Config { path: "" }
+    let vars = env::vars()
+    let mut result = col::hashmap_new()
+    let mut i = 0
+    while i < vars.len() is
+        let kv = vars[i]
+        let eq = strings_index_of(kv, "=")
+        if eq >= 0 is
+            let key = kv[0..eq]
+            let val = kv[eq + 1..kv.len()]
+            result = col::hashmap_insert(result, key, val)
+        end
+        i += 1
+    end
+    return Config { path: "", values: result }
 end
-pub fn get(c: Config, key: string) -> string is return "" end
-pub fn get_int(c: Config, key: string) -> int is return 0 end
-pub fn get_bool(c: Config, key: string) -> bool is return false end
-pub fn get_or(c: Config, key: string, default: string) -> string is return default end
-pub fn set(c: Config, key: string, val: string) -> Config is return c end
-pub fn save(c: Config) is end
-pub fn has(c: Config, key: string) -> bool is return false end
-pub fn all_keys(c: Config) -> string is return "" end
+
+pub fn get(c: Config, key: string) -> string is
+    let v = col::hashmap_get(c.values, key)
+    if v == nil is return "" end
+    return v
+end
+
+pub fn get_int(c: Config, key: string) -> int is
+    return __builtin_conv_str_to_int(get(c, key))
+end
+
+pub fn get_bool(c: Config, key: string) -> bool is
+    let v = strings_to_lower(get(c, key))
+    return v == "true" || v == "1" || v == "yes"
+end
+
+pub fn get_or(c: Config, key: string, default: string) -> string is
+    if !has(c, key) is return default end
+    return get(c, key)
+end
+
+pub fn set(c: Config, key: string, val: string) -> Config is
+    return Config { path: c.path, values: col::hashmap_insert(c.values, key, val) }
+end
+
+pub fn has(c: Config, key: string) -> bool is
+    return col::hashmap_contains(c.values, key)
+end
+
+pub fn all_keys(c: Config) -> [string] is
+    return col::hashmap_keys(c.values)
+end
+
+;; Write the config back out as a KEY=VALUE file at `c.path`. No-op if
+;; `c.path` is "" (e.g. a `load_env()`-sourced config, which has
+;; nowhere sensible to write back to).
+pub fn save(c: Config) is
+    if c.path == "" is return end
+    let keys = all_keys(c)
+    let mut out = ""
+    let mut i = 0
+    while i < keys.len() is
+        out = out + keys[i] + "=" + get(c, keys[i]) + "\n"
+        i += 1
+    end
+    fs::write(c.path, out)
+end
+
+;; ── private helpers ──────────────────────────────────────────────────
+fn strings_trim(s: string) -> string is return __builtin_str_trim(s) end
+fn strings_index_of(s: string, sub: string) -> int is return __builtin_str_index_of(s, sub) end
+fn strings_to_lower(s: string) -> string is return __builtin_str_to_lower(s) end
