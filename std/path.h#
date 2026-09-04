@@ -1,20 +1,53 @@
-;; H# Standard Library — std -> path
+pub fn join(a: string, b: string) -> string is
+    return __builtin_path_join(a, b)
+end
 
-pub fn join(a: string, b: string) -> string is return a + "/" + b end
-pub fn parent(p: string) -> string is return p end
-pub fn filename(p: string) -> string is return p end
-pub fn stem(p: string) -> string is return p end
+;; The parent directory of a path, or "" if it has none.
+pub fn parent(p: string) -> string is
+    return __builtin_path_parent(p)
+end
+
+;; The last component of a path (file or directory name), including
+;; its extension.
+pub fn filename(p: string) -> string is
+    return __builtin_path_filename(p)
+end
+
+;; The filename without its extension.
+pub fn stem(p: string) -> string is
+    return __builtin_path_stem(p)
+end
+
+;; The file extension, without the leading dot ("" if none).
 pub fn extension(p: string) -> string is
-    return ""
+    return __builtin_path_extension(p)
 end
+
+;; Whether the path is absolute (starts from the filesystem root).
 pub fn is_absolute(p: string) -> bool is
-    return false
+    return __builtin_path_is_absolute(p)
 end
+
+;; Whether the path is relative.
 pub fn is_relative(p: string) -> bool is
-    return true
+    return !is_absolute(p)
 end
-pub fn normalize(p: string) -> string is return p end
+
+;; Lexically normalize a path: collapse "." and resolve ".." components
+;; without touching the filesystem (so it also works on paths that
+;; don't exist yet). Does not resolve symlinks — use `fs::canonicalize`
+;; equivalents for that once available.
+pub fn normalize(p: string) -> string is
+    return __builtin_path_normalize(p)
+end
+
+;; Whether a path currently exists on disk. Forwards to `fs::exists`.
 pub fn exists(p: string) -> bool is
-    return false
+    return __builtin_path_exists(p)
 end
-pub fn with_extension(p: string, ext: string) -> string is return p end
+
+;; Return a copy of the path with its extension replaced by `ext`
+;; (`ext` given without the leading dot, e.g. "txt").
+pub fn with_extension(p: string, ext: string) -> string is
+    return __builtin_path_with_extension(p, ext)
+end
