@@ -1,7 +1,87 @@
-;; H# Standard Library — std -> color
-pub fn rgb(r: int, g: int, b: int) -> string is return "" end
-pub fn hex_to_rgb(hex: string) -> string is return "" end
-pub fn rgb_to_hex(r: int, g: int, b: int) -> string is return "" end
-pub fn blend(a: string, b: string, t: f64) -> string is return "" end
-pub fn darken(c: string, pct: f64) -> string is return "" end
-pub fn lighten(c: string, pct: f64) -> string is return "" end
+pub fn rgb(r: int, g: int, b: int) -> string is
+    return "rgb(" + to_string(clamp255(r)) + "," + to_string(clamp255(g)) + "," + to_string(clamp255(b)) + ")"
+end
+
+fn clamp255(v: int) -> int is
+    if v < 0 is return 0 end
+    if v > 255 is return 255 end
+    return v
+end
+
+fn hex_digit(n: int) -> string is
+    let digits = "0123456789abcdef"
+    return digits[n..n+1]
+end
+
+fn byte_to_hex(n: int) -> string is
+    let v = clamp255(n)
+    return hex_digit(v / 16) + hex_digit(v % 16)
+end
+
+fn hex_val(c: string) -> int is
+    let digits = "0123456789abcdef"
+    let mut i = 0
+    while i < digits.len() is
+        if digits[i..i+1] == c is return i end
+        i += 1
+    end
+    return 0
+end
+
+;; Parse a "#rrggbb" or "rrggbb" hex string into "rgb(r,g,b)".
+pub fn hex_to_rgb(hex: string) -> string is
+    let mut h = hex
+    if h.len() > 0 && h[0..1] == "#" is h = h[1..h.len()] end
+    if h.len() < 6 is return rgb(0, 0, 0) end
+    let r = hex_val(h[0..1]) * 16 + hex_val(h[1..2])
+    let g = hex_val(h[2..3]) * 16 + hex_val(h[3..4])
+    let b = hex_val(h[4..5]) * 16 + hex_val(h[5..6])
+    return rgb(r, g, b)
+end
+
+pub fn rgb_to_hex(r: int, g: int, b: int) -> string is
+    return "#" + byte_to_hex(r) + byte_to_hex(g) + byte_to_hex(b)
+end
+
+fn parse_component(rgb_str: string, idx: int) -> int is
+    ;; rgb_str looks like "rgb(12,34,56)" — extract the idx-th (0/1/2)
+    ;; comma-separated number. A tiny hand-rolled parser since this is
+    ;; the only place in std/color.h# that needs one.
+    let inner = rgb_str[4..rgb_str.len() - 1]
+    let mut start = 0
+    let mut part = 0
+    let mut i = 0
+    while i <= inner.len() is
+        if i == inner.len() || inner[i..i+1] == "," is
+            if part == idx is return __builtin_conv_str_to_int(inner[start..i]) end
+            part += 1
+            start = i + 1
+        end
+        i += 1
+    end
+    return 0
+end
+
+;; Linearly blend two "rgb(...)" colors; `t` is 0.0 (all `a`) to 1.0 (all `b`).
+pub fn blend(a: string, b: string, t: f64) -> string is
+    let ar = parse_component(a, 0)
+    let ag = parse_component(a, 1)
+    let ab = parse_component(a, 2)
+    let br = parse_component(b, 0)
+    let bg = parse_component(b, 1)
+    let bb = parse_component(b, 2)
+    ;; only `+` mixes int/float in this interpreter — see conv.h#'s
+    ;; int_to_float doc comment — so every int is `+ 0.0`'d before `*`.
+    let r  = __builtin_conv_float_to_int((ar + 0.0) * (1.0 - t) + (br + 0.0) * t)
+    let g  = __builtin_conv_float_to_int((ag + 0.0) * (1.0 - t) + (bg + 0.0) * t)
+    let bl = __builtin_conv_float_to_int((ab + 0.0) * (1.0 - t) + (bb + 0.0) * t)
+    return rgb(r, g, bl)
+end
+
+pub fn darken(c: string, pct: f64) -> string is
+    return blend(c, "rgb(0,0,0)", pct)
+end
+
+pub fn lighten(c: string, pct: f64) -> string is
+    return blend(c, "rgb(255,255,255)", pct)
+end
