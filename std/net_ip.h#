@@ -1,17 +1,121 @@
-;; H# Standard Library — std -> net -> ip
-;; IP address manipulation
+fn octets(s: string) -> [int] is
+    let parts = __builtin_str_split(s, ".")
+    let mut out: [int] = []
+    let mut i = 0
+    while i < parts.len() is
+        out.push(__builtin_conv_str_to_int(parts[i]))
+        i += 1
+    end
+    return out
+end
 
-pub fn parse_ip(s: string) -> string is return s end
-pub fn is_valid(s: string) -> bool is return false end
-pub fn is_ipv4(s: string) -> bool is return false end
-pub fn is_ipv6(s: string) -> bool is return false end
-pub fn is_loopback(ip: string) -> bool is return ip == "127.0.0.1" end
-pub fn is_private(ip: string) -> bool is return false end
-pub fn is_public(ip: string) -> bool is return true end
-pub fn to_int(ip: string) -> int is return 0 end
-pub fn from_int(n: int) -> string is return "0.0.0.0" end
-pub fn cidr_hosts(cidr: string) -> string is return "" end
-pub fn cidr_broadcast(cidr: string) -> string is return "" end
-pub fn cidr_network(cidr: string) -> string is return "" end
-pub fn my_ip() -> string is return "" end
-pub fn public_ip() -> string is return "" end
+pub fn is_ipv4(s: string) -> bool is
+    let parts = octets(s)
+    if parts.len() != 4 is return false end
+    let mut i = 0
+    while i < parts.len() is
+        if parts[i] < 0 || parts[i] > 255 is return false end
+        i += 1
+    end
+    return true
+end
+
+;; NOT IMPLEMENTED — see module doc comment.
+pub fn is_ipv6(s: string) -> bool is
+    return false
+end
+
+pub fn is_valid(s: string) -> bool is
+    return is_ipv4(s) || is_ipv6(s)
+end
+
+pub fn parse_ip(s: string) -> string is
+    if is_valid(s) is return s end
+    return ""
+end
+
+pub fn is_loopback(ip: string) -> bool is
+    if !is_ipv4(ip) is return false end
+    let o = octets(ip)
+    return o[0] == 127
+end
+
+pub fn is_private(ip: string) -> bool is
+    if !is_ipv4(ip) is return false end
+    let o = octets(ip)
+    if o[0] == 10 is return true end
+    if o[0] == 172 && o[1] >= 16 && o[1] <= 31 is return true end
+    if o[0] == 192 && o[1] == 168 is return true end
+    return false
+end
+
+pub fn is_public(ip: string) -> bool is
+    return is_ipv4(ip) && !is_private(ip) && !is_loopback(ip)
+end
+
+pub fn to_int(ip: string) -> int is
+    if !is_ipv4(ip) is return 0 end
+    let o = octets(ip)
+    return o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3]
+end
+
+pub fn from_int(n: int) -> string is
+    let a = (n / 16777216) % 256
+    let b = (n / 65536) % 256
+    let c = (n / 256) % 256
+    let d = n % 256
+    return to_string(a) + "." + to_string(b) + "." + to_string(c) + "." + to_string(d)
+end
+
+fn parse_cidr(cidr: string) -> [int] is
+    ;; returns [network_int, prefix_len]
+    let parts = __builtin_str_split(cidr, "/")
+    if parts.len() != 2 is return [0, 32] end
+    return [to_int(parts[0]), __builtin_conv_str_to_int(parts[1])]
+end
+
+pub fn cidr_network(cidr: string) -> string is
+    let p = parse_cidr(cidr)
+    let mask = (4294967295 << (32 - p[1])) % 4294967296
+    return from_int(p[0] & mask)
+end
+
+pub fn cidr_broadcast(cidr: string) -> string is
+    let p = parse_cidr(cidr)
+    let mask = (4294967295 << (32 - p[1])) % 4294967296
+    let network = p[0] & mask
+    let host_bits = 4294967295 ^ mask
+    return from_int(network | host_bits)
+end
+
+;; Number of usable host addresses in the CIDR block (excludes network
+;; and broadcast addresses, matching the conventional /24-has-254-hosts
+;; convention — for /31 and /32 this returns 0 rather than a negative
+;; number).
+pub fn cidr_hosts(cidr: string) -> int is
+    let p = parse_cidr(cidr)
+    let bits = 32 - p[1]
+    if bits <= 1 is return 0 end
+    let total = 1
+    let mut shifted = 1
+    let mut i = 0
+    while i < bits is
+        shifted = shifted * 2
+        i += 1
+    end
+    return shifted - 2
+end
+
+;; This machine's own LAN IP (via `hostname -I`, first address). Real,
+;; but Linux-specific and depends on `hostname` supporting `-I`.
+pub fn my_ip() -> string is
+    let out = __builtin_process_run("hostname -I 2>/dev/null | awk '{print $1}'")
+    return __builtin_str_trim(out)
+end
+
+;; NOT IMPLEMENTED — would need an outbound HTTP call to a "what's my
+;; IP" service; std -> http is http-only (no TLS) and most such services
+;; are https-only, so this isn't wired up.
+pub fn public_ip() -> string is
+    return ""
+end
