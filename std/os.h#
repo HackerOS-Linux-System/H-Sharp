@@ -1,23 +1,43 @@
-;; H# Standard Library — std -> os
+pub fn platform() -> string is
+    return __builtin_os_platform()
+end
 
-pub fn platform() -> string is return "linux" end
+;; CPU architecture: "x86_64", "aarch64", ...
+pub fn arch() -> string is
+    return __builtin_os_arch()
+end
+
+;; Machine hostname (read from /etc/hostname on Linux).
 pub fn hostname() -> string is
-    return ""
+    return __builtin_os_hostname()
 end
+
+;; Current user's login name ($USER / $LOGNAME).
 pub fn username() -> string is
-    return ""
+    return __builtin_os_username()
 end
+
+;; Current user's home directory.
 pub fn home_dir() -> string is
-    return ""
+    return __builtin_os_home_dir()
 end
-pub fn temp_dir() -> string is return "/tmp" end
+
+;; System temp directory.
+pub fn temp_dir() -> string is
+    return __builtin_os_temp_dir()
+end
+
+;; This process's PID.
 pub fn pid() -> int is
-    return 0
+    return __builtin_os_pid()
 end
+
+;; Whether this process is running as root (uid 0).
 pub fn is_root() -> bool is
-    return false
+    return __builtin_os_is_root()
 end
+
+;; Kernel release string (`uname -r`).
 pub fn kernel_version() -> string is
-    return ""
+    return __builtin_os_kernel_version()
 end
-pub fn arch() -> string is return "x86_64" end
