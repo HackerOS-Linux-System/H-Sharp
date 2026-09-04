@@ -1,12 +1,146 @@
-;; H# Standard Library — std -> xml
-
-pub fn parse(s: string) -> string is return s end
-pub fn get_attr(node: string, attr: string) -> string is return "" end
-pub fn get_text(node: string) -> string is return "" end
-pub fn get_child(node: string, tag: string) -> string is return "" end
-pub fn get_children(node: string, tag: string) -> string is return "" end
-pub fn to_string_xml(node: string) -> string is return node end
-pub fn create_element(tag: string, attrs: string, content: string) -> string is
-    return "<" + tag + ">" + content + "</" + tag + ">"
+struct Element is
+    pub tag:      string
+    pub text:     string
+    pub children: [Element]
 end
-pub fn has_attr(node: string, attr: string) -> bool is return false end
+
+;; Parse `data` and return its single root element. Returns an empty
+;; Element (tag "") if `data` has no well-formed root tag.
+pub fn parse(data: string) -> Element is
+    let cleaned = strip_prolog(data)
+    let result = parse_element(cleaned, 0)
+    return result
+end
+
+fn strip_prolog(s: string) -> string is
+    let mut out = s
+    while true is
+        let t = strings_trim(out)
+        if t.len() >= 2 && t[0..2] == "<?" is
+            let close = __builtin_str_index_of(t, "?>")
+            if close < 0 is break end
+            out = t[close + 2..t.len()]
+        else is
+            if t.len() >= 4 && t[0..4] == "<!--" is
+                let close = __builtin_str_index_of(t, "-->")
+                if close < 0 is break end
+                out = t[close + 3..t.len()]
+            else is
+                return t
+            end
+        end
+    end
+    return strings_trim(out)
+end
+
+;; Returns the parsed element; ignores everything after its closing tag
+;; (only the first top-level element is parsed — matching `parse`'s
+;; "single root" contract).
+fn parse_element(s: string, depth: int) -> Element is
+    let t = strings_trim(s)
+    if t.len() == 0 || t[0..1] != "<" is return Element { tag: "", text: "", children: [] } end
+    let tag_end = __builtin_str_index_of(t, ">")
+    if tag_end < 0 is return Element { tag: "", text: "", children: [] } end
+    let mut open_inner = t[1..tag_end]
+    let self_closing = open_inner.len() > 0 && open_inner[open_inner.len()-1..open_inner.len()] == "/"
+    if self_closing is open_inner = open_inner[0..open_inner.len()-1] end
+    let tag = first_word(strings_trim(open_inner))
+    if self_closing is
+        return Element { tag: tag, text: "", children: [] }
+    end
+    let close_tag = "</" + tag + ">"
+    let body_start = tag_end + 1
+    let close_pos = find_matching_close(t, tag, body_start)
+    if close_pos < 0 is return Element { tag: tag, text: "", children: [] } end
+    let body = t[body_start..close_pos]
+    return Element { tag: tag, text: extract_text(body), children: extract_children(body) }
+end
+
+fn first_word(s: string) -> string is
+    let mut i = 0
+    while i < s.len() && s[i..i+1] != " " is i += 1 end
+    return s[0..i]
+end
+
+;; Naively finds the closing tag matching depth-0 nesting of same-named
+;; tags — a real gap for documents with many same-named nested siblings
+;; deep in the tree, but correct for the common shallow case.
+fn find_matching_close(s: string, tag: string, from: int) -> int is
+    let open_tag = "<" + tag
+    let close_tag = "</" + tag + ">"
+    let mut depth = 1
+    let mut pos = from
+    while pos < s.len() is
+        let next_open = index_of_from(s, open_tag, pos)
+        let next_close = index_of_from(s, close_tag, pos)
+        if next_close < 0 is return -1 end
+        if next_open >= 0 && next_open < next_close is
+            depth += 1
+            pos = next_open + open_tag.len()
+        else is
+            depth -= 1
+            if depth == 0 is return next_close end
+            pos = next_close + close_tag.len()
+        end
+    end
+    return -1
+end
+
+fn index_of_from(s: string, needle: string, from: int) -> int is
+    if from >= s.len() is return -1 end
+    let rel = __builtin_str_index_of(s[from..s.len()], needle)
+    if rel < 0 is return -1 end
+    return from + rel
+end
+
+fn extract_text(body: string) -> string is
+    let t = strings_trim(body)
+    if t.len() == 0 || t[0..1] != "<" is return decode_entities(t) end
+    return ""
+end
+
+fn extract_children(body: string) -> [Element] is
+    let mut children: [Element] = []
+    let mut rest = strings_trim(body)
+    while rest.len() > 0 && rest[0..1] == "<" is
+        let el = parse_element(rest, 0)
+        if el.tag == "" is break end
+        children.push(el)
+        let close_tag = "</" + el.tag + ">"
+        let pos = __builtin_str_index_of(rest, close_tag)
+        if pos < 0 is break end
+        rest = strings_trim(rest[pos + close_tag.len()..rest.len()])
+    end
+    return children
+end
+
+fn decode_entities(s: string) -> string is
+    let mut out = s
+    out = __builtin_str_replace_all(out, "&lt;", "<")
+    out = __builtin_str_replace_all(out, "&gt;", ">")
+    out = __builtin_str_replace_all(out, "&quot;", "\"")
+    out = __builtin_str_replace_all(out, "&apos;", "'")
+    out = __builtin_str_replace_all(out, "&amp;", "&")
+    return out
+end
+
+pub fn find_child(el: Element, tag: string) -> Element is
+    let mut i = 0
+    while i < el.children.len() is
+        if el.children[i].tag == tag is return el.children[i] end
+        i += 1
+    end
+    return Element { tag: "", text: "", children: [] }
+end
+
+pub fn find_all(el: Element, tag: string) -> [Element] is
+    let mut out: [Element] = []
+    let mut i = 0
+    while i < el.children.len() is
+        if el.children[i].tag == tag is out.push(el.children[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn strings_trim(s: string) -> string is return __builtin_str_trim(s) end
