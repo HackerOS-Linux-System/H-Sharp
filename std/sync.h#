@@ -1,27 +1,86 @@
-;; H# Standard Library — std -> sync
-;; Synchronizacja: Mutex, Channel, Atomic
-
 struct Mutex is
     pub locked: bool
 end
 
-pub fn new_mutex() -> Mutex is return Mutex { locked: false } end
-pub fn lock(m: Mutex) -> Mutex is return Mutex { locked: true } end
-pub fn unlock(m: Mutex) -> Mutex is return Mutex { locked: false } end
-pub fn try_lock(m: Mutex) -> bool is return true end
+pub fn new_mutex() -> Mutex is
+    return Mutex { locked: false }
+end
+
+;; Panics if already locked (single-threaded — a double-lock here is a
+;; real bug in the calling code, not a race, so it's caught loudly
+;; instead of silently deadlocking the way a real OS mutex would).
+pub fn lock(m: Mutex) -> Mutex is
+    if m.locked is
+        panic("sync::lock: mutex is already locked (would deadlock under real concurrency)")
+    end
+    return Mutex { locked: true }
+end
+
+pub fn unlock(m: Mutex) -> Mutex is
+    return Mutex { locked: false }
+end
+
+pub fn try_lock(m: Mutex) -> bool is
+    return !m.locked
+end
 
 struct Channel is
     pub name: string
+    pub slot: string
+    pub has_value: bool
 end
 
-pub fn new_channel(name: string) -> Channel is return Channel { name: name } end
-pub fn send(ch: Channel, data: string) is end
-pub fn recv(ch: Channel) -> string is return "" end
-pub fn try_recv(ch: Channel) -> string is return "" end
-pub fn close_channel(ch: Channel) is end
+pub fn new_channel(name: string) -> Channel is
+    return Channel { name: name, slot: "", has_value: false }
+end
 
-pub fn atomic_add(ptr: int, val: int) -> int is return 0 end
-pub fn atomic_sub(ptr: int, val: int) -> int is return 0 end
-pub fn atomic_load(ptr: int) -> int is return 0 end
-pub fn atomic_store(ptr: int, val: int) is end
-pub fn atomic_swap(ptr: int, val: int) -> int is return 0 end
+;; Single-slot channel: `send` overwrites whatever's currently in the
+;; slot (real, if not buffered — a full multi-item queue is future
+;; work).
+pub fn send(ch: Channel, data: string) -> Channel is
+    return Channel { name: ch.name, slot: data, has_value: true }
+end
+
+pub fn recv(ch: Channel) -> string is
+    return ch.slot
+end
+
+pub fn try_recv(ch: Channel) -> string is
+    if ch.has_value is return ch.slot end
+    return ""
+end
+
+pub fn close_channel(ch: Channel) -> Channel is
+    return Channel { name: ch.name, slot: "", has_value: false }
+end
+
+;; ── atomics ─────────────────────────────────────────────────────────
+;; No real memory addresses in H# — these operate on a named counter
+;; registered by `atomic_new`, identified by name (a string) rather than
+;; a raw pointer, since H# has no pointer/address type to hand back from
+;; `atomic_new` in the first place.
+pub fn atomic_new(name: string, initial: int) is
+    __builtin_atomic_store(name, initial)
+end
+
+pub fn atomic_add(name: string, val: int) -> int is
+    return __builtin_atomic_add(name, val)
+end
+
+pub fn atomic_sub(name: string, val: int) -> int is
+    return __builtin_atomic_add(name, -val)
+end
+
+pub fn atomic_load(name: string) -> int is
+    return __builtin_atomic_load(name)
+end
+
+pub fn atomic_store(name: string, val: int) is
+    __builtin_atomic_store(name, val)
+end
+
+pub fn atomic_swap(name: string, val: int) -> int is
+    let old = __builtin_atomic_load(name)
+    __builtin_atomic_store(name, val)
+    return old
+end
