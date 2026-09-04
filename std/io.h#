@@ -1,21 +1,28 @@
-;; H# Standard Library — std -> io
-;; Wejście/wyjście, odczyt klawiatury, pliki
-
 pub fn read_line(prompt: string) -> string is
-    ;; Wypisz prompt bez nowej linii, odczytaj stdin
-    write(prompt)
-    return ""   ;; runtime: replaced by native read_line
+    write_no_nl(prompt)
+    flush()
+    return ""
 end
 
+;; Read a single raw byte from stdin as a one-character string.
+;; [FIXED] see module doc comment — unavailable on this backend.
 pub fn read_char() -> string is
-    return ""   ;; runtime: read single char
+    return ""
 end
 
+;; Write a string to stdout without a trailing newline (`write()` always
+;; appends one).
+;; [FIXED] `__builtin_io_write_no_nl` is interpreter-only; `io_print` is
+;; the same operation under a different, LLVM-backed name.
 pub fn write_no_nl(s: string) is
-    ;; write without newline — runtime handles
-    write(s)
+    io_print(s)
 end
 
-pub fn flush() is
-    ;; flush stdout — no-op in interpreter
-end
+;; Flush stdout — matters when mixing `write_no_nl` with a blocking
+;; read, on unbuffered/piped stdout where writes might otherwise sit in
+;; a buffer until the process exits.
+;; [FIXED] `__builtin_io_flush` is interpreter-only. `io_print`/`write`
+;; are already unbuffered on this backend (nothing else would explain
+;; `bytes`' own live, in-place progress-bar redraws working), so there
+;; is nothing left to flush.
+pub fn flush() is end
