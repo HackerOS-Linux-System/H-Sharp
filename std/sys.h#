@@ -1,23 +1,79 @@
-;; H# Standard Library — std -> sys
-;; Dostęp do systemu operacyjnego
+pub fn cpu_count() -> int is
+    return __builtin_sys_cpu_count()
+end
 
-pub fn cpu_count() -> int is return 1 end
-pub fn cpu_usage() -> f64 is return 0.0 end
-pub fn memory_total() -> int is return 0 end
-pub fn memory_free() -> int is return 0 end
-pub fn memory_used() -> int is return 0 end
-pub fn disk_total(path: string) -> int is return 0 end
-pub fn disk_free(path: string) -> int is return 0 end
-pub fn uptime() -> int is return 0 end
-pub fn load_avg() -> f64 is return 0.0 end
-pub fn is_64bit() -> bool is return true end
-pub fn is_little_endian() -> bool is return true end
-pub fn page_size() -> int is return 4096 end
-pub fn get_uid() -> int is return 0 end
-pub fn get_gid() -> int is return 0 end
-pub fn get_pid() -> int is return 0 end
-pub fn get_ppid() -> int is return 0 end
-pub fn hostname() -> string is return "" end
-pub fn sysname() -> string is return "Linux" end
-pub fn machine() -> string is return "x86_64" end
-pub fn kernel_version() -> string is return "" end
+pub fn memory_total() -> int is
+    return __builtin_sys_memory_total()
+end
+
+pub fn memory_free() -> int is
+    return __builtin_sys_memory_free()
+end
+
+pub fn memory_used() -> int is
+    return memory_total() - memory_free()
+end
+
+;; Free space on the filesystem containing `path`, in bytes.
+pub fn disk_total(path: string) -> int is
+    return __builtin_sys_disk_total(path)
+end
+
+pub fn disk_free(path: string) -> int is
+    return __builtin_sys_disk_free(path)
+end
+
+pub fn uptime() -> int is
+    return __builtin_sys_uptime()
+end
+
+;; 1-minute load average.
+pub fn load_avg() -> f64 is
+    return __builtin_sys_load_avg()
+end
+
+pub fn is_64bit() -> bool is
+    return __builtin_sys_is_64bit()
+end
+
+pub fn is_little_endian() -> bool is
+    return __builtin_sys_is_little_endian()
+end
+
+pub fn page_size() -> int is
+    return __builtin_sys_page_size()
+end
+
+pub fn get_uid() -> int is
+    return __builtin_sys_get_uid()
+end
+
+pub fn get_gid() -> int is
+    return __builtin_sys_get_gid()
+end
+
+pub fn get_pid() -> int is
+    return __builtin_sys_get_pid()
+end
+
+pub fn get_ppid() -> int is
+    return __builtin_sys_get_ppid()
+end
+
+pub fn hostname() -> string is
+    return __builtin_sys_hostname()
+end
+
+;; Kernel name, e.g. "Linux" (`uname -s`).
+pub fn sysname() -> string is
+    return __builtin_sys_sysname()
+end
+
+;; Machine hardware name, e.g. "x86_64" (`uname -m`).
+pub fn machine() -> string is
+    return __builtin_sys_machine()
+end
+
+pub fn kernel_version() -> string is
+    return __builtin_sys_kernel_version()
+end
