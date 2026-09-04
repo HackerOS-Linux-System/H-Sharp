@@ -1,21 +1,47 @@
-;; H# Standard Library — std -> buf
-;; Dynamiczny bufor bajtów / string builder
-
 struct Buffer is
     pub data: string
     pub len:  int
 end
 
-pub fn new_buf() -> Buffer is return Buffer { data: "", len: 0 } end
+pub fn new_buf() -> Buffer is
+    return Buffer { data: "", len: 0 }
+end
+
 pub fn write_buf(b: Buffer, data: string) -> Buffer is
-    return Buffer { data: b.data + data, len: b.len + len(data) }
+    return Buffer { data: b.data + data, len: b.len + data.len() }
 end
-pub fn write_byte(b: Buffer, byte: int) -> Buffer is return b end
+
+;; Append a single byte, given as its codepoint (0-255 for ASCII/Latin-1
+;; bytes). Multi-byte UTF-8 sequences should go through `write_buf`
+;; instead.
+pub fn write_byte(b: Buffer, byte: int) -> Buffer is
+    return write_buf(b, __builtin_char_code_to_str(byte))
+end
+
 pub fn write_int(b: Buffer, n: int) -> Buffer is
-    return Buffer { data: b.data + to_string(n), len: b.len + 8 }
+    let s = to_string(n)
+    return Buffer { data: b.data + s, len: b.len + s.len() }
 end
-pub fn to_string_buf(b: Buffer) -> string is return b.data end
-pub fn to_bytes_buf(b: Buffer) -> string is return b.data end
-pub fn reset_buf(b: Buffer) -> Buffer is return new_buf() end
-pub fn capacity(b: Buffer) -> int is return b.len end
-pub fn is_empty_buf(b: Buffer) -> bool is return b.len == 0 end
+
+pub fn to_string_buf(b: Buffer) -> string is
+    return b.data
+end
+
+pub fn to_bytes_buf(b: Buffer) -> bytes is
+    return string_to_bytes(b.data)
+end
+
+pub fn reset_buf(b: Buffer) -> Buffer is
+    return new_buf()
+end
+
+;; Current length in bytes (UTF-8) — there's no separately-tracked
+;; over-allocated capacity to report, since H# strings aren't a
+;; pre-sized buffer the way e.g. a Rust `Vec<u8>` is.
+pub fn capacity(b: Buffer) -> int is
+    return b.len
+end
+
+pub fn is_empty_buf(b: Buffer) -> bool is
+    return b.len == 0
+end
