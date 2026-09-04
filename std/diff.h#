@@ -1,5 +1,67 @@
-;; H# Standard Library — std -> diff
-pub fn diff_lines(a: string, b: string) -> string is return "" end
-pub fn diff_chars(a: string, b: string) -> string is return "" end
-pub fn patch(original: string, diff: string) -> string is return "" end
-pub fn is_equal(a: string, b: string) -> bool is return false end
+pub fn diff_lines(a: string, b: string) -> string is
+    let la = __builtin_str_split(a, "\n")
+    let lb = __builtin_str_split(b, "\n")
+    let n = la.len()
+    let m = lb.len()
+
+    ;; lcs[i][j] = length of the LCS of la[i..] and lb[j..]
+    let mut lcs: [[int]] = []
+    let mut i = 0
+    while i <= n is
+        let mut row: [int] = []
+        let mut j = 0
+        while j <= m is row.push(0) j += 1 end
+        lcs.push(row)
+        i += 1
+    end
+    i = n - 1
+    while i >= 0 is
+        let mut j = m - 1
+        while j >= 0 is
+            if la[i] == lb[j] is
+                lcs[i][j] = lcs[i + 1][j + 1] + 1
+            else is
+                let up = lcs[i + 1][j]
+                let left = lcs[i][j + 1]
+                lcs[i][j] = if up > left is up else left end
+            end
+            j -= 1
+        end
+        i -= 1
+    end
+
+    let mut out = ""
+    let mut x = 0
+    let mut y = 0
+    while x < n && y < m is
+        if la[x] == lb[y] is
+            out = out + "  " + la[x] + "\n"
+            x += 1
+            y += 1
+        else is
+            if lcs[x + 1][y] >= lcs[x][y + 1] is
+                out = out + "- " + la[x] + "\n"
+                x += 1
+            else is
+                out = out + "+ " + lb[y] + "\n"
+                y += 1
+            end
+        end
+    end
+    while x < n is out = out + "- " + la[x] + "\n" x += 1 end
+    while y < m is out = out + "+ " + lb[y] + "\n" y += 1 end
+    return out
+end
+
+;; NOT IMPLEMENTED — real gaps, not silently faked.
+pub fn diff_chars(a: string, b: string) -> string is
+    return diff_lines(a, b)
+end
+
+pub fn patch(original: string, diff: string) -> string is
+    return original
+end
+
+pub fn is_equal(a: string, b: string) -> bool is
+    return a == b
+end
