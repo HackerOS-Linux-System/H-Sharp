@@ -1,11 +1,98 @@
-;; H# Standard Library — std -> csv
+use "std -> fs" from "fs"
 
-pub fn parse(data: string) -> string is return data end
-pub fn parse_header(data: string) -> string is return "" end
-pub fn get_row(parsed: string, i: int) -> string is return "" end
-pub fn get_col(row: string, col: string) -> string is return "" end
-pub fn row_count(parsed: string) -> int is return 0 end
-pub fn to_string_csv(data: string) -> string is return data end
-pub fn write_csv(path: string, data: string) is end
-pub fn read_csv(path: string) -> string is return "" end
-pub fn filter_rows(data: string, col: string, val: string) -> string is return "" end
+;; Parse CSV text (including its header row) into rows of cells.
+pub fn parse(data: string) -> [[string]] is
+    let lines = split_lines(data)
+    let mut rows: [[string]] = []
+    let mut i = 0
+    while i < lines.len() is
+        if lines[i] != "" is
+            rows.push(split_csv_line(lines[i]))
+        end
+        i += 1
+    end
+    return rows
+end
+
+;; The header row (first row) of parsed CSV.
+pub fn parse_header(data: string) -> [string] is
+    let rows = parse(data)
+    if rows.len() == 0 is return [] end
+    return rows[0]
+end
+
+pub fn get_row(parsed: [[string]], i: int) -> [string] is
+    if i < 0 || i >= parsed.len() is return [] end
+    return parsed[i]
+end
+
+;; Get a cell by header column name, using `parsed[0]` as the header.
+pub fn get_col(parsed: [[string]], col: string) -> [string] is
+    if parsed.len() == 0 is return [] end
+    let header = parsed[0]
+    let mut idx = -1
+    let mut i = 0
+    while i < header.len() is
+        if header[i] == col is idx = i end
+        i += 1
+    end
+    if idx < 0 is return [] end
+    let mut out: [string] = []
+    let mut r = 1
+    while r < parsed.len() is
+        if idx < parsed[r].len() is out.push(parsed[r][idx]) end
+        r += 1
+    end
+    return out
+end
+
+;; Number of data rows, excluding the header.
+pub fn row_count(parsed: [[string]]) -> int is
+    if parsed.len() == 0 is return 0 end
+    return parsed.len() - 1
+end
+
+pub fn to_string_csv(rows: [[string]]) -> string is
+    let mut out = ""
+    let mut i = 0
+    while i < rows.len() is
+        out = out + strings_join(rows[i], ",") + "\n"
+        i += 1
+    end
+    return out
+end
+
+pub fn write_csv(path: string, rows: [[string]]) is
+    fs::write(path, to_string_csv(rows))
+end
+
+pub fn read_csv(path: string) -> [[string]] is
+    return parse(fs::read(path))
+end
+
+;; Rows (excluding header) where column `col` equals `val`. Returns the
+;; header row followed by the matching rows, so the result is still a
+;; valid parsed table.
+pub fn filter_rows(data: [[string]], col: string, val: string) -> [[string]] is
+    if data.len() == 0 is return [] end
+    let header = data[0]
+    let mut idx = -1
+    let mut i = 0
+    while i < header.len() is
+        if header[i] == col is idx = i end
+        i += 1
+    end
+    let mut out: [[string]] = [header]
+    if idx < 0 is return out end
+    let mut r = 1
+    while r < data.len() is
+        if idx < data[r].len() && data[r][idx] == val is out.push(data[r]) end
+        r += 1
+    end
+    return out
+end
+
+;; ── private helpers ──────────────────────────────────────────────────
+fn split_lines(s: string) -> [string] is return __builtin_str_split(s, "\n") end
+fn split_csv_line(s: string) -> [string] is return __builtin_str_split(s, ",") end
+fn strings_join(parts: [string], sep: string) -> string is return __builtin_str_join(parts, sep) end
