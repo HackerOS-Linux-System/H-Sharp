@@ -1,8 +1,70 @@
-;; H# Standard Library — std -> cache
-pub fn new_lru(capacity: int) -> string is return "" end
-pub fn set(cache: string, key: string, val: string) is end
-pub fn get(cache: string, key: string) -> string is return "" end
-pub fn has(cache: string, key: string) -> bool is return false end
-pub fn remove(cache: string, key: string) is end
-pub fn clear(cache: string) is end
-pub fn size(cache: string) -> int is return 0 end
+use "std -> collections" from "col"
+
+struct Cache is
+    pub capacity: int
+    pub map:      any     ;; hashmap<string, string>
+    pub order:    [string] ;; most-recently-used at the end
+end
+
+pub fn new_lru(capacity: int) -> Cache is
+    return Cache { capacity: capacity, map: col::hashmap_new(), order: [] }
+end
+
+fn remove_from_order(order: [string], key: string) -> [string] is
+    let mut out: [string] = []
+    let mut i = 0
+    while i < order.len() is
+        if order[i] != key is out.push(order[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn set(c: Cache, key: string, val: string) -> Cache is
+    let mut map = col::hashmap_insert(c.map, key, val)
+    let mut order = remove_from_order(c.order, key)
+    order.push(key)
+    while order.len() > c.capacity is
+        let evict = order[0]
+        order = remove_from_order(order, evict)
+        map = col::hashmap_remove(map, evict)
+    end
+    return Cache { capacity: c.capacity, map: map, order: order }
+end
+
+;; Returns "" if the key isn't present (use `has` to distinguish that
+;; from a real empty-string value). NOTE: unlike `set`, `get` does not
+;; bump `key` to most-recently-used — see `touch` if that matters to
+;; you, since H#'s value semantics mean a plain `get` can't cheaply
+;; also mutate the cache's recency order the way it would in a
+;; reference-based language.
+pub fn get(c: Cache, key: string) -> string is
+    let v = col::hashmap_get(c.map, key)
+    if v == nil is return "" end
+    return v
+end
+
+;; Explicitly mark `key` as most-recently-used (moves it to the back
+;; of the eviction order) without changing its value.
+pub fn touch(c: Cache, key: string) -> Cache is
+    if !has(c, key) is return c end
+    let mut order = remove_from_order(c.order, key)
+    order.push(key)
+    return Cache { capacity: c.capacity, map: c.map, order: order }
+end
+
+pub fn has(c: Cache, key: string) -> bool is
+    return col::hashmap_contains(c.map, key)
+end
+
+pub fn remove(c: Cache, key: string) -> Cache is
+    return Cache { capacity: c.capacity, map: col::hashmap_remove(c.map, key), order: remove_from_order(c.order, key) }
+end
+
+pub fn clear(c: Cache) -> Cache is
+    return new_lru(c.capacity)
+end
+
+pub fn size(c: Cache) -> int is
+    return c.order.len()
+end
