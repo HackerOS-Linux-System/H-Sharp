@@ -1,21 +1,33 @@
-;; H# Standard Library — std -> process
-
 pub fn run(cmd: string) -> string is
-    return ""
+    return __builtin_process_run(cmd)
 end
+
+;; Run a program directly (no shell) with an explicit argv, and return
+;; its stdout. Prefer this over `run`/`shell` when any argument comes
+;; from untrusted input — it never goes through `sh -c`, so there's no
+;; shell-injection risk.
 pub fn run_args(cmd: string, args: [string]) -> string is
-    return ""
+    return __builtin_process_run_args(cmd, args)
 end
+
+;; Start a command in the background (`sh -c cmd`) without waiting for
+;; it to finish. Returns its PID.
 pub fn spawn(cmd: string) -> int is
-    return 0
+    return __builtin_process_spawn(cmd)
 end
-pub fn kill(pid: int) is end
-pub fn exit_code(pid: int) -> int is
-    return 0
+
+;; Send SIGTERM to a process by PID.
+pub fn kill(pid: int) is
+    __builtin_process_kill(pid)
 end
+
+;; Resolve a command name to its full path via `$PATH` (like the `which`
+;; shell command). Returns "" if not found.
 pub fn which(cmd: string) -> string is
-    return ""
+    return __builtin_process_which(cmd)
 end
+
+;; Alias for `run` — kept for API familiarity with shell scripting.
 pub fn shell(cmd: string) -> string is
-    return ""
+    return __builtin_process_shell(cmd)
 end
