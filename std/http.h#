@@ -1,27 +1,38 @@
-;; H# Standard Library — std -> http
+struct Response is
+    pub status:  int
+    pub body:    string
+end
+
+fn wrap(raw: any) -> Response is
+    return Response { status: raw.status, body: raw.body }
+end
 
 pub fn get(url: string) -> string is
-    return ""
+    return wrap(__builtin_http_request("GET", url, "")).body
 end
+
 pub fn post(url: string, body: string) -> string is
-    return ""
+    return wrap(__builtin_http_request("POST", url, body)).body
 end
+
 pub fn post_json(url: string, json: string) -> string is
-    return ""
+    return post(url, json)
 end
+
 pub fn put(url: string, body: string) -> string is
-    return ""
+    return wrap(__builtin_http_request("PUT", url, body)).body
 end
+
 pub fn delete(url: string) -> string is
-    return ""
+    return wrap(__builtin_http_request("DELETE", url, "")).body
 end
 
-struct Response is
-    pub status: int
-    pub body:   string
-    pub headers: string
-end
-
+;; Full response — status code plus body — for when you need more than
+;; just the body text (e.g. to check for a non-2xx status).
 pub fn get_full(url: string) -> Response is
-    return Response { status: 0, body: "", headers: "" }
+    return wrap(__builtin_http_request("GET", url, ""))
+end
+
+pub fn post_full(url: string, body: string) -> Response is
+    return wrap(__builtin_http_request("POST", url, body))
 end
