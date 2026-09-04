@@ -1,12 +1,54 @@
-;; H# Standard Library — std -> toml
+use "std -> collections" from "col"
 
-pub fn parse(s: string) -> string is return s end
-pub fn stringify(data: string) -> string is return data end
-pub fn get(data: string, key: string) -> string is return "" end
-pub fn get_int(data: string, key: string) -> int is return 0 end
-pub fn get_bool(data: string, key: string) -> bool is return false end
-pub fn get_array(data: string, key: string) -> string is return "" end
-pub fn get_table(data: string, key: string) -> string is return "" end
-pub fn has_key(data: string, key: string) -> bool is return false end
-pub fn read_file(path: string) -> string is return "" end
-pub fn write_file(path: string, data: string) is end
+pub fn parse(data: string) -> any is
+    let lines = __builtin_str_split(data, "\n")
+    let mut map = col::hashmap_new()
+    let mut section = ""
+    let mut i = 0
+    while i < lines.len() is
+        let line = strings_trim(lines[i])
+        i += 1
+        if line == "" || line[0..1] == "#" is continue end
+        if line[0..1] == "[" is
+            let end = __builtin_str_index_of(line, "]")
+            if end > 0 is section = line[1..end] end
+            continue
+        end
+        let eq = __builtin_str_index_of(line, "=")
+        if eq < 0 is continue end
+        let key = strings_trim(line[0..eq])
+        let mut val = strings_trim(line[eq + 1..line.len()])
+        val = unquote(val)
+        let full_key = if section == "" is key else section + "." + key end
+        map = col::hashmap_insert(map, full_key, val)
+        i += 0
+    end
+    return map
+end
+
+fn unquote(s: string) -> string is
+    if s.len() >= 2 && s[0..1] == "\"" && s[s.len()-1..s.len()] == "\"" is
+        return s[1..s.len()-1]
+    end
+    return s
+end
+
+pub fn get(parsed: any, key: string) -> string is
+    let v = col::hashmap_get(parsed, key)
+    if v == nil is return "" end
+    return v
+end
+
+pub fn get_int(parsed: any, key: string) -> int is
+    return __builtin_conv_str_to_int(get(parsed, key))
+end
+
+pub fn get_bool(parsed: any, key: string) -> bool is
+    return get(parsed, key) == "true"
+end
+
+pub fn has(parsed: any, key: string) -> bool is
+    return col::hashmap_contains(parsed, key)
+end
+
+fn strings_trim(s: string) -> string is return __builtin_str_trim(s) end
