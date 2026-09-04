@@ -1,7 +1,3 @@
-;; std -> iter — Iterator utilities
-;; H# Standard Library v0.6
-
-/// Map over an array, applying f to each element.
 pub fn map(arr: [any], f: fn(any) -> any) -> [any] is
     let mut result: [any] = []
     for x in arr is
@@ -10,7 +6,7 @@ pub fn map(arr: [any], f: fn(any) -> any) -> [any] is
     return result
 end
 
-/// Filter an array, keeping elements where f returns true.
+;; Filter an array, keeping elements where f returns true.
 pub fn filter(arr: [any], f: fn(any) -> bool) -> [any] is
     let mut result: [any] = []
     for x in arr is
@@ -21,7 +17,7 @@ pub fn filter(arr: [any], f: fn(any) -> bool) -> [any] is
     return result
 end
 
-/// Reduce (fold) an array to a single value.
+;; Reduce (fold) an array to a single value.
 pub fn reduce(arr: [any], init: any, f: fn(any, any) -> any) -> any is
     let mut acc = init
     for x in arr is
@@ -30,7 +26,7 @@ pub fn reduce(arr: [any], init: any, f: fn(any, any) -> any) -> any is
     return acc
 end
 
-/// Zip two arrays into an array of tuples.
+;; Zip two arrays into an array of tuples.
 pub fn zip(a: [any], b: [any]) -> [(any, any)] is
     let mut result: [(any, any)] = []
     let len = if a.len() < b.len() is a.len() else is b.len() end
@@ -42,7 +38,7 @@ pub fn zip(a: [any], b: [any]) -> [(any, any)] is
     return result
 end
 
-/// Chain two arrays into one.
+;; Chain two arrays into one.
 pub fn chain(a: [any], b: [any]) -> [any] is
     let mut result: [any] = []
     for x in a is result.push(x) end
@@ -50,7 +46,7 @@ pub fn chain(a: [any], b: [any]) -> [any] is
     return result
 end
 
-/// Take first n elements.
+;; Take first n elements.
 pub fn take(arr: [any], n: int) -> [any] is
     let limit = if n < arr.len() is n else is arr.len() end
     let mut result: [any] = []
@@ -62,13 +58,13 @@ pub fn take(arr: [any], n: int) -> [any] is
     return result
 end
 
-/// Skip first n elements.
+;; Skip first n elements.
 pub fn skip(arr: [any], n: int) -> [any] is
     if n >= arr.len() is return [] end
-    return arr[n..]
+    return arr[n..arr.len()]
 end
 
-/// Take elements while predicate is true.
+;; Take elements while predicate is true.
 pub fn take_while(arr: [any], f: fn(any) -> bool) -> [any] is
     let mut result: [any] = []
     for x in arr is
@@ -78,7 +74,7 @@ pub fn take_while(arr: [any], f: fn(any) -> bool) -> [any] is
     return result
 end
 
-/// Drop elements while predicate is true.
+;; Drop elements while predicate is true.
 pub fn drop_while(arr: [any], f: fn(any) -> bool) -> [any] is
     let mut dropping: bool = true
     let mut result: [any] = []
@@ -90,7 +86,7 @@ pub fn drop_while(arr: [any], f: fn(any) -> bool) -> [any] is
     return result
 end
 
-/// Check if any element satisfies predicate.
+;; Check if any element satisfies predicate.
 pub fn any(arr: [any], f: fn(any) -> bool) -> bool is
     for x in arr is
         if f(x) is return true end
@@ -98,7 +94,7 @@ pub fn any(arr: [any], f: fn(any) -> bool) -> bool is
     return false
 end
 
-/// Check if all elements satisfy predicate.
+;; Check if all elements satisfy predicate.
 pub fn all(arr: [any], f: fn(any) -> bool) -> bool is
     for x in arr is
         if !f(x) is return false end
@@ -106,7 +102,7 @@ pub fn all(arr: [any], f: fn(any) -> bool) -> bool is
     return true
 end
 
-/// Count elements satisfying predicate.
+;; Count elements satisfying predicate.
 pub fn count(arr: [any], f: fn(any) -> bool) -> int is
     let mut n: int = 0
     for x in arr is
@@ -115,7 +111,7 @@ pub fn count(arr: [any], f: fn(any) -> bool) -> int is
     return n
 end
 
-/// Find first element satisfying predicate.
+;; Find first element satisfying predicate.
 pub fn find(arr: [any], f: fn(any) -> bool) -> any is
     for x in arr is
         if f(x) is return x end
@@ -123,7 +119,7 @@ pub fn find(arr: [any], f: fn(any) -> bool) -> any is
     return nil
 end
 
-/// Flatten an array of arrays into a single array.
+;; Flatten an array of arrays into a single array.
 pub fn flatten(arr: [[any]]) -> [any] is
     let mut result: [any] = []
     for sub in arr is
@@ -132,7 +128,7 @@ pub fn flatten(arr: [[any]]) -> [any] is
     return result
 end
 
-/// FlatMap: map + flatten.
+;; FlatMap: map + flatten.
 pub fn flat_map(arr: [any], f: fn(any) -> [any]) -> [any] is
     let mut result: [any] = []
     for x in arr is
@@ -141,7 +137,7 @@ pub fn flat_map(arr: [any], f: fn(any) -> [any]) -> [any] is
     return result
 end
 
-/// Create array of n repetitions of val.
+;; Create array of n repetitions of val.
 pub fn repeat(val: any, n: int) -> [any] is
     let mut result: [any] = []
     let mut i: int = 0
@@ -152,7 +148,7 @@ pub fn repeat(val: any, n: int) -> [any] is
     return result
 end
 
-/// Enumerate: returns [(index, value), ...].
+;; Enumerate: returns [(index, value), ...].
 pub fn enumerate(arr: [any]) -> [(int, any)] is
     let mut result: [(int, any)] = []
     let mut i: int = 0
@@ -163,7 +159,7 @@ pub fn enumerate(arr: [any]) -> [(int, any)] is
     return result
 end
 
-/// Partition array into (matching, not-matching) tuple.
+;; Partition array into (matching, not-matching) tuple.
 pub fn partition(arr: [any], f: fn(any) -> bool) -> ([any], [any]) is
     let mut yes: [any] = []
     let mut no:  [any] = []
@@ -173,21 +169,21 @@ pub fn partition(arr: [any], f: fn(any) -> bool) -> ([any], [any]) is
     return (yes, no)
 end
 
-/// Sum integer array.
+;; Sum integer array.
 pub fn sum(arr: [int]) -> int is
     let mut s: int = 0
     for x in arr is s += x end
     return s
 end
 
-/// Product of integer array.
+;; Product of integer array.
 pub fn product(arr: [int]) -> int is
     let mut p: int = 1
     for x in arr is p *= x end
     return p
 end
 
-/// Unique: remove duplicates, preserve order.
+;; Unique: remove duplicates, preserve order.
 pub fn unique(arr: [any]) -> [any] is
     let mut seen: [any] = []
     let mut result: [any] = []
@@ -204,7 +200,7 @@ pub fn unique(arr: [any]) -> [any] is
     return result
 end
 
-/// Reverse an array.
+;; Reverse an array.
 pub fn reverse(arr: [any]) -> [any] is
     let mut result: [any] = []
     let mut i: int = arr.len() - 1
