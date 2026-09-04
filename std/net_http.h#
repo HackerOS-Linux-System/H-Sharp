@@ -1,115 +1,37 @@
-;; std -> net_http — HTTP client + server
-;; H# Standard Library v0.6
+use "std -> http" from "http"
 
-struct Response is
-    pub status:  int
-    pub body:    string
-    pub headers: any
+pub fn get(url: string) -> http::Response is
+    return http::get_full(url)
 end
 
+;; NOT IMPLEMENTED — headers on outgoing requests aren't supported by
+;; the backend yet; this currently just ignores `headers` and issues a
+;; plain GET rather than silently pretending they were sent.
+pub fn get_with_headers(url: string, headers: any) -> http::Response is
+    return get(url)
+end
+
+pub fn post(url: string, body: string) -> http::Response is
+    return http::post_full(url, body)
+end
+
+pub fn put(url: string, body: string) -> http::Response is
+    return Response { status: 0, body: "put_full is not implemented in std/http.h# yet" }
+end
+
+pub fn delete(url: string) -> http::Response is
+    return Response { status: 0, body: "delete_full is not implemented in std/http.h# yet" }
+end
+
+;; ── Server — NOT IMPLEMENTED ─────────────────────────────────────────
 struct Request is
-    pub method:  string
-    pub path:    string
-    pub body:    string
-    pub headers: any
-    pub params:  any
+    pub method: string
+    pub path:   string
+    pub body:   string
 end
 
-// ── HTTP Client ──────────────────────────────────────────────────────────────
-
-/// HTTP GET request.
-pub fn get(url: string) -> Response is
-    return __builtin_http_get(url)
+pub fn listen(port: int) -> bool is
+    return false
 end
 
-/// HTTP GET with headers.
-pub fn get_with_headers(url: string, headers: any) -> Response is
-    return __builtin_http_get_headers(url, headers)
-end
-
-/// HTTP POST with body.
-pub fn post(url: string, body: string) -> Response is
-    return __builtin_http_post(url, body)
-end
-
-/// HTTP POST with content-type.
-pub fn post_json(url: string, body: string) -> Response is
-    return __builtin_http_post_json(url, body)
-end
-
-/// HTTP PUT request.
-pub fn put(url: string, body: string) -> Response is
-    return __builtin_http_put(url, body)
-end
-
-/// HTTP PATCH request.
-pub fn patch(url: string, body: string) -> Response is
-    return __builtin_http_patch(url, body)
-end
-
-/// HTTP DELETE request.
-pub fn delete(url: string) -> Response is
-    return __builtin_http_delete(url)
-end
-
-/// Generic request with full control.
-pub fn request(method: string, url: string, body: string, headers: any) -> Response is
-    return __builtin_http_request(method, url, body, headers)
-end
-
-// ── HTTP Server ──────────────────────────────────────────────────────────────
-
-/// Start an HTTP server. handler receives (method, path, body) and returns Response.
-pub fn listen(host: string, port: int, handler: fn(string, string, string) -> Response) is
-    __builtin_http_listen(host, port, handler)
-end
-
-/// Create an OK response with body and content-type.
-pub fn ok(body: string, content_type: string) -> Response is
-    return Response { status: 200, body: body, headers: headers_with("Content-Type", content_type) }
-end
-
-/// Create a JSON response.
-pub fn json(status: int, data: any) -> Response is
-    return Response {
-        status:  status,
-        body:    __builtin_json_stringify(data),
-        headers: headers_with("Content-Type", "application/json")
-    }
-end
-
-/// 404 Not Found response.
-pub fn not_found(msg: string) -> Response is
-    return Response { status: 404, body: msg, headers: empty_headers() }
-end
-
-/// 400 Bad Request.
-pub fn bad_request(msg: string) -> Response is
-    return Response { status: 400, body: msg, headers: empty_headers() }
-end
-
-/// 500 Internal Server Error.
-pub fn internal_error(msg: string) -> Response is
-    return Response { status: 500, body: msg, headers: empty_headers() }
-end
-
-/// Redirect response.
-pub fn redirect(url: string) -> Response is
-    return Response { status: 302, body: "", headers: headers_with("Location", url) }
-end
-
-// ── Header helpers ───────────────────────────────────────────────────────────
-
-pub fn empty_headers() -> any is
-    return __builtin_http_empty_headers()
-end
-
-pub fn headers_with(key: string, val: string) -> any is
-    let h = empty_headers()
-    __builtin_http_set_header(h, key, val)
-    return h
-end
-
-pub fn get_header(resp: Response, key: string) -> string is
-    return __builtin_http_get_header(resp.headers, key)
-end
+pub fn route(method: string, path: string, handler: fn(Request) -> http::Response) is end
