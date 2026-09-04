@@ -1,22 +1,29 @@
-;; H# Standard Library — std -> net -> tcp
+use "std -> tcp" from "tcp"
 
-struct TcpStream is
-    pub host: string
-    pub port: int
+pub fn connect(host: string, port: int) -> tcp::TcpStream is
+    return tcp::connect(host, port)
 end
 
-pub fn connect(host: string, port: int) -> TcpStream is
-    return TcpStream { host: host, port: port }
+pub fn is_connected(stream: tcp::TcpStream) -> bool is
+    return tcp::is_connected(stream)
 end
 
-pub fn send(stream: TcpStream, data: string) is end
-pub fn recv(stream: TcpStream, size: int) -> string is
-    return ""
+pub fn send(stream: tcp::TcpStream, data: string) -> bool is
+    return tcp::send(stream, data)
 end
-pub fn close(stream: TcpStream) is end
+
+pub fn recv(stream: tcp::TcpStream, size: int) -> string is
+    return tcp::recv(stream, size)
+end
+
+pub fn close(stream: tcp::TcpStream) is
+    tcp::close(stream)
+end
+
 pub fn scan_port(host: string, port: int, timeout_ms: int) -> bool is
-    return false
+    return tcp::scan_port(host, port, timeout_ms)
 end
-pub fn listen(host: string, port: int) -> TcpStream is
-    return TcpStream { host: host, port: port }
+
+pub fn listen(host: string, port: int) -> tcp::TcpStream is
+    return tcp::listen(host, port)
 end
