@@ -1,4 +1,10 @@
-;; H# Standard Library — std -> encoding -> url
+pub fn encode(s: string) -> string is
+    return __builtin_url_encode(s)
+end
 
-pub fn encode(s: string) -> string is return s end
-pub fn decode(s: string) -> string is return s end
+;; Decode a percent-encoded string. "+" is treated as a space, matching
+;; application/x-www-form-urlencoded (the common case for query strings
+;; and form bodies) rather than raw RFC 3986 path decoding.
+pub fn decode(s: string) -> string is
+    return __builtin_url_decode(s)
+end
