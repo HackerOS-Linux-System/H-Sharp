@@ -1,16 +1,30 @@
-;; H# Standard Library — std -> time
-
 pub fn now_unix() -> int is
-    return 0
+    return __builtin_time_now_unix()
 end
+
+;; Current unix timestamp in milliseconds.
 pub fn now_ms() -> int is
-    return 0
+    return __builtin_time_now_ms()
 end
-pub fn sleep_ms(ms: int) is end
-pub fn sleep_s(s: int) is end
+
+pub fn sleep_ms(ms: int) is
+    __builtin_time_sleep_ms(ms)
+end
+
+pub fn sleep_s(s: int) is
+    __builtin_time_sleep_ms(s * 1000)
+end
+
+;; Format a unix timestamp (UTC). Supports %Y %m %d %H %M %S — see
+;; std/date.h#'s doc comment for the same limitation (no timezone
+;; database, no locale names).
 pub fn format(ts: int, fmt: string) -> string is
-    return ""
+    return __builtin_date_format(ts, fmt)
 end
+
+;; Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" into a unix timestamp
+;; (UTC). `fmt` is accepted for API compatibility with `format` but not
+;; otherwise interpreted yet.
 pub fn parse(s: string, fmt: string) -> int is
-    return 0
+    return __builtin_date_parse(s)
 end
