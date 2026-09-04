@@ -1,6 +1,131 @@
-;; H# Standard Library — std -> pdf_gen
-pub fn new_doc() -> string is return "" end
-pub fn add_page(doc: string) -> string is return "" end
-pub fn add_text(page: string, text: string, x: int, y: int) is end
-pub fn add_image(page: string, path: string, x: int, y: int, w: int, h: int) is end
-pub fn save(doc: string, path: string) is end
+use "std -> fs" from "fs"
+
+struct TextLine is
+    pub x:    int
+    pub y:    int
+    pub size: int
+    pub text: string
+end
+
+struct PdfDoc is
+    pub width:  int
+    pub height: int
+    pub lines:  [TextLine]
+end
+
+pub fn new_doc(width: int, height: int) -> PdfDoc is
+    return PdfDoc { width: width, height: height, lines: [] }
+end
+
+pub fn new_letter() -> PdfDoc is
+    return new_doc(612, 792) ;; US Letter, in PDF points (72/inch)
+end
+
+pub fn new_a4() -> PdfDoc is
+    return new_doc(595, 842)
+end
+
+;; Add one line of text. `y` is measured from the *bottom* of the page
+;; (PDF's native coordinate system), so a typical top-down document
+;; should start near `height - 50` and decrease `y` for each line.
+pub fn add_line(doc: PdfDoc, x: int, y: int, size: int, text: string) -> PdfDoc is
+    let mut lines = doc.lines
+    lines.push(TextLine { x: x, y: y, size: size, text: escape_pdf(text) })
+    return PdfDoc { width: doc.width, height: doc.height, lines: lines }
+end
+
+;; Convenience: lay out lines top-down at a fixed size/line-height
+;; starting near the top margin, one call per paragraph of already-
+;; wrapped text (see std -> fmt's `wrap` to pre-wrap long text).
+pub fn add_paragraph(doc: PdfDoc, x: int, top_y: int, size: int, line_height: int, paragraph_lines: [string]) -> PdfDoc is
+    let mut d = doc
+    let mut y = top_y
+    let mut i = 0
+    while i < paragraph_lines.len() is
+        d = add_line(d, x, y, size, paragraph_lines[i])
+        y = y - line_height
+        i += 1
+    end
+    return d
+end
+
+fn escape_pdf(s: string) -> string is
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() is
+        let c = s[i..i+1]
+        if c == "(" || c == ")" || c == "\\" is
+            out = out + "\\" + c
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out
+end
+
+fn content_stream(doc: PdfDoc) -> string is
+    let mut out = ""
+    let mut i = 0
+    while i < doc.lines.len() is
+        let l = doc.lines[i]
+        out = out + "BT /F1 " + to_string(l.size) + " Tf " + to_string(l.x) + " " + to_string(l.y)
+            + " Td (" + l.text + ") Tj ET\n"
+        i += 1
+    end
+    return out
+end
+
+;; Build the full PDF byte stream. Real xref offsets are computed by
+;; tracking `.len()` of the growing output as each object is appended —
+;; a PDF reader validates these, so a wrong offset here would produce a
+;; genuinely broken (not just ugly) file, unlike most of this stdlib's
+;; other "honest placeholder" gaps.
+pub fn build(doc: PdfDoc) -> string is
+    let content = content_stream(doc)
+    let mut out = "%PDF-1.4\n"
+    let mut offsets: [int] = [0] ;; object 0 is the free-list head, offset 0 by convention
+
+    ;; obj 1: Catalog
+    offsets.push(out.len())
+    out = out + "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+
+    ;; obj 2: Pages
+    offsets.push(out.len())
+    out = out + "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+
+    ;; obj 3: Page
+    offsets.push(out.len())
+    out = out + "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + to_string(doc.width) + " " + to_string(doc.height)
+        + "] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n"
+
+    ;; obj 4: Content stream
+    offsets.push(out.len())
+    out = out + "4 0 obj\n<< /Length " + to_string(content.len()) + " >>\nstream\n" + content + "endstream\nendobj\n"
+
+    ;; obj 5: Font
+    offsets.push(out.len())
+    out = out + "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+
+    let xref_offset = out.len()
+    let obj_count = offsets.len()
+    out = out + "xref\n0 " + to_string(obj_count) + "\n"
+    out = out + "0000000000 65535 f \n"
+    let mut i = 1
+    while i < obj_count is
+        out = out + pad10(offsets[i]) + " 00000 n \n"
+        i += 1
+    end
+    out = out + "trailer\n<< /Size " + to_string(obj_count) + " /Root 1 0 R >>\nstartxref\n" + to_string(xref_offset) + "\n%%EOF"
+    return out
+end
+
+fn pad10(n: int) -> string is
+    let mut s = to_string(n)
+    while s.len() < 10 is s = "0" + s end
+    return s
+end
+
+pub fn save(doc: PdfDoc, path: string) is
+    fs::write(path, build(doc))
+end
