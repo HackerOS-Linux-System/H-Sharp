@@ -1,5 +1,5 @@
 # ![H# - Programming Language for HackerOS.](https://github.com/HackerOS-Linux-System/H-Sharp/blob/main/images/logo.png)
-# H# Language — v0.8
+# H# Language — v0.9
 
 **H#** (H-Sharp) to kompilowany język programowania pisany z myślą o HackerOS — bezpieczny, ekstremalnie szybki, z natywnym wsparciem dla cybersecurity, systemów i narzędzi CLI.
 
