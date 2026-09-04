@@ -1,5 +1,55 @@
-;; H# Standard Library — std -> smtp
-pub fn connect(host: string, port: int) -> string is return "" end
-pub fn auth(smtp: string, user: string, pass: string) -> bool is return false end
-pub fn send_mail(smtp: string, from: string, to: string, subject: string, body: string) -> bool is return false end
-pub fn close(smtp: string) is end
+use "std -> tcp" from "tcp"
+
+struct SmtpClient is
+    pub conn: tcp::TcpStream
+end
+
+pub fn connect(host: string, port: int) -> SmtpClient is
+    let c = SmtpClient { conn: tcp::connect(host, port) }
+    ;; consume the server's greeting banner so it doesn't show up as
+    ;; part of the first real command's reply
+    tcp::recv(c.conn, 4096)
+    return c
+end
+
+fn command(c: SmtpClient, line: string) -> string is
+    tcp::send(c.conn, line + "\r\n")
+    return tcp::recv(c.conn, 4096)
+end
+
+fn reply_ok(reply: string) -> bool is
+    ;; SMTP success codes are 2xx; a well-formed reply starts with the
+    ;; 3-digit code.
+    if reply.len() < 3 is return false end
+    let code = reply[0..1]
+    return code == "2"
+end
+
+pub fn close(c: SmtpClient) is
+    command(c, "QUIT")
+    tcp::close(c.conn)
+end
+
+;; Send one plain-text email. Returns whether every step of the
+;; conversation succeeded (HELO, MAIL FROM, RCPT TO, DATA all replied
+;; 2xx).
+pub fn send_mail(host: string, port: int, from: string, to: string, subject: string, body: string) -> bool is
+    let c = connect(host, port)
+    if !reply_ok(command(c, "HELO hsharp")) is close(c) return false end
+    if !reply_ok(command(c, "MAIL FROM:<" + from + ">")) is close(c) return false end
+    if !reply_ok(command(c, "RCPT TO:<" + to + ">")) is close(c) return false end
+    if !reply_ok(command(c, "DATA")) is close(c) return false end
+    let message = "From: " + from + "\r\nTo: " + to + "\r\nSubject: " + subject + "\r\n\r\n" + body + "\r\n.\r\n"
+    tcp::send(c.conn, message)
+    let final_reply = tcp::recv(c.conn, 4096)
+    close(c)
+    return reply_ok(final_reply)
+end
+
+;; Same as `send_mail` but for a locally running relay on the default
+;; unauthenticated SMTP submission port used by most dev mail-catchers
+;; (e.g. MailHog's default is 1025, not the well-known 587/465 which
+;; expect TLS + AUTH this runtime doesn't support).
+pub fn send_local(from: string, to: string, subject: string, body: string) -> bool is
+    return send_mail("localhost", 1025, from, to, subject, body)
+end
