@@ -1,5 +1,57 @@
-;; H# Standard Library — std -> money
-pub fn format_usd(cents: int) -> string is return "" end
-pub fn format_eur(cents: int) -> string is return "" end
-pub fn parse_amount(s: string) -> int is return 0 end
-pub fn convert(amount: int, from_curr: string, to_curr: string, rate: f64) -> int is return 0 end
+fn pad2(n: int) -> string is
+    if n < 10 is return "0" + to_string(n) end
+    return to_string(n)
+end
+
+fn format_cents(cents: int, symbol: string) -> string is
+    let neg = cents < 0
+    let c = if neg is -cents else cents end
+    let dollars = c / 100
+    let rem = c % 100
+    let sign = if neg is "-" else "" end
+    return sign + symbol + to_string(dollars) + "." + pad2(rem)
+end
+
+pub fn format_usd(cents: int) -> string is
+    return format_cents(cents, "$")
+end
+
+pub fn format_eur(cents: int) -> string is
+    return format_cents(cents, "€")
+end
+
+;; Parse a "$12.34" / "12.34" / "-5.00" string into integer cents.
+;; Returns 0 for unparseable input rather than raising.
+pub fn parse_amount(s: string) -> int is
+    let mut t = s
+    if t.len() > 0 && (t[0..1] == "$" || t[0..1] == "€") is t = t[1..t.len()] end
+    let neg = t.len() > 0 && t[0..1] == "-"
+    if neg is t = t[1..t.len()] end
+    let dot = strings_index_of(t, ".")
+    let mut dollars = 0
+    let mut cents = 0
+    if dot < 0 is
+        dollars = __builtin_conv_str_to_int(t)
+    else is
+        dollars = __builtin_conv_str_to_int(t[0..dot])
+        let frac = t[dot + 1..t.len()]
+        if frac.len() == 1 is
+            cents = __builtin_conv_str_to_int(frac) * 10
+        else is
+            if frac.len() >= 2 is
+                cents = __builtin_conv_str_to_int(frac[0..2])
+            end
+        end
+    end
+    let total = dollars * 100 + cents
+    if neg is return -total end
+    return total
+end
+
+;; Convert an integer cents amount using a float exchange rate. Rounds
+;; to the nearest cent.
+pub fn convert(amount: int, from_curr: string, to_curr: string, rate: f64) -> int is
+    return __builtin_conv_float_to_int((amount + 0.0) * rate + 0.5)
+end
+
+fn strings_index_of(s: string, sub: string) -> int is return __builtin_str_index_of(s, sub) end
