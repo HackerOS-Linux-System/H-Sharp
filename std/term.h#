@@ -1,21 +1,93 @@
-;; H# Standard Library — std -> term
-;; Terminal control: size, raw mode, keys
+pub fn width() -> int is
+    let result: ProcResult = proc_run_cmd("stty size -F /dev/tty 2>/dev/null", 2)
+    if result.exit_code != 0 is return 80 end
+    let parts: [string] = str_split(trim(result.stdout), " ")
+    if parts.len() < 2 is return 80 end
+    let w: int = str_to_int(parts[1])
+    if w <= 0 is return 80 end
+    return w
+end
 
-pub fn width() -> int is return 80 end
-pub fn height() -> int is return 24 end
-pub fn is_tty() -> bool is return true end
-pub fn is_dumb() -> bool is return false end
+pub fn height() -> int is
+    let result: ProcResult = proc_run_cmd("stty size -F /dev/tty 2>/dev/null", 2)
+    if result.exit_code != 0 is return 24 end
+    let parts: [string] = str_split(trim(result.stdout), " ")
+    if parts.len() < 1 is return 24 end
+    let h: int = str_to_int(parts[0])
+    if h <= 0 is return 24 end
+    return h
+end
+
+;; [FIXED] a *correct* is_tty needs a native isatty(1) check on this
+;; process's own stdout — shelling out can't answer that (a subprocess
+;; spawned to test it would have ITS OWN stdout piped for capture,
+;; regardless of whether ours is a real terminal, so `test -t 1` run
+;; that way would always say no). Falls back to the same TERM-env
+;; heuristic many real tools use when isatty() isn't available: unset or
+;; "dumb" almost always means non-interactive; anything else usually
+;; means a real terminal. Imperfect (a program can have TERM set while
+;; piped to a file) but not silently wrong the way a self-testing
+;; subprocess would be — and nothing in this codebase currently depends
+;; on this being exact.
+pub fn is_tty() -> bool is
+    let term: string = __builtin_env_get("TERM")
+    return term != "" && term != "dumb"
+end
+
+pub fn is_dumb() -> bool is
+    return !is_tty()
+end
+
+;; ── ANSI escape-sequence helpers (real — these just print, no native
+;; ── primitive needed beyond stdout, which every H# program already has).
+pub fn clear() is
+    write("\x1b[2J\x1b[H")
+end
+
+pub fn clear_line() is
+    write("\r\x1b[2K")
+end
+
+pub fn move_to(x: int, y: int) is
+    write("\x1b[" + to_string(y) + ";" + to_string(x) + "H")
+end
+
+pub fn save_cursor() is
+    write("\x1b[s")
+end
+
+pub fn restore_cursor() is
+    write("\x1b[u")
+end
+
+pub fn hide_cursor() is
+    write("\x1b[?25l")
+end
+
+pub fn show_cursor() is
+    write("\x1b[?25h")
+end
+
+pub fn scroll_up(n: int) is
+    write("\x1b[" + to_string(n) + "S")
+end
+
+pub fn scroll_down(n: int) is
+    write("\x1b[" + to_string(n) + "T")
+end
+
+pub fn set_title(title: string) is
+    write("\x1b]0;" + title + "\x07")
+end
+
+pub fn bell() is
+    write("\x07")
+end
+
+;; ── Raw mode / single-key reads genuinely need termios (tcsetattr) —
+;; ── there is no native `__builtin_term_enable_raw`/`read_key` in this
+;; ── runtime yet, so these are honestly left as documented no-ops
+;; ── instead of a fake implementation that would silently misbehave.
 pub fn enable_raw() is end
 pub fn disable_raw() is end
 pub fn read_key() -> string is return "" end
-pub fn clear() is end
-pub fn clear_line() is end
-pub fn move_to(x: int, y: int) is end
-pub fn save_cursor() is end
-pub fn restore_cursor() is end
-pub fn hide_cursor() is end
-pub fn show_cursor() is end
-pub fn scroll_up(n: int) is end
-pub fn scroll_down(n: int) is end
-pub fn set_title(title: string) is end
-pub fn bell() is end
