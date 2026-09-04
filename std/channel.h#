@@ -1,7 +1,26 @@
-;; H# Standard Library — std -> channel
-pub fn new_chan(capacity: int) -> string is return "" end
-pub fn send(ch: string, val: string) is end
-pub fn recv(ch: string) -> string is return "" end
-pub fn try_recv(ch: string) -> string is return "" end
-pub fn close(ch: string) is end
-pub fn len(ch: string) -> int is return 0 end
+use "std -> sync" from "sync"
+
+pub fn new_chan(capacity: int) -> sync::Channel is
+    return sync::new_channel("chan")
+end
+
+pub fn send(ch: sync::Channel, val: string) -> sync::Channel is
+    return sync::send(ch, val)
+end
+
+pub fn recv(ch: sync::Channel) -> string is
+    return sync::recv(ch)
+end
+
+pub fn try_recv(ch: sync::Channel) -> string is
+    return sync::try_recv(ch)
+end
+
+pub fn close(ch: sync::Channel) -> sync::Channel is
+    return sync::close_channel(ch)
+end
+
+pub fn len(ch: sync::Channel) -> int is
+    if ch.has_value is return 1 end
+    return 0
+end
