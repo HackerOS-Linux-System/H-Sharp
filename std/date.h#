@@ -1,12 +1,47 @@
-;; H# Standard Library — std -> date
-pub fn today() -> string is return "" end
-pub fn now_str() -> string is return "" end
-pub fn parse(s: string) -> int is return 0 end
-pub fn format(ts: int, fmt: string) -> string is return "" end
-pub fn add_days(ts: int, days: int) -> int is return 0 end
-pub fn add_hours(ts: int, hours: int) -> int is return 0 end
-pub fn diff_days(a: int, b: int) -> int is return 0 end
-pub fn year(ts: int) -> int is return 0 end
-pub fn month(ts: int) -> int is return 0 end
-pub fn day(ts: int) -> int is return 0 end
-pub fn weekday(ts: int) -> string is return "" end
+pub fn today() -> string is
+    return format(__builtin_time_now_unix(), "%Y-%m-%d")
+end
+
+pub fn now_str() -> string is
+    return format(__builtin_time_now_unix(), "%Y-%m-%d %H:%M:%S")
+end
+
+;; Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" into a unix timestamp.
+pub fn parse(s: string) -> int is
+    return __builtin_date_parse(s)
+end
+
+pub fn format(ts: int, fmt: string) -> string is
+    return __builtin_date_format(ts, fmt)
+end
+
+pub fn add_days(ts: int, days: int) -> int is
+    return __builtin_date_add_days(ts, days)
+end
+
+pub fn add_hours(ts: int, hours: int) -> int is
+    return __builtin_date_add_hours(ts, hours)
+end
+
+;; Whole days between two timestamps (a - b) / 86400, truncated toward
+;; zero.
+pub fn diff_days(a: int, b: int) -> int is
+    return __builtin_date_diff_days(a, b)
+end
+
+pub fn year(ts: int) -> int is
+    return __builtin_date_year(ts)
+end
+
+pub fn month(ts: int) -> int is
+    return __builtin_date_month(ts)
+end
+
+pub fn day(ts: int) -> int is
+    return __builtin_date_day(ts)
+end
+
+;; Three-letter weekday abbreviation: "Mon".."Sun".
+pub fn weekday(ts: int) -> string is
+    return __builtin_date_weekday(ts)
+end
