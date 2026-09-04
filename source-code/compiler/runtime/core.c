@@ -638,6 +638,122 @@ static hsh_string hsh_exec_argv(char* const argv[]) {
     return buf;
 }
 
+/* [ADDED] `db_query_bind`'s C implementation. The H# std module
+ * (std/db.h#) and the compiler's own builtin registry both already
+ * declared this as an LLVM-backed builtin (`hsh_sqlite_query_bind1/2/3`,
+ * dispatched by arity — see codegen.rs's "db_query_bind" match arm) but
+ * no C definition existed anywhere in this runtime: a real gap, not a
+ * naming mismatch like most of the other "interpreter only" builtins
+ * turned out to be. `std/db.h#`'s doc comment for `query_params` et al.
+ * promises SQL-injection safety "via sqlite3_bind_text" — true
+ * prepared-statement binding against libsqlite3 directly — but linking
+ * a new C library dependency into every H# binary isn't something this
+ * change takes on. Instead, `?` placeholders are substituted with
+ * properly SQL-escaped (quote-doubled) string literals and handed to
+ * the real `sqlite3` CLI via `hsh_exec_argv` above — no shell, so no
+ * shell-injection surface, and every value is always quoted, so no
+ * SQL-injection surface either, just not via the exact binding
+ * mechanism the doc comment describes. A real libsqlite3 FFI link
+ * remains the natural follow-up if this project ever needs it.
+ *
+ * Rows come back one per line, columns tab-separated (`sqlite3
+ * -separator '\t'`), matching what `std/db.h#`'s "array of maps" query
+ * result would need a caller to split apart manually on this backend
+ * (there is no separate row/column decoder builtin here — see hco's
+ * db.h# for the parsing side of this contract). */
+
+/* Escapes a value for embedding as an SQL string literal: wraps it in
+ * single quotes, doubling any embedded single quote (the standard SQL
+ * escaping rule). This is SQL escaping, not shell escaping — the
+ * result is never interpreted by a shell (hsh_exec_argv execvp's
+ * `sqlite3` directly), only by sqlite3's own SQL parser. */
+static char* hsh_sql_escape(const char* s) {
+    if (!s) return strdup("''");
+    size_t n = strlen(s);
+    char* out = (char*)malloc(n * 2 + 3);
+    if (!out) return strdup("''");
+    size_t w = 0;
+    out[w++] = '\'';
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\'') { out[w++] = '\''; out[w++] = '\''; }
+        else out[w++] = s[i];
+    }
+    out[w++] = '\'';
+    out[w] = '\0';
+    return out;
+}
+
+/* Substitutes each `?` in `sql` (in source order) with the
+ * corresponding already-SQL-escaped bind value. A `?` beyond
+ * `n_binds` is left as literal text — sqlite3 itself will then report
+ * a normal "?" syntax error for it, the same way a real prepared
+ * statement would reject a missing binding, rather than this silently
+ * guessing. */
+static char* hsh_sql_bind(const char* sql, char** escaped_binds, int n_binds) {
+    size_t cap = strlen(sql) + 1;
+    for (int i = 0; i < n_binds; i++) cap += strlen(escaped_binds[i]);
+    char* out = (char*)malloc(cap);
+    if (!out) return strdup(sql);
+    size_t w = 0;
+    int bi = 0;
+    for (const char* p = sql; *p; p++) {
+        if (*p == '?' && bi < n_binds) {
+            size_t elen = strlen(escaped_binds[bi]);
+            memcpy(out + w, escaped_binds[bi], elen);
+            w += elen;
+            bi++;
+        } else {
+            out[w++] = *p;
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
+/* Runs `sqlite3 -separator '<tab>' <db> <bound_sql>` via the existing
+ * fork+execvp helper above (no shell involved at all) and returns its
+ * combined stdout/stderr, exactly like `hsh_shell`/`hsh_exec_argv`
+ * already do for every other shelled-out builtin in this runtime. */
+static hsh_string hsh_sqlite_query_bind_n(hsh_string db, hsh_string sql, hsh_string* binds, int n_binds) {
+    if (!db || !sql) return "";
+    char* escaped[3];
+    for (int i = 0; i < n_binds; i++) escaped[i] = hsh_sql_escape(binds[i]);
+    char* bound_sql = hsh_sql_bind(sql, escaped, n_binds);
+    for (int i = 0; i < n_binds; i++) free(escaped[i]);
+
+    char* argv[6];
+    argv[0] = (char*)"sqlite3";
+    argv[1] = (char*)"-separator";
+    argv[2] = (char*)"\t";
+    argv[3] = (char*)db;
+    argv[4] = bound_sql;
+    argv[5] = NULL;
+    hsh_string result = hsh_exec_argv(argv);
+    free(bound_sql);
+    return result;
+}
+
+hsh_string hsh_sqlite_query_bind1(hsh_string db, hsh_string sql, hsh_string b1) {
+    hsh_string binds[1] = { b1 };
+    /* An absent bind arg arrives here as "" (see codegen.rs's str_arg!
+     * macro), which would otherwise consume the first "?" with an
+     * empty-string literal instead of leaving it for sqlite3 to report
+     * — only treat it as a real bind value if the caller actually
+     * passed something non-empty via a 3-arg `db_query_bind` call. */
+    int n = (b1 && b1[0] != '\0') ? 1 : 0;
+    return hsh_sqlite_query_bind_n(db, sql, binds, n);
+}
+
+hsh_string hsh_sqlite_query_bind2(hsh_string db, hsh_string sql, hsh_string b1, hsh_string b2) {
+    hsh_string binds[2] = { b1, b2 };
+    return hsh_sqlite_query_bind_n(db, sql, binds, 2);
+}
+
+hsh_string hsh_sqlite_query_bind3(hsh_string db, hsh_string sql, hsh_string b1, hsh_string b2, hsh_string b3) {
+    hsh_string binds[3] = { b1, b2, b3 };
+    return hsh_sqlite_query_bind_n(db, sql, binds, 3);
+}
+
 /* Read every byte currently available from `fd` into a heap buffer
  * (non-blocking use: caller only calls this once the child is known to
  * have exited or been killed, so a plain blocking read-to-EOF is fine —
@@ -1118,6 +1234,23 @@ int64_t hsh_file_size(hsh_string path) {
 hsh_string hsh_getcwd(void) {
     char buf[4096];
     return getcwd(buf, sizeof(buf)) ? strdup(buf) : "";
+}
+
+/*
+ * hsh_chdir(path) — change the process's current working directory.
+ * Returns 1 on success, 0 on failure (missing/inaccessible path, not a
+ * directory, permissions, etc. — errno is left set by chdir(2) for
+ * whatever diagnostic use a caller might want, same as hsh_rename below
+ * doesn't surface errno either; this matches that existing convention of
+ * "a plain success/fail flag, not a full error channel").
+ *
+ * Previously `fs::chdir` was aliased straight to `fs_cwd` (i.e. it just
+ * read and returned the cwd, silently doing nothing to actually change
+ * it — see interpreter/src/helpers.rs's alias table, now fixed to point
+ * at this real implementation instead of that no-op placeholder).
+ */
+int64_t hsh_chdir(hsh_string path) {
+    return (path && chdir(path) == 0) ? 1 : 0;
 }
 
 int64_t hsh_rename(hsh_string from, hsh_string to) {
