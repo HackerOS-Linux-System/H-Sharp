@@ -1,14 +1,10 @@
-;; std -> sort — Sorting and searching
-;; H# Standard Library v0.6
-
-/// Sort an int array in-place (ascending).
 pub fn sort_ints(arr: [int]) is
     __builtin_sort_ints(arr)
 end
 
-/// Sort an int array in-place (descending).
-pub fn sort_ints_desc(arr: [int]) is
-    sort_ints(arr)
+;; Sort an int array in-place (descending).
+pub fn sort_ints_desc(mut arr: [int]) is
+    arr = sort_ints(arr)
     let mut l: int = 0
     let mut r: int = arr.len() - 1
     while l < r is
@@ -20,18 +16,18 @@ pub fn sort_ints_desc(arr: [int]) is
     end
 end
 
-/// Sort a string array in-place (ascending).
+;; Sort a string array in-place (ascending).
 pub fn sort_strings(arr: [string]) is
     __builtin_sort_strings(arr)
 end
 
-/// Sort an array in-place using a comparator fn.
-/// comparator(a, b) should return negative if a < b, 0 if equal, positive if a > b.
+;; Sort an array in-place using a comparator fn.
+;; comparator(a, b) should return negative if a < b, 0 if equal, positive if a > b.
 pub fn sort_by(arr: [any], cmp: fn(any, any) -> int) is
     __builtin_sort_by(arr, cmp)
 end
 
-/// Sort by a key extractor function (stable).
+;; Sort by a key extractor function (stable).
 pub fn sort_by_key(arr: [any], key_fn: fn(any) -> any) is
     sort_by(arr, |a: any, b: any| -> int is
         let ka = key_fn(a)
@@ -42,7 +38,7 @@ pub fn sort_by_key(arr: [any], key_fn: fn(any) -> any) is
     end)
 end
 
-/// Binary search in a sorted int array. Returns index or -1 if not found.
+;; Binary search in a sorted int array. Returns index or -1 if not found.
 pub fn binary_search(arr: [int], target: int) -> int is
     let mut lo: int = 0
     let mut hi: int = arr.len() - 1
@@ -58,7 +54,7 @@ pub fn binary_search(arr: [int], target: int) -> int is
     return -1
 end
 
-/// Binary search for insertion position (leftmost position where target could be inserted).
+;; Binary search for insertion position (leftmost position where target could be inserted).
 pub fn binary_search_left(arr: [int], target: int) -> int is
     let mut lo: int = 0
     let mut hi: int = arr.len()
@@ -73,12 +69,12 @@ pub fn binary_search_left(arr: [int], target: int) -> int is
     return lo
 end
 
-/// Check if sorted array contains a value.
+;; Check if sorted array contains a value.
 pub fn contains_sorted(arr: [int], target: int) -> bool is
     return binary_search(arr, target) != -1
 end
 
-/// Merge two sorted arrays into one sorted array.
+;; Merge two sorted arrays into one sorted array.
 pub fn merge_sorted(a: [int], b: [int]) -> [int] is
     let mut result: [int] = []
     let mut i: int = 0
@@ -95,7 +91,7 @@ pub fn merge_sorted(a: [int], b: [int]) -> [int] is
     return result
 end
 
-/// Find minimum of an int array. Returns nil if empty.
+;; Find minimum of an int array. Returns nil if empty.
 pub fn min_int(arr: [int]) -> int? is
     if arr.len() == 0 is return nil end
     let mut m: int = arr[0]
@@ -103,7 +99,7 @@ pub fn min_int(arr: [int]) -> int? is
     return m
 end
 
-/// Find maximum of an int array. Returns nil if empty.
+;; Find maximum of an int array. Returns nil if empty.
 pub fn max_int(arr: [int]) -> int? is
     if arr.len() == 0 is return nil end
     let mut m: int = arr[0]
