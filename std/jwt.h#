@@ -1,5 +1,50 @@
-;; H# Standard Library — std -> jwt
-pub fn encode(payload: string, secret: string) -> string is return "" end
-pub fn decode(token: string, secret: string) -> string is return "" end
-pub fn verify(token: string, secret: string) -> bool is return false end
-pub fn get_payload(token: string) -> string is return "" end
+use "std -> json" from "json"
+
+fn header_json() -> string is
+    return "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+end
+
+;; Sign `payload` (a JSON string) with `secret`, producing a complete
+;; "header.payload.signature" JWT.
+pub fn encode(payload: string, secret: string) -> string is
+    let h = __builtin_base64url_encode(header_json())
+    let p = __builtin_base64url_encode(payload)
+    let signing_input = h + "." + p
+    let sig = __builtin_hmac_sha256_b64url(secret, signing_input)
+    return signing_input + "." + sig
+end
+
+fn split_token(token: string) -> [string] is
+    return __builtin_str_split(token, ".")
+end
+
+;; Verify the signature and return the decoded payload JSON, or "" if
+;; the token is malformed or the signature doesn't match.
+pub fn decode(token: string, secret: string) -> string is
+    if !verify(token, secret) is return "" end
+    return get_payload(token)
+end
+
+pub fn verify(token: string, secret: string) -> bool is
+    let parts = split_token(token)
+    if parts.len() != 3 is return false end
+    let signing_input = parts[0] + "." + parts[1]
+    let expected = __builtin_hmac_sha256_b64url(secret, signing_input)
+    return expected == parts[2]
+end
+
+;; Decode the payload without verifying the signature — useful for
+;; inspecting an untrusted token's claims before deciding whether to
+;; call `verify` (e.g. to pick which key/secret to check it against).
+;; Never trust this output for authorization decisions on its own.
+pub fn get_payload(token: string) -> string is
+    let parts = split_token(token)
+    if parts.len() != 3 is return "" end
+    return __builtin_base64url_decode(parts[1])
+end
+
+pub fn get_header(token: string) -> string is
+    let parts = split_token(token)
+    if parts.len() != 3 is return "" end
+    return __builtin_base64url_decode(parts[0])
+end
