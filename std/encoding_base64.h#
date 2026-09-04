@@ -1,14 +1,20 @@
-;; H# Standard Library — std -> encoding -> base64
-
 pub fn encode(data: bytes) -> string is
-    return ""
+    return __builtin_base64_encode(data)
 end
+
+;; Decode a base64 string back to its original text. Returns "" if the
+;; input isn't valid base64 (whitespace and "=" padding are tolerated).
 pub fn decode(s: string) -> string is
-    return ""
+    return __builtin_base64_decode(s)
 end
+
+;; Encode a UTF-8 string's bytes as base64 (convenience over `encode`
+;; for when you already have a `string`, not `bytes`).
 pub fn encode_str(s: string) -> string is
-    return ""
+    return __builtin_base64_encode(string_to_bytes(s))
 end
+
+;; Alias for `decode` — kept for API symmetry with `encode_str`.
 pub fn decode_str(s: string) -> string is
-    return ""
+    return decode(s)
 end
