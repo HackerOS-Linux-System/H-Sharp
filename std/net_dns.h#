@@ -1,12 +1,77 @@
-;; H# Standard Library — std -> net -> dns
+use "std -> net -> ip" from "ip"
 
-pub fn resolve(hostname: string) -> string is return "" end
-pub fn resolve_all(hostname: string) -> string is return "" end
-pub fn reverse_lookup(ip: string) -> string is return "" end
+pub fn resolve(hostname: string) -> string is
+    let all = resolve_all(hostname)
+    if all.len() == 0 is return "" end
+    return all[0]
+end
+
+pub fn resolve_all(hostname: string) -> [string] is
+    let out = __builtin_process_run("getent hosts " + hostname + " 2>/dev/null | awk '{print $1}'")
+    let lines = __builtin_str_split(__builtin_str_trim(out), "\n")
+    let mut result: [string] = []
+    let mut i = 0
+    while i < lines.len() is
+        if lines[i] != "" is result.push(lines[i]) end
+        i += 1
+    end
+    return result
+end
+
+pub fn reverse_lookup(ip: string) -> string is
+    let out = __builtin_process_run("getent hosts " + ip + " 2>/dev/null | awk '{print $2}'")
+    return __builtin_str_trim(out)
+end
+
+;; NOT IMPLEMENTED — `getent` only resolves A/AAAA records; MX/TXT/NS
+;; need a real DNS client speaking the DNS wire protocol (or shelling
+;; out to `dig`, which isn't guaranteed to be installed the way `getent`
+;; is on any glibc system).
 pub fn lookup_mx(domain: string) -> string is return "" end
 pub fn lookup_txt(domain: string) -> string is return "" end
 pub fn lookup_ns(domain: string) -> string is return "" end
-pub fn is_valid_ip(ip: string) -> bool is return false end
-pub fn is_valid_domain(domain: string) -> bool is return false end
-pub fn is_ipv6(ip: string) -> bool is return false end
-pub fn cidr_contains(cidr: string, ip: string) -> bool is return false end
+
+pub fn is_valid_ip(ip: string) -> bool is
+    return ip::is_valid(ip)
+end
+
+pub fn is_ipv6(ip: string) -> bool is
+    return ip::is_ipv6(ip)
+end
+
+;; Real (if simple) hostname syntax check — labels of letters/digits/
+;; hyphens, 1-63 chars each, joined by dots. Doesn't verify the domain
+;; actually resolves; use `resolve` for that.
+pub fn is_valid_domain(domain: string) -> bool is
+    if domain == "" || domain.len() > 253 is return false end
+    let labels = __builtin_str_split(domain, ".")
+    if labels.len() < 2 is return false end
+    let mut i = 0
+    while i < labels.len() is
+        if !is_valid_label(labels[i]) is return false end
+        i += 1
+    end
+    return true
+end
+
+fn is_valid_label(label: string) -> bool is
+    if label.len() == 0 || label.len() > 63 is return false end
+    let mut i = 0
+    while i < label.len() is
+        let c = label[i..i+1]
+        let ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn cidr_contains(cidr: string, ip: string) -> bool is
+    return ip::cidr_network(cidr) == ip::cidr_network(ip + "/" + cidr_prefix(cidr))
+end
+
+fn cidr_prefix(cidr: string) -> string is
+    let parts = __builtin_str_split(cidr, "/")
+    if parts.len() != 2 is return "32" end
+    return parts[1]
+end
