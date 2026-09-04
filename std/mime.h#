@@ -1,5 +1,60 @@
-;; H# Standard Library — std -> mime
-pub fn from_ext(ext: string) -> string is return "" end
-pub fn from_path(path: string) -> string is return "" end
-pub fn is_text(mime: string) -> bool is return false end
-pub fn is_binary(mime: string) -> bool is return false end
+pub fn from_ext(ext: string) -> string is
+    let e = strings_to_lower(ext)
+    if e == "html" || e == "htm"  is return "text/html" end
+    if e == "css"                 is return "text/css" end
+    if e == "js" || e == "mjs"    is return "text/javascript" end
+    if e == "json"                is return "application/json" end
+    if e == "xml"                 is return "application/xml" end
+    if e == "txt"                 is return "text/plain" end
+    if e == "csv"                 is return "text/csv" end
+    if e == "md"                  is return "text/markdown" end
+    if e == "png"                 is return "image/png" end
+    if e == "jpg" || e == "jpeg"  is return "image/jpeg" end
+    if e == "gif"                 is return "image/gif" end
+    if e == "svg"                 is return "image/svg+xml" end
+    if e == "webp"                is return "image/webp" end
+    if e == "ico"                 is return "image/x-icon" end
+    if e == "pdf"                 is return "application/pdf" end
+    if e == "zip"                 is return "application/zip" end
+    if e == "tar"                 is return "application/x-tar" end
+    if e == "gz"                  is return "application/gzip" end
+    if e == "mp3"                 is return "audio/mpeg" end
+    if e == "wav"                 is return "audio/wav" end
+    if e == "mp4"                 is return "video/mp4" end
+    if e == "wasm"                is return "application/wasm" end
+    if e == "woff"                is return "font/woff" end
+    if e == "woff2"               is return "font/woff2" end
+    return "application/octet-stream"
+end
+
+pub fn from_path(path: string) -> string is
+    let dot = last_dot(path)
+    if dot < 0 is return "application/octet-stream" end
+    return from_ext(path[dot + 1..path.len()])
+end
+
+fn last_dot(s: string) -> int is
+    let mut i = s.len() - 1
+    while i >= 0 is
+        if s[i..i+1] == "." is return i end
+        i -= 1
+    end
+    return -1
+end
+
+pub fn is_text(mime: string) -> bool is
+    return strings_starts_with(mime, "text/")
+        || mime == "application/json"
+        || mime == "application/xml"
+        || mime == "image/svg+xml"
+end
+
+pub fn is_binary(mime: string) -> bool is
+    return !is_text(mime)
+end
+
+fn strings_to_lower(s: string) -> string is return __builtin_str_to_lower(s) end
+fn strings_starts_with(s: string, prefix: string) -> bool is
+    if prefix.len() > s.len() is return false end
+    return s[0..prefix.len()] == prefix
+end
