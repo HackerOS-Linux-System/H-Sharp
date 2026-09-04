@@ -1,21 +1,117 @@
-;; H# Standard Library — std -> conv
-;; Konwersje typów
-
 pub fn int_to_str(n: int) -> string is return to_string(n) end
 pub fn float_to_str(f: f64) -> string is return to_string(f) end
+
 pub fn bool_to_str(b: bool) -> string is
     if b is return "true" end
     return "false"
 end
-pub fn str_to_int(s: string) -> int is return 0 end
-pub fn str_to_float(s: string) -> f64 is return 0.0 end
-pub fn str_to_bool(s: string) -> bool is return false end
-pub fn int_to_float(n: int) -> f64 is return 0.0 end
-pub fn float_to_int(f: f64) -> int is return 0 end
-pub fn int_to_hex(n: int) -> string is return "" end
-pub fn int_to_bin(n: int) -> string is return "" end
-pub fn int_to_oct(n: int) -> string is return "" end
-pub fn hex_to_int(s: string) -> int is return 0 end
-pub fn bin_to_int(s: string) -> int is return 0 end
-pub fn char_to_int(c: string) -> int is return 0 end
-pub fn int_to_char(n: int) -> string is return "" end
+
+;; Parse an integer, returning 0 on failure (there is no `Result`/
+;; `Option` return here yet — check `str_is_numeric` first if you need
+;; to distinguish "0" from "not a number").
+;; [FIXED] `__builtin_conv_str_to_int` is interpreter-only on the LLVM
+;; (`--release`) backend (confirmed via a real build failure). The bare
+;; `str_to_int` (no module prefix) is a real, separately LLVM-backed
+;; builtin — same operation, different underlying symbol.
+pub fn str_to_int(s: string) -> int is
+    return str_to_int(s)
+end
+
+pub fn str_to_float(s: string) -> f64 is
+    return __builtin_conv_str_to_float(s)
+end
+
+pub fn str_to_bool(s: string) -> bool is
+    return s == "true" || s == "1" || s == "yes"
+end
+
+;; Note: only `+` supports mixed int/float operands in this interpreter
+;; (see call.rs's `eval_binop`) — `*` requires both sides to already be
+;; the same type, so this goes through `+ 0.0` rather than `* 1.0`.
+pub fn int_to_float(n: int) -> f64 is return n + 0.0 end
+pub fn float_to_int(f: f64) -> int is return __builtin_conv_float_to_int(f) end
+
+pub fn int_to_hex(n: int) -> string is
+    return __builtin_conv_int_to_hex(n)
+end
+
+;; Base-2 string, no "0b" prefix, no leading zeros (except for 0 itself).
+pub fn int_to_bin(n: int) -> string is
+    if n == 0 is return "0" end
+    let mut v = n
+    let neg = v < 0
+    if neg is v = -v end
+    let mut out = ""
+    while v > 0 is
+        if v % 2 == 0 is
+            out = "0" + out
+        else is
+            out = "1" + out
+        end
+        v = v / 2
+    end
+    if neg is return "-" + out end
+    return out
+end
+
+;; Base-8 string, no "0o" prefix.
+pub fn int_to_oct(n: int) -> string is
+    if n == 0 is return "0" end
+    let mut v = n
+    let neg = v < 0
+    if neg is v = -v end
+    let digits = "01234567"
+    let mut out = ""
+    while v > 0 is
+        out = digits[v % 8 .. v % 8 + 1] + out
+        v = v / 8
+    end
+    if neg is return "-" + out end
+    return out
+end
+
+pub fn hex_to_int(s: string) -> int is
+    let digits = "0123456789abcdef"
+    let lower = strings_to_lower(s)
+    let mut result: int = 0
+    let mut i: int = 0
+    while i < lower.len() is
+        let idx = strings_index_of(digits, lower[i..i+1])
+        if idx < 0 is return 0 end
+        result = result * 16 + idx
+        i += 1
+    end
+    return result
+end
+
+pub fn bin_to_int(s: string) -> int is
+    let mut result: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        let c = s[i..i+1]
+        if c != "0" && c != "1" is return 0 end
+        result = result * 2 + (if c == "1" is 1 else 0 end)
+        i += 1
+    end
+    return result
+end
+
+;; ASCII/UTF-8 codepoint of the first character of `c`.
+pub fn char_to_int(c: string) -> int is
+    return __builtin_str_to_char_code(c)
+end
+
+;; Convert a codepoint back to a single-character string.
+pub fn int_to_char(n: int) -> string is
+    return __builtin_char_code_to_str(n)
+end
+
+;; ── small private helpers (avoid a hard `use "std -> strings"` for a
+;; ── couple of one-line calls; these hit the exact same __builtin_*
+;; ── primitives strings.h# does) ─────────────────────────────────────
+fn strings_to_lower(s: string) -> string is
+    return __builtin_str_to_lower(s)
+end
+fn strings_index_of(s: string, sub: string) -> int is
+    return __builtin_str_index_of(s, sub)
+end
