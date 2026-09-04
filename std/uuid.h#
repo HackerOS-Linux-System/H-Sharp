@@ -1,11 +1,39 @@
-;; H# Standard Library — std -> uuid
-;; UUID v4/v5 generation
+pub fn v4() -> string is
+    return __builtin_uuid_v4()
+end
 
-pub fn v4() -> string is return "00000000-0000-4000-0000-000000000000" end
-pub fn v5(namespace: string, name: string) -> string is return v4() end
-pub fn is_valid(s: string) -> bool is return false end
-pub fn parse(s: string) -> string is return s end
-pub fn to_bytes(uuid: string) -> string is return "" end
-pub fn from_bytes(data: string) -> string is return "" end
-pub fn zero_uuid() -> string is return "00000000-0000-0000-0000-000000000000" end
-pub fn is_zero(uuid: string) -> bool is return uuid == zero_uuid() end
+;; v5 (namespace + name, SHA-1 based) is not implemented natively yet —
+;; this runtime has no native RFC-4122-v5 primitive, so rather than
+;; silently return a wrong/fake UUID, this documents the gap by falling
+;; back to a fresh v4 (i.e. NOT deterministic — do not rely on this for
+;; anything that needs the same (namespace, name) to always map to the
+;; same UUID).
+pub fn v5(namespace: string, name: string) -> string is
+    return v4()
+end
+
+;; Structural validation only (36 chars, dashes in the right places,
+;; hex digits elsewhere) — does not verify the version/variant nibbles.
+pub fn is_valid(s: string) -> bool is
+    return __builtin_uuid_is_valid(s)
+end
+
+;; Normalize a UUID string to lowercase (the canonical form).
+pub fn parse(s: string) -> string is
+    return strings_to_lower(s)
+end
+
+pub fn zero_uuid() -> string is
+    return "00000000-0000-0000-0000-000000000000"
+end
+
+pub fn is_zero(uuid: string) -> bool is
+    return parse(uuid) == zero_uuid()
+end
+
+;; Small private helper — `std -> strings` isn't imported here to avoid
+;; a hard dependency for a single lowercase call; this uses the same
+;; `__builtin_str_to_lower` primitive `strings.h#`'s `to_lower` does.
+fn strings_to_lower(s: string) -> string is
+    return __builtin_str_to_lower(s)
+end
