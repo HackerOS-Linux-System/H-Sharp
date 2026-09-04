@@ -1,3 +1,96 @@
-;; H# Standard Library — std -> msgpack
-pub fn encode(data: string) -> string is return "" end
-pub fn decode(data: string) -> string is return "" end
+pub fn encode_nil() -> bytes is
+    return __builtin_bytes_from_ints([192]) ;; 0xc0
+end
+
+pub fn encode_bool(b: bool) -> bytes is
+    if b is return __builtin_bytes_from_ints([195]) end ;; 0xc3 true
+    return __builtin_bytes_from_ints([194]) ;; 0xc2 false
+end
+
+fn int_to_be_bytes(n: int, width: int) -> [int] is
+    let mut out: [int] = []
+    let mut i = width - 1
+    while i >= 0 is
+        out.push((n >> (i * 8)) & 255)
+        i -= 1
+    end
+    return out
+end
+
+;; Encodes as a fixed 64-bit signed int (opcode 0xd3) regardless of
+;; magnitude — always correct, just not maximally compact (a real
+;; encoder would pick fixint/int8/int16/int32 for small values).
+pub fn encode_int(n: int) -> bytes is
+    let mut header = [211] ;; 0xd3 = int64
+    header = header + int_to_be_bytes(n, 8)
+    return __builtin_bytes_from_ints(header)
+end
+
+;; Encodes as str32 (opcode 0xdb) regardless of length — always
+;; correct, just not maximally compact for short strings.
+pub fn encode_string(s: string) -> bytes is
+    let str_bytes = string_to_bytes(s)
+    let len = __builtin_bytes_len(str_bytes)
+    let mut header = [219] ;; 0xdb = str32
+    header = header + int_to_be_bytes(len, 4)
+    return __builtin_bytes_concat(__builtin_bytes_from_ints(header), str_bytes)
+end
+
+;; Encodes as array32 (opcode 0xdd) of int64 elements.
+pub fn encode_int_array(arr: [int]) -> bytes is
+    let mut header = [221] ;; 0xdd = array32
+    header = header + int_to_be_bytes(arr.len(), 4)
+    let mut out = __builtin_bytes_from_ints(header)
+    let mut i = 0
+    while i < arr.len() is
+        out = __builtin_bytes_concat(out, encode_int(arr[i]))
+        i += 1
+    end
+    return out
+end
+
+pub fn encode_string_array(arr: [string]) -> bytes is
+    let mut header = [221]
+    header = header + int_to_be_bytes(arr.len(), 4)
+    let mut out = __builtin_bytes_from_ints(header)
+    let mut i = 0
+    while i < arr.len() is
+        out = __builtin_bytes_concat(out, encode_string(arr[i]))
+        i += 1
+    end
+    return out
+end
+
+;; Decode a single int64 value (opcode 0xd3) from the *start* of
+;; `data`. Returns 0 if `data` doesn't start with that opcode — real
+;; multi-type/multi-value stream decoding is future work (this decodes
+;; exactly one value this encoder actually produces, not the full
+;; MessagePack opcode space).
+pub fn decode_int(data: bytes) -> int is
+    let ints = __builtin_bytes_to_ints(data)
+    if ints.len() < 9 || ints[0] != 211 is return 0 end
+    let mut n = 0
+    let mut i = 1
+    while i <= 8 is
+        n = (n << 8) | ints[i]
+        i += 1
+    end
+    return n
+end
+
+pub fn decode_string(data: bytes) -> string is
+    let ints = __builtin_bytes_to_ints(data)
+    if ints.len() < 5 || ints[0] != 219 is return "" end
+    let len = (ints[1] << 24) | (ints[2] << 16) | (ints[3] << 8) | ints[4]
+    let mut str_ints: [int] = []
+    let mut i = 0
+    while i < len is
+        str_ints.push(ints[5 + i])
+        i += 1
+    end
+    return bytes_to_string(__builtin_bytes_from_ints(str_ints))
+end
+
+fn bytes_to_string(b: bytes) -> string is
+    return __builtin_bytes_to_string(b)
+end
