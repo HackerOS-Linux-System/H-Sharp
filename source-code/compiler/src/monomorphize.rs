@@ -272,9 +272,22 @@ fn collect_in_block(
                 local_types.insert(name.clone(), t);
             }
         }
+        // A `let`'s own declared type is passed down as `expected_ret_ty`
+        // for its *direct* RHS call only (not to nested calls reached via
+        // the recursive walk below, which still pass `None` — see
+        // `infer_type_args`'s doc comment on why this is specifically a
+        // return-type hint, not a general expected-type propagation).
+        // This is what makes `fn make<T>() -> T` callable as
+        // `let x: Foo = make();` — previously `T` only appearing in the
+        // return type always fell through to `stats.unresolved`, even
+        // when the call site trivially spells out the answer right there.
+        let let_expected: Option<HType> = match stmt {
+            Stmt::Let { ty: Some(t), .. } => Some(HType::from_type_expr(t)),
+            _ => None,
+        };
         match stmt {
             Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) | Stmt::Expr(e, _) =>
-            collect_in_expr(e, generic_fns, impls_table, checker, worklist, stats, local_types),
+            collect_in_expr(e, generic_fns, impls_table, checker, worklist, stats, local_types, let_expected.as_ref()),
             _ => {}
         }
     }
@@ -288,11 +301,12 @@ fn collect_in_expr(
     worklist: &mut VecDeque<(String, Vec<HType>)>,
                    stats: &mut MonoStats,
     local_types: &HashMap<String, HType>,
+    expected_ret_ty: Option<&HType>,
 ) {
     if let Expr::Call(callee, args, span) = expr {
         if let Expr::Ident(name, _) = callee.as_ref() {
             if let Some(generic_fn) = generic_fns.get(name) {
-                match infer_type_args(generic_fn, args, checker, local_types) {
+                match infer_type_args(generic_fn, args, checker, local_types, expected_ret_ty) {
                     Some(type_args) => {
                         // See `check_bounds`'s doc comment: this is the
                         // point where a concrete type argument is known
@@ -316,9 +330,12 @@ fn collect_in_expr(
     // top of what's already known — see the shadowing caveat on
     // `collect_generic_uses`'s doc comment — so a plain shared
     // reference is enough; no need to thread a fresh mutable copy per
-    // nested scope for this best-effort pass).
+    // nested scope for this best-effort pass). `expected_ret_ty` is
+    // deliberately *not* forwarded into the recursion — it only applies
+    // to a call that is directly a `let`'s RHS (see above), not to any
+    // call nested inside a larger expression.
     let mut local_types_owned = local_types.clone();
-    walk_sub_exprs(expr, &mut |e| collect_in_expr(e, generic_fns, impls_table, checker, worklist, stats, &local_types_owned));
+    walk_sub_exprs(expr, &mut |e| collect_in_expr(e, generic_fns, impls_table, checker, worklist, stats, &local_types_owned, None));
     walk_sub_blocks(expr, &mut |b| collect_in_block(b, generic_fns, impls_table, checker, worklist, stats, &mut local_types_owned));
 }
 
@@ -330,7 +347,7 @@ fn collect_in_expr(
 /// Returns `None` if any type parameter couldn't be pinned down from the
 /// arguments (e.g. it only appears in the return type) — the caller records
 /// this as `unresolved` for `features.rs` to report.
-fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChecker, local_types: &HashMap<String, HType>) -> Option<Vec<HType>> {
+fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChecker, local_types: &HashMap<String, HType>, expected_ret_ty: Option<&HType>) -> Option<Vec<HType>> {
     let mut resolved: HashMap<String, HType> = HashMap::new();
 
     for (param, arg_expr) in generic_fn.params.iter().zip(call_args.iter()) {
@@ -342,6 +359,20 @@ fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChe
             _ => checker.infer_expr_pub(arg_expr),
         };
         bind_type_param(&param.ty, &arg_ty, &mut resolved);
+    }
+
+    // Fall back to the call site's *expected* type (currently: a `let`
+    // binding's own declared type — see `collect_in_block`/
+    // `rewrite_block_calls`) for any type parameter that only appears in
+    // `generic_fn`'s return type and so couldn't be pinned down from the
+    // arguments above — e.g. `fn make<T>() -> T` called as
+    // `let x: Foo = make();`. Only used to fill gaps the argument pass
+    // left open, never to override a binding already inferred from a
+    // real argument (`or_insert_with` inside `bind_type_param` already
+    // has that "first writer wins" property, so this is safe to just
+    // call unconditionally rather than checking `resolved` first).
+    if let (Some(ret_ty), Some(expected)) = (&generic_fn.return_type, expected_ret_ty) {
+        bind_type_param(ret_ty, expected, &mut resolved);
     }
 
     let mut out = Vec::with_capacity(generic_fn.type_params.len());
@@ -567,20 +598,29 @@ fn rewrite_block_calls(stmts: &mut [Stmt], generic_fns: &HashMap<String, FnDef>,
                 local_types.insert(name.clone(), t);
             }
         }
+        // Mirrors `collect_in_block`'s `let_expected` — must agree with
+        // that pass's inference exactly, or a call site that got resolved
+        // (and queued for instantiation) during collection could be left
+        // un-rewritten here, calling the generic (never-instantiated)
+        // name at codegen time.
+        let let_expected: Option<HType> = match stmt {
+            Stmt::Let { ty: Some(t), .. } => Some(HType::from_type_expr(t)),
+            _ => None,
+        };
         match stmt {
             Stmt::Let { value: Some(e), .. } | Stmt::Return(Some(e), _) |
             Stmt::Expr(e, _) | Stmt::Break(Some(e), _) =>
-            rewrite_expr_calls(e, generic_fns, checker, stats, local_types),
+            rewrite_expr_calls(e, generic_fns, checker, stats, local_types, let_expected.as_ref()),
             _ => {}
         }
     }
 }
 
-fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats, local_types: &mut HashMap<String, HType>) {
+fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats, local_types: &mut HashMap<String, HType>, expected_ret_ty: Option<&HType>) {
     if let Expr::Call(callee, args, _) = expr {
         if let Expr::Ident(name, ident_span) = callee.as_mut() {
             if let Some(generic_fn) = generic_fns.get(name.as_str()) {
-                if let Some(type_args) = infer_type_args(generic_fn, args, checker, local_types) {
+                if let Some(type_args) = infer_type_args(generic_fn, args, checker, local_types, expected_ret_ty) {
                     let suffix = mangle_suffix(&type_args);
                     *name = format!("{}__{}", name, suffix);
                     let _ = ident_span; // span preserved as-is
@@ -593,7 +633,7 @@ fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, che
         }
     }
     let mut local_types_owned = local_types.clone();
-    walk_sub_exprs_mut(expr, &mut |e| rewrite_expr_calls(e, generic_fns, checker, stats, &mut local_types_owned));
+    walk_sub_exprs_mut(expr, &mut |e| rewrite_expr_calls(e, generic_fns, checker, stats, &mut local_types_owned, None));
     walk_sub_blocks_mut(expr, &mut |b| rewrite_block_calls(b, generic_fns, checker, stats, &mut local_types_owned));
 }
 
