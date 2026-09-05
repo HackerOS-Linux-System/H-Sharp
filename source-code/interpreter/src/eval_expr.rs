@@ -43,7 +43,7 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 Literal::Bytes(b) => Value::Bytes(b.clone()),
             }),
             Expr::Ident(name, _) => {
-                if let Some(v) = self.env.get(name).cloned() {
+                if let Some(v) = self.env.get(name) {
                     Ok(v)
                 } else if self.fns.contains_key(name) {
                     let f = self.fns[name].clone();
@@ -87,15 +87,25 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 // module::function(...) call — e.g. json::parse(x), math::sqrt(x)
                 if let Expr::Path(segments, _) = callee.as_ref() {
                     let result = self.call_path(segments, arg_vals)?;
-                    // sort::sort_ints / sort::sort_strings document an
+                    // `sort_ints`/`sort_strings`/`sort_by` document an
                     // in-place mutation API (`sort::sort_ints(arr)` sorts
-                    // `arr` itself, not a copy) — the builtin returns the
-                    // sorted array, and we write it back to the first
-                    // argument's binding if it's a plain named variable,
-                    // mirroring the MethodCall write-back mechanism used
-                    // for collection mutation elsewhere.
-                    let full = segments.join("::");
-                    if matches!(full.as_str(), "sort::sort_ints" | "sort::sort_strings") {
+                    // `arr` itself, not a copy) — the underlying builtin
+                    // actually returns a new sorted array, and we write it
+                    // back to the first argument's binding if it's a plain
+                    // named variable, mirroring the MethodCall write-back
+                    // mechanism used for collection mutation elsewhere.
+                    //
+                    // Matched on the *last path segment* rather than the
+                    // full `module::function` string: `std -> sort` can be
+                    // `use`d under any alias the caller chooses (`from
+                    // "s"`, `from "sorting"`, ...), so hardcoding
+                    // `"sort::sort_ints"` here would silently stop
+                    // write-back from working the moment someone picked a
+                    // different alias than the literal module name — the
+                    // function's own identity (not which namespace it was
+                    // imported under) is what determines whether it's a
+                    // mutating-by-convention builtin.
+                    if matches!(segments.last().map(|s| s.as_str()), Some("sort_ints" | "sort_strings" | "sort_by" | "sort_by_key")) {
                         if let Some(Expr::Ident(name, _)) = args.first() {
                             self.env.set(name, result.clone());
                         }
@@ -123,7 +133,10 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                     .map(|a| self.eval_expr(a))
                     .collect::<Result<_, _>>()?;
 
-                let var_name = if let Expr::Ident(n, _) = obj.as_ref() { Some(n.clone()) } else { None };
+                // (Receiver-place write-back is now handled generically via
+                // `assign_lhs(obj, ...)` below — see its call sites — so
+                // there's no need to special-case a plain-`Ident` receiver
+                // name up front the way this used to.)
 
                 // Case 1: receiver is a struct with a user-defined `impl`
                 // method. Run it with `self` bound, then — if the receiver
@@ -133,9 +146,24 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 if matches!(obj_val, Value::Struct { .. }) {
                     if let Some(result) = self.try_user_method(&obj_val, method, &arg_vals) {
                         let (ret, mutated_self) = result?;
-                        if let Some(name) = &var_name {
-                            self.env.set(name, mutated_self);
-                        }
+                        // Generalized write-back: was previously
+                        // `Expr::Ident`-only, which meant a method call on
+                        // any struct reached through a field
+                        // (`queue._items` is itself fine since that's the
+                        // *method receiver* here being `self`, but the
+                        // *caller-side* receiver being something like
+                        // `container.queue.push(x)` needs this) or index
+                        // expression silently failed to persist the
+                        // mutated `self` anywhere. `assign_lhs` already
+                        // knows how to write back through `Ident`,
+                        // `Ident.field`, and `Ident[index]` places (see
+                        // `Stmt::Assign` handling) — reusing it here
+                        // instead of requiring the narrower `Expr::Ident`
+                        // match fixes that class of bug for every std
+                        // struct with mutating `impl` methods (`Queue`,
+                        // `Stack`, `HashMap`, `HashSet`, ...), not just
+                        // plain top-level variables.
+                        let _ = self.assign_lhs(obj, mutated_self);
                         return Ok(ret);
                     }
                 }
@@ -144,11 +172,14 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 // on a plain named variable — compute the new container
                 // value and write it back into the environment, since this
                 // interpreter passes Value by clone rather than by shared
-                // reference.
-                if let Some(name) = &var_name {
-                    if let Some(new_val) = compute_mutated_container(&obj_val, method, &arg_vals) {
-                        self.env.set(name, new_val);
-                    }
+                // reference. Same generalization as Case 1 above: this
+                // used to require the receiver to be a bare `Expr::Ident`
+                // (so `self._items.push(val)` silently no-op'd inside a
+                // method body — the array got pushed to in isolation and
+                // then thrown away), now routed through `assign_lhs` so a
+                // field or index receiver works too.
+                if let Some(new_val) = compute_mutated_container(&obj_val, method, &arg_vals) {
+                    let _ = self.assign_lhs(obj, new_val);
                 }
                 self.call_method(obj_val, method, arg_vals)
             }
@@ -349,7 +380,7 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 Ok(Value::Nil)
             }
             Expr::SelfExpr(_) => {
-                self.env.get("self").cloned()
+                self.env.get("self")
                     .ok_or_else(|| RuntimeError::UndefinedVar("self".into()))
             }
             Expr::Unsafe(body, _arena_cfg, _) => {
