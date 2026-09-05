@@ -16,6 +16,7 @@ use inkwell::{
 use hsharp_parser::ast::{Module as HshModule, *};
 use hsharp_parser::span::Span;
 use crate::{CompileOptions, OutputKind};
+use crate::target::TargetTriple;
 use crate::llvm_types::htype_to_llvm;
 use crate::builtins::LlvmBuiltins;
 use crate::llvm_optimize::{optimize_module, mark_nounwind};
@@ -204,6 +205,29 @@ impl LlvmCodegen {
             }
         }
 
+        // Collect enum variant arities (bare variant name -> number of
+        // tuple fields; unit variants get 0) so variant construction
+        // (`EnumName::Variant(args)` / bare `EnumName::Variant`) and
+        // destructuring match arms (`Variant(x, y) => ...`) can be
+        // codegen'd — see the long doc comment on `FnCx::enums` for the
+        // uniform-boxing rationale. Named-field variants
+        // (`Variant { x: .. }`) aren't covered by this positional
+        // scheme yet, so they're recorded with arity 0 (bare-tag-only,
+        // same as before this change) rather than guessed at.
+        let mut enum_arity: HashMap<String, usize> = HashMap::new();
+        for item in &m.items {
+            if let Item::EnumDef(ed) = item {
+                for v in &ed.variants {
+                    let arity = match &v.fields {
+                        EnumVariantFields::Unit => 0,
+                        EnumVariantFields::Tuple(tys) => tys.len(),
+                        EnumVariantFields::Struct(_) => 0,
+                    };
+                    enum_arity.insert(v.name.clone(), arity);
+                }
+            }
+        }
+
         // Pass 1: declare signatures for H#-defined functions/methods
         let fns = self.collect_fns(m);
         for f in &fns {
@@ -234,7 +258,7 @@ impl LlvmCodegen {
         for f in &fns {
             let fv = func_vals[&f.name];
             self.compile_fn(ctx, &module, &builder, &builtins, f, fv,
-                            &func_vals, &mut str_globals, &structs, &fn_ret_types)?;
+                            &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity)?;
         }
 
         // Target machine. Cross-compiling (`--target ...` naming
@@ -799,12 +823,14 @@ impl LlvmCodegen {
         str_globals: &mut HashMap<String, PointerValue<'ctx>>,
         structs:     &HashMap<String, Vec<StructField>>,
         fn_ret_types: &HashMap<String, TypeExpr>,
+        enums:       &HashMap<String, usize>,
     ) -> R<()> {
         let entry = ctx.append_basic_block(fv, "entry");
         builder.position_at_end(entry);
 
         let mut vars: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)> = HashMap::new();
         let mut var_types: HashMap<String, String> = HashMap::new();
+        let mut var_tuple_types: HashMap<String, Vec<TypeExpr>> = HashMap::new();
         let mut array_elem_types: HashMap<String, String> = HashMap::new();
         let mut array_elem_llvm_ty: HashMap<String, BasicTypeEnum<'ctx>> = HashMap::new();
         let mut array_elem_type_expr: HashMap<String, TypeExpr> = HashMap::new();
@@ -815,6 +841,9 @@ impl LlvmCodegen {
                 if structs.contains_key(n) {
                     var_types.insert(p.name.clone(), n.clone());
                 }
+            }
+            if let TypeExpr::Tuple(elems) = &p.ty {
+                var_tuple_types.insert(p.name.clone(), elems.clone());
             }
             if let TypeExpr::Array(elem) = &p.ty {
                 if let TypeExpr::Named(n) = elem.as_ref() {
@@ -847,8 +876,9 @@ impl LlvmCodegen {
         let mut cx = FnCx {
             ctx, module, builder, builtins, func_vals, str_globals,
             vars, fn_name: f.name.clone(), ret_type: f.return_type.clone(),
-            structs, var_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
-            fn_ret_types,
+            structs, var_types, var_tuple_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
+            fn_ret_types, enums,
+            fn_aliases: HashMap::new(),
             arc_owned: std::cell::RefCell::new(Vec::new()),
             branch_depth: std::cell::Cell::new(0),
             loop_stack: Vec::new(),
@@ -1167,7 +1197,124 @@ impl LlvmCodegen {
                 .unwrap_or(false)
     }
 
+    /// Resolve which C-compiler-driver binary to invoke for linking (and
+    /// for compiling `runtime/*.c`) against `self.opts.target`, plus any
+    /// extra flags that binary needs to actually target that triple.
+    ///
+    /// Previously every link/compile step in this file unconditionally
+    /// invoked the literal `"cc"` binary — i.e. the *host's* default C
+    /// compiler, with zero connection to whatever `TargetTriple` was
+    /// actually selected via `--target`. For a same-arch/same-OS build
+    /// that's harmless (`cc` already targets the host by definition), but
+    /// for an actual cross-build (e.g. `--target windows-x86_64` from a
+    /// Linux host) it meant either a hard failure (the host `cc` rejects
+    /// `.exe`-shaped output it can't produce) or, worse, a *silent wrong
+    /// binary* if the host toolchain happened to accept the flags anyway
+    /// (a Linux ELF written to a path named `foo.exe`). `TargetTriple`
+    /// carrying a real `llvm_triple` for IR/codegen purposes but never
+    /// being consulted at the *link* step was the actual gap — LLVM
+    /// itself was already emitting object code for the right target, it
+    /// was only ever the final `cc … -o out` step that ignored it.
+    ///
+    /// Resolution order, matching how cross-toolchains conventionally
+    /// present themselves on a dev machine:
+    /// 1. Host-native target (`self.opts.target == TargetTriple::host()`)
+    ///    → just `"cc"`, unchanged behavior, zero risk of regressing the
+    ///    overwhelmingly common non-cross case.
+    /// 2. A triple-prefixed GNU cross-compiler on PATH (e.g.
+    ///    `x86_64-w64-mingw32-gcc`, `aarch64-linux-gnu-gcc`,
+    ///    `riscv64-linux-gnu-gcc`) — the standard naming convention
+    ///    distro cross-toolchain packages install under
+    ///    (`gcc-mingw-w64`, `gcc-aarch64-linux-gnu`, ...). Preferred over
+    ///    clang below because it needs no separate sysroot flag — the
+    ///    prefixed binary already bakes in its own target and default
+    ///    sysroot.
+    /// 3. `clang` with an explicit `-target <llvm_triple>` — works for
+    ///    many host/target pairs out of the box (clang is inherently
+    ///    multi-target) but may still need `--sysroot`/`-L` for a target
+    ///    whose libc isn't installed locally; left to the caller to add
+    ///    if needed (see the `hint` this returns).
+    /// 4. Neither found → a clear, actionable error instead of silently
+    ///    falling back to the host `cc` and producing a wrong-format
+    ///    binary.
+    fn cross_toolchain(&self) -> R<(String, Vec<String>)> {
+        if self.opts.target == TargetTriple::host() {
+            return Ok(("cc".to_string(), vec![]));
+        }
+        if let Some(prefix) = Self::gnu_cross_prefix(&self.opts.target) {
+            let candidate = format!("{}-gcc", prefix);
+            if Self::binary_on_path(&candidate) {
+                return Ok((candidate, vec![]));
+            }
+            // clang can also drive a GNU cross-toolchain's linker/libs via
+            // `--target=<prefix>` without needing the prefixed gcc binary
+            // itself, if only the sysroot/binutils package is installed.
+            if Self::binary_on_path("clang") {
+                return Ok(("clang".to_string(), vec![format!("--target={}", prefix)]));
+            }
+        }
+        if Self::binary_on_path("clang") {
+            return Ok(("clang".to_string(), vec![format!("-target={}", self.opts.target.llvm_triple)]));
+        }
+        Err(CodegenError::Link(format!(
+            "cross-compiling to `{}` needs either a `{}-gcc` cross-toolchain or `clang` on PATH — neither was found. \
+             On Debian/Ubuntu, try: sudo apt install {}",
+            self.opts.target,
+            Self::gnu_cross_prefix(&self.opts.target).unwrap_or_else(|| self.opts.target.llvm_triple.clone()),
+            Self::cross_toolchain_apt_hint(&self.opts.target),
+        )))
+    }
+
+    /// The conventional GNU cross-toolchain triple prefix for a target —
+    /// deliberately *not* always identical to `TargetTriple::llvm_triple`
+    /// (LLVM and GNU binutils/gcc don't always agree on triple spelling,
+    /// e.g. LLVM's `x86_64-pc-windows-msvc` has no GNU-toolchain
+    /// equivalent at all — MSVC targets need MSVC's own `link.exe`/`cl`,
+    /// not a GNU cross-compiler, so that case returns `None` here and
+    /// falls through to the `clang -target` path above instead).
+    fn gnu_cross_prefix(target: &TargetTriple) -> Option<String> {
+        use crate::target::{Arch, Os, Abi};
+        match (&target.arch, &target.os, &target.abi) {
+            (Arch::X86_64, Os::Windows, Abi::Gnu) => Some("x86_64-w64-mingw32".to_string()),
+            (Arch::Aarch64, Os::Windows, Abi::Gnu) => Some("aarch64-w64-mingw32".to_string()),
+            (Arch::Aarch64, Os::Linux, Abi::Gnu) => Some("aarch64-linux-gnu".to_string()),
+            (Arch::Aarch64, Os::Linux, Abi::Musl) => Some("aarch64-linux-musl".to_string()),
+            (Arch::Riscv64, Os::Linux, Abi::Gnu) => Some("riscv64-linux-gnu".to_string()),
+            (Arch::Riscv64, Os::Linux, Abi::Musl) => Some("riscv64-linux-musl".to_string()),
+            (Arch::X86_64, Os::Linux, Abi::Musl) => Some("x86_64-linux-musl".to_string()),
+            _ => None, // MSVC, macOS (needs Xcode's own toolchain, not a GNU cross-compiler), wasm32 (see emit_binary_with_machine's wasm short-circuit — never reaches this)
+        }
+    }
+
+    /// Best-effort `apt install <package>` suggestion for the error
+    /// message in `cross_toolchain` — intentionally approximate/Debian-
+    /// centric (matches this repo's own CI, which is Ubuntu-based; see
+    /// .github/workflows/build.yml) rather than trying to detect the
+    /// user's actual distro and its exact package name, which would need
+    /// a much larger lookup table for a once-in-a-while hint message.
+    fn cross_toolchain_apt_hint(target: &TargetTriple) -> String {
+        use crate::target::{Arch, Os};
+        match (&target.arch, &target.os) {
+            (Arch::X86_64, Os::Windows) | (Arch::Aarch64, Os::Windows) => "gcc-mingw-w64".to_string(),
+            (Arch::Aarch64, Os::Linux) => "gcc-aarch64-linux-gnu".to_string(),
+            (Arch::Riscv64, Os::Linux) => "gcc-riscv64-linux-gnu".to_string(),
+            (Arch::X86_64, Os::Linux) => "musl-tools".to_string(),
+            _ => "clang".to_string(),
+        }
+    }
+
+    fn binary_on_path(name: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+            .unwrap_or(false)
+    }
+
     fn emit_binary_with_machine(&self, module: &Module, machine: &TargetMachine) -> R<()> {
+        // Resolved once per compile — see `cross_toolchain`'s doc comment
+        // for why every `cc` invocation below now goes through this
+        // instead of a hardcoded `"cc"` literal.
+        let (cc_bin, cc_extra) = self.cross_toolchain()?;
+
         // ── Locate the runtime directory ─────────────────────────────────────
         // The runtime/ directory lives next to the compiler binary:
         //   <exe_dir>/runtime/core.c
@@ -1194,48 +1341,86 @@ impl LlvmCodegen {
         // This determines which .c files (and -l flags) are compiled in.
         let (needs_regex, needs_db) = self.detect_runtime_needs();
 
+        // ── regex:: / db:: on the LLVM (AOT) backend ──────────────────────
+        // These used to be backed by `regex.c` (libpcre2) / `sqlite.c`
+        // (libsqlite3) — real C implementations, but *embedded straight
+        // into the compiled binary* as a second, hidden std library,
+        // completely bypassing `std/regex.h#` / `std/db.h#`. Those two
+        // files have been removed from `compiler/runtime/` entirely: the
+        // only std libraries this toolchain ships now are the real
+        // `.h#` sources under `std/`, loaded at `use "std -> x"` time
+        // (see hsharp-interpreter's `helpers.rs` / `interp.rs`).
+        //
+        // The interpreter backend already resolves `regex::`/`db::` this
+        // way (`std/regex.h#` and `std/db.h#` shell out to real
+        // `grep`/`sed`/`sqlite3` via `__builtin_*` — see call.rs). The
+        // LLVM/AOT backend has no equivalent native bridge for those two
+        // yet, so rather than silently produce a binary with a dangling
+        // link against a runtime file that no longer exists (or, worse,
+        // one that resolves `regex::`/`db::` some third, different way),
+        // this fails loudly and points at the backend that *does* work.
+        if needs_regex || needs_db {
+            let which = match (needs_regex, needs_db) {
+                (true, true)  => "`regex ->` and `db ->`",
+                (true, false) => "`regex ->`",
+                _             => "`db ->`",
+            };
+            return Err(CodegenError::Link(format!(
+                "this program uses {which}, which the native AOT (LLVM) backend doesn't support yet.\n\n\
+`regex.c`/`sqlite.c` — the C runtimes that used to provide these — have been removed: H# no \
+longer embeds std libraries straight into the compiler/binary. `std -> regex` and `std -> db` \
+now live purely as real source under /usr/lib/HackerOS/H#/std/{{regex,db}}.h#, and are fully \
+supported by the interpreter backend today.\n\n\
+Run this program with `hsharp preview` (or `hsharp run`) instead of `hsharp build` until the \
+AOT backend grows its own native bridge for these two."
+            )));
+        }
+
         // ── Runtime link flags (built early — used by SharedLib + Binary) ────
         let mut runtime_libs: Vec<String> = Vec::new();
-        if needs_regex {
-            match pkg_config_libs("libpcre2-8") {
-                Some(libs) => runtime_libs.extend(libs),
-                None       => runtime_libs.push("-lpcre2-8".to_string()),
-            }
-        }
-        if needs_db {
-            match pkg_config_libs("sqlite3") {
-                Some(libs) => runtime_libs.extend(libs),
-                None       => runtime_libs.push("-lsqlite3".to_string()),
-            }
-        }
-        // Always link pthreads (needed by async_rt.c) — except on Termux,
-        // where bionic libc has no separate libpthread.so at all (pthread_*
-        // symbols live directly in libc).
-        if !Self::is_termux() {
+        // Always link pthreads (needed by async_rt.c) on Linux — except
+        // on Termux, where bionic libc has no separate libpthread.so at
+        // all (pthread_* symbols live directly in libc). Previously
+        // unconditional except for the Termux check, which meant a
+        // cross-build to Windows/macOS also got a stray `-lpthread`
+        // (harmless for wasm32 — that target skips this whole runtime-C
+        // link step further down — but a real, if minor, link-flag bug
+        // for a normal Windows/macOS cross-build). macOS doesn't need
+        // this at all (pthread symbols are already in libSystem, same
+        // story as `-ldl` elsewhere in this function). Windows/mingw-w64
+        // support for `async_rt.c`'s POSIX pthread calls needs its own
+        // follow-up (likely `-lwinpthread`, not `-lpthread` — mingw-w64's
+        // pthread compatibility layer isn't a drop-in `-lpthread`, and
+        // this hasn't been verified against a real mingw toolchain), so
+        // this deliberately does *not* guess a Windows equivalent rather
+        // than risk silently linking the wrong thing.
+        if !Self::is_termux() && self.opts.target.os == crate::target::Os::Linux {
             runtime_libs.push("-lpthread".to_string());
         }
 
         // ── Compile each runtime C file → object file ────────────────────────
         let mut rt_objects: Vec<String> = Vec::new();
 
-        // wasm32: skip compiling core.c/regex.c/sqlite.c/async_rt.c
-        // entirely. `compile()` in lib.rs already refuses every
-        // OutputKind except Object for wasm32 (see
-        // `CompileError::WasmIncompatible`), and Object output doesn't
-        // use rt_objects at all (they'd just be deleted unused a few
-        // lines below) — so there's nothing that actually needs these
-        // compiled here, and attempting to would fail anyway: core.c's
-        // POSIX headers (`<unistd.h>`, `<sys/wait.h>`, `FILE*`-based
-        // stdio) don't exist for a freestanding wasm32 target,
-        // regardless of which functions in it a given program calls.
+        // wasm32: skip compiling core.c/async_rt.c entirely. `compile()`
+        // in lib.rs already refuses every OutputKind except Object for
+        // wasm32 (see `CompileError::WasmIncompatible`), and Object
+        // output doesn't use rt_objects at all (they'd just be deleted
+        // unused a few lines below) — so there's nothing that actually
+        // needs these compiled here, and attempting to would fail
+        // anyway: core.c's POSIX headers (`<unistd.h>`, `<sys/wait.h>`,
+        // `FILE*`-based stdio) don't exist for a freestanding wasm32
+        // target, regardless of which functions in it a given program
+        // calls.
+        //
+        // `regex.c` / `sqlite.c` used to live here too — removed along
+        // with the `needs_regex`/`needs_db` early-return above; see that
+        // comment for why.
         let rt_files: &[(&str, bool, &[&str])] = if self.opts.target.is_wasm() {
             &[]
         } else {
         &[
             // (filename, always_include, extra_packages_for_pkg_config)
             ("core.c",     true,         &[]),
-            ("regex.c",    needs_regex,  &["libpcre2-8"]),
-            ("sqlite.c",   needs_db,     &["sqlite3"]),
             // async runtime — always included; links -lpthread
             ("async_rt.c", true,         &[]),
         ]
@@ -1282,19 +1467,13 @@ impl LlvmCodegen {
                 obj_str.clone(),
             ]);
 
-            let ok = std::process::Command::new("cc")
+            let ok = std::process::Command::new(&cc_bin)
+                .args(&cc_extra)
                 .args(&cflags)
                 .status()?.success();
             if !ok {
-                let hint = if *fname == "regex.c" {
-                    " — is libpcre2-dev installed? (sudo apt install libpcre2-dev)"
-                } else if *fname == "sqlite.c" {
-                    " — is libsqlite3-dev installed? (sudo apt install libsqlite3-dev)"
-                } else {
-                    " — check that cc/gcc is installed"
-                };
                 return Err(CodegenError::Link(
-                    format!("runtime compile failed ({}){}", fname, hint)
+                    format!("runtime compile failed ({}) — check that cc/gcc is installed", fname)
                 ));
             }
             rt_objects.push(obj_str);
@@ -1343,12 +1522,19 @@ impl LlvmCodegen {
                 let so_suffix = self.opts.output_kind.file_suffix(&self.opts.target);
                 let out = format!("{}{}", self.opts.output, so_suffix);
                 let extern_args = self.link_flags.borrow().to_cc_args();
-                let mut cmd = std::process::Command::new("cc");
+                let mut cmd = std::process::Command::new(&cc_bin);
+                cmd.args(&cc_extra);
                 cmd.arg("-shared").arg("-fPIC");
                 cmd.arg(&obj_path);
                 for rt_o in &rt_objects { cmd.arg(rt_o); }
                 cmd.arg("-o").arg(&out);
-                if !Self::is_termux() { cmd.args(["-lm", "-lpthread", "-ldl"]); }
+                // Same Linux-only-flags fix as the main binary link path
+                // below (see its longer comment on `linux_only_flags`).
+                if !Self::is_termux() && self.opts.target.os == crate::target::Os::Linux {
+                    cmd.args(["-lm", "-lpthread", "-ldl"]);
+                } else if self.opts.target.os == crate::target::Os::MacOS {
+                    cmd.arg("-lm");
+                }
                 for lib in &runtime_libs { cmd.arg(lib); }
                 for a in &extern_args    { cmd.arg(a); }
                 if self.opts.optimize { cmd.arg("-O2"); }
@@ -1381,13 +1567,27 @@ impl LlvmCodegen {
 
         let extern_args = self.link_flags.borrow().to_cc_args();
 
-        let mut cmd = std::process::Command::new("cc");
+        let mut cmd = std::process::Command::new(&cc_bin);
+        cmd.args(&cc_extra);
         cmd.arg(&obj_path);
         for rt_o in &rt_objects { cmd.arg(rt_o); }
         cmd.arg("-o").arg(&out);
         let on_termux = Self::is_termux();
-        if !on_termux { cmd.arg("-no-pie"); }
-        if !on_termux { cmd.args(["-lm", "-lpthread", "-ldl"]); }
+        // These are all GNU/Linux-`cc`-specific: `-no-pie` is a GNU ld
+        // flag mingw-w64/lld-link don't recognize the same way, and
+        // `-lpthread`/`-ldl` name ELF shared objects that don't exist on
+        // a Windows/macOS target (Windows threading/dynamic-loading is
+        // baked into the CRT already; macOS's libSystem similarly
+        // doesn't split these out). Previously gated only on `!on_termux`
+        // — correct for "don't do this on Android," but not for "don't
+        // do this when cross-compiling to a non-Linux target," which
+        // silently broke Windows/macOS cross-links even before they got
+        // as far as needing the right cross-`cc` binary (see
+        // `cross_toolchain`'s doc comment for that half of this fix).
+        let linux_only_flags = !on_termux && self.opts.target.os == crate::target::Os::Linux;
+        if linux_only_flags { cmd.arg("-no-pie"); }
+        if linux_only_flags { cmd.args(["-lm", "-lpthread", "-ldl"]); }
+        else if self.opts.target.os == crate::target::Os::MacOS { cmd.arg("-lm"); } // libpthread/libdl are part of libSystem on macOS already — only libm needs to be named explicitly
         for lib in &runtime_libs { cmd.arg(lib); }
         for a in &extern_args    { cmd.arg(a); }
         if self.opts.optimize {
@@ -1400,12 +1600,14 @@ impl LlvmCodegen {
 
         let result = cmd.output()?;
         if !result.status.success() {
-            let mut cmd2 = std::process::Command::new("cc");
+            let mut cmd2 = std::process::Command::new(&cc_bin);
+            cmd2.args(&cc_extra);
             cmd2.arg(&obj_path);
             for rt_o in &rt_objects { cmd2.arg(rt_o); }
             cmd2.arg("-o").arg(&out);
-            if !on_termux { cmd2.arg("-no-pie"); }
-            if !on_termux { cmd2.args(["-lm", "-lpthread", "-ldl"]); }
+            if linux_only_flags { cmd2.arg("-no-pie"); }
+            if linux_only_flags { cmd2.args(["-lm", "-lpthread", "-ldl"]); }
+            else if self.opts.target.os == crate::target::Os::MacOS { cmd2.arg("-lm"); }
             for lib in &runtime_libs { cmd2.arg(lib); }
             for a in &extern_args    { cmd2.arg(a); }
             if self.opts.optimize { cmd2.arg("-O2"); }
@@ -1427,7 +1629,22 @@ impl LlvmCodegen {
         }
 
         if self.opts.optimize {
-            let _ = std::process::Command::new("strip")
+            // Same cross-toolchain concern as `cc` (see `cross_toolchain`'s
+            // doc comment) — a foreign-architecture object stripped with
+            // the *host's* `strip` is lower-risk than the `cc` case (GNU
+            // binutils is usually built with every BFD backend enabled,
+            // and an unrecognized format is a clean, loud failure rather
+            // than silently-wrong output), but still worth getting right:
+            // prefer the matching `<prefix>-strip` when cross-compiling
+            // and it's actually on PATH, falling back to the host `strip`
+            // (previous, unconditional behavior) otherwise rather than
+            // hard-erroring over what `--strip-all`/`--strip-unneeded`
+            // are ultimately just a size optimization, not correctness.
+            let strip_bin = Self::gnu_cross_prefix(&self.opts.target)
+                .map(|p| format!("{}-strip", p))
+                .filter(|s| Self::binary_on_path(s))
+                .unwrap_or_else(|| "strip".to_string());
+            let _ = std::process::Command::new(&strip_bin)
             .args(["--strip-all", "--strip-unneeded", &out])
             .status();
         }
@@ -1450,8 +1667,53 @@ impl LlvmCodegen {
     }
 }
 
-/// Walk an Item and set `has_regex`/`has_db` if `regex::` or `db::` paths
-/// are found anywhere inside (expressions, sub-items, nested blocks).
+/// Walk an Item and set `has_regex`/`has_db` if `regex::`/`db::` paths, OR
+/// the actual bare builtin call names those modules compile down to, are
+/// found anywhere inside (expressions, sub-items, nested blocks).
+///
+/// # BUG FIX — bare builtin calls never tripped this scan
+/// `std -> regex`'s own wrapper functions (`is_match`, `find`, ...) call
+/// unimplemented `__builtin_regex_*` intrinsics with no codegen backend
+/// at all, so the *only* regex path that actually compiles and links is
+/// calling the bare builtins directly: `regex_match(...)`, `regex_find`,
+/// `regex_replace` (same story for `db`: `sqlite_open`/`sqlite_exec`/
+/// `sqlite_query`/`sqlite_close`). But this scan only ever checked for a
+/// path whose *first segment* is exactly `"regex"` / `"db"` — i.e.
+/// module-qualified calls like `regex::foo(...)` — never the bare names.
+/// A program that (correctly) calls `regex_match(...)` directly therefore
+/// got `needs_regex == false`, so `runtime/regex.c` was never compiled in
+/// and `-lpcre2-8` never linked, and the call site was left referencing a
+/// symbol (`hsh_regex_match`) that plain doesn't exist in the final
+/// binary — undefined reference at link time. Recognizing the real bare
+/// names fixes that without touching the (separately broken)
+/// `std -> regex`/`std -> sqlite` wrapper modules at all.
+fn is_bare_regex_builtin(name: &str) -> bool {
+    // Also matches the `__builtin_`-prefixed spellings `std/regex.h#`
+    // actually calls today (see `ModuleResolver::resolve_std_import` in
+    // `modules.rs` — `use "std -> regex"` now really inlines that file's
+    // wrapper functions instead of being a no-op). Without this, a
+    // program written the "correct", `use`-based way would sail past
+    // this scanner (`needs_regex` staying `false`) and go straight to a
+    // raw "undefined reference to hsh_regex_match" linker error instead
+    // of the clear "AOT doesn't support regex:: yet" message
+    // `emit_binary_with_machine` gives when `needs_regex` is `true` —
+    // exactly the failure mode this whole scanner exists to prevent.
+    matches!(
+        name,
+        "regex_match" | "regex_find" | "regex_replace" |
+        "__builtin_regex_match" | "__builtin_regex_find" |
+        "__builtin_regex_find_all" | "__builtin_regex_replace" |
+        "__builtin_regex_replace_all" | "__builtin_regex_split"
+    )
+}
+fn is_bare_db_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "sqlite_open" | "sqlite_exec" | "sqlite_query" | "sqlite_close" |
+        "__builtin_db_open" | "__builtin_db_exec" | "__builtin_db_query" | "__builtin_db_close"
+    )
+}
+
 fn scan_item_features(item: &Item, has_regex: &mut bool, has_db: &mut bool) {
     match item {
         Item::FnDef(f) => {
@@ -1483,14 +1745,37 @@ fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
     if *has_regex && *has_db { return; }
     match expr {
         Expr::Call(callee, args, _) => {
-            if let Expr::Path(segs, _) = callee.as_ref() {
-                if !segs.is_empty() {
+            // BUG FIX (round 2): the previous fix checked
+            // `Expr::Path(segs, _)` for the bare builtin names too, but
+            // per this AST's own doc comment `Path` is ONLY ever a
+            // qualified `module::function` reference. An unqualified
+            // call like `regex_match(a, b)` — the one call style that
+            // actually has a working codegen backend — parses as
+            // `Expr::Ident("regex_match", span)`, a completely separate
+            // variant. So the round-1 fix's new match arms were dead
+            // code: they lived inside a branch that bare calls never
+            // take at all, which is exactly why the link error came
+            // back byte-for-byte identical after rebuilding. Checking
+            // `Expr::Ident` here (in addition to `Path`, kept for any
+            // future/other qualified callers) is the actual fix.
+            match callee.as_ref() {
+                Expr::Path(segs, _) if !segs.is_empty() => {
                     match segs[0].as_str() {
                         "regex" => *has_regex = true,
                         "db"    => *has_db = true,
+                        s if is_bare_regex_builtin(s) => *has_regex = true,
+                        s if is_bare_db_builtin(s)    => *has_db = true,
                         _       => {}
                     }
                 }
+                Expr::Ident(name, _) => {
+                    match name.as_str() {
+                        s if is_bare_regex_builtin(s) => *has_regex = true,
+                        s if is_bare_db_builtin(s)    => *has_db = true,
+                        _       => {}
+                    }
+                }
+                _ => {}
             }
             scan_expr_features(callee, has_regex, has_db);
             for a in args { scan_expr_features(a, has_regex, has_db); }
@@ -1500,8 +1785,21 @@ fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
                 match segs[0].as_str() {
                     "regex" => *has_regex = true,
                     "db"    => *has_db = true,
+                    s if is_bare_regex_builtin(s) => *has_regex = true,
+                    s if is_bare_db_builtin(s)    => *has_db = true,
                     _       => {}
                 }
+            }
+        }
+        // A bare builtin name referenced without being called (not
+        // actually how regex_match/sqlite_open etc. are used anywhere
+        // in practice, but matched for the same completeness the `Path`
+        // arm above already has for module-qualified names).
+        Expr::Ident(name, _) => {
+            match name.as_str() {
+                s if is_bare_regex_builtin(s) => *has_regex = true,
+                s if is_bare_db_builtin(s)    => *has_db = true,
+                _       => {}
             }
         }
         Expr::MethodCall(obj, _, args, _) => {
@@ -1653,6 +1951,35 @@ struct FnCx<'ctx, 'a> {
     /// scanning every struct for a field with a matching name (see
     /// `infer_struct_name` / the FieldAccess arm in `expr()`).
     var_types:   HashMap<String, String>,
+    /// Parallel to `var_types`, but for TUPLE-typed bindings (`let x:
+    /// (T1, T2) = ...`). Tuples aren't registered in `self.structs` (they
+    /// have no name), so `var_types`/`infer_struct_name` can never track
+    /// them — every `.0`/`.1` access on a tuple fell all the way through
+    /// to the "scan every struct for a matching field name" fallback,
+    /// which can never succeed (real struct fields are never named "0" or
+    /// "1"), silently defaulting to field index 0 for *every* numeric
+    /// access regardless of which index was actually requested — so
+    /// `t.0` and `t.1` returned the exact same (wrong, uncoerced) value.
+    /// See `infer_tuple_elem_types` and the numeric-field-name branch of
+    /// the `FieldAccess` codegen arm for the fix built on top of this.
+    var_tuple_types: HashMap<String, Vec<TypeExpr>>,
+    /// Local variable name -> real top-level function name, for the case
+    /// where the variable was initialized from a bare function reference
+    /// (`let f = add;`, optionally chained through further `let g = f;`
+    /// aliasing). `Expr::Call`'s `Expr::Ident` callee arm consults this
+    /// *before* falling back to `call_fn(name, ...)`, so `f(1, 2)`
+    /// through such a variable resolves to a direct, ABI-correct call to
+    /// `add` — a compile-time-resolved ("devirtualized") implementation
+    /// of "function value stored in a variable", rather than a genuine
+    /// runtime function-pointer dereference. This deliberately does not
+    /// cover a variable that could hold *different* functions depending
+    /// on a runtime branch (`let f = if c is add else sub end`) — that
+    /// needs a real boxed function value with a uniform call ABI (the
+    /// closure trampoline machinery already scaffolded in
+    /// `compiler/runtime/core.c` as `hsh_closure_create`/
+    /// `hsh_closure_call1/2`, but never actually wired up anywhere in
+    /// this file — a separate, larger follow-up).
+    fn_aliases:  HashMap<String, String>,
     /// Companion to `var_types`, but for the *element* type of an
     /// array-typed variable/parameter (`[Foo]`) rather than the
     /// variable's own type — e.g. `entries: [HackerEntry]` records
@@ -1685,6 +2012,43 @@ struct FnCx<'ctx, 'a> {
     /// comment for the broader "avoid the scan-every-struct guess" goal
     /// this and `array_elem_types` are both part of.
     fn_ret_types: &'a HashMap<String, TypeExpr>,
+    /// Enum variant name -> arity (number of positional/tuple fields),
+    /// collected once from the module's `Item::EnumDef` items (see
+    /// `build_module`), keyed by *bare* variant name (matching how
+    /// `Pattern::Enum { variant, .. }` already only carries the bare
+    /// name, not the qualified `EnumName::Variant` form — see that
+    /// pattern's existing tag-comparison arm in `compile_pattern_cond`).
+    /// Drives both variant *construction* (`EnumName::Variant(args)` /
+    /// bare `EnumName::Variant`) and *destructuring* match arms
+    /// (`Variant(x, y) => ...`) — see the `Expr::Path`/`Expr::Call`
+    /// arms in `expr()` and the `Pattern::Enum` arm in
+    /// `compile_pattern_cond`/`bind_pattern_vars`.
+    ///
+    /// Every enum value (unit variants included) is uniformly boxed as
+    /// an `HshArray` of `[tag_string, field0, field1, ...]` — a unit
+    /// variant is just a 1-element array holding only its tag. This is
+    /// deliberate, not incidental: match arms don't know at codegen
+    /// time which variant a subject value *actually* holds at runtime,
+    /// so every arm's condition gets compiled (though only the one
+    /// whose predecessor conditions all failed actually *executes* at
+    /// runtime). If unit variants stayed encoded as bare `char*` (the
+    /// old encoding) while payload variants were boxed arrays, a
+    /// payload-pattern arm listed *before* the arm that actually
+    /// matches would run `hsh_array_get` on what is really a raw
+    /// string pointer — reading `len`/`data` off of unrelated string
+    /// bytes, an out-of-bounds/undefined-behavior read. Uniform boxing
+    /// makes `hsh_array_get(subj, 0)` (the tag read every arm's
+    /// condition starts with) safe unconditionally, regardless of arm
+    /// order or which variant the subject actually holds.
+    ///
+    /// Known consequence: `write(some_enum_value)`/`to_string` on a
+    /// *bare* (unit-variant) enum value no longer prints the tag name
+    /// directly (it now prints the boxed array's pointer, same as any
+    /// other array today) — `hsh_val_to_str` doesn't yet special-case
+    /// a 1-element array-of-one-string as "just print that string".
+    /// Flagged as a follow-up rather than fixed here to keep this
+    /// change focused on match-arm safety.
+    enums: &'a HashMap<String, usize>,
     /// This function's `@arena`/`@safety`/`@arc`/`@pointers`/`@default`
     /// annotation. `Arena` and `Arc` change codegen behavior (see
     /// `compile_fn`'s prologue and `build_return_coerced`'s epilogue);
@@ -1791,6 +2155,99 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     /// callers fall back to the old any-struct scan in that case, but should
     /// surface a compile-time warning when they do, since that fallback can
     /// be wrong.
+    /// Tuple counterpart to `infer_struct_name` — resolves the *element
+    /// types* of a tuple-valued expression, so `.0`/`.1`/... field access
+    /// on it can be coerced to the right type instead of falling through
+    /// to the (always-wrong-for-tuples) scan-every-struct fallback. See
+    /// `var_tuple_types`'s doc comment for the full story.
+    ///
+    /// Handles a bare identifier (`var_tuple_types` lookup) and a direct
+    /// call to a plain-`Ident`-or-`module::fn`-named function whose
+    /// declared return type is itself a tuple — the two shapes every
+    /// tuple-returning call site in practice actually uses (either
+    /// `let t: (A, B) = f(...)` then `t.0`, or `f(...).0` directly).
+    fn infer_tuple_elem_types(&self, e: &Expr) -> Option<Vec<TypeExpr>> {
+        match e {
+            Expr::Ident(name, _) => self.var_tuple_types.get(name).cloned(),
+            Expr::Call(callee, _, _) => {
+                let fn_name = match callee.as_ref() {
+                    Expr::Ident(n, _) => Some(n.clone()),
+                    Expr::Path(segments, _) => {
+                        let snake = segments.join("_");
+                        if self.fn_ret_types.contains_key(&snake) {
+                            Some(snake)
+                        } else {
+                            segments.last().cloned()
+                        }
+                    }
+                    _ => None,
+                };
+                match fn_name.and_then(|n| self.fn_ret_types.get(&n)) {
+                    Some(TypeExpr::Tuple(elems)) => Some(elems.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Best-effort, conservative check for "this expression is DEFINITELY
+    /// an `int`" — used by `to_string()`'s codegen (see that arm) to
+    /// bypass `hsh_val_to_str`, a purely-runtime, bits-only heuristic
+    /// that guesses "int vs. string pointer" from the numeric MAGNITUDE
+    /// of the raw i64 alone: values `<= 0x10000` or `>= 0x7ffffffffffe`
+    /// are treated as ints, but anything in between is blindly
+    /// dereferenced as a string pointer. Ordinary "large but not
+    /// pointer-huge" integers fall squarely in that dangerous middle
+    /// range purely by coincidence of their magnitude — a Unix
+    /// millisecond timestamp from `time_ms()` (~1.7 x 10^12 as of 2026)
+    /// being the textbook example — and crash with a SIGSEGV dereferencing
+    /// an address that was never a pointer at all.
+    ///
+    /// This only returns `true` for cases codegen can prove int-typed
+    /// without a general expression-type-inference pass (which doesn't
+    /// exist in this file — see `infer_struct_name`/`infer_tuple_elem_types`
+    /// for the same "narrow, purpose-built inference" pattern applied to
+    /// struct/tuple types instead of primitives): integer literals, and
+    /// direct calls to a function (builtin or user-defined) whose return
+    /// type is `int`. Anything else (variables, arithmetic, nested calls
+    /// through an alias, etc.) falls back to the existing `hsh_val_to_str`
+    /// behavior unchanged — this is additive, not a general fix for every
+    /// possible `to_string()` call shape.
+    fn is_definitely_int(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Literal(Literal::Int(_), _) => true,
+            Expr::Call(callee, _, _) => {
+                let fn_name = match callee.as_ref() {
+                    Expr::Ident(n, _) => Some(n.clone()),
+                    Expr::Path(segments, _) => {
+                        let snake = segments.join("_");
+                        if self.fn_ret_types.contains_key(&snake) { Some(snake) }
+                        else { segments.last().cloned() }
+                    }
+                    _ => None,
+                };
+                // User-defined functions: check the real declared return type.
+                if let Some(n) = &fn_name {
+                    if let Some(TypeExpr::Named(t)) = self.fn_ret_types.get(n) {
+                        if t.as_str() == "int" { return true; }
+                    }
+                }
+                // Builtins with no entry in `fn_ret_types` (it's populated
+                // from user `fn` declarations, not the builtin table) —
+                // every builtin that unconditionally returns `int`.
+                const INT_BUILTINS: &[&str] = &[
+                    "time_ms", "now_ms", "proc_id", "len", "array_len",
+                    "string_len", "strlen", "string_find", "string_rfind",
+                    "index_of", "rindex_of", "string_to_int", "to_int",
+                    "float_to_int", "hash", "random_int", "count",
+                ];
+                fn_name.map(|n| INT_BUILTINS.contains(&n.as_str())).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
     fn infer_struct_name(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::StructLit(name, _, _) => Some(name.clone()),
@@ -2024,6 +2481,25 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         p
     }
 
+    /// Build a boxed enum value: `HshArray* [tag_string, field0, field1, ...]`.
+    /// Used by both variant *construction* sites (bare `EnumName::Variant`
+    /// and `EnumName::Variant(args...)` in `expr()`) — see the long doc
+    /// comment on `FnCx::enums` for why *every* variant (including unit
+    /// ones) is boxed this way rather than only variants that carry a
+    /// payload.
+    fn build_enum_variant(&mut self, variant: &str, fields: &[BasicValueEnum<'ctx>]) -> R<BasicValueEnum<'ctx>> {
+        let tag = self.build_string_constant(variant);
+        let new_call = self.call_coerced(self.builtins.hsh_array_new, &[], "evariant");
+        let mut arr = self.unwrap_call(new_call);
+        let push_tag = self.call_coerced(self.builtins.hsh_array_push, &[arr.into(), tag.into()], "evtag");
+        arr = self.unwrap_call(push_tag);
+        for f in fields {
+            let push = self.call_coerced(self.builtins.hsh_array_push, &[arr.into(), (*f).into()], "evfield");
+            arr = self.unwrap_call(push);
+        }
+        Ok(arr)
+    }
+
     /// Coerce a single value to an exact target type: int<->pointer via
     /// inttoptr/ptrtoint (this runtime bit-reinterprets pointers as `i64`
     /// in several places — struct fields and array elements are stored as
@@ -2032,6 +2508,28 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     /// width mismatches via sign-extend/truncate. Anything else (already
     /// matching, or a combination we don't specifically handle) passes
     /// through unchanged.
+    ///
+    /// # BUG FIX — missing float<->int slot coercion
+    /// This runtime stores every struct field / array element as a
+    /// generic `i64` slot (see the doc comment above and
+    /// `hsh_struct_get`'s own comment at its call site), and a `double`
+    /// field's *value* still has to travel through that same `i64` slot
+    /// — bit-reinterpreted, not converted, exactly like `value_to_i64_bits`
+    /// already does for the analogous "pass a value into a generic i64
+    /// runtime parameter" case (`hsh_val_to_str` etc.). This match had
+    /// int<->pointer and int<->int covered but no float<->int arm at
+    /// all, so a `FloatValue` heading into an `i64`-typed struct/array
+    /// slot (or vice versa on the way back out) fell through to the `_ =>
+    /// v` catch-all completely unconverted. That's exactly what produced
+    /// every "Call parameter type does not match function signature!
+    /// double ... i64" and "Function return type does not match operand
+    /// type of return inst! ret i64 ... double" LLVM verifier error seen
+    /// from the `builder` target's `hkfmt.h#` (numeric `HkValue.num_val`
+    /// struct field sets, `hkfmt_format_hk_number`'s `f64` parameter, and
+    /// `format_hk_number`'s `f64` return path all go through here). Only
+    /// bitcast between float and int types of the *same* bit width —
+    /// `f64`<->`i64`, `f32`<->`i32` — matching this runtime's only actual
+    /// slot width; anything else falls through unchanged same as before.
     fn coerce_basic_value(&mut self, v: BasicValueEnum<'ctx>, target: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
         match (v, target) {
             (BasicValueEnum::IntValue(iv), BasicTypeEnum::PointerType(pt)) => {
@@ -2046,6 +2544,33 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 } else {
                     self.builder.build_int_truncate(iv, it, "trunc").unwrap().into()
                 }
+            }
+            // Only the two same-width pairs this runtime's i64 generic
+            // slot ever actually needs (f64<->i64) — plus f32<->i32 for
+            // completeness/symmetry, even though nothing here currently
+            // stores an f32 in a 32-bit slot. Comparing against the
+            // concrete `Context` types directly (rather than querying
+            // bit widths through `FloatType`, which inkwell doesn't
+            // expose a direct accessor for) keeps this exact and simple.
+            (BasicValueEnum::FloatValue(fv), BasicTypeEnum::IntType(it))
+                if fv.get_type() == self.ctx.f64_type() && it == self.ctx.i64_type() =>
+            {
+                self.builder.build_bit_cast(fv, it, "f2i").unwrap()
+            }
+            (BasicValueEnum::FloatValue(fv), BasicTypeEnum::IntType(it))
+                if fv.get_type() == self.ctx.f32_type() && it == self.ctx.i32_type() =>
+            {
+                self.builder.build_bit_cast(fv, it, "f2i").unwrap()
+            }
+            (BasicValueEnum::IntValue(iv), BasicTypeEnum::FloatType(ft))
+                if iv.get_type() == self.ctx.i64_type() && ft == self.ctx.f64_type() =>
+            {
+                self.builder.build_bit_cast(iv, ft, "i2f").unwrap()
+            }
+            (BasicValueEnum::IntValue(iv), BasicTypeEnum::FloatType(ft))
+                if iv.get_type() == self.ctx.i32_type() && ft == self.ctx.f32_type() =>
+            {
+                self.builder.build_bit_cast(iv, ft, "i2f").unwrap()
             }
             _ => v,
         }
@@ -2156,25 +2681,37 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 }
             }
             Pattern::Enum { variant, inner, .. } => {
-                if !inner.is_empty() {
-                    // Enum payload extraction needs a runtime representation
-                    // for "tag + fields", which the current tag-as-string
-                    // encoding doesn't have. Matching bare tags (`Variant`)
-                    // still works below; only `Variant(x, y)`-style
-                    // destructuring is unimplemented. Fail the build instead
-                    // of silently treating the whole pattern as "always
-                    // matches" (which is what happened before this fix).
-                    return Err(CodegenError::Llvm(format!(
-                        "match arm: enum pattern `{}(...)` with payload destructuring is not supported by the codegen yet — only bare tag matching (`{}`) is implemented",
-                        variant, variant
-                    )));
-                }
-                // Enum variants lower to string tag comparison
-                let tag = self.build_string_constant(variant);
-                let cmp = self.call_coerced(strcmp_fn, &[(*subj).into(), tag.into()], "ec");
+                // Every enum value (unit variants included, as of the
+                // uniform-boxing change — see `FnCx::enums`' doc comment)
+                // is an `HshArray* [tag_string, field0, field1, ...]`, so
+                // the tag is always at index 0 regardless of whether this
+                // particular pattern also destructures a payload. Reading
+                // the tag via `hsh_array_get` first (rather than a direct
+                // `strcmp` against `subj` itself, which is what this arm
+                // used to do when unit variants were bare `char*`) is what
+                // makes it safe for a payload-pattern arm to be tried
+                // *before* the arm that actually matches — see that doc
+                // comment for why a mismatched raw-`char*` reinterpretation
+                // used to be an out-of-bounds/UB risk.
+                let idx0 = self.ctx.i64_type().const_zero();
+                let tag_call = self.call_coerced(self.builtins.hsh_array_get, &[(*subj).into(), idx0.into()], "etag_get");
+                let tag_val  = self.unwrap_call(tag_call);
+                let tag      = self.build_string_constant(variant);
+                let cmp = self.call_coerced(strcmp_fn, &[tag_val.into(), tag.into()], "ec");
                 let ci  = self.unwrap_call(cmp).into_int_value();
                 let z   = i32t.const_zero();
-                let eq  = self.builder.build_int_compare(IntPredicate::EQ, ci, z, "eeq").unwrap();
+                let mut eq = self.builder.build_int_compare(IntPredicate::EQ, ci, z, "eeq").unwrap();
+
+                // Payload destructuring (`Variant(x, y) => ...`): AND the
+                // tag check with a per-field condition, each field read
+                // from index `i + 1` (index 0 is the tag).
+                for (i, sub_pat) in inner.iter().enumerate() {
+                    let fidx = self.ctx.i64_type().const_int((i + 1) as u64, false);
+                    let fcall = self.call_coerced(self.builtins.hsh_array_get, &[(*subj).into(), fidx.into()], "efield_get");
+                    let fval  = self.unwrap_call(fcall);
+                    let fcond = self.compile_pattern_cond(&fval, sub_pat, orig)?.into_int_value();
+                    eq = self.builder.build_and(eq, fcond, "eand").unwrap();
+                }
                 Ok(eq.into())
             }
             Pattern::Or(pats, _) => {
@@ -2284,7 +2821,21 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     self.bind_pattern_vars(&elem, sub_pat);
                 }
             }
-            // Wildcard/Literal/Range/Enum(bare tag) introduce no bindings.
+            // Recurse into enum payload fields — same boxed-array layout
+            // as `compile_pattern_cond`'s `Pattern::Enum` arm uses
+            // (`[tag, field0, field1, ...]`), so field `i` lives at
+            // index `i + 1`. Only reached for a payload variant's pattern
+            // (`inner` non-empty); a bare-tag pattern introduces no
+            // bindings, same as before.
+            Pattern::Enum { inner, .. } => {
+                for (i, sub_pat) in inner.iter().enumerate() {
+                    let idx_v = self.ctx.i64_type().const_int((i + 1) as u64, false);
+                    let call  = self.call_coerced(self.builtins.hsh_array_get, &[(*subj).into(), idx_v.into()], "ep_bind");
+                    let elem  = self.unwrap_call(call);
+                    self.bind_pattern_vars(&elem, sub_pat);
+                }
+            }
+            // Wildcard/Literal/Range introduce no bindings.
             // Pattern::Or intentionally isn't handled here: its alternatives
             // may bind different names, and we have no way at this point to
             // know which alternative actually matched at runtime — binding
@@ -2406,6 +2957,46 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 match inferred {
                     Some(n) => { self.var_types.insert(name.clone(), n); }
                     None    => { self.var_types.remove(name); }
+                }
+                // Same idea as immediately above, but for TUPLE-typed
+                // bindings — see `var_tuple_types`'s field doc comment for
+                // why this needs to be tracked completely separately from
+                // `var_types` (tuples have no name to look up in
+                // `self.structs`). Falls back to the callee's declared
+                // return type for `let x = some_fn(...)` with no
+                // annotation, mirroring `infer_struct_name`'s `Call` arm.
+                let inferred_tuple = match ty {
+                    Some(TypeExpr::Tuple(elems)) => Some(elems.clone()),
+                    _ => value.as_ref().and_then(|e| self.infer_tuple_elem_types(e)),
+                };
+                match inferred_tuple {
+                    Some(elems) => { self.var_tuple_types.insert(name.clone(), elems); }
+                    None        => { self.var_tuple_types.remove(name); }
+                }
+                // Track "this variable currently holds a reference to
+                // top-level function X" (name -> real function name), so
+                // `f(...)` through a variable `f` that was initialized
+                // from a plain function name (`let f = add;`) can be
+                // resolved back to a direct call to `add` at the
+                // `Expr::Call` site below — see the long comment on
+                // `fn_aliases`'s field declaration for why this
+                // compile-time-resolved approach was chosen over a
+                // genuine runtime function-pointer call for this case.
+                // Chains through an existing alias too (`let g = f;`
+                // where `f` already aliases `add` makes `g` alias `add`
+                // directly, not `f`), and is cleared on any other kind of
+                // initializer so a later `let f = 5;` shadowing/reusing
+                // the name doesn't leave a stale alias behind.
+                let fn_alias_target = match value.as_ref() {
+                    Some(Expr::Ident(src, _)) if !self.vars.contains_key(src.as_str()) => {
+                        self.fn_aliases.get(src).cloned()
+                            .or_else(|| self.func_vals.contains_key(src.as_str()).then(|| src.clone()))
+                    }
+                    _ => None,
+                };
+                match fn_alias_target {
+                    Some(target) => { self.fn_aliases.insert(name.clone(), target); }
+                    None          => { self.fn_aliases.remove(name); }
                 }
                 // Same idea, but for `let entries: [Foo] = ...` — records
                 // the *element* type (both the struct name, for
@@ -3204,10 +3795,30 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    match e {
                        Expr::Literal(lit, _) => self.literal(lit, hint),
                        Expr::Ident(name, span)  => {
-                           let (ptr, ty) = self.vars.get(name.as_str())
-                           .copied()
-                           .ok_or_else(|| CodegenError::UndefinedVar { name: name.clone(), span: span.clone() })?;
-                           Ok(self.builder.build_load(ty, ptr, name).unwrap())
+                           match self.vars.get(name.as_str()).copied() {
+                               Some((ptr, ty)) => Ok(self.builder.build_load(ty, ptr, name).unwrap()),
+                               None => {
+                                   // Bare top-level function name used as a
+                                   // *value*, not called directly — e.g.
+                                   // `let f = add;` so `f` can be called
+                                   // indirectly later. This only covers
+                                   // taking the address; whether a later
+                                   // `f(...)` call through that variable
+                                   // actually dispatches correctly is
+                                   // handled separately by the `fn_aliases`
+                                   // tracking in `Stmt::Let`/`Expr::Assign`
+                                   // and the `Expr::Call` callee arm below
+                                   // (search for `fn_aliases` in this file).
+                                   // If `name` isn't a local var *or* a
+                                   // known function, this is a genuine
+                                   // undefined-variable error, same as
+                                   // before this fallback existed.
+                                   match self.func_vals.get(name.as_str()) {
+                                       Some(&fv) => Ok(fv.as_global_value().as_pointer_value().into()),
+                                       None => Err(CodegenError::UndefinedVar { name: name.clone(), span: span.clone() }),
+                                   }
+                               }
+                           }
                        }
                        Expr::BinOp(l, op, r, _) => {
                            // BUG FIX: `&&`/`||` used to fall straight
@@ -3297,8 +3908,46 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            })
                        }
                        Expr::Call(callee, args, call_span) => {
+                           // ── `EnumName::Variant(args...)` construction ──
+                           // Checked first (before the general Ident/Path
+                           // call dispatch below) so a variant name never
+                           // has a chance to collide with a same-named
+                           // builtin/user fn. Bare-tag (unit, arity 0)
+                           // variants are handled in the `Expr::Path` arm
+                           // instead — a *call* to a unit variant with 0
+                           // args (`Status::Ok()`) is still accepted here
+                           // too, since that's a reasonable spelling.
+                           if let Expr::Path(segments, _) = callee.as_ref() {
+                               if let Some(variant) = segments.last() {
+                                   if let Some(&arity) = self.enums.get(variant) {
+                                       if args.len() != arity {
+                                           return Err(CodegenError::Llvm(format!(
+                                               "{}: `{}` takes {} field(s), got {}",
+                                               call_span, variant, arity, args.len()
+                                           )));
+                                       }
+                                       let mut field_vals: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(args.len());
+                                       for a in args {
+                                           field_vals.push(self.expr(a, None)?);
+                                       }
+                                       return self.build_enum_variant(variant, &field_vals);
+                                   }
+                               }
+                           }
                            if let Expr::Ident(name, _) = callee.as_ref() {
-                               self.call_fn(name, args, hint, call_span)
+                               // Indirect call through a variable that
+                               // holds a (statically-tracked) reference to
+                               // a real top-level function — see the long
+                               // doc comment on `FnCx::fn_aliases` for what
+                               // this does and doesn't cover. Falls through
+                               // to the normal direct-by-name path
+                               // unchanged for the overwhelming majority of
+                               // calls, where `name` is never an alias.
+                               if let Some(real_name) = self.fn_aliases.get(name).cloned() {
+                                   self.call_fn(&real_name, args, hint, call_span)
+                               } else {
+                                   self.call_fn(name, args, hint, call_span)
+                               }
                            } else if let Expr::Path(segments, _) = callee.as_ref() {
                                // module::function — try the snake_case mangled
                                // runtime symbol first (matches the interpreter's
@@ -3348,6 +3997,23 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            };
                            let v = self.expr(rhs, target_ty)?;
                            self.assign_lvalue(lhs, v)?;
+                           // Keep `fn_aliases` (see its doc comment) in
+                           // sync on plain reassignment too, not just
+                           // `let` — otherwise `let f = add; f = sub; f(1)`
+                           // would keep dispatching to the stale `add`.
+                           if let Expr::Ident(name, _) = lhs.as_ref() {
+                               let fn_alias_target = match rhs.as_ref() {
+                                   Expr::Ident(src, _) if !self.vars.contains_key(src.as_str()) || src == name => {
+                                       self.fn_aliases.get(src).cloned()
+                                           .or_else(|| self.func_vals.contains_key(src.as_str()).then(|| src.clone()))
+                                   }
+                                   _ => None,
+                               };
+                               match fn_alias_target {
+                                   Some(target) => { self.fn_aliases.insert(name.clone(), target); }
+                                   None          => { self.fn_aliases.remove(name); }
+                               }
+                           }
                            Ok(self.ctx.i64_type().const_zero().into())
                        }
                        Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
@@ -3487,13 +4153,65 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        // ── FieldAccess expr.field ─────────────────────────
                        Expr::FieldAccess(obj_e, field_name, span) => {
                            let obj = self.expr(obj_e, None)?;
-                           let (field_idx, field_ty): (usize, Option<TypeExpr>) = match self.infer_struct_name(obj_e) {
+                           // BUG FIX: tuple positional access (`t.0`, `t.1`,
+                           // ...) is parsed as this exact same
+                           // `FieldAccess` node, with `field_name` being
+                           // the literal string "0"/"1"/etc. Tuples have
+                           // no name to register in `self.structs`, so
+                           // `infer_struct_name` always returned `None`
+                           // for them, and the fallback below — which
+                           // scans every *named* struct for a field
+                           // matching that name — could never find one
+                           // (real struct fields are never bare digits),
+                           // silently leaving `field_idx` at its default
+                           // of `0` no matter which index was actually
+                           // requested. `t.0` and `t.1` therefore fetched
+                           // the exact same (also un-coerced, since
+                           // `field_ty` stayed `None` too) raw slot,
+                           // which is exactly the class of bug behind the
+                           // `hsh_val_to_str` crash in `bytes`' own
+                           // `workspace_capture_with_status` (`.0`/`.1`
+                           // access on a `(string, int)`). Resolve
+                           // numeric field names against the tuple's
+                           // statically-known element types FIRST, before
+                           // ever falling into the named-struct logic.
+                           let numeric_field: Option<usize> = field_name.parse::<usize>().ok();
+                           let (field_idx, field_ty, is_tuple_access): (usize, Option<TypeExpr>, bool) = match numeric_field {
+                               Some(n) if self.infer_tuple_elem_types(obj_e).is_some() => {
+                                   let elems = self.infer_tuple_elem_types(obj_e).unwrap();
+                                   (n, elems.get(n).cloned(), true)
+                               }
+                               // Numeric field name, but we couldn't pin
+                               // down the tuple's element types statically
+                               // (e.g. the base expression is itself the
+                               // result of a chain codegen can't trace).
+                               // Still use the REQUESTED index rather than
+                               // silently defaulting to 0 — an uncoerced
+                               // value for an unknown type is no worse
+                               // than today's struct fallback already
+                               // produces for a genuinely-unresolvable
+                               // case, but at least `.0` and `.1` no
+                               // longer alias the same slot. Since every
+                               // *bare tuple literal* (the only thing a
+                               // numeric field name can ever mean — see
+                               // the `is_tuple_access` note below) is
+                               // itself represented as an `HshArray`, not
+                               // a struct (see `Expr::TupleLit`'s own
+                               // codegen a few hundred lines up: it's
+                               // built with `hsh_array_new`/
+                               // `hsh_array_push`, not
+                               // `hsh_struct_new`/`hsh_struct_set`),
+                               // `is_tuple_access` is unconditionally
+                               // `true` for every numeric field name,
+                               // resolved or not.
+                               Some(n) => (n, None, true),
+                               None => match self.infer_struct_name(obj_e) {
                                Some(struct_name) => {
                                    let idx = self.resolve_struct_field_index(&struct_name, field_name);
                                    let ty = self.structs.get(&struct_name)
                                        .and_then(|fields| fields.iter().find(|f| &f.name == field_name))
                                        .map(|f| f.ty.clone());
-                                   (idx, ty)
+                                   (idx, ty, false)
                                }
                                None => {
                                    // Couldn't statically determine the struct
@@ -3521,12 +4239,38 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                            }
                                        }
                                    }
-                                   (found, found_ty)
+                                   (found, found_ty, false)
                                }
+                           }
                            };
                            let idx_v = self.ctx.i64_type().const_int(field_idx as u64, false);
+                           // BUG FIX: a bare tuple value (`(a, b)`) is
+                           // represented at runtime as an `HshArray` (see
+                           // `Expr::TupleLit`'s codegen: `hsh_array_new` +
+                           // `hsh_array_push` per element), which has its
+                           // own internal header (capacity/length bookkeeping)
+                           // ahead of the actual element slots — a
+                           // completely different memory layout from a
+                           // named struct (`hsh_struct_new`/`_set`/`_get`),
+                           // which has no such header since its field
+                           // count is fixed at compile time. Reading a
+                           // tuple through `hsh_struct_get` (as this code
+                           // did before this fix) skips straight to
+                           // "offset = index * 8" with no header
+                           // adjustment, so `.0` actually read the
+                           // array's internal header word instead of
+                           // element 0 — verified via gdb: a `(string,
+                           // int)` tuple's `hsh_struct_get(_, 0)` returned
+                           // a small header value instead of the real
+                           // string pointer, which lived a further two
+                           // slots into the object instead. Route tuple
+                           // access through `hsh_array_get`, which already
+                           // knows how to skip that header correctly
+                           // (it's the exact same function `t.get(i)` /
+                           // `for x in array` use elsewhere in this file).
+                           let get_fn = if is_tuple_access { self.builtins.hsh_array_get } else { self.builtins.hsh_struct_get };
                            let call = self.call_coerced(
-                               self.builtins.hsh_struct_get,
+                               get_fn,
                                &[obj.into(), idx_v.into()], "fget");
                            let raw = self.unwrap_call(call);
                            // CRITICAL FIX: this used to just return `raw`
@@ -3737,6 +4481,29 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                }
                            }
                        }
+                       // ── bare `EnumName::Variant` (no call) ──────────────
+                       // Only unit variants (arity 0) are legal spelled this
+                       // way — a variant declared with tuple fields needs
+                       // `EnumName::Variant(args...)`, handled in the
+                       // `Expr::Call` arm above. Anything that isn't a known
+                       // enum variant at all falls through to the previous
+                       // (silent-zero) behavior unchanged, since `Expr::Path`
+                       // used as a bare value covers cases this change isn't
+                       // trying to touch (e.g. unresolved/qualified consts).
+                       Expr::Path(segments, span) => {
+                           if let Some(variant) = segments.last() {
+                               if let Some(&arity) = self.enums.get(variant) {
+                                   if arity != 0 {
+                                       return Err(CodegenError::Llvm(format!(
+                                           "{}: `{}` has {} field(s) and must be constructed as `{}(...)`, not used bare",
+                                           span, variant, arity, variant
+                                       )));
+                                   }
+                                   return Ok(self.build_enum_variant(variant, &[])?);
+                               }
+                           }
+                           Ok(self.ctx.i64_type().const_zero().into())
+                       }
                        _ => Ok(self.ctx.i64_type().const_zero().into()),
                    }
                }
@@ -3799,6 +4566,38 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    if let Some(&fv) = self.func_vals.get(name) {
                        return self.call_user_fn(fv, args, name);
                    }
+                   // `__builtin_*` → real dispatch name bridge. Every
+                   // `std/*.h#` wrapper (once inlined by
+                   // `ModuleResolver::resolve_std_import` — see
+                   // `modules.rs`) calls a `__builtin_*`-prefixed
+                   // intrinsic for the actual native primitive, exactly
+                   // mirroring `hsharp-interpreter`'s own
+                   // `resolve_builtin_dunder` bridge in `helpers.rs` (see
+                   // that function's doc comment for the full
+                   // interpreter/AOT-parity story). This is the AOT
+                   // side of the same bridge: many of these primitives
+                   // (uuid_v4, base64/url encode-decode, env get/set,
+                   // fs read/write/exists/..., random_*, scan_port,
+                   // now_unix/now_ms/sleep_ms, hostname, getpid) already
+                   // have a real `hsh_*` C implementation and a plain
+                   // (non-prefixed) dispatch arm below — they just never
+                   // had anything routing a `__builtin_`-prefixed call to
+                   // them, since the whole `__builtin_*` naming
+                   // convention didn't exist on this backend until now.
+                   //
+                   // For a `__builtin_*` name with NO real arm below yet
+                   // (e.g. `sha256`, `tcp_connect`, `http_request` — see
+                   // `builtins_registry.rs`'s newly added entries, all
+                   // marked `backends: &[Backend::Interpreter]`), this
+                   // recursion bottoms out in the same `UndefinedFn`
+                   // error every other missing builtin gets — which
+                   // `features::check_module_features` already turns
+                   // into a proper "not supported by the LLVM backend"
+                   // diagnostic *before* codegen ever runs, rather than
+                   // a cryptic linker error surfacing here.
+                   if let Some(real) = crate::builtins_registry::resolve_builtin_dunder_llvm(name) {
+                       return self.call_fn(real, args, _hint, call_span);
+                   }
                    let i8ptr = self.ctx.ptr_type(AddressSpace::default());
                    macro_rules! str_arg {
                        ($i:expr) => {
@@ -3829,6 +4628,33 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "to_string" => {
                            let a = if let Some(e) = args.first() { self.expr(e, None)? }
                            else { self.ctx.i64_type().const_zero().into() };
+                           // BUG FIX: `hsh_val_to_str` (the generic path
+                           // below, used unconditionally before this
+                           // check existed) decides "int vs string
+                           // pointer" purely from the numeric MAGNITUDE
+                           // of the raw i64 bits — values `<= 0x10000` or
+                           // `>= 0x7ffffffffffe` are treated as ints,
+                           // anything in between is blindly dereferenced
+                           // as a string pointer. An ordinary large `int`
+                           // (a millisecond timestamp from `time_ms()`
+                           // being the textbook example — ~1.7 x 10^12 as
+                           // of 2026) falls squarely in that dangerous
+                           // middle range purely by coincidence of its
+                           // magnitude, and crashes with a SIGSEGV
+                           // dereferencing an address that was never a
+                           // pointer at all. When codegen can PROVE the
+                           // argument is `int` (see `is_definitely_int` —
+                           // an int literal, or a direct call to a
+                           // function whose return type is known to be
+                           // `int`), skip the dangerous guess entirely
+                           // and go straight to the unambiguous int path.
+                           if let Some(e) = args.first() {
+                               if self.is_definitely_int(e) {
+                                   let iv = self.value_to_i64_bits(a);
+                                   let r = self.call_coerced(self.builtins.hsh_int_to_string, &[iv.into()], "ts_int");
+                                   return Ok(self.unwrap_call(r));
+                               }
+                           }
                            let iv = self.value_to_i64_bits(a);
                            let r = self.call_coerced(self.builtins.hsh_val_to_str, &[iv.into()], "ts");
                            Ok(self.unwrap_call(r))
@@ -3928,6 +4754,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "file_size_bytes" | "file_size" | "fs_size" => call1!(self.builtins.hsh_file_size, "fsize"),
                        "fs_remove" | "remove_file" => call1!(self.builtins.hsh_remove_file, "frm"),
                        "fs_rename" => call2!(self.builtins.hsh_rename, "fren"),
+                       "fs_chdir" | "chdir" => call1!(self.builtins.hsh_chdir, "fchdir"),
                        "fs_remove_dir" | "remove_dir_recursive" => call1!(self.builtins.hsh_remove_dir_recursive, "frmdir"),
                        "conv_int_to_str" | "int_to_str" => {
                            let n = if let Some(e) = args.first() {
@@ -3946,6 +4773,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "json_set_str" => call3!(self.builtins.hsh_json_set_str, "jsonset"),
                        "json_get_str" => call2!(self.builtins.hsh_json_get, "jsongetstr"),
                        "is_dir" => call1!(self.builtins.hsh_is_dir, "isdir"),
+                       // `hsh_is_file`/`hsh_append_file` — see their
+                       // `LlvmBuiltins` field doc comment; real C
+                       // implementations that simply had no dispatch arm
+                       // until now.
+                       "is_file" | "fs_is_file" => call1!(self.builtins.hsh_is_file, "isfile"),
+                       "fs_append" | "append_file" => call2!(self.builtins.hsh_append_file, "fapp"),
                        "bold"        => call1!(self.builtins.hsh_bold, "bold"),
                        "green_text" | "green" => call1!(self.builtins.hsh_green_text, "grn"),
                        "red_text"   | "red"   => call1!(self.builtins.hsh_red_text, "red"),
@@ -4747,7 +5580,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let call = self.call_coerced(self.builtins.hsh_string_contains, &[s.into(), n.into()], "sc");
                            Ok(self.unwrap_call(call))
                        }
-                       "string_replace" => {
+                       "string_replace" | "string_replace_all" => {
                            let s = self.expr(&args[0], None)?;
                            let f = self.expr(&args[1], None)?;
                            let r = self.expr(&args[2], None)?;
@@ -5147,6 +5980,11 @@ fn pkg_config_cflags(pkg: &str) -> Option<Vec<String>> {
 /// flags (handles distro naming differences, e.g. `libpcre2-8` provides
 /// `-lpcre2-8`, plus any extra transitive deps pkg-config knows about).
 /// Returns `None` if unavailable — caller falls back to a hardcoded guess.
+/// No longer called now that `regex.c`/`sqlite.c` (its only two callers)
+/// have been removed — kept (rather than deleted) since it's a small,
+/// generically useful `pkg-config --libs` wrapper a future native runtime
+/// module might want again.
+#[allow(dead_code)]
 fn pkg_config_libs(pkg: &str) -> Option<Vec<String>> {
     let out = std::process::Command::new("pkg-config").args(["--libs", pkg]).output().ok()?;
     if !out.status.success() { return None; }
