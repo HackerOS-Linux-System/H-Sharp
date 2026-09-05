@@ -1,5 +1,6 @@
 use hsharp_parser::ast::*;
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use serde_json::Value as Json;
 use sha2::{Sha256, Sha512, Digest as Sha2Digest};
 use sha1::Sha1;
@@ -133,7 +134,7 @@ impl Interpreter {
             self.env.define(&param.name, val, param.mutable);
         }
         let result = self.exec_block(&f.body);
-        let mutated_self = self.env.get("self").cloned().unwrap_or_else(|| obj.clone());
+        let mutated_self = self.env.get("self").unwrap_or_else(|| obj.clone());
         self.env.pop();
 
         Some(result.map(|r| {
@@ -170,9 +171,24 @@ impl Interpreter {
     }
 
     pub fn call_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        // ── std/*.h# → native runtime bridge ────────────────────────────
+        // Every `std/*.h#` wrapper function (once actually loaded by a
+        // real `use "std -> x"` — see `interp.rs::load_std_module`) calls
+        // down into a `__builtin_*`-prefixed intrinsic for anything that
+        // needs a genuine native primitive (real file I/O, real SHA-256,
+        // real JSON parsing, ...). Those `__builtin_*` names aren't
+        // ordinary H# functions and were never given their own match arm
+        // below — this is the one place that recognizes the prefix and
+        // redirects to whichever real dispatch name backs it.
+        if name.starts_with("__builtin_") {
+            if let Some(real) = crate::helpers::resolve_builtin_dunder(name) {
+                return self.call_fn(real, args);
+            }
+            return Err(RuntimeError::Custom(crate::helpers::unimplemented_builtin_message(name)));
+        }
 
                     // Check if name is a closure/fn stored in environment (e.g. let triple = |n| n*3)
-        if let Some(val) = self.env.get(name).cloned() {
+        if let Some(val) = self.env.get(name) {
             match val {
                 Value::Fn { params, body, env: captured_env, is_async, .. } => {
                     let saved = self.env.clone();
@@ -441,7 +457,7 @@ impl Interpreter {
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
                 let start_ns = self.env.get(&format!("__prof_{}", label))
-                    .and_then(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                    .and_then(|v| if let Value::Int(n) = v { Some(n) } else { None })
                     .unwrap_or(end_ns);
                 let elapsed_ms = (end_ns - start_ns) / 1_000_000;
                 let msg = format!("[prof] {} = {}ms", label, elapsed_ms);
@@ -470,6 +486,124 @@ impl Interpreter {
                         .map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<i64>().unwrap_or(0)))
                     .unwrap_or(0);
                 return Ok(Value::Int(mem));
+            }
+            // ── io (real stdin — but only when output isn't captured;
+            // captured mode is used by the playground/tests, which have
+            // no real stdin to read from, so blocking there would just
+            // hang instead of erroring) ─────────────────────────────────
+            "io_read_line" => {
+                if self.captured_output {
+                    return Ok(Value::Str(String::new()));
+                }
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let n = std::io::stdin().read_line(&mut line).unwrap_or(0);
+                if n == 0 { return Ok(Value::Str(String::new())); } // real EOF
+                if line.ends_with('\n') { line.pop(); if line.ends_with('\r') { line.pop(); } }
+                return Ok(Value::Str(line));
+            }
+            "io_read_char" => {
+                if self.captured_output {
+                    return Ok(Value::Str(String::new()));
+                }
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                let n = std::io::stdin().read(&mut buf).unwrap_or(0);
+                if n == 0 { return Ok(Value::Str(String::new())); }
+                return Ok(Value::Str((buf[0] as char).to_string()));
+            }
+            "io_write_no_nl" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                use std::io::Write;
+                if self.captured_output {
+                    self.stdout.push_str(&s);
+                } else {
+                    print!("{}", s);
+                    let _ = std::io::stdout().flush();
+                }
+                return Ok(Value::Nil);
+            }
+            "io_flush" => {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                return Ok(Value::Nil);
+            }
+            // ── sys (real /proc parsing on Linux; honest 0/false
+            // fallback elsewhere — there is no cross-platform sysinfo
+            // crate dependency available to verify in this environment) ──
+            "sys_cpu_count" => {
+                let n = std::fs::read_to_string("/proc/cpuinfo")
+                    .map(|s| s.lines().filter(|l| l.starts_with("processor")).count() as i64)
+                    .unwrap_or(1);
+                return Ok(Value::Int(n.max(1)));
+            }
+            "sys_memory_total" | "sys_memory_free" => {
+                let key = if name == "sys_memory_total" { "MemTotal:" } else { "MemAvailable:" };
+                let kb = std::fs::read_to_string("/proc/meminfo").ok()
+                    .and_then(|s| s.lines().find(|l| l.starts_with(key))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|n| n.parse::<i64>().ok()))
+                    .unwrap_or(0);
+                return Ok(Value::Int(kb * 1024)); // bytes
+            }
+            "sys_uptime" => {
+                let secs = std::fs::read_to_string("/proc/uptime").ok()
+                    .and_then(|s| s.split_whitespace().next().map(|s| s.to_string()))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                return Ok(Value::Int(secs as i64));
+            }
+            "sys_load_avg" => {
+                let load = std::fs::read_to_string("/proc/loadavg").ok()
+                    .and_then(|s| s.split_whitespace().next().map(|s| s.to_string()))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                return Ok(Value::Float(load));
+            }
+            "sys_disk_total" | "sys_disk_free" => {
+                // `df -k <path>` — portable across Unixes without a
+                // `statvfs` FFI binding this crate doesn't have.
+                let path = args.first().map(|v| v.to_string()).unwrap_or_else(|| "/".to_string());
+                let out = std::process::Command::new("df").args(["-k", &path]).output();
+                let kb = out.ok().and_then(|o| {
+                    let text = String::from_utf8_lossy(&o.stdout).to_string();
+                    let line = text.lines().nth(1)?.to_string();
+                    let cols: Vec<&str> = line.split_whitespace().collect();
+                    // df -k: Filesystem 1K-blocks Used Available Use% Mounted
+                    let idx = if name == "sys_disk_total" { 1 } else { 3 };
+                    cols.get(idx)?.parse::<i64>().ok()
+                }).unwrap_or(0);
+                return Ok(Value::Int(kb * 1024));
+            }
+            "sys_page_size" => {
+                let out = std::process::Command::new("getconf").arg("PAGESIZE").output();
+                let sz = out.ok()
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok())
+                    .unwrap_or(4096);
+                return Ok(Value::Int(sz));
+            }
+            "sys_get_uid" | "sys_get_gid" | "sys_get_ppid" => {
+                let n = match name {
+                    "sys_get_uid" => std::process::Command::new("id").arg("-u").output().ok()
+                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok()).unwrap_or(0),
+                    "sys_get_gid" => std::process::Command::new("id").arg("-g").output().ok()
+                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok()).unwrap_or(0),
+                    // No getppid(2) FFI binding in this crate — shells
+                    // out to `ps` instead, which is a bit heavier but
+                    // dependency-free and portable across Unixes.
+                    _ => std::process::Command::new("ps").args(["-o", "ppid=", "-p", &std::process::id().to_string()]).output().ok()
+                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok()).unwrap_or(0),
+                };
+                return Ok(Value::Int(n));
+            }
+            "sys_is_64bit" => { return Ok(Value::Bool(std::mem::size_of::<usize>() == 8)); }
+            "sys_is_little_endian" => { return Ok(Value::Bool(cfg!(target_endian = "little"))); }
+            "sys_sysname" | "sys_machine" => {
+                let flag = if name == "sys_sysname" { "-s" } else { "-m" };
+                let out = std::process::Command::new("uname").arg(flag).output();
+                let v = out.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                return Ok(Value::Str(v));
             }
             "print" => {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -521,12 +655,36 @@ impl Interpreter {
             "to_string" => {
                 return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default()));
             }
+            // ── char <-> codepoint (backs std/conv.h#) ─────────────────────
+            "str_to_char_code" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let cp = s.chars().next().map(|c| c as i64).unwrap_or(0);
+                return Ok(Value::Int(cp));
+            }
+            "char_code_to_str" => {
+                let n = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let s = u32::try_from(n).ok().and_then(char::from_u32).map(|c| c.to_string()).unwrap_or_default();
+                return Ok(Value::Str(s));
+            }
             "parse_int" => {
                 let s = match args.first() {
                     Some(Value::Str(s)) => s.clone(),
                     _ => return Ok(Value::Nil),
                 };
                 return Ok(s.parse::<i64>().map(Value::Int).unwrap_or(Value::Nil));
+            }
+            // Free-function form of the `(Value::Str, "parse_float")`
+            // method-call arm in `call_method` below — added so
+            // `std/conv.h#`'s `str_to_float` can reach it via
+            // `__builtin_conv_str_to_float`, the same way `parse_int`
+            // already had both a free-function and (elsewhere) a method
+            // form.
+            "parse_float" => {
+                let s = match args.first() {
+                    Some(Value::Str(s)) => s.clone(),
+                    _ => return Ok(Value::Nil),
+                };
+                return Ok(s.trim().parse::<f64>().map(Value::Float).unwrap_or(Value::Nil));
             }
             // ── v0.3 Real stdlib — no stubs ────────────────────────────
             "trim" | "str_trim" => {
@@ -553,11 +711,16 @@ impl Interpreter {
                 let p = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 return Ok(Value::Bool(s.ends_with(p.as_str())));
             }
-            "replace" | "str_replace" => {
+            "replace" | "str_replace" | "str_replace_all" => {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let f = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 let t = args.get(2).map(|v| v.to_string()).unwrap_or_default();
                 return Ok(Value::Str(s.replace(f.as_str(), t.as_str())));
+            }
+            "str_split_whitespace" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let parts: Vec<Value> = s.split_whitespace().map(|p| Value::Str(p.to_string())).collect();
+                return Ok(Value::Array(parts));
             }
             "split" | "str_split" => {
                 let s   = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -619,6 +782,19 @@ impl Interpreter {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
                 return Ok(Value::Str(s.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()));
             }
+            // Bytes-aware variant — `hex_encode` above stringifies its
+            // argument first, which for `Value::Bytes` produces the
+            // `"<bytes len=N>"` placeholder (same issue `sha256_bytes`
+            // was added to fix). Backs `std/sec.h#`'s `hex_encode(data:
+            // bytes)`.
+            "hex_encode_bytes" => {
+                let data: Vec<u8> = match args.first() {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    Some(Value::Str(s)) => s.clone().into_bytes(),
+                    _ => Vec::new(),
+                };
+                return Ok(Value::Str(data.iter().map(|b| format!("{:02x}", b)).collect()));
+            }
             "hex_decode" => {
                 let h = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let bytes: Vec<u8> = (0..h.len()).step_by(2)
@@ -644,6 +820,38 @@ impl Interpreter {
                     use std::io::Read; let _ = f.read_exact(&mut bytes);
                 }
                 return Ok(Value::Str(bytes.iter().map(|&b| cs[b as usize % cs.len()] as char).collect()));
+            }
+            // Real *raw* random bytes (not the alphanumeric-string form
+            // above) — backs `std/crypto.h#`'s `random_bytes(n) -> bytes`.
+            "crypto_random_bytes" => {
+                let n = args.first().map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
+                let mut bytes = vec![0u8; n];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                    use std::io::Read; let _ = f.read_exact(&mut bytes);
+                }
+                return Ok(Value::Bytes(bytes));
+            }
+            "crypto_bytes_eq" => {
+                let a: Vec<u8> = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                let b: Vec<u8> = match args.get(1) { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                // Genuinely constant-time (doesn't short-circuit on the
+                // first mismatch) — the whole point of this function
+                // over `==` is resisting timing side-channels on MAC
+                // comparison.
+                let mut diff: u8 = (a.len() != b.len()) as u8;
+                for i in 0..a.len().max(b.len()) {
+                    diff |= a.get(i).unwrap_or(&0) ^ b.get(i).unwrap_or(&0);
+                }
+                return Ok(Value::Bool(diff == 0));
+            }
+            "crypto_xor_bytes" => {
+                let a: Vec<u8> = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                let b: Vec<u8> = match args.get(1) { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                if a.len() != b.len() || a.is_empty() {
+                    return Ok(Value::Bytes(Vec::new()));
+                }
+                let out: Vec<u8> = a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect();
+                return Ok(Value::Bytes(out));
             }
             "hostname" => {
                 let h = std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "unknown".into());
@@ -671,6 +879,14 @@ impl Interpreter {
             "math_ceil"  => return Ok(Value::Float(args.first().map(|v| v.to_float()).unwrap_or(0.0).ceil())),
             "math_round" => return Ok(Value::Float(args.first().map(|v| v.to_float()).unwrap_or(0.0).round())),
             "math_trunc" => return Ok(Value::Float(args.first().map(|v| v.to_float()).unwrap_or(0.0).trunc())),
+            // `std/conv.h#`'s `float_to_int` needs an actual int back
+            // (math_trunc above intentionally stays float-in-float-out,
+            // matching every other math_* function) — this is that
+            // conversion.
+            "conv_float_to_int" => {
+                let f = args.first().map(|v| v.to_float()).unwrap_or(0.0);
+                return Ok(Value::Int(f.trunc() as i64));
+            }
             "math_log"   => return Ok(Value::Float(args.first().map(|v| v.to_float()).unwrap_or(0.0).ln())),
             "math_log2"  => return Ok(Value::Float(args.first().map(|v| v.to_float()).unwrap_or(0.0).log2())),
             "math_log10" => return Ok(Value::Float(args.first().map(|v| v.to_float()).unwrap_or(0.0).log10())),
@@ -1082,6 +1298,20 @@ impl Interpreter {
                 let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
                 return Ok(Value::Str(cwd));
             }
+            "fs_chdir" => {
+                // Real implementation — previously `fs::chdir` was aliased
+                // straight to `fs_cwd` (see helpers.rs's alias table),
+                // meaning it silently read-and-returned the cwd instead of
+                // ever changing it. `std::env::set_current_dir` mirrors
+                // the LLVM backend's `hsh_chdir` (runtime/core.c): returns
+                // whether it succeeded rather than raising, matching this
+                // interpreter's existing fs_* convention of int/bool
+                // success flags (see fs_rename/fs_copy above) rather than
+                // a distinct error-reporting channel.
+                let path = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let ok = std::env::set_current_dir(&path).is_ok();
+                return Ok(Value::Int(if ok { 1 } else { 0 }));
+            }
             "fs_list_dir" => {
                 let p = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let entries: Vec<Value> = std::fs::read_dir(p.as_str())
@@ -1090,6 +1320,107 @@ impl Interpreter {
                         .collect())
                     .unwrap_or_default();
                 return Ok(Value::Array(entries));
+            }
+            "fs_read_bytes" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(std::fs::read(p.as_str()).map(Value::Bytes).unwrap_or(Value::Nil));
+            }
+            "fs_write_bytes" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let data: Vec<u8> = match args.get(1) {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    Some(Value::Str(s)) => s.clone().into_bytes(),
+                    _ => Vec::new(),
+                };
+                let _ = std::fs::write(p.as_str(), &data);
+                return Ok(Value::Nil);
+            }
+            // Build raw `bytes` from an `[int]` array of 0-255 byte
+            // values. Needed because H# `string`s are UTF-8-validated
+            // text — there's no way to represent e.g. a lone 0x80 byte
+            // (an invalid standalone UTF-8 lead byte) as a `string` at
+            // all, which binary formats like MessagePack need to emit
+            // freely. Backs `std/msgpack.h#`.
+            "bytes_from_ints" => {
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let data: Vec<u8> = arr.iter().map(|v| (v.to_int() & 0xff) as u8).collect();
+                return Ok(Value::Bytes(data));
+            }
+            // Inverse of the above — read raw bytes back out as an
+            // `[int]` array of 0-255 values, for decoding a binary
+            // format byte-by-byte in H#.
+            "bytes_to_ints" => {
+                let data: Vec<u8> = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                let arr: Vec<Value> = data.iter().map(|&b| Value::Int(b as i64)).collect();
+                return Ok(Value::Array(arr));
+            }
+            "bytes_concat" => {
+                let mut out: Vec<u8> = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                if let Some(Value::Bytes(b)) = args.get(1) { out.extend_from_slice(b); }
+                return Ok(Value::Bytes(out));
+            }
+            "bytes_len" => {
+                let n = match args.first() { Some(Value::Bytes(b)) => b.len(), _ => 0 };
+                return Ok(Value::Int(n as i64));
+            }
+            // `std/fs.h#`'s `walk(root)` — real recursive directory walk,
+            // returning every *file* path found beneath `root` (matching
+            // the doc comment on the H# side: "Returns all file paths").
+            // Written by hand instead of pulling in the `walkdir` crate,
+            // since this is the only caller and the recursion is a few
+            // lines; symlinks are followed via `read_dir`'s own default
+            // behavior (no explicit cycle guard — same tradeoff libc's
+            // `nftw` without `FTW_PHYS` makes).
+            "fs_walk" => {
+                let root = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let mut out: Vec<Value> = Vec::new();
+                let mut stack = vec![std::path::PathBuf::from(&root)];
+                while let Some(dir) = stack.pop() {
+                    let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                    for entry in rd.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            stack.push(path);
+                        } else {
+                            out.push(Value::Str(path.to_string_lossy().to_string()));
+                        }
+                    }
+                }
+                return Ok(Value::Array(out));
+            }
+            // `std/fs.h#`'s `modified_time(path)` — last-modified time as
+            // a unix timestamp (seconds), matching `time.h#`/`date.h#`'s
+            // convention of representing instants as `int` seconds since
+            // the epoch rather than a dedicated timestamp type.
+            "fs_modified_time" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let secs = std::fs::metadata(p.as_str())
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                return Ok(Value::Int(secs));
+            }
+            // `std/fs.h#`'s `temp_file(prefix)` — creates an empty file
+            // under the OS temp dir and returns its path, so the caller
+            // gets back something that's guaranteed to already exist
+            // (rather than just a "probably free" name), same guarantee
+            // `mkstemp(3)` gives on a real OS.
+            "fs_temp_file" => {
+                let prefix = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let unique = format!(
+                    "{}{}_{}",
+                    prefix,
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                );
+                let path = std::env::temp_dir().join(unique);
+                let _ = std::fs::write(&path, b"");
+                return Ok(Value::Str(path.to_string_lossy().to_string()));
             }
             // ── path (v0.8) ──────────────────────────────────────────────────
             "path_join" => {
@@ -1119,6 +1450,41 @@ impl Interpreter {
                     .unwrap_or_default();
                 return Ok(Value::Str(parent));
             }
+            "path_filename" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let f = std::path::Path::new(&p).file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                return Ok(Value::Str(f));
+            }
+            "path_is_absolute" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Bool(std::path::Path::new(&p).is_absolute()));
+            }
+            // Lexical normalization only (`.`/`..` component folding) —
+            // does not touch the filesystem or resolve symlinks, unlike
+            // `fs::canonicalize`. That distinction matters: `normalize`
+            // should work on paths that don't exist yet (e.g. a path
+            // you're about to create), which `canonicalize` can't do.
+            "path_normalize" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let mut out: Vec<std::path::Component> = Vec::new();
+                for comp in std::path::Path::new(&p).components() {
+                    match comp {
+                        std::path::Component::ParentDir => { out.pop(); }
+                        std::path::Component::CurDir => {}
+                        other => out.push(other),
+                    }
+                }
+                let joined: std::path::PathBuf = out.iter().collect();
+                return Ok(Value::Str(joined.to_string_lossy().to_string()));
+            }
+            "path_with_extension" => {
+                let p = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let ext = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let out = std::path::Path::new(&p).with_extension(&ext);
+                return Ok(Value::Str(out.to_string_lossy().to_string()));
+            }
             // ── env (v0.8) ───────────────────────────────────────────────────
             "env_temp_dir" => {
                 return Ok(Value::Str(std::env::temp_dir().to_string_lossy().to_string()));
@@ -1134,13 +1500,432 @@ impl Interpreter {
             "env_home" => {
                 return Ok(std::env::var("HOME").map(Value::Str).unwrap_or(Value::Str(String::new())));
             }
+            // `env::set`/`env::remove` — `std::env::set_var`/`remove_var`
+            // only affect this process (and anything it spawns), same
+            // scope `setenv(3)`/`unsetenv(3)` have; there's no way for an
+            // H# program to reach back and mutate its parent shell's
+            // environment, same as any other language.
+            "env_set" => {
+                let k = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let v = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                unsafe { std::env::set_var(&k, &v); }
+                return Ok(Value::Nil);
+            }
+            "env_remove" => {
+                let k = args.first().map(|v| v.to_string()).unwrap_or_default();
+                unsafe { std::env::remove_var(&k); }
+                return Ok(Value::Nil);
+            }
+            // Returns `["KEY=value", ...]` — kept as a flat array of
+            // `"KEY=value"` strings rather than a map, since H#'s
+            // `hashmap_*` builtins live behind `std -> collections` and
+            // this is a `core`-level primitive that shouldn't have to
+            // know about that struct representation.
+            "env_vars" => {
+                let vars: Vec<Value> = std::env::vars().map(|(k, v)| Value::Str(format!("{k}={v}"))).collect();
+                return Ok(Value::Array(vars));
+            }
+            // ── os (v0.9) ────────────────────────────────────────────────────
+            "os_platform" => { return Ok(Value::Str(std::env::consts::OS.to_string())); }
+            "os_arch"     => { return Ok(Value::Str(std::env::consts::ARCH.to_string())); }
+            "os_username" => {
+                let u = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default();
+                return Ok(Value::Str(u));
+            }
+            "os_home_dir" => {
+                return Ok(std::env::var("HOME").map(Value::Str).unwrap_or(Value::Str(String::new())));
+            }
+            "os_is_root" => {
+                // No libc dependency: shell out to `id -u`, the same
+                // interface `sh` scripts use for this exact check.
+                let out = std::process::Command::new("id").arg("-u").output();
+                let uid = out.ok()
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().ok())
+                    .unwrap_or(-1);
+                return Ok(Value::Bool(uid == 0));
+            }
+            "os_kernel_version" => {
+                let out = std::process::Command::new("uname").arg("-r").output();
+                let v = out.ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                return Ok(Value::Str(v));
+            }
+            // ── process (v0.9) ───────────────────────────────────────────────
+            // `run`/`run_args` capture stdout (matching `std/process.h#`'s
+            // doc comments: "returns output"); real exit-code / stderr
+            // access would need a richer return type than `string`, which
+            // is intentionally left to a future revision of
+            // `std/process.h#` rather than smuggled into this one as a
+            // stringly-typed hack.
+            "proc_run" => {
+                let cmd = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output();
+                return Ok(match out {
+                    Ok(o) => Value::Str(String::from_utf8_lossy(&o.stdout).to_string()),
+                    Err(e) => Value::Str(format!("process error: {e}")),
+                });
+            }
+            "proc_run_args" => {
+                let cmd = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let argv: Vec<String> = match args.get(1) {
+                    Some(Value::Array(a)) => a.iter().map(|v| v.to_string()).collect(),
+                    _ => Vec::new(),
+                };
+                let out = std::process::Command::new(&cmd).args(&argv).output();
+                return Ok(match out {
+                    Ok(o) => Value::Str(String::from_utf8_lossy(&o.stdout).to_string()),
+                    Err(e) => Value::Str(format!("process error: {e}")),
+                });
+            }
+            // Fire-and-forget spawn — returns the child PID so the H#
+            // caller can later `proc_kill`/`proc_exit_code` it, mirroring
+            // `fork`+`exec`'s PID-as-handle convention rather than
+            // returning some opaque handle type H# doesn't have yet.
+            "proc_spawn" => {
+                let cmd = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let child = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
+                return Ok(match child {
+                    Ok(c) => Value::Int(c.id() as i64),
+                    Err(_) => Value::Int(-1),
+                });
+            }
+            "proc_kill" => {
+                let pid = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                return Ok(Value::Nil);
+            }
+            "proc_which" => {
+                let cmd = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let out = std::process::Command::new("which").arg(&cmd).output();
+                let path = out.ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                return Ok(Value::Str(path));
+            }
+            // ── term (v0.9) ──────────────────────────────────────────────────
+            // No ioctl/termios crate available — shells out to `stty
+            // size`, reading the controlling terminal directly
+            // (`-F /dev/tty`) so it still works when stdout itself is
+            // redirected/piped. Falls back to the conventional 80x24
+            // default (same fallback most CLI tools use) if that fails,
+            // e.g. because there's no controlling terminal at all.
+            "term_width" | "term_height" => {
+                let out = std::process::Command::new("stty").args(["size", "-F", "/dev/tty"]).output();
+                let (rows, cols) = out.ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        let mut parts = s.split_whitespace();
+                        let r = parts.next()?.parse::<i64>().ok()?;
+                        let c = parts.next()?.parse::<i64>().ok()?;
+                        Some((r, c))
+                    })
+                    .unwrap_or((24, 80));
+                return Ok(Value::Int(if name == "term_width" { cols } else { rows }));
+            }
+            "term_is_tty" => {
+                // `test -t 1` is the portable, dependency-free way to ask
+                // "is stdout a terminal" from a spawned subprocess; doing
+                // it for *this* process without a libc/atty crate would
+                // need an `isatty(3)` FFI call this crate doesn't have.
+                let out = std::process::Command::new("sh").arg("-c").arg("test -t 1").status();
+                return Ok(Value::Bool(out.map(|s| s.success()).unwrap_or(false)));
+            }
+            // ── tcp (real client sockets, std::net — no crate needed) ───────
+            // Connections are kept alive in `self.tcp_streams`, keyed by
+            // a handle returned to H# as a plain int (see the doc comment
+            // on that field in value.rs for why a socket can't just be
+            // "reopened by address" the way sqlite/file paths are
+            // elsewhere in this file).
+            "tcp_connect" => {
+                let host = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let port = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                let addr = format!("{host}:{port}");
+                match std::net::TcpStream::connect(&addr) {
+                    Ok(stream) => {
+                        let handle = self.next_tcp_handle;
+                        self.next_tcp_handle += 1;
+                        self.tcp_streams.insert(handle, stream);
+                        return Ok(Value::Int(handle));
+                    }
+                    Err(_) => return Ok(Value::Int(-1)),
+                }
+            }
+            "tcp_send" => {
+                use std::io::Write;
+                let handle = args.first().map(|v| v.to_int()).unwrap_or(-1);
+                let data = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let ok = self.tcp_streams.get_mut(&handle)
+                    .map(|s| s.write_all(data.as_bytes()).is_ok())
+                    .unwrap_or(false);
+                return Ok(Value::Bool(ok));
+            }
+            "tcp_recv" => {
+                use std::io::Read;
+                let handle = args.first().map(|v| v.to_int()).unwrap_or(-1);
+                let size = args.get(1).map(|v| v.to_int()).unwrap_or(4096).max(0) as usize;
+                let mut buf = vec![0u8; size];
+                let n = self.tcp_streams.get_mut(&handle)
+                    .and_then(|s| s.read(&mut buf).ok())
+                    .unwrap_or(0);
+                buf.truncate(n);
+                return Ok(Value::Str(String::from_utf8_lossy(&buf).to_string()));
+            }
+            "tcp_close" => {
+                let handle = args.first().map(|v| v.to_int()).unwrap_or(-1);
+                self.tcp_streams.remove(&handle);
+                return Ok(Value::Nil);
+            }
+            // ── sync (named atomics — see std/sync.h#'s module doc
+            // comment for why these are real state, just never
+            // contended in this single-native-thread interpreter) ──────
+            "atomic_add" => {
+                let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let delta = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                let entry = self.atomics.entry(key).or_insert(0);
+                *entry += delta;
+                return Ok(Value::Int(*entry));
+            }
+            "atomic_load" => {
+                let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Int(*self.atomics.get(&key).unwrap_or(&0)));
+            }
+            "atomic_store" => {
+                let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let val = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                self.atomics.insert(key, val);
+                return Ok(Value::Nil);
+            }
+            // Real reachability check with a genuine timeout (the naive
+            // `TcpStream::connect` above blocks with no timeout at all,
+            // which is wrong for a "is this port open" probe specifically)
+            "tcp_scan_port" => {
+                let host = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let port = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                let timeout_ms = args.get(2).map(|v| v.to_int()).unwrap_or(1000).max(0) as u64;
+                let addr = format!("{host}:{port}");
+                let ok = addr.to_socket_addrs().ok()
+                    .and_then(|mut it| it.next())
+                    .map(|sa| std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(timeout_ms)).is_ok())
+                    .unwrap_or(false);
+                return Ok(Value::Bool(ok));
+            }
+            // ── http (plain HTTP/1.1 only — NO TLS backend in this
+            // runtime, so `https://` URLs will simply fail to connect;
+            // that's a real, stated limitation, not a silent downgrade) ──
+            // Hand-rolled over the same `std::net::TcpStream` `tcp_*`
+            // uses above, since there's no way to verify a `reqwest`/
+            // `hyper`/`native-tls` dependency resolves in this
+            // environment. Real enough for `http://` APIs and local
+            // services; not a browser-grade HTTP client (no redirects,
+            // no chunked-transfer decoding, no keep-alive).
+            "http_request" => {
+                let method = args.first().map(|v| v.to_string()).unwrap_or_else(|| "GET".to_string());
+                let url = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let body = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+                return Ok(http_request(&method, &url, &body));
+            }
+            "uuid_v4" => {
+                let mut b = [0u8; 16];
+                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                    use std::io::Read; let _ = f.read_exact(&mut b);
+                }
+                b[6] = (b[6] & 0x0f) | 0x40; // version 4
+                b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+                let hex: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+                let s = format!(
+                    "{}-{}-{}-{}-{}",
+                    &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+                );
+                return Ok(Value::Str(s));
+            }
+            "uuid_is_valid" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let bytes = s.as_bytes();
+                let ok = bytes.len() == 36
+                    && bytes[8] == b'-' && bytes[13] == b'-' && bytes[18] == b'-' && bytes[23] == b'-'
+                    && s.chars().enumerate().all(|(i, c)| {
+                        matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit()
+                    });
+                return Ok(Value::Bool(ok));
+            }
+            // ── base64 (RFC 4648, standard alphabet, `=` padding) ───────────
+            // Hand-written rather than pulling in the `base64` crate:
+            // there's no way to `cargo add` + verify a new dependency
+            // resolves in this environment, and the algorithm itself is
+            // short and has no edge cases worth a crate for.
+            "base64_encode" => {
+                let data: Vec<u8> = match args.first() {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    Some(Value::Str(s)) => s.clone().into_bytes(),
+                    _ => Vec::new(),
+                };
+                return Ok(Value::Str(base64_encode_bytes(&data)));
+            }
+            "base64url_encode" => {
+                let data: Vec<u8> = match args.first() {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    Some(Value::Str(s)) => s.clone().into_bytes(),
+                    _ => Vec::new(),
+                };
+                let b64 = base64_encode_bytes(&data);
+                let url = b64.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string();
+                return Ok(Value::Str(url));
+            }
+            "base64url_decode" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let mut std_form = s.replace('-', "+").replace('_', "/");
+                while std_form.len() % 4 != 0 { std_form.push('='); }
+                return Ok(match base64_decode_str(&std_form) {
+                    Some(bytes) => Value::Str(String::from_utf8_lossy(&bytes).to_string()),
+                    None => Value::Nil,
+                });
+            }
+            "base64_decode" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(match base64_decode_str(&s) {
+                    Some(bytes) => Value::Str(String::from_utf8_lossy(&bytes).to_string()),
+                    None => Value::Nil,
+                });
+            }
+            // ── percent-encoding (RFC 3986 unreserved set) ──────────────────
+            "url_encode" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let mut out = String::with_capacity(s.len());
+                for b in s.bytes() {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                        out.push(b as char);
+                    } else {
+                        out.push_str(&format!("%{:02X}", b));
+                    }
+                }
+                return Ok(Value::Str(out));
+            }
+            "url_decode" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let bytes = s.as_bytes();
+                let mut out = Vec::with_capacity(bytes.len());
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 2 < bytes.len() {
+                        if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                            out.push(b);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+                    i += 1;
+                }
+                return Ok(Value::Str(String::from_utf8_lossy(&out).to_string()));
+            }
+            // ── date/time (proleptic Gregorian, UTC only) ───────────────────
+            // Uses Howard Hinnant's `civil_from_days`/`days_from_civil`
+            // (public-domain algorithm, http://howardhinnant.github.io/date_algorithms.html)
+            // instead of a `chrono`/`time` crate dependency this
+            // environment has no way to verify resolves. UTC-only is a
+            // real, stated limitation — no timezone database is bundled.
+            "date_year" | "date_month" | "date_day" | "date_weekday" => {
+                let ts = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let (y, m, d, wd) = civil_from_unix(ts);
+                return Ok(match name {
+                    "date_year"    => Value::Int(y),
+                    "date_month"   => Value::Int(m),
+                    "date_day"     => Value::Int(d),
+                    _ => Value::Str(["Thu","Fri","Sat","Sun","Mon","Tue","Wed"][(wd.rem_euclid(7)) as usize].to_string()),
+                });
+            }
+            "date_add_days" => {
+                let ts = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let days = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                return Ok(Value::Int(ts + days * 86400));
+            }
+            "date_add_hours" => {
+                let ts = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let hrs = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                return Ok(Value::Int(ts + hrs * 3600));
+            }
+            "date_diff_days" => {
+                let a = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let b = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+                return Ok(Value::Int((a - b) / 86400));
+            }
+            // Supports the common subset: %Y %m %d %H %M %S. Anything
+            // wider (locale names, %z, ...) is a documented gap in
+            // `std/date.h#`/`std/time.h#`, not something silently
+            // faked here.
+            "date_format" => {
+                let ts = args.first().map(|v| v.to_int()).unwrap_or(0);
+                let fmt = args.get(1).map(|v| v.to_string()).unwrap_or_else(|| "%Y-%m-%d %H:%M:%S".to_string());
+                let (y, mo, d, _) = civil_from_unix(ts);
+                let secs_of_day = ts.rem_euclid(86400);
+                let (h, mi, se) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+                let out = fmt
+                    .replace("%Y", &format!("{:04}", y))
+                    .replace("%m", &format!("{:02}", mo))
+                    .replace("%d", &format!("{:02}", d))
+                    .replace("%H", &format!("{:02}", h))
+                    .replace("%M", &format!("{:02}", mi))
+                    .replace("%S", &format!("{:02}", se));
+                return Ok(Value::Str(out));
+            }
+            // Parses exactly "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" — the
+            // `fmt` argument is accepted for API-compatibility with
+            // `format` but not otherwise interpreted (a real strptime-
+            // style parser is future work, tracked in std/date.h#'s doc
+            // comment rather than faked here).
+            "date_parse" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let (date_part, time_part) = s.split_once(' ').unwrap_or((s.as_str(), "00:00:00"));
+                let dparts: Vec<i64> = date_part.split('-').filter_map(|p| p.parse().ok()).collect();
+                let tparts: Vec<i64> = time_part.split(':').filter_map(|p| p.parse().ok()).collect();
+                if dparts.len() != 3 {
+                    return Ok(Value::Int(0));
+                }
+                let days = days_from_civil(dparts[0], dparts[1], dparts[2]);
+                let secs = tparts.first().copied().unwrap_or(0) * 3600
+                    + tparts.get(1).copied().unwrap_or(0) * 60
+                    + tparts.get(2).copied().unwrap_or(0);
+                return Ok(Value::Int(days * 86400 + secs));
+            }
             // ── iter (v0.8) — higher-order array operations that invoke
             // H# closures passed as Value::Fn arguments via invoke_fn_value.
+            // `sort_by` — comparator-based sort, invoking an H# closure
+            // for each comparison (see `invoke_fn_value`'s doc comment,
+            // which already named this as a planned caller). Uses a
+            // simple insertion sort rather than relying on Rust's
+            // `sort_by` + a closure that can return `Err`, since a
+            // comparator invocation can fail (e.g. the user's closure
+            // panics) and `Vec::sort_by`'s comparator can't propagate a
+            // `Result` — insertion sort's comparisons are trivial to
+            // thread a `?` through one at a time instead.
+            "sort_by" => {
+                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let f = args.get(1).cloned();
+                let (params, body, fenv) = match &f {
+                    Some(Value::Fn { params, body, env, .. }) => (params.clone(), body.clone(), env.clone()),
+                    _ => return Ok(Value::Array(arr)),
+                };
+                for i in 1..arr.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        let cmp = self.invoke_fn_value(&params, &body, fenv.clone(), vec![arr[j - 1].clone(), arr[j].clone()])?;
+                        if cmp.to_int() > 0 {
+                            arr.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                return Ok(Value::Array(arr));
+            }
             "iter_map" => {
                 let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
                 let f = args.get(1).cloned();
                 let mut result = Vec::with_capacity(arr.len());
                 for x in arr {
+
                     let v = match &f {
                         Some(Value::Fn { params, body, env, .. }) =>
                             self.invoke_fn_value(params, body, env.clone(), vec![x])?,
@@ -1518,6 +2303,23 @@ impl Interpreter {
                 let result = hasher.finalize();
                 return Ok(Value::Str(result.iter().map(|b| format!("{:02x}", b)).collect()));
             }
+            // Real byte-hashing variant — `sha256` above stringifies its
+            // argument first (`Value::to_string()`), which for
+            // `Value::Bytes` produces the placeholder `"<bytes len=N>"`
+            // (see its `Display` impl), not the actual bytes. This exists
+            // specifically so `std/crypto.h#`'s `sha256_bytes(data: bytes)`
+            // hashes the real byte content instead of that placeholder.
+            "sha256_bytes" => {
+                let data: Vec<u8> = match args.first() {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    Some(Value::Str(s)) => s.clone().into_bytes(),
+                    _ => Vec::new(),
+                };
+                let mut hasher = Sha256::new();
+                Sha2Digest::update(&mut hasher, &data);
+                let result = hasher.finalize();
+                return Ok(Value::Str(result.iter().map(|b| format!("{:02x}", b)).collect()));
+            }
             "sha512" => {
                 let data = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let mut hasher = Sha512::new();
@@ -1547,6 +2349,23 @@ impl Interpreter {
                 Mac::update(&mut mac, msg.as_bytes());
                 let result = mac.finalize().into_bytes();
                 return Ok(Value::Str(result.iter().map(|b| format!("{:02x}", b)).collect()));
+            }
+            // Base64url (no padding) of the *raw* HMAC-SHA256 bytes —
+            // added specifically for `std/jwt.h#`'s HS256 signing, which
+            // needs the actual binary MAC, not `hmac_sha256`'s hex
+            // string (round-tripping hex -> `hex_decode`'s lossy-UTF8
+            // string -> base64 would corrupt binary signatures whose
+            // bytes aren't valid UTF-8, which is most of them).
+            "hmac_sha256_b64url" => {
+                let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let msg = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes())
+                    .expect("HMAC accepts any key length");
+                Mac::update(&mut mac, msg.as_bytes());
+                let raw = mac.finalize().into_bytes();
+                let b64 = base64_encode_bytes(&raw);
+                let url = b64.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string();
+                return Ok(Value::Str(url));
             }
             "hmac_sha512" => {
                 let key = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -1743,6 +2562,14 @@ impl Interpreter {
             "string_to_bytes" => {
                 let s = args.first().map(|v| v.to_str_val()).unwrap_or_default();
                 return Ok(Value::Bytes(s.into_bytes()));
+            }
+            // Lossy inverse of `string_to_bytes` — needed by
+            // `std/msgpack.h#`'s decoder, which reconstructs a `bytes`
+            // value from raw `[int]`s via `bytes_from_ints` and then
+            // needs it back as a `string` for the caller.
+            "bytes_to_string" => {
+                let b = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
+                return Ok(Value::Str(String::from_utf8_lossy(&b).to_string()));
             }
             // ── end array_*/string_* free-function forms ──────────────────
             // These have no interpreter implementation: `hsharp run` is a
@@ -2139,10 +2966,10 @@ impl Interpreter {
             },
             BinOp::Eq => Ok(Value::Bool(values_equal(&l, &r))),
             BinOp::NotEq => Ok(Value::Bool(!values_equal(&l, &r))),
-            BinOp::Lt => compare_values(l, r, |a, b| a < b),
-            BinOp::Gt => compare_values(l, r, |a, b| a > b),
-            BinOp::LtEq => compare_values(l, r, |a, b| a <= b),
-            BinOp::GtEq => compare_values(l, r, |a, b| a >= b),
+            BinOp::Lt => compare_values(l, r, |ord| ord == std::cmp::Ordering::Less),
+            BinOp::Gt => compare_values(l, r, |ord| ord == std::cmp::Ordering::Greater),
+            BinOp::LtEq => compare_values(l, r, |ord| ord != std::cmp::Ordering::Greater),
+            BinOp::GtEq => compare_values(l, r, |ord| ord != std::cmp::Ordering::Less),
             BinOp::And => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
             BinOp::Or => Ok(if l.is_truthy() { l } else { r }),
             BinOp::BitAnd => match (l, r) {
@@ -2297,6 +3124,19 @@ impl Interpreter {
         &self.stdout
     }
 
+    /// Assign `val` into the place described by `lhs`.
+    ///
+    /// Generalized (was previously `Expr::Ident`-only for the *base* of
+    /// each case — `arr[i]` worked but `matrix[i][j]` or `obj.a.b` did
+    /// not, since e.g. `IndexAccess`'s array sub-expression had to
+    /// literally be an `Ident`) to recurse: evaluate the immediate
+    /// container, mutate the one element/field being assigned, then
+    /// call `assign_lhs` again on the *sub*-expression to write that
+    /// mutated container back wherever it actually lives — which is
+    /// exactly the same "value types, no shared references" situation
+    /// every other write-back in this file (`MethodCall`,
+    /// `sort::sort_ints`, ...) already has to work around, just applied
+    /// one level at a time until it bottoms out at a plain `Ident`.
     pub fn assign_lhs(&mut self, lhs: &Expr, val: Value) -> Result<(), RuntimeError> {
         match lhs {
             Expr::Ident(name, _) => {
@@ -2310,33 +3150,183 @@ impl Interpreter {
                     Value::Int(i) => i as usize,
                     _ => return Err(RuntimeError::TypeError("index must be int".into())),
                 };
-                if let Expr::Ident(name, _) = arr_expr.as_ref() {
-                    if let Some(v) = self.env.get(name).cloned() {
-                        if let Value::Array(mut arr) = v {
-                            if idx < arr.len() {
-                                arr[idx] = val;
-                                self.env.set(name, Value::Array(arr));
-                                return Ok(());
-                            }
+                let container = self.eval_expr(arr_expr)?;
+                match container {
+                    Value::Array(mut arr) => {
+                        if idx >= arr.len() {
                             return Err(RuntimeError::IndexOutOfBounds(idx as i64, arr.len()));
                         }
+                        arr[idx] = val;
+                        self.assign_lhs(arr_expr, Value::Array(arr))
                     }
+                    _ => Err(RuntimeError::TypeError("cannot index-assign".into())),
                 }
-                Err(RuntimeError::TypeError("cannot index-assign".into()))
             }
             Expr::FieldAccess(obj_expr, field, _) => {
-                if let Expr::Ident(name, _) = obj_expr.as_ref() {
-                    if let Some(v) = self.env.get(name).cloned() {
-                        if let Value::Struct { name: sname, mut fields } = v {
-                            fields.insert(field.clone(), val);
-                            self.env.set(name, Value::Struct { name: sname, fields });
-                            return Ok(());
-                        }
+                let container = self.eval_expr(obj_expr)?;
+                match container {
+                    Value::Struct { name: sname, mut fields } => {
+                        fields.insert(field.clone(), val);
+                        self.assign_lhs(obj_expr, Value::Struct { name: sname, fields })
                     }
+                    _ => Err(RuntimeError::TypeError("cannot field-assign".into())),
                 }
-                Err(RuntimeError::TypeError("cannot field-assign".into()))
             }
             _ => Err(RuntimeError::TypeError("invalid assignment target".into())),
+        }
+    }
 }
+
+// ─── free-function helpers backing the builtins above ──────────────────────
+// Kept outside `impl Interpreter` since they're pure functions of their
+// arguments with no interpreter state involved.
+
+/// RFC 4648 standard base64 alphabet, `=` padded.
+fn base64_encode_bytes(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
 }
+
+fn base64_decode_str(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = s.bytes().filter(|&b| b != b'=' && !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3 + 3);
+    for chunk in clean.chunks(4) {
+        let vals: Vec<u32> = chunk.iter().map(|&c| val(c)).collect::<Option<Vec<_>>>()?;
+        let n = vals.iter().enumerate().fold(0u32, |acc, (i, v)| acc | (v << (18 - 6 * i)));
+        out.push(((n >> 16) & 0xff) as u8);
+        if vals.len() > 2 { out.push(((n >> 8) & 0xff) as u8); }
+        if vals.len() > 3 { out.push((n & 0xff) as u8); }
+    }
+    Some(out)
+}
+
+/// Howard Hinnant's `civil_from_days` (public domain —
+/// http://howardhinnant.github.io/date_algorithms.html), adapted to take
+/// a unix timestamp directly. Returns `(year, month, day, days_since_epoch_mod_7)`;
+/// the last field is used by `date_weekday` (1970-01-01 was a Thursday,
+/// which is why that lookup table there starts at "Thu").
+fn civil_from_unix(ts: i64) -> (i64, i64, i64, i64) {
+    let z = ts.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d, ts.div_euclid(86400))
+}
+
+/// Real (plain-HTTP-only — no TLS) HTTP/1.1 request over a raw
+/// `TcpStream`. Returns a `Value::Struct { name: "__http_response",
+/// fields: {status: Int, body: Str} }` — deliberately not `Value::Nil`
+/// on failure, since "connection refused" and "200 OK with an empty
+/// body" need to stay distinguishable to the H# caller (status 0 means
+/// the request itself failed, not that the server returned nothing).
+fn http_request(method: &str, url: &str, body: &str) -> Value {
+    fn make(status: i64, body: &str) -> Value {
+        let mut fields = HashMap::new();
+        fields.insert("status".to_string(), Value::Int(status));
+        fields.insert("body".to_string(), Value::Str(body.to_string()));
+        Value::Struct { name: "__http_response".to_string(), fields }
+    }
+
+    let rest = match url.strip_prefix("http://") {
+        Some(r) => r,
+        None if url.starts_with("https://") => {
+            return make(0, "https:// is not supported — this runtime has no TLS backend, use http:// or a reverse proxy");
+        }
+        None => url,
+    };
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().unwrap_or(80)),
+        None => (host_port, 80),
+    };
+
+    let addr = format!("{host}:{port}");
+    let sock_addr = match addr.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+        Some(a) => a,
+        None => return make(0, "DNS resolution failed"),
+    };
+    let mut stream = match std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(10)) {
+        Ok(s) => s,
+        Err(e) => return make(0, &format!("connection failed: {e}")),
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+
+    use std::io::{Read, Write};
+    let request = if body.is_empty() {
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: hsharp\r\n\r\n")
+    } else {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: hsharp\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    if let Err(e) = stream.write_all(request.as_bytes()) {
+        return make(0, &format!("write failed: {e}"));
+    }
+
+    let mut raw = Vec::new();
+    if let Err(e) = stream.read_to_end(&mut raw) {
+        return make(0, &format!("read failed: {e}"));
+    }
+    let text = String::from_utf8_lossy(&raw).to_string();
+
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    // Split headers from body at the first blank line. Deliberately does
+    // NOT decode chunked transfer-encoding — a real gap, documented on
+    // the std/http.h#/std/net_http.h# side rather than silently
+    // returning a mangled body.
+    let resp_body = match text.find("\r\n\r\n") {
+        Some(i) => &text[i + 4..],
+        None => "",
+    };
+    make(status, resp_body)
+}
+
+/// Howard Hinnant's `days_from_civil` — inverse of `civil_from_unix`,
+/// used by `date_parse`. Returns days since 1970-01-01 (not yet
+/// multiplied by 86400).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
 }
