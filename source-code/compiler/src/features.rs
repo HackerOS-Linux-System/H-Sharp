@@ -13,9 +13,14 @@ pub enum LangFeature {
     UnsafeArena,
     /// `unsafe manual(...) is ... end` — manual memory management modes.
     UnsafeManual,
-    /// Closures capturing more than 2 outer variables (current
-    /// `hsh_closure_call1/2` trampolines only forward up to 2 captures —
-    /// see roadmap §4).
+    /// Closures capturing more than 2 outer variables on the **LLVM**
+    /// backend (current `hsh_closure_call1/2` trampolines only forward
+    /// up to 2 captures — see roadmap §4). The interpreter has no such
+    /// limit: `Env` captures via an ordinary `HashMap<String, Slot>`
+    /// (see `interpreter/src/value.rs`), so this is purely a codegen
+    /// trampoline gap, not a language-level restriction — hence
+    /// `supported_on` below is backend-specific rather than blanket
+    /// `false`.
     ClosureManyCaptures,
     /// Generic functions/structs/impls (`fn f<T>(...)`) — requires
     /// monomorphization (§2) to have run first; if it hasn't (or a call
@@ -32,7 +37,11 @@ impl LangFeature {
             LangFeature::UnsafeArena | LangFeature::UnsafeManual =>
             backend == Backend::Llvm,
             LangFeature::ClosureManyCaptures =>
-            false, // not supported by ANY backend yet (hard 2-capture limit)
+            // Interpreter: no fixed-arity limit (HashMap-based Env).
+            // LLVM: still capped at 2 by the hsh_closure_call1/2
+            // trampolines until codegen grows a variadic (or
+            // struct-bundled) capture-passing convention — see roadmap §4.
+            backend == Backend::Interpreter,
             LangFeature::UnresolvedGeneric =>
             false, // never valid post-monomorphization; always an error
         }
@@ -49,7 +58,7 @@ impl LangFeature {
                         LangFeature::UnsafeManual =>
                         format!("`unsafe manual(...)` is not supported by the {} backend", backend.name()),
                             LangFeature::ClosureManyCaptures =>
-                            "closures capturing more than 2 outer variables are not yet supported by any backend".to_string(),
+                            format!("closures capturing more than 2 outer variables are not supported by the {} backend (works fine with `h# preview` / the interpreter)", backend.name()),
                             LangFeature::UnresolvedGeneric =>
                             "generic function/type left unresolved after monomorphization".to_string(),
         }
@@ -64,7 +73,7 @@ impl LangFeature {
             LangFeature::UnsafeManual =>
             "manual memory management requires a compiled backend; this code path is interpreter-only here",
             LangFeature::ClosureManyCaptures =>
-            "reduce the closure to <= 2 captured variables (e.g. bundle extras into a small struct and capture that one value instead)",
+            "for a compiled (LLVM) build, reduce the closure to <= 2 captured variables (e.g. bundle extras into a small struct and capture that one value instead); no change needed for `h# preview`",
             LangFeature::UnresolvedGeneric =>
             "ensure every call site provides enough type information to infer the type parameter (e.g. via the let binding's declared type)",
         }
