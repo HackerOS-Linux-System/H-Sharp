@@ -2,6 +2,7 @@ use hsharp_parser::ast::*;
 use crate::runtime_async;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -136,9 +137,36 @@ impl Value {
     }
 }
 
+/// A single variable binding. Held behind `Arc<Mutex<..>>` (see
+/// `Slot` alias below) so that closures can capture the *binding
+/// itself* rather than a snapshot of its value at capture time —
+/// this is what makes mutable capture work: a closure and its
+/// defining scope share the same `Arc`, so a write through either
+/// side is visible to the other.
+///
+/// `Arc<Mutex<..>>` rather than the cheaper `Rc<RefCell<..>>` is
+/// deliberate: `runtime_async::Reactor::spawn_io` runs real
+/// `std::thread::spawn` background threads for I/O tasks (`http`,
+/// `shell`, ...), which requires `Value` — and therefore `Env`, and
+/// therefore this slot type — to be `Send`. `Rc`/`RefCell` are not
+/// `Send`; `Arc`/`Mutex` are (as long as the contents are `Send`,
+/// which `Value` is once this is the only shared-mutability
+/// primitive it uses). The lock is uncontended in the vast majority
+/// of cases (H# has no shared-memory threads exposed to user code
+/// today — only the internal I/O task threads, which don't touch
+/// closure captures), so this doesn't meaningfully change performance.
+#[derive(Debug)]
+pub struct Binding {
+    pub value: Value,
+    pub mutable: bool,
+}
+
+/// Shared, interior-mutable variable slot.
+pub type Slot = Arc<Mutex<Binding>>;
+
 #[derive(Debug, Clone)]
 pub struct Env {
-    pub scopes: Vec<HashMap<String, (Value, bool)>>, // (value, mutable)
+    pub scopes: Vec<HashMap<String, Slot>>,
 }
 
 impl Env {
@@ -154,16 +182,28 @@ impl Env {
         self.scopes.pop();
     }
 
+    /// Introduce a brand-new binding (shadowing any binding of the
+    /// same name in an outer scope). This always allocates a fresh
+    /// `Slot`, so it deliberately does *not* alias an outer variable
+    /// of the same name — that's the correct shadowing behavior for
+    /// `let x = ...` inside a nested block.
     pub fn define(&mut self, name: &str, val: Value, mutable: bool) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), (val, mutable));
+            scope.insert(name.to_string(), Arc::new(Mutex::new(Binding { value: val, mutable })));
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&Value> {
+    pub fn get(&self, name: &str) -> Option<Value> {
+        self.get_slot(name).map(|slot| slot.lock().unwrap().value.clone())
+    }
+
+    /// Look up the raw `Slot` (shared cell) for a variable, without
+    /// cloning its value. Used by closure capture so the closure
+    /// shares the exact same storage as the defining scope.
+    pub fn get_slot(&self, name: &str) -> Option<Slot> {
         for scope in self.scopes.iter().rev() {
-            if let Some((v, _)) = scope.get(name) {
-                return Some(v);
+            if let Some(slot) = scope.get(name) {
+                return Some(Arc::clone(slot));
             }
         }
         None
@@ -174,9 +214,9 @@ impl Env {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for scope in self.scopes.iter().rev() {
-            for (k, (v, _)) in scope {
+            for (k, slot) in scope {
                 if seen.insert(k.clone()) {
-                    result.push((k.clone(), v.clone()));
+                    result.push((k.clone(), slot.lock().unwrap().value.clone()));
                 }
             }
         }
@@ -184,10 +224,11 @@ impl Env {
     }
 
     pub fn set(&mut self, name: &str, val: Value) -> bool {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some((v, m)) = scope.get_mut(name) {
-                if *m {
-                    *v = val;
+        for scope in self.scopes.iter().rev() {
+            if let Some(slot) = scope.get(name) {
+                let mut binding = slot.lock().unwrap();
+                if binding.mutable {
+                    binding.value = val;
                     return true;
                 } else {
                     return false; // immutable
@@ -198,10 +239,18 @@ impl Env {
     }
 
     /// Flatten all scopes into one for closure capture.
+    ///
+    /// This shares the underlying `Slot`s (via `Arc::clone`) rather
+    /// than copying values, so a closure created here and the scope
+    /// it was created in point at the *same* storage: writes made
+    /// through `set()` from inside the closure are visible to the
+    /// enclosing scope afterwards, and vice versa. This is what makes
+    /// mutable capture work — previously this cloned `Value`s
+    /// directly, which silently produced read-only snapshots.
     pub fn flatten_for_capture(&self) -> Self {
-        let mut flat = std::collections::HashMap::new();
+        let mut flat: HashMap<String, Slot> = HashMap::new();
         for scope in self.scopes.iter() {
-            for (k, v) in scope { flat.insert(k.clone(), v.clone()); }
+            for (k, slot) in scope { flat.insert(k.clone(), Arc::clone(slot)); }
         }
         Self { scopes: vec![flat] }
     }
@@ -247,6 +296,16 @@ pub enum RuntimeError {
     /// is a panic or a bug.
     #[error("exit({0})")]
     Exit(i32),
+    /// Any error that doesn't fit an existing variant — used for module /
+    /// stdlib resolution failures (see `helpers::std_lib_missing_message`)
+    /// and for the `__builtin_*` dispatch bridge's "not implemented in
+    /// this runtime yet" message (`call.rs`). Kept as a single catch-all
+    /// `String` variant instead of one new variant per failure mode, since
+    /// none of these need to be pattern-matched on by callers (unlike
+    /// `Exit`, which the native CLI's own top level specifically intercepts
+    /// to call `std::process::exit`) — they only ever need to be displayed.
+    #[error("{0}")]
+    Custom(String),
 }
 
 pub struct Interpreter {
@@ -294,4 +353,20 @@ pub struct Interpreter {
     /// `Some(n)` = `exec_stmt` returns `RuntimeError::Panic("step limit
     /// exceeded")` once `step_count` would exceed `n`.
     pub step_limit: Option<u64>,
+    /// Open TCP client connections, keyed by an opaque handle returned
+    /// to H# code from `tcp_connect` (see `std/tcp.h#`/`std/net_tcp.h#`).
+    /// A real `std::net::TcpStream` needs to stay alive *across* separate
+    /// `call_fn` invocations (`connect`, then `send`, then `recv`, then
+    /// `close`, each a distinct call from H# code) — unlike every other
+    /// resource this interpreter deals with (files, sqlite "handles"),
+    /// which are cheap to just reopen by path on every call. A live
+    /// socket can't be reopened-by-address the same way without losing
+    /// the connection's actual state, so it has to be kept somewhere
+    /// that outlives one `call_fn` call: here.
+    pub tcp_streams: HashMap<i64, std::net::TcpStream>,
+    pub next_tcp_handle: i64,
+    /// Named atomics for `std/sync.h#` — see that file's module doc
+    /// comment for why these are real-but-uncontended in this
+    /// single-native-thread interpreter.
+    pub atomics: HashMap<String, i64>,
 }
