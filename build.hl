@@ -4,7 +4,7 @@
 > LLVM_SYS_210_PREFIX=/usr/lib/llvm-21 cargo build --release
 
 ;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; ^> apt install llvm-21-dev libpolly-21-dev libzstd-dev
+;; ^> apt install llvm-21-dev libpolly-21-dev libzstd-dev g++ libstdc++-14-dev
 ;; 4. Buduj
 ;; > LLVM_SYS_210_PREFIX=/usr/lib/llvm-21 cargo build --release -p hsharp-llvm-compiler
 ;;
