@@ -18,6 +18,9 @@ impl Interpreter {
             mem_mode_notes_given: std::collections::HashSet::new(),
             step_count: 0,
             step_limit: None,
+            tcp_streams: HashMap::new(),
+            next_tcp_handle: 1,
+            atomics: HashMap::new(),
         }
     }
 
@@ -42,6 +45,30 @@ impl Interpreter {
     /// `#[test]` functions one at a time — can register the module once and
     /// then drive execution themselves via whatever entry point they want.
     pub fn run_module_register_only(&mut self, module: &Module) -> Result<(), RuntimeError> {
+        // ── `use "std -> x"` resolution ──────────────────────────────────
+        // Real file-based std library loading. This used to be a complete
+        // no-op (`Stmt::Import`/`module.imports` were parsed and then
+        // discarded — see git history / COMPILER-PATCH-NOTES.md); every
+        // `std ->` capability instead came from a hidden Rust-side alias
+        // table (`helpers::resolve_stdlib_alias`, now disabled by design).
+        // From here on, each `use "std -> lib"` a program declares is
+        // resolved against the real HackerOS std library layout and its
+        // functions are registered exactly like a `mod lib` declaration
+        // would be — done *before* any other item registration, so a
+        // user-defined function of the same name naturally shadows the
+        // std one (later inserts into `self.fns` win) rather than the
+        // reverse. `use "core -> x"` is intentionally left untouched here:
+        // `core` stays statically embedded in this runtime, unaffected by
+        // this whole mechanism (see `helpers.rs` module doc comment).
+        for (kind, alias, _span) in &module.imports {
+            if let hsharp_parser::ast::ImportKind::Std { path, .. } = kind {
+                let lib = path.last().cloned().unwrap_or_default();
+                if lib.is_empty() { continue; }
+                let ns = alias.clone().unwrap_or_else(|| lib.clone());
+                self.load_std_module(&lib, &ns)?;
+            }
+        }
+
         // Register top-level items
         for item in &module.items {
             match item {
@@ -69,6 +96,75 @@ impl Interpreter {
                 self.env.define(name, v, false);
             }
         }
+        Ok(())
+    }
+
+    /// Resolve and load one `use "std -> lib"` import: find
+    /// `/usr/lib/HackerOS/H#/std/{lib}.h#` on disk, parse it, and register
+    /// its public functions under the `{ns}::{fn}` namespace (`ns` is the
+    /// import's `from "alias"` if given, otherwise `lib` itself) — the
+    /// same registration `register_mod_items` already does for an inline
+    /// `mod` block, reused here so `fs::read(...)`-style call sites
+    /// resolve identically either way.
+    ///
+    /// A std file is free to `use "std -> other"` itself (e.g. `fs.h#`
+    /// leaning on `path.h#`); those nested imports are resolved
+    /// recursively, each under its own declared namespace, before this
+    /// file's own functions are registered — so a std file's internal
+    /// calls into another std module see it already loaded.
+    ///
+    /// Returns a hard error (not a warning, not a silent fallback) if the
+    /// file doesn't exist or fails to parse — see
+    /// `helpers::std_lib_missing_message` for the exact wording, which
+    /// deliberately points at `hacker unpack h#-utils` rather than just
+    /// saying "file not found".
+    ///
+    /// NOTE on redundancy with the compiler crate: `hsharp-compiler`'s
+    /// `modules::ModuleResolver::expand_program` now *also* resolves
+    /// `use "std -> x"` — by inlining the std file's items straight into
+    /// `module.items` (mangled as `{alias}_{fn}`, the same convention
+    /// `mod` uses) *before* `run_module`/`run_module_register_only` here
+    /// ever runs, so that both the interpreter and the LLVM/AOT backend
+    /// compile the exact same expanded source (see that function's doc
+    /// comment for the full interpreter/AOT-divergence story this fixed).
+    /// Every CLI entry point that goes through `expand_program` first
+    /// (`hsharp preview`/`build`/`check`) therefore hits this function
+    /// with imports that are already satisfied — this becomes a no-op-
+    /// shaped redundant registration, not a bug, since re-registering an
+    /// already-inlined function under its `{ns}::{fn}` key alongside the
+    /// mangled `{ns}_{fn}` one just adds a second, harmless way to call
+    /// it. This function is kept (rather than deleted) for the one
+    /// caller that *doesn't* go through `expand_program`: the WASM
+    /// playground (`playground/src/run.rs`), which calls `run_module`
+    /// directly on a freshly-parsed single-file snippet with no
+    /// filesystem access at all — where this will simply, correctly,
+    /// fail with the "please install h# utils" message, since
+    /// `/usr/lib/HackerOS` doesn't exist in a browser sandbox either way.
+    pub fn load_std_module(&mut self, lib: &str, ns: &str) -> Result<(), RuntimeError> {
+        let path = crate::helpers::std_lib_path(lib);
+        let src = std::fs::read_to_string(&path)
+            .map_err(|_| RuntimeError::Custom(crate::helpers::std_lib_missing_message(lib)))?;
+
+        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(lib));
+        if result.has_errors() {
+            return Err(RuntimeError::Custom(format!(
+                "parse errors while loading std module '{}' ({}):\n{}",
+                lib, path.display(), result.render_errors()
+            )));
+        }
+
+        // A std file's own `use "std -> other"` imports, resolved before
+        // its functions are registered (see doc comment above).
+        for (kind, sub_alias, _span) in &result.module.imports {
+            if let ImportKind::Std { path: sub_path, .. } = kind {
+                let sub_lib = sub_path.last().cloned().unwrap_or_default();
+                if sub_lib.is_empty() { continue; }
+                let sub_ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
+                self.load_std_module(&sub_lib, &sub_ns)?;
+            }
+        }
+
+        self.register_mod_items(ns, &result.module.items);
         Ok(())
     }
 
