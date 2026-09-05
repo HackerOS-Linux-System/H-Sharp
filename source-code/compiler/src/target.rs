@@ -81,6 +81,30 @@ impl TargetTriple {
         }
     }
 
+    /// Added alongside `cross_toolchain`'s cross-linker resolution (see
+    /// codegen.rs) — `Arch::Riscv64` already existed as an enum variant,
+    /// but had no constructor, no `from_str` entry, and no `all_named()`
+    /// listing, so `--target riscv64-*` had no way to actually be
+    /// selected from the CLI even though the LLVM backend itself (and
+    /// now the cross-linker lookup table) both already understand it.
+    pub fn linux_riscv64() -> Self {
+        Self {
+            arch: Arch::Riscv64,
+            os: Os::Linux,
+            abi: Abi::Gnu,
+            llvm_triple: "riscv64gc-unknown-linux-gnu".to_string(),
+        }
+    }
+
+    pub fn linux_riscv64_musl() -> Self {
+        Self {
+            arch: Arch::Riscv64,
+            os: Os::Linux,
+            abi: Abi::Musl,
+            llvm_triple: "riscv64gc-unknown-linux-musl".to_string(),
+        }
+    }
+
     pub fn windows_x86_64() -> Self {
         Self {
             arch: Arch::X86_64,
@@ -151,6 +175,8 @@ impl TargetTriple {
             "linux-x86_64" | "linux" => Some(Self::linux_x86_64_musl()),
             "linux-x86_64-gnu" => Some(Self::linux_x86_64_gnu()),
             "linux-aarch64" => Some(Self::linux_aarch64()),
+            "linux-riscv64" => Some(Self::linux_riscv64()),
+            "linux-riscv64-musl" => Some(Self::linux_riscv64_musl()),
             "windows" | "windows-x86_64" => Some(Self::windows_x86_64()),
             "windows-aarch64" => Some(Self::windows_aarch64()),
             "macos" | "macos-x86_64" => Some(Self::macos_x86_64()),
@@ -177,6 +203,8 @@ impl TargetTriple {
             ("linux-x86_64", "Linux x86_64 (musl, fully static) [default]"),
             ("linux-x86_64-gnu", "Linux x86_64 (gnu)"),
             ("linux-aarch64", "Linux ARM64"),
+            ("linux-riscv64", "Linux RISC-V 64-bit (gnu, RV64GC)"),
+            ("linux-riscv64-musl", "Linux RISC-V 64-bit (musl, RV64GC)"),
             ("windows-x86_64", "Windows x86_64"),
             ("windows-aarch64", "Windows ARM64"),
             ("macos-x86_64", "macOS Intel"),
