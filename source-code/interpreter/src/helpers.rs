@@ -2,158 +2,362 @@ use serde_json::Value as Json;
 use std::collections::HashMap;
 use crate::value::{Value, RuntimeError};
 
+// ─── std/*.h# resolution (HackerOS layout) ─────────────────────────────────
+//
+// From today onward, `use "std -> X"` is a REAL file lookup, not a name
+// shortcut into a Rust/C builtin table. When a program (or the H# runtime
+// itself, at REPL/preview/build time) declares `use "std -> env"`, the
+// runtime looks for the actual library source at:
+//
+//   /usr/lib/HackerOS/H#/std/env.h#
+//
+// and parses + registers it exactly like a `mod` (see `interp.rs`'s
+// `load_std_module` and `register_mod_items`). There is no silent
+// "built-in fallback" anymore — a missing file is a hard error, since a
+// program that imports a stdlib module and gets a silently-different
+// (and possibly less complete) embedded implementation instead is a much
+// worse failure mode than a loud, actionable one.
+//
+// `use "core -> X"` is unaffected by any of this — `core` is, by design,
+// the one layer that *does* ship statically compiled into the H# runtime
+// itself (this crate + `runtime/core.c` on the LLVM side), the same way a
+// C program always has libc linked in without needing to `apt install`
+// anything. `std` is everything built on top of that core, and now lives
+// exclusively as real, inspectable, editable `.h#` source under `std/`.
+pub const STD_LIB_ROOT: &str = "/usr/lib/HackerOS/H#/std";
 
-pub fn resolve_stdlib_alias(full_path: &str) -> Option<&'static str> {
-    Some(match full_path {
-        // crypto — bridge to the differently-named existing builtins
-        "crypto::sha256"        => "sha256",
-        "crypto::sha512"        => "sha512",
-        "crypto::md5"            => "md5",
-        "crypto::sha1"           => "sha1",
-        "crypto::hmac_sha256"   => "hmac_sha256",
-        "crypto::hmac_sha512"   => "hmac_sha512",
-        "crypto::random_bytes"  => "random_string",
-        "crypto::random_int"    => "random_int",
-        "sec::xor"               => "xor_hex",
-        "sec::rot13"             => "rot13",
-        "sec::scan_port"         => "scan_port",
-        // hex
-        "hex::encode"            => "hex_encode",
-        "hex::decode"            => "hex_decode",
-        // regex — std/regex.h#'s H# API takes (text, pattern, ...) i.e.
-        // subject-first; bridge to the _ta ("text-argument-first") wrapper
-        // builtins, which swap order before delegating to the underlying
-        // grep/sed-based (pattern, text) implementations.
-        "regex::is_match"        => "re_match_ta",
-        "re::is_match"           => "re_match_ta",
-        "regex::find"            => "re_find_ta",
-        "re::find"                => "re_find_ta",
-        "regex::find_all"        => "re_find_all_ta",
-        "re::find_all"            => "re_find_all_ta",
-        "regex::replace"         => "re_replace_ta",
-        "re::replace"             => "re_replace_ta",
-        "regex::replace_all"     => "re_replace_all_ta",
-        "re::replace_all"         => "re_replace_all_ta",
-        "regex::split"            => "re_split_ta",
-        "re::split"                => "re_split_ta",
-        // fs
-        "fs::read"                => "fs_read",
-        "fs::write"               => "fs_write",
-        "fs::exists"              => "fs_exists",
-        "fs::mkdir"               => "fs_mkdir_all",
-        "fs::remove"              => "fs_remove",
-        "fs::append"              => "fs_append",
-        "fs::is_dir"              => "fs_is_dir",
-        "fs::is_file"             => "fs_is_file",
-        "fs::rmdir"               => "fs_rmdir",
-        "fs::rmdir_all"           => "fs_rmdir_all",
-        "fs::read_lines"          => "fs_read_lines",
-        "fs::size"                => "fs_size",
-        "fs::copy"                => "fs_copy",
-        "fs::rename"              => "fs_rename",
-        "fs::cwd"                 => "fs_cwd",
-        "fs::chdir"               => "fs_cwd", // no-op placeholder until chdir lands
-        "fs::list_dir"            => "fs_list_dir",
-        // path
-        "path::join"              => "path_join",
-        "path::stem"              => "path_stem",
-        "path::extension"         => "path_extension",
-        "path::parent"            => "path_parent",
-        // env
-        "env::temp_dir"           => "env_temp_dir",
-        "env::get"                => "env_get",
-        "env::args"               => "env_args",
-        "env::home"               => "env_home",
-        // iter
-        "iter::map"                => "iter_map",
-        "iter::filter"             => "iter_filter",
-        "iter::reduce"             => "iter_reduce",
-        "iter::zip"                => "iter_zip",
-        "iter::chain"              => "iter_chain",
-        "iter::take"                => "iter_take",
-        "iter::skip"                => "iter_skip",
-        "iter::any"                 => "iter_any",
-        "iter::all"                 => "iter_all",
-        "iter::sum"                 => "iter_sum",
-        "iter::product"             => "iter_product",
-        "iter::reverse"             => "iter_reverse",
-        "iter::join"                => "iter_join",
-        "iter::repeat"              => "iter_repeat",
-        "iter::unique"              => "iter_unique",
-        // sort
-        "sort::sort_ints"           => "sort_ints",
-        "sort::sort_strings"        => "sort_strings",
-        "sort::binary_search"       => "binary_search",
-        "sort::binary_search_left"  => "binary_search_left",
-        "sort::min_int"             => "min_int",
-        "sort::max_int"             => "max_int",
-        "sort::merge_sorted"        => "merge_sorted",
-        // async
-        "async::spawn"               => "async_spawn",
-        "async::timeout"             => "async_timeout",
-        // str
-        "str::trim"               => "str_trim",
-        "str::split"              => "str_split",
-        "str::replace"            => "str_replace",
-        "str::join"               => "str_join",
-        // conv
-        "conv::str_to_int"        => "conv_str_to_int",
-        "conv::int_to_hex"        => "conv_int_to_hex",
-        "conv::to_bytes"          => "conv_to_bytes",
-        // db
-        "db::open"                => "db_open",
-        "db::query"               => "db_query",
-        "db::exec"                => "db_exec",
-        "db::close"               => "db_close",
-        // dns
-        "dns::resolve"            => "dns_resolve",
-        // uuid
-        "uuid::v4"                 => "new_uuid",
-        // time
-        "t::now_unix"             => "now_unix",
-        "t::now_ms"               => "now_ms",
-        "t::sleep_ms"             => "sleep_ms",
-        "time::now_unix"          => "time_unix",
-        "time::now_ms"            => "time_ms",
-        // collections — native HashMap/HashSet/Queue/Stack constructors
-        "col::HashMap::new"        => "hashmap_new",
-        "col::HashSet::new"        => "hashset_new",
-        "col::Queue::new"          => "queue_new",
-        "col::Stack::new"          => "stack_new",
-        // json — set_str/set_int/set_bool all bridge to the same generic
-        // json_set builtin (the value's runtime type is preserved either way)
-        "json::set_str"            => "json_set",
-        "json::set_int"            => "json_set",
-        "json::set_bool"           => "json_set",
-        // The rest of the json:: API — each maps 1:1 to its json_* builtin.
-        // These were missing entirely before (only the three set_* aliases
-        // existed), meaning json::parse, json::get_str, json::stringify,
-        // etc. all silently fell through call_path's snake_case/
-        // builtin_exists fallback to a nonexistent bare-last-segment
-        // function name and returned Nil instead of ever reaching their
-        // real implementations — every JSON test failed because of this.
-        "json::parse"               => "json_parse",
-        "json::parse_array"         => "json_parse_array",
-        "json::stringify"           => "json_stringify",
-        "json::stringify_pretty"    => "json_stringify_pretty",
-        "json::empty_object"        => "json_empty_object",
-        "json::object"              => "json_object",
-        "json::get_str"             => "json_get_str",
-        "json::get_int"             => "json_get_int",
-        "json::get_float"           => "json_get_float",
-        "json::get_bool"            => "json_get_bool",
-        "json::get_obj"             => "json_get_obj",
-        "json::get_arr"             => "json_get_arr",
-        "json::has_key"             => "json_has_key",
-        "json::is_null"             => "json_is_null",
-        "json::obj_at"              => "json_obj_at",
-        "json::int_at"              => "json_int_at",
-        "json::str_at"              => "json_as_str",
-        "json::as_int"              => "json_as_int",
-        "json::as_str"              => "json_as_str",
-        "json::query"               => "json_query",
+/// The on-disk path a `use "std -> ...-> lib"` import resolves to.
+pub fn std_lib_path(lib: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(STD_LIB_ROOT).join(format!("{}.h#", lib))
+}
+
+/// The message shown when a `std -> lib` import can't find its file.
+/// Exact wording/format is intentional — this is user-facing product
+/// copy, not an internal diagnostic, and should stay stable so scripts/
+/// docs that grep for it keep working. The Windows line is a known,
+/// deliberate placeholder: HackerOS' `h#-utils` package currently only
+/// ships a Linux path (`hacker unpack h#-utils`); there is no Windows
+/// install path defined yet.
+pub fn std_lib_missing_message(lib: &str) -> String {
+    format!(
+        "std module '{lib}' not found at {path}\n\n\
+please install h# utils for HackerOS use:\n\
+  linux:   hacker unpack h#-utils\n\
+  windows: (not available yet — no install path is defined for Windows yet)\n",
+        lib = lib,
+        path = std_lib_path(lib).display(),
+    )
+}
+
+/// Bridge for the `__builtin_*` names that `std/*.h#` wrapper functions
+/// call internally (e.g. `strings.h#`'s `trim()` calling
+/// `__builtin_str_trim(s)`). These are NOT stdlib aliases (see
+/// `resolve_stdlib_alias` below, which is now core-only) — they're the
+/// std library's own private bridge down into the actual native runtime
+/// primitive, the same way libc's `fopen()` is a thin wrapper over the
+/// `open`/`read` syscalls. A std file can only reach these by being
+/// loaded (i.e. only after a successful `use "std -> x"`), never
+/// directly from user code, since `__builtin_` names aren't part of any
+/// public `std ->` API.
+///
+/// Returns the real dispatch name to retry `call_fn` with, or `None` if
+/// the primitive genuinely doesn't exist yet in this runtime (in which
+/// case the caller should surface `unimplemented_builtin_message`).
+pub fn resolve_builtin_dunder(name: &str) -> Option<&'static str> {
+    let stripped = name.strip_prefix("__builtin_")?;
+    Some(match stripped {
+        // ── strings ──────────────────────────────────────────────────
+        "str_trim"             => "str_trim",
+        "str_trim_start"       => "str_trim_start",
+        "str_trim_end"         => "str_trim_end",
+        "str_split"            => "str_split",
+        "str_split_whitespace" => "str_split_whitespace",
+        "str_join"             => "str_join",
+        "str_replace"          => "str_replace",
+        "str_replace_all"      => "str_replace_all",
+        "str_to_upper"         => "str_to_upper",
+        "str_to_lower"         => "str_to_lower",
+        "str_reverse"          => "str_reverse",
+        "str_count"            => "str_count",
+        "str_index_of"         => "str_index_of",
+        "str_is_numeric"       => "str_is_numeric",
+        // ── fs (only the subset with a real native implementation —
+        // see `call.rs`'s "fs_*" match arms) ─────────────────────────
+        "fs_read"        => "fs_read",
+        "fs_read_bytes"  => "fs_read_bytes",
+        "fs_read_lines"  => "fs_read_lines",
+        "fs_write"       => "fs_write",
+        "fs_write_bytes" => "fs_write_bytes",
+        "fs_append"      => "fs_append",
+        "fs_exists"      => "fs_exists",
+        "fs_remove"      => "fs_remove",
+        "fs_copy"        => "fs_copy",
+        "fs_rename"      => "fs_rename",
+        "fs_is_dir"      => "fs_is_dir",
+        "fs_is_file"     => "fs_is_file",
+        "fs_mkdir"       => "fs_mkdir_all",
+        "fs_rmdir"       => "fs_rmdir",
+        "fs_rmdir_all"   => "fs_rmdir_all",
+        "fs_size"        => "fs_size",
+        "fs_cwd"         => "fs_cwd",
+        "fs_chdir"       => "fs_chdir",
+        "fs_list_dir"    => "fs_list_dir",
+        "fs_walk"          => "fs_walk",
+        "fs_modified_time" => "fs_modified_time",
+        "fs_temp_file"     => "fs_temp_file",
+        "bytes_from_ints"  => "bytes_from_ints",
+        "bytes_to_ints"    => "bytes_to_ints",
+        "bytes_concat"     => "bytes_concat",
+        "bytes_len"        => "bytes_len",
+        "bytes_to_string"  => "bytes_to_string",
+        // ── json ─────────────────────────────────────────────────────
+        "json_parse"             => "json_parse",
+        "json_parse_array"       => "json_parse_array",
+        "json_stringify"         => "json_stringify",
+        "json_stringify_pretty"  => "json_stringify_pretty",
+        "json_empty_object"      => "json_empty_object",
+        "json_set"               => "json_set",
+        "json_get_str"           => "json_get_str",
+        "json_get_int"           => "json_get_int",
+        "json_get_float"         => "json_get_float",
+        "json_get_bool"          => "json_get_bool",
+        "json_get_obj"           => "json_get_obj",
+        "json_get_arr"           => "json_get_arr",
+        "json_has_key"           => "json_has_key",
+        "json_is_null"           => "json_is_null",
+        "json_query"             => "json_query",
+        "json_as_int"            => "json_as_int",
+        "json_as_str"            => "json_as_str",
+        // ── math ─────────────────────────────────────────────────────
+        // Each arm returns its own `&'static str` literal rather than
+        // reusing `stripped` (the `name.strip_prefix(...)` result,
+        // borrowed from the caller's `&str` — that's what actually
+        // caused the E0521 "borrowed data escapes outside of function"
+        // build error: `stripped`'s lifetime is tied to `name`'s, which
+        // this function's signature can't promise is `'static`, even
+        // though every *value* it could hold in these arms happens to
+        // already be a real `'static` literal too).
+        "math_sin"   => "math_sin",
+        "math_cos"   => "math_cos",
+        "math_tan"   => "math_tan",
+        "math_asin"  => "math_asin",
+        "math_acos"  => "math_acos",
+        "math_atan"  => "math_atan",
+        "math_atan2" => "math_atan2",
+        "math_sqrt"  => "math_sqrt",
+        "math_pow"   => "math_pow",
+        "math_floor" => "math_floor",
+        "math_ceil"  => "math_ceil",
+        "math_round" => "math_round",
+        "math_trunc" => "math_trunc",
+        "math_log"   => "math_log",
+        "math_log2"  => "math_log2",
+        "math_log10" => "math_log10",
+        "math_exp"   => "math_exp",
+        "conv_float_to_int" => "conv_float_to_int",
+        // ── regex (real grep/sed backend — see call.rs) ─────────────────
+        "regex_match"      => "regex_match",
+        "regex_find"       => "regex_find",
+        "regex_find_all"   => "regex_find_all",
+        "regex_replace"        => "regex_replace",
+        "regex_replace_all"    => "regex_replace",
+        "regex_split"          => "re_split_ta",
+        // ── sort ─────────────────────────────────────────────────────
+        "sort_ints"    => "sort_ints",
+        "sort_strings" => "sort_strings",
+        "sort_by"      => "sort_by",
+        // ── path ─────────────────────────────────────────────────────
+        "path_join"          => "path_join",
+        "path_stem"          => "path_stem",
+        "path_extension"     => "path_extension",
+        "path_parent"        => "path_parent",
+        "path_filename"      => "path_filename",
+        "path_is_absolute"   => "path_is_absolute",
+        "path_normalize"     => "path_normalize",
+        "path_with_extension"=> "path_with_extension",
+        "path_exists"        => "fs_exists",
+        // ── env ──────────────────────────────────────────────────────
+        "env_get"       => "env_get",
+        "env_set"       => "env_set",
+        "env_remove"    => "env_remove",
+        "env_args"      => "env_args",
+        "env_vars"      => "env_vars",
+        "env_temp_dir"  => "env_temp_dir",
+        "env_home"      => "env_home",
+        // ── os ───────────────────────────────────────────────────────
+        "os_platform"       => "os_platform",
+        "os_arch"           => "os_arch",
+        "os_hostname"       => "hostname",
+        "os_username"       => "os_username",
+        "os_home_dir"       => "os_home_dir",
+        "os_temp_dir"       => "env_temp_dir",
+        "os_pid"            => "getpid",
+        "os_is_root"        => "os_is_root",
+        "os_kernel_version" => "os_kernel_version",
+        // ── process ──────────────────────────────────────────────────
+        "process_run"      => "proc_run",
+        "process_run_args" => "proc_run_args",
+        "process_spawn"    => "proc_spawn",
+        "process_kill"     => "proc_kill",
+        "process_which"    => "proc_which",
+        "process_shell"    => "shell",
+        // ── term ─────────────────────────────────────────────────────
+        "term_width"   => "term_width",
+        "term_height"  => "term_height",
+        "term_is_tty"  => "term_is_tty",
+        // ── uuid ─────────────────────────────────────────────────────
+        "uuid_v4"       => "uuid_v4",
+        "uuid_is_valid" => "uuid_is_valid",
+        // ── base64 / url encoding ────────────────────────────────────
+        "base64_encode" => "base64_encode",
+        "base64_decode" => "base64_decode",
+        "base64url_encode" => "base64url_encode",
+        "base64url_decode" => "base64url_decode",
+        "hmac_sha256_b64url" => "hmac_sha256_b64url",
+        "url_encode"    => "url_encode",
+        "url_decode"    => "url_decode",
+        // ── hex (already-existing text-hex codec + hex-string XOR) ────
+        "hex_encode" => "hex_encode",
+        "hex_encode_bytes" => "hex_encode_bytes",
+        "hex_decode" => "hex_decode",
+        "hex_xor"    => "xor_hex",
+        // ── conv ─────────────────────────────────────────────────────
+        "conv_str_to_int"   => "conv_str_to_int",
+        "conv_str_to_float" => "parse_float",
+        "conv_int_to_hex"   => "conv_int_to_hex",
+        "str_to_char_code"  => "str_to_char_code",
+        "char_code_to_str"  => "char_code_to_str",
+        // ── date / time (Howard-Hinnant civil calendar — see call.rs) ─
+        "date_year"      => "date_year",
+        "date_month"     => "date_month",
+        "date_day"       => "date_day",
+        "date_weekday"   => "date_weekday",
+        "date_add_days"  => "date_add_days",
+        "date_add_hours" => "date_add_hours",
+        "date_diff_days" => "date_diff_days",
+        "date_format"    => "date_format",
+        "date_parse"     => "date_parse",
+        "time_now_unix"  => "now_unix",
+        "time_now_ms"    => "now_ms",
+        "time_sleep_ms"  => "sleep_ms",
+        // ── crypto (real hashes only — see crypto.h# doc comments for
+        // which functions still have no native backend) ───────────────
+        "crypto_sha256"        => "sha256",
+        "crypto_sha256_bytes"  => "sha256_bytes",
+        "crypto_sha512"        => "sha512",
+        "crypto_sha1"          => "sha1",
+        "crypto_md5"           => "md5",
+        "crypto_hmac_sha256"   => "hmac_sha256",
+        "crypto_hmac_sha512"   => "hmac_sha512",
+        "crypto_random_bytes"  => "crypto_random_bytes",
+        "crypto_random_int"    => "random_int",
+        "crypto_bytes_eq"      => "crypto_bytes_eq",
+        "crypto_xor_bytes"     => "crypto_xor_bytes",
+        // ── db (shells out to the `sqlite3` CLI — see call.rs) ─────────
+        "db_open"  => "db_open",
+        "db_exec"  => "db_exec",
+        "db_query" => "db_query",
+        "db_close" => "db_close",
+        // ── test ─────────────────────────────────────────────────────
+        "test_fail" => "fail",
+        "test_skip" => "skip",
+        // ── collections ──────────────────────────────────────────────
+        "hashmap_new"        => "hashmap_new",
+        "hashmap_insert"     => "hashmap_insert",
+        "hashmap_get"        => "hashmap_get",
+        "hashmap_remove"     => "hashmap_remove",
+        "hashmap_contains"   => "hashmap_contains",
+        "hashmap_keys"       => "hashmap_keys",
+        "hashmap_values"     => "hashmap_values",
+        "hashmap_len"        => "hashmap_len",
+        "hashset_new"        => "hashset_new",
+        "hashset_insert"     => "hashset_insert",
+        "hashset_remove"     => "hashset_remove",
+        "hashset_contains"   => "hashset_contains",
+        "hashset_len"        => "hashset_len",
+        "hashset_to_array"   => "hashset_to_array",
+        // ── tcp ──────────────────────────────────────────────────────
+        "tcp_connect"   => "tcp_connect",
+        "tcp_send"      => "tcp_send",
+        "tcp_recv"      => "tcp_recv",
+        "tcp_close"     => "tcp_close",
+        "tcp_scan_port" => "tcp_scan_port",
+        // ── http (plain HTTP/1.1, no TLS — see call.rs's http_request) ──
+        "http_request" => "http_request",
+        // ── sync ─────────────────────────────────────────────────────
+        "atomic_add"   => "atomic_add",
+        "atomic_load"  => "atomic_load",
+        "atomic_store" => "atomic_store",
+        // ── io ───────────────────────────────────────────────────────
+        "io_read_line"    => "io_read_line",
+        "io_read_char"    => "io_read_char",
+        "io_write_no_nl"  => "io_write_no_nl",
+        "io_flush"        => "io_flush",
+        // ── sys ──────────────────────────────────────────────────────
+        "sys_cpu_count"    => "sys_cpu_count",
+        "sys_memory_total" => "sys_memory_total",
+        "sys_memory_free"  => "sys_memory_free",
+        "sys_uptime"       => "sys_uptime",
+        "sys_load_avg"     => "sys_load_avg",
+        "sys_disk_total"   => "sys_disk_total",
+        "sys_disk_free"    => "sys_disk_free",
+        "sys_page_size"    => "sys_page_size",
+        "sys_is_64bit"         => "sys_is_64bit",
+        "sys_is_little_endian" => "sys_is_little_endian",
+        "sys_get_uid"      => "sys_get_uid",
+        "sys_get_gid"      => "sys_get_gid",
+        "sys_get_ppid"     => "sys_get_ppid",
+        "sys_get_pid"      => "getpid",
+        "sys_hostname"     => "hostname",
+        "sys_sysname"      => "sys_sysname",
+        "sys_machine"      => "sys_machine",
+        "sys_kernel_version" => "os_kernel_version",
         _ => return None,
     })
+}
+
+/// `__builtin_*` names with no native implementation *anywhere* in this
+/// runtime yet (not a resolution failure — the primitive itself hasn't
+/// been written). Kept as an explicit list rather than "anything
+/// `resolve_builtin_dunder` didn't match" so the error message can name
+/// concretely what's missing instead of a generic "undefined function".
+pub fn unimplemented_builtin_message(name: &str) -> String {
+    let stripped = name.strip_prefix("__builtin_").unwrap_or(name);
+    format!(
+        "std library primitive '{stripped}' has no native implementation in this H# runtime yet.\n\
+This isn't a missing `use` or a typo — the underlying `__builtin_{stripped}` intrinsic itself \
+hasn't been implemented in the interpreter (see source-code/interpreter/src/call.rs) or the \
+LLVM runtime (source-code/compiler/runtime/core.c). The std/*.h# wrapper that calls it is real, \
+but has nothing to call into on this backend."
+    )
+}
+
+/// **Deprecated / disabled by design.** This used to be a table mapping
+/// fully-qualified `module::function` paths (e.g. `"fs::read"`,
+/// `"crypto::sha256"`, `"json::parse"`) straight onto native Rust
+/// builtins — which meant a program could call `fs::read(...)` and get a
+/// real answer *without ever writing* `use "std -> fs"`, silently
+/// bypassing the std library entirely and reaching a second, hidden
+/// implementation embedded in this crate instead.
+///
+/// That's exactly the "embedded std lib" behavior HackerOS' H# no longer
+/// wants: every `std -> X` capability must come from the real
+/// `/usr/lib/HackerOS/H#/std/X.h#` file (see `std_lib_path` above), which
+/// `interp.rs`'s `load_std_module` now actually loads and registers into
+/// `self.fns` under `X::function` — so `call_path`'s very first lookup
+/// (`self.fns.contains_key(&full)`) already finds it, before this
+/// function would ever be consulted. Keeping this function return `None`
+/// unconditionally (rather than deleting every call site) means: if a
+/// program calls `fs::read(...)` *without* a working `use "std -> fs"`,
+/// it now fails loudly with `UndefinedFn("fs::read")` — exactly what
+/// should happen — instead of quietly succeeding via a shortcut the user
+/// never asked for.
+///
+/// `use "core -> X"` is unaffected: `core` is intentionally still
+/// statically embedded (see the module-level doc comment above), and its
+/// resolution never went through this table in the first place.
+pub fn resolve_stdlib_alias(_full_path: &str) -> Option<&'static str> {
+    None
 }
 
 /// Returns true for snake_case names known to be handled by the builtin
@@ -163,28 +367,16 @@ pub fn resolve_stdlib_alias(full_path: &str) -> Option<&'static str> {
 /// isn't actually implemented, in which case `call_fn` silently returns
 /// `Nil` rather than erroring. Prefer adding new mappings to
 /// `resolve_stdlib_alias` over relying on this fallback.
-pub fn builtin_exists(snake_name: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "math_sin", "math_cos", "math_tan", "math_asin", "math_acos", "math_atan",
-        "math_atan2", "math_sqrt", "math_pow", "math_floor", "math_ceil", "math_round",
-        "math_trunc", "math_log", "math_log2", "math_log10", "math_exp", "math_abs",
-        "math_fabs", "math_ipow", "math_min", "math_max", "math_fmin", "math_fmax",
-        "math_clamp", "math_fclamp", "math_gcd", "math_lcm", "math_pi", "math_e", "math_tau",
-        "fs_read", "fs_write", "fs_exists", "fs_mkdir_all", "fs_remove", "fs_append",
-        "fs_is_dir", "fs_rmdir", "fs_rmdir_all", "fs_read_lines", "fs_size",
-        "fs_copy", "fs_rename", "fs_cwd", "fs_list_dir",
-        "path_join", "path_stem", "path_extension", "path_parent",
-        "env_temp_dir", "env_get", "env_args", "env_home",
-        "str_trim", "str_split", "str_replace", "str_contains",
-        "db_open", "db_query", "db_exec", "db_close",
-        "sqlite_open", "sqlite_query", "sqlite_exec", "sqlite_close",
-        "regex_match", "regex_find", "regex_find_all", "regex_replace",
-        "re_match", "re_find", "re_find_all", "re_replace",
-        "re_match_ta", "re_find_ta", "re_find_all_ta", "re_replace_ta",
-        "re_replace_all_ta", "re_split_ta",
-        "dns_resolve",
-    ];
-    KNOWN.contains(&snake_name)
+/// **Deprecated / disabled by design** — same reasoning as
+/// `resolve_stdlib_alias` above. This used to let a bare `module_function`
+/// snake_case guess (e.g. `fs::read` → `fs_read`) reach a native builtin
+/// even when the corresponding `std -> module` was never `use`d. Now
+/// returns `false` unconditionally so that path is closed: the only way
+/// to reach a std capability is a successful `use "std -> module"`, which
+/// registers the real function under `module::name` and satisfies
+/// `call_path`'s lookup *before* this function is ever consulted.
+pub fn builtin_exists(_snake_name: &str) -> bool {
+    false
 }
 
 /// Convert a parsed `serde_json::Value` into H#'s runtime `Value`.
@@ -366,13 +558,23 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-pub fn compare_values(a: Value, b: Value, f: impl Fn(f64, f64) -> bool) -> Result<Value, RuntimeError> {
-    let result = match (a, b) {
-        (Value::Int(a), Value::Int(b)) => f(a as f64, b as f64),
-        (Value::Float(a), Value::Float(b)) => f(a, b),
-        (Value::Int(a), Value::Float(b)) => f(a as f64, b),
-        (Value::Float(a), Value::Int(b)) => f(a, b as f64),
+pub fn compare_values(a: Value, b: Value, f: impl Fn(std::cmp::Ordering) -> bool) -> Result<Value, RuntimeError> {
+    // Extended to cover `(Value::Str, Value::Str)` — plain lexicographic
+    // byte-wise comparison, same ordering `String`'s own `Ord` impl
+    // gives — since `std/semver.h#`'s prerelease-tag comparison (and
+    // any future std code doing the same) needs `a < b` to work on
+    // strings, not just numbers. Reworked to compare via
+    // `std::cmp::Ordering` rather than a `Fn(f64, f64) -> bool` closure,
+    // since there's no sensible way to project a string comparison
+    // through "cast both sides to f64" the way the old signature
+    // required.
+    let ord = match (a, b) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(&b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Int(a), Value::Float(b)) => (a as f64).partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(b as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Str(a), Value::Str(b)) => a.cmp(&b),
         (a, b) => return Err(RuntimeError::TypeError(format!("cannot compare {} and {}", a, b))),
     };
-    Ok(Value::Bool(result))
+    Ok(Value::Bool(f(ord)))
 }
