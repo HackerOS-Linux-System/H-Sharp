@@ -174,6 +174,7 @@ pub struct LlvmBuiltins<'ctx> {
     // codegen.rs). hsh_getcwd/hsh_username/hsh_platform/hsh_setenv are
     // newly declared.
     pub hsh_getcwd: FunctionValue<'ctx>,
+    pub hsh_chdir: FunctionValue<'ctx>,
     pub hsh_username: FunctionValue<'ctx>,
     pub hsh_platform: FunctionValue<'ctx>,
     pub hsh_setenv: FunctionValue<'ctx>,
@@ -196,6 +197,13 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_map_keys:   FunctionValue<'ctx>,
     pub hsh_map_clear:  FunctionValue<'ctx>,
     pub hsh_is_dir:        FunctionValue<'ctx>,
+    /// Real C implementations that already existed in `core.c`
+    /// (`hsh_is_file`/`hsh_append_file`) but had no `LlvmBuiltins` field
+    /// or dispatch arm at all — added here to back `std/fs.h#`'s
+    /// `is_file`/`append` for the LLVM backend (they already worked on
+    /// the interpreter, via `call.rs`'s own separate arms).
+    pub hsh_is_file:       FunctionValue<'ctx>,
+    pub hsh_append_file:   FunctionValue<'ctx>,
     // ANSI / Terminal
     pub hsh_bold:          FunctionValue<'ctx>,
     pub hsh_green_text:    FunctionValue<'ctx>,
@@ -415,6 +423,7 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_min_f: decl("hsh_min_f", f64t.fn_type(&[f64t.into(), f64t.into()], false)),
             hsh_max_f: decl("hsh_max_f", f64t.fn_type(&[f64t.into(), f64t.into()], false)),
             hsh_getcwd: np("hsh_getcwd"),
+            hsh_chdir: pi("hsh_chdir"),
             hsh_username: np("hsh_username"),
             hsh_platform: np("hsh_platform"),
             hsh_setenv: ppi("hsh_setenv"),
@@ -431,6 +440,8 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_map_keys:   pp("hsh_map_keys"),
             hsh_map_clear:  decl("hsh_map_clear", void.fn_type(&[ptr.into()], false)),
             hsh_is_dir:        pi("hsh_is_dir"),
+            hsh_is_file:       pi("hsh_is_file"),
+            hsh_append_file:   ppi("hsh_append_file"),
             // ANSI
             hsh_bold:          pp("hsh_bold"),
             hsh_green_text:    pp("hsh_green_text"),
