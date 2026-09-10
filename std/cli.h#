@@ -237,8 +237,17 @@ end
 fn strings_trim(s: string) -> string is return __builtin_str_trim(s) end
 fn strings_to_lower(s: string) -> string is return __builtin_str_to_lower(s) end
 fn strings_join(parts: [string], sep: string) -> string is return iter_join(parts, sep) end
+;; Both of these call the real `__builtin_io_*` intrinsics directly — as
+;; of `builtins_registry.rs`'s `resolve_builtin_dunder_llvm`, they're
+;; portable on both the interpreter and the LLVM backend (previously
+;; LLVM-only compiles of anything using `cli::prompt`/interactive
+;; subcommands hit a hard "not supported by the LLVM backend" error
+;; here). The explicit flush matters the same way `std/io.h#`'s
+;; `read_line` documents: without it, a no-newline prompt can still be
+;; sitting in libc's stdout buffer when the blocking read below starts.
 fn io_read_line(prompt: string) -> string is
     write_no_nl_priv(prompt)
+    __builtin_io_flush()
     return __builtin_io_read_line()
 end
 fn write_no_nl_priv(s: string) is __builtin_io_write_no_nl(s) end
