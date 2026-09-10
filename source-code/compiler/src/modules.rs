@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use hsharp_parser::ast::*;
+use crate::bytes_resolve;
 
 /// Resolved module: parsed AST + source path
 pub struct ResolvedModule {
@@ -158,21 +159,145 @@ please install h# utils for HackerOS use:\n\
         Ok(out)
     }
 
+    /// Resolve one `use "bytes -> name[/version]"` (or `dynamic use
+    /// "bytes -> name[/version]"`) import: find the package in the
+    /// on-disk cache(s) the `bytes` package manager fills in, parse its
+    /// entry file, recursively resolve *its* own `use`/`mod` declarations,
+    /// mangle its items under `alias` (exactly like `resolve_std_import`
+    /// does for a std file), and return the resulting flat item list.
+    ///
+    /// Static and Dynamic links diverge here in a way they don't for the
+    /// tree-walking interpreter (see `hsharp-interpreter::interp`'s
+    /// `load_bytes_module` doc comment): a `Static` (the default) import
+    /// genuinely gets its code baked into the compiled binary, so it's
+    /// resolved and inlined exactly like a std/`mod` file. A `Dynamic`
+    /// import's whole contract (`ast.rs`'s `ImportLinkKind` doc comment)
+    /// is "the code stays on the host machine, not in the binary" — doing
+    /// that properly means emitting a runtime loader/dlopen-style stub in
+    /// the generated code, which this LLVM backend does not implement yet
+    /// (only `extern dynamic [c]` FFI blocks get real dynamic dispatch,
+    /// via `ffi_linker`/libc `dlopen`, not arbitrary `.h#` packages). So a
+    /// `dynamic use "bytes -> x"` is a **hard compile error** here, with
+    /// an actionable way out, rather than silently degrading to a static
+    /// inline (which would contradict what the programmer asked for) or
+    /// silently doing nothing (which would produce "undefined fn" errors
+    /// with no indication why). The interpreter (`hsharp run`/`preview`)
+    /// has no such limitation and supports `dynamic use` fully.
+    pub fn resolve_bytes_import(
+        &mut self,
+        name: &str,
+        version: Option<&str>,
+        alias: &str,
+        link: ImportLinkKind,
+        start_dir: &Path,
+    ) -> Result<Vec<Item>, String> {
+        if matches!(link, ImportLinkKind::Dynamic) {
+            return Err(format!(
+                "dynamic use \"bytes -> {name}\" cannot be compiled to a native binary yet: \
+the LLVM/AOT backend has no runtime package loader (unlike `extern dynamic [c]` \
+FFI blocks, which do dispatch through libc `dlopen`).\n\n\
+fix one of:\n\
+  - drop `dynamic`: `use \"bytes -> {name}\"` links it statically into the binary\n\
+  - run it through the interpreter instead: `hsharp run <file>` / `hsharp preview <file>`\n",
+                name = name,
+            ));
+        }
+
+        let project_root = bytes_resolve::find_bytes_project_root(start_dir);
+        let lock = bytes_resolve::read_bytes_lockfile(&project_root);
+        if let Some(wanted) = version {
+            if let Some(locked) = lock.get(name) {
+                if !locked.version.is_empty() && locked.version != wanted {
+                    return Err(bytes_resolve::version_mismatch_message(name, wanted, &locked.version));
+                }
+            }
+        }
+
+        let path = match bytes_resolve::find_pkg_entry(name, start_dir) {
+            Ok(p) => p,
+            Err(bytes_resolve::BytesResolveError::NotFound(tried)) => {
+                return Err(bytes_resolve::missing_message(name, &tried));
+            }
+            Err(bytes_resolve::BytesResolveError::NoEntry(dir)) => {
+                return Err(bytes_resolve::no_entry_message(name, &dir));
+            }
+        };
+
+        // Same "only inline once, program-wide" dedup `mod`/`std ->`
+        // resolution already needs — a `bytes ->` package commonly gets
+        // `use`d from more than one file in the same program.
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !self.inlined_files.insert(canonical) {
+            return Ok(Vec::new());
+        }
+
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read bytes package '{}' at {}: {}", name, path.display(), e))?;
+        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(name));
+        if result.has_errors() {
+            return Err(format!(
+                "parse errors in bytes package '{}' ({}):\n{}",
+                name, path.display(), result.render_errors()
+            ));
+        }
+        let sub_module = result.module;
+        let sub_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+
+        // This package's own `use "std -> x"` / `use "bytes -> y"`
+        // imports, resolved before its own functions are mangled/
+        // appended — mirrors `resolve_std_import`'s identical recursion,
+        // one level down. A nested `bytes ->` is resolved starting from
+        // *this* package's own directory — `find_bytes_project_root`
+        // walks back up from there and lands on the same top-level
+        // project manifest either way, since `bytes` flat-installs every
+        // dependency into one shared cache rather than nesting caches per
+        // package (see that function's doc comment for the full story).
+        let mut out = Vec::new();
+        for (kind, sub_alias, _span) in &sub_module.imports {
+            match kind {
+                ImportKind::Std { path: sub_path, .. } => {
+                    let sub_lib = sub_path.last().cloned().unwrap_or_default();
+                    if sub_lib.is_empty() { continue; }
+                    let ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
+                    out.extend(self.resolve_std_import(&sub_lib, &ns)?);
+                }
+                ImportKind::BytesRepo { name: sub_name, version: sub_version, link: sub_link, .. } => {
+                    let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
+                    out.extend(self.resolve_bytes_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
+                }
+                _ => {}
+            }
+        }
+
+        let mangled = mangle_module_items(sub_module.items, alias);
+        let expanded = self.expand_module(mangled, &sub_dir)?;
+        out.extend(expanded);
+        Ok(out)
+    }
+
     /// The single front-end entry point every caller (`hsharp preview`,
     /// `hsharp build`/`compile`, `hsharp check`) should use instead of
     /// calling `expand_module` directly: resolves this module's
-    /// `use "std -> x"` imports (via `resolve_std_import`, above) *and*
-    /// its `mod X` declarations (via `expand_module`), producing one
+    /// `use "std -> x"` imports (via `resolve_std_import`, above), its
+    /// `use "bytes -> x"` imports (via `resolve_bytes_import`, above),
+    /// *and* its `mod X` declarations (via `expand_module`), producing one
     /// flat, fully-inlined item list — the same one, regardless of which
     /// backend eventually compiles or interprets it.
     pub fn expand_program(&mut self, module: &Module, entry_dir: &Path) -> Result<Vec<Item>, String> {
         let mut items = Vec::new();
         for (kind, alias, _span) in &module.imports {
-            if let ImportKind::Std { path, .. } = kind {
-                let lib = path.last().cloned().unwrap_or_default();
-                if lib.is_empty() { continue; }
-                let ns = alias.clone().unwrap_or_else(|| lib.clone());
-                items.extend(self.resolve_std_import(&lib, &ns)?);
+            match kind {
+                ImportKind::Std { path, .. } => {
+                    let lib = path.last().cloned().unwrap_or_default();
+                    if lib.is_empty() { continue; }
+                    let ns = alias.clone().unwrap_or_else(|| lib.clone());
+                    items.extend(self.resolve_std_import(&lib, &ns)?);
+                }
+                ImportKind::BytesRepo { name, version, link, .. } => {
+                    let ns = alias.clone().unwrap_or_else(|| name.clone());
+                    items.extend(self.resolve_bytes_import(name, version.as_deref(), &ns, *link, entry_dir)?);
+                }
+                _ => {}
             }
         }
         items.extend(self.expand_module(module.items.clone(), entry_dir)?);
