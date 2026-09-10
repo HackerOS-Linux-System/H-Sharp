@@ -1788,6 +1788,25 @@ impl Interpreter {
                     None => Value::Nil,
                 });
             }
+            // BUG FIX / NEW: `base64_decode` above can only ever return a
+            // `string`, which forces the decoded bytes through
+            // `String::from_utf8_lossy` — for base64 of actual *text*
+            // that's a no-op, but for base64 of arbitrary binary data
+            // (an image, a WAV file, ...) any byte sequence that isn't
+            // valid UTF-8 silently gets replaced with U+FFFD, corrupting
+            // it. `std/image.h#`'s `to_base64`/`from_base64` round-trip
+            // (used to re-encode/decode a whole .bmp through base64 with
+            // no temp file) surfaced this immediately — round-tripping a
+            // real BMP through `decode` produced pixel corruption every
+            // time. This returns the real decoded `bytes` with no lossy
+            // step in between, for exactly that binary-data use case.
+            "base64_decode_bytes" => {
+                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(match base64_decode_str(&s) {
+                    Some(bytes) => Value::Bytes(bytes),
+                    None => Value::Nil,
+                });
+            }
             // ── percent-encoding (RFC 3986 unreserved set) ──────────────────
             "url_encode" => {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -2937,6 +2956,23 @@ impl Interpreter {
                 (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
                 (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
                 (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+                // Array concatenation. BUG FIX: this was entirely
+                // missing — `eval_binop`'s `Add` arm only ever handled
+                // Int/Float/Str, so `arr1 + arr2` (used throughout
+                // `std/msgpack.h#` to build up a byte-header array, e.g.
+                // `header = header + int_to_be_bytes(len, 4)`, and now
+                // also by the new real WAV/BMP codecs in
+                // `std/audio.h#`/`std/image.h#`) hit this same "cannot
+                // add" error on *every* call, not just an edge case —
+                // `msgpack.h#`'s encoders have apparently never actually
+                // been run. `+` between two arrays now does what every
+                // caller already assumed it did: concatenation, same as
+                // Python/JS/Ruby's `+` on lists/arrays.
+                (Value::Array(a), Value::Array(b)) => {
+                    let mut out = a;
+                    out.extend(b);
+                    Ok(Value::Array(out))
+                }
                 (l, r) => Err(RuntimeError::TypeError(format!("cannot add {} and {}", l, r))),
             },
             BinOp::Sub => match (l, r) {
