@@ -1,28 +1,36 @@
 pub fn read_line(prompt: string) -> string is
     write_no_nl(prompt)
     flush()
-    return ""
+    return __builtin_io_read_line()
 end
 
 ;; Read a single raw byte from stdin as a one-character string.
-;; [FIXED] see module doc comment — unavailable on this backend.
+;;
+;; Genuinely interpreter-only: there is still no LLVM-backed
+;; implementation of `__builtin_io_read_char` (unlike read_line/
+;; write_no_nl/flush, there's no existing `hsh_*` C runtime function this
+;; could alias to). Calling `__builtin_io_read_char()` directly — instead
+;; of the previous unconditional `return ""` "fix" — means: on the
+;; interpreter this genuinely reads a byte, and on the LLVM backend
+;; `hsharp build`/`--release` now fails loudly at compile time (via
+;; `features::check_module_features`) with a clear "not supported by the
+;; LLVM backend, works on hsharp preview" message, instead of silently
+;; compiling into a function that always returns an empty string.
 pub fn read_char() -> string is
-    return ""
+    return __builtin_io_read_char()
 end
 
 ;; Write a string to stdout without a trailing newline (`write()` always
-;; appends one).
-;; [FIXED] `__builtin_io_write_no_nl` is interpreter-only; `io_print` is
-;; the same operation under a different, LLVM-backed name.
+;; appends one). Portable on both backends — see `read_line`'s doc
+;; comment above for why this no longer needs the `io_print` workaround.
 pub fn write_no_nl(s: string) is
-    io_print(s)
+    __builtin_io_write_no_nl(s)
 end
 
 ;; Flush stdout — matters when mixing `write_no_nl` with a blocking
 ;; read, on unbuffered/piped stdout where writes might otherwise sit in
-;; a buffer until the process exits.
-;; [FIXED] `__builtin_io_flush` is interpreter-only. `io_print`/`write`
-;; are already unbuffered on this backend (nothing else would explain
-;; `bytes`' own live, in-place progress-bar redraws working), so there
-;; is nothing left to flush.
-pub fn flush() is end
+;; a buffer until the process exits. Portable on both backends — see
+;; `read_line`'s doc comment above.
+pub fn flush() is
+    __builtin_io_flush()
+end
