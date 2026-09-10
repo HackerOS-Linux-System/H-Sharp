@@ -10,6 +10,7 @@ mod preview;
 mod repl;
 mod fmt;
 mod lsp_cmd;
+mod ffi_header;
 
 #[derive(Parser)]
 #[command(
@@ -127,6 +128,24 @@ pub enum Command {
 
     /// Open the H# documentation in your browser
     Docs,
+
+    /// Generate a companion C or Rust header for a file's `extern`
+    /// blocks — including a real `typedef struct { int64_t ...; }` /
+    /// `#[repr(C)] struct { ... i64 }` for every H# struct type an
+    /// extern function references by pointer (`&`/`&mut`), matching
+    /// H#'s actual field layout (see `compiler::ffi::struct_c_def`'s doc
+    /// comment). This is the concrete tool the `StructByValueFfi`
+    /// compile-error's hint points to: it's how you find out what layout
+    /// your struct actually has on the H# side before hand-writing (or
+    /// generating) the matching C/Rust definition.
+    FfiHeader {
+        #[arg(help = "Source file whose extern blocks to generate a header for")]
+        file: std::path::PathBuf,
+
+        /// Header language: c (default) or rust
+        #[arg(short, long, default_value = "c")]
+        lang: String,
+    },
 }
 
 fn main() {
@@ -153,6 +172,7 @@ fn main() {
             println!("\n{}", "Usage: h# compile --target linux-aarch64 src/main.h#".dimmed());
         }
         Command::Docs => open_docs(),
+        Command::FfiHeader { file, lang } => ffi_header::run(file, lang),
         Command::Repl => repl::run(),
         Command::Fmt { files, check } => fmt::run(files, check),
         Command::Lsp => lsp_cmd::run(),
