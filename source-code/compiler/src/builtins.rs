@@ -261,6 +261,13 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_dir_exists:    FunctionValue<'ctx>,
     // Extra aliases
     pub hsh_readline:        FunctionValue<'ctx>,
+    /// `flush stdout` — see `__builtin_io_flush`/`io_flush`'s doc comment
+    /// in builtins_registry.rs/codegen.rs: added alongside `hsh_readline`
+    /// so `std/io.h#`'s `read_line(prompt)` can reliably flush a
+    /// no-trailing-newline prompt before blocking on stdin, on both
+    /// backends, not just the interpreter (which flushes stdout directly
+    /// in Rust before its own blocking read).
+    pub hsh_flush:           FunctionValue<'ctx>,
     pub hsh_string_chars:    FunctionValue<'ctx>,
     pub hsh_dir_remove_all:  FunctionValue<'ctx>,
     pub hsh_bytes_to_string: FunctionValue<'ctx>,
@@ -499,6 +506,7 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_dir_exists:    pi("hsh_dir_exists"),
             // Extra aliases
             hsh_readline:        np("hsh_readline"),
+            hsh_flush:           decl("hsh_flush", void.fn_type(&[], false)),
             hsh_string_chars:    pp("hsh_string_chars"),
             hsh_dir_remove_all:  pi("hsh_dir_remove_all"),
             hsh_bytes_to_string: decl("hsh_bytes_to_string", ptr.fn_type(&[ptr.into(), i64t.into()], false)),
