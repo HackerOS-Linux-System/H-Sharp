@@ -9,12 +9,21 @@ end
 ;; Parse an integer, returning 0 on failure (there is no `Result`/
 ;; `Option` return here yet — check `str_is_numeric` first if you need
 ;; to distinguish "0" from "not a number").
-;; [FIXED] `__builtin_conv_str_to_int` is interpreter-only on the LLVM
-;; (`--release`) backend (confirmed via a real build failure). The bare
-;; `str_to_int` (no module prefix) is a real, separately LLVM-backed
-;; builtin — same operation, different underlying symbol.
+;;
+;; BUG FIX: this used to be `return str_to_int(s)` — an unconditional
+;; call to itself under the exact same name, i.e. infinite recursion (a
+;; guaranteed stack overflow on the very first call), left behind by a
+;; `[FIXED]` comment claiming "the bare `str_to_int` (no module prefix)
+;; is a real, separately LLVM-backed builtin" as if that made this a
+;; distinct function — it doesn't; H# has no such implicit bare-name/
+;; module-prefixed overload distinction, so it really was calling
+;; itself. `__builtin_conv_str_to_int` is now portable on both backends
+;; (see `builtins_registry.rs`'s `resolve_builtin_dunder_llvm`), so this
+;; just calls that directly, same as every other `std/*.h#` file already
+;; does for the same operation (net_ip.h#, cli.h#, yaml.h#, redis.h#,
+;; money.h#, toml.h#, color.h#, semver.h#, config.h#).
 pub fn str_to_int(s: string) -> int is
-    return str_to_int(s)
+    return __builtin_conv_str_to_int(s)
 end
 
 pub fn str_to_float(s: string) -> f64 is
