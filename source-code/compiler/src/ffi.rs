@@ -30,6 +30,57 @@ pub struct ExternParam {
     pub ty:   TypeExpr,
 }
 
+// ─── Conversions from the AST's own ExternBlock/ExternFnDecl ──────────────────
+//
+// `codegen.rs`'s `build_extern_fn_type` works directly off
+// `hsharp_parser::ast::ExternFnDecl` (never off this module's types at
+// all — this module's `ExternBlock`/`ExternFn`/`ExternParam` are a
+// separate, simplified description used only by the C/Rust header-text
+// generators below and their callers, e.g. the `hsharp ffi-header` CLI
+// command). These conversions are how a real parsed AST gets into that
+// simplified shape.
+impl From<&hsharp_parser::ast::ExternLang> for ExternLang {
+    fn from(l: &hsharp_parser::ast::ExternLang) -> Self {
+        match l {
+            hsharp_parser::ast::ExternLang::C      => ExternLang::C,
+            hsharp_parser::ast::ExternLang::Rust   => ExternLang::Rust,
+            hsharp_parser::ast::ExternLang::Cpp    => ExternLang::Cpp,
+            hsharp_parser::ast::ExternLang::Python => ExternLang::Python,
+        }
+    }
+}
+
+impl From<&hsharp_parser::ast::ExternLinkKind> for LinkKind {
+    fn from(l: &hsharp_parser::ast::ExternLinkKind) -> Self {
+        match l {
+            hsharp_parser::ast::ExternLinkKind::Static  => LinkKind::Static,
+            hsharp_parser::ast::ExternLinkKind::Dynamic => LinkKind::Dynamic,
+        }
+    }
+}
+
+impl From<&hsharp_parser::ast::ExternFnDecl> for ExternFn {
+    fn from(f: &hsharp_parser::ast::ExternFnDecl) -> Self {
+        ExternFn {
+            name: f.name.clone(),
+            params: f.params.iter().map(|p| ExternParam { name: p.name.clone(), ty: p.ty.clone() }).collect(),
+            return_type: f.return_type.clone(),
+            variadic: f.variadic,
+        }
+    }
+}
+
+impl From<&hsharp_parser::ast::ExternBlock> for ExternBlock {
+    fn from(b: &hsharp_parser::ast::ExternBlock) -> Self {
+        ExternBlock {
+            lang: (&b.lang).into(),
+            link_kind: (&b.link_kind).into(),
+            library: b.library.clone(),
+            functions: b.functions.iter().map(ExternFn::from).collect(),
+        }
+    }
+}
+
 // ─── C / C++ ─────────────────────────────────────────────────────────────────
 
 /// Build a C function prototype declaration.
@@ -64,6 +115,197 @@ pub fn c_header_block(fns: &[ExternFn]) -> String {
     out
 }
 
+/// Same as `c_header_block`, but given the module's struct registry
+/// (name -> ordered fields, exactly what `codegen.rs`'s `build_module`
+/// collects into its own `structs: HashMap<String, Vec<StructField>>`),
+/// emits a REAL `typedef struct { ... }` for every H# struct type
+/// referenced (by name, or through a `&`/`&mut`) in `fns`' signatures —
+/// instead of `type_to_c`'s bare fallback, which previously mapped *any*
+/// struct name straight to `void*` with no field information at all.
+///
+/// FUNDAMENTAL LIMITATION (see `struct_c_def`'s doc comment for the full
+/// story): H# gives every struct field a uniform `int64_t` slot
+/// regardless of its H# type (`compiler/runtime/core.c`'s
+/// `hsh_struct_new`/`hsh_struct_get`/`hsh_struct_set` — plain
+/// `int64_t[n_fields]`, no per-field width or type tag at all). So the
+/// struct definition this emits is *correct* for describing what's
+/// actually in memory at a pointer to an H# struct (every field really
+/// is 8 bytes, in declaration order) — including for `float`/`bool`
+/// fields, whose slot holds their bits, not a small-width C value — but
+/// it is a hard error (see `features.rs`'s `StructByValueFfi` gate) to
+/// pass such a struct *by value* across this boundary today: nothing in
+/// `codegen.rs` builds the real byte-for-byte C-ABI-classified aggregate
+/// that by-value struct passing would need (register-vs-stack
+/// classification, correct small-struct packing, etc.) — only the
+/// "here's a pointer to my int64-slots" shape this header describes is
+/// implemented. Pass `&MyStruct`/`&mut MyStruct` (a raw pointer) instead.
+pub fn c_header_block_with_structs(
+    fns: &[ExternFn],
+    structs: &std::collections::HashMap<String, Vec<hsharp_parser::ast::StructField>>,
+) -> String {
+    let mut out = String::from("#include <stdint.h>\n#include <stdbool.h>\n\n");
+    for name in referenced_struct_names(fns, structs) {
+        if let Some(fields) = structs.get(&name) {
+            out.push_str(&struct_c_def(&name, fields));
+            out.push('\n');
+        }
+    }
+    for f in fns {
+        out.push_str(&c_decl_with_structs(f, structs));
+        out.push('\n');
+    }
+    out
+}
+
+/// A real C struct definition matching an H# struct's actual in-memory
+/// layout: every field is `int64_t`, in H#'s declaration order, with a
+/// comment naming its real H# type and — for `f32`/`f64`/`bool`/`string`/
+/// `bytes` fields, where the bit pattern in that slot isn't itself a
+/// plain integer — a `memcpy`-based one-liner showing how to reinterpret
+/// it correctly from C (a numeric `(double)slot` cast would silently
+/// produce the wrong value for a float field: the slot holds the float's
+/// *bit pattern*, stored there by an LLVM `bitcast`, not its value
+/// converted to an integer).
+pub fn struct_c_def(name: &str, fields: &[hsharp_parser::ast::StructField]) -> String {
+    let mut out = format!("/* H# struct `{}` — every field is one int64_t slot, in\n", name);
+    out.push_str(" * declaration order (see hsh_struct_new/get/set in core.c). */\n");
+    out.push_str("typedef struct {\n");
+    for field in fields {
+        let hint = ffi_reinterpret_hint(&field.name, &field.ty);
+        out.push_str(&format!("    int64_t {};{}\n", field.name, hint));
+    }
+    out.push_str(&format!("}} {};\n", name));
+    out
+}
+
+/// The Rust equivalent of `struct_c_def`: a `#[repr(C)]` struct of `i64`
+/// fields matching H#'s real in-memory layout, with the same
+/// bit-reinterpretation guidance in comments (`f64::from_bits`,
+/// `as *const c_char`, ...) since a numeric `as f64` cast on the raw
+/// slot would be just as wrong in Rust as a `(double)` cast is in C.
+pub fn struct_rust_def(name: &str, fields: &[hsharp_parser::ast::StructField]) -> String {
+    let mut out = format!("// H# struct `{}` — every field is one i64 slot, in\n", name);
+    out.push_str("// declaration order (see hsh_struct_new/get/set in core.c).\n");
+    out.push_str("#[repr(C)]\n");
+    out.push_str(&format!("pub struct {} {{\n", name));
+    for field in fields {
+        let hint = ffi_reinterpret_hint_rust(&field.ty);
+        out.push_str(&format!("    pub {}: i64,{}\n", field.name, hint));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// C-side comment explaining how to get the *real* value back out of a
+/// field's raw `int64_t` slot, for the field types where a plain integer
+/// read isn't already the right answer.
+fn ffi_reinterpret_hint(field_name: &str, ty: &TypeExpr) -> String {
+    let named = |n: &str| -> Option<String> {
+        match n {
+            "f64" | "float64" => Some(format!(
+                "  /* f64: double v; memcpy(&v, &s.{f}, 8); */", f = field_name
+            )),
+            "f32" | "float32" => Some(format!(
+                "  /* f32 stored widened to f64 bits, then to this slot: \
+                     double v; memcpy(&v, &s.{f}, 8); float v32 = (float)v; */",
+                     f = field_name
+            )),
+            "bool" => Some("  /* bool: 0 or 1 */".to_string()),
+            "string" | "str" => Some(format!("  /* string: (const char*)s.{} */", field_name)),
+            "bytes" | "byte" => Some(format!("  /* bytes: (uint8_t*)s.{} */", field_name)),
+            _ => None,
+        }
+    };
+    match ty {
+        TypeExpr::F64 => named("f64").unwrap(),
+        TypeExpr::F32 => named("f32").unwrap(),
+        TypeExpr::Bool => named("bool").unwrap(),
+        TypeExpr::String => named("string").unwrap(),
+        TypeExpr::Bytes => named("bytes").unwrap(),
+        TypeExpr::Named(n) => named(n).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn ffi_reinterpret_hint_rust(ty: &TypeExpr) -> String {
+    let named = |n: &str| -> Option<String> {
+        match n {
+            "f64" | "float64" => Some("  // f64::from_bits(self.field as u64)".to_string()),
+            "f32" | "float32" => Some("  // f32 widened to f64 bits: (f64::from_bits(self.field as u64)) as f32".to_string()),
+            "bool" => Some("  // 0 or 1".to_string()),
+            "string" | "str" => Some("  // self.field as *const std::ffi::c_char".to_string()),
+            "bytes" | "byte" => Some("  // self.field as *mut u8".to_string()),
+            _ => None,
+        }
+    };
+    match ty {
+        TypeExpr::F64 => named("f64").unwrap(),
+        TypeExpr::F32 => named("f32").unwrap(),
+        TypeExpr::Bool => named("bool").unwrap(),
+        TypeExpr::String => named("string").unwrap(),
+        TypeExpr::Bytes => named("bytes").unwrap(),
+        TypeExpr::Named(n) => named(n).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Every struct name reachable from `fns`' parameter/return types
+/// (through a bare name or a `&`/`&mut`), in first-referenced order —
+/// used by `c_header_block_with_structs` to know which `struct_c_def`s to
+/// emit before the function prototypes that use them.
+fn referenced_struct_names(
+    fns: &[ExternFn],
+    structs: &std::collections::HashMap<String, Vec<hsharp_parser::ast::StructField>>,
+) -> Vec<String> {
+    fn note(ty: &TypeExpr, structs: &std::collections::HashMap<String, Vec<hsharp_parser::ast::StructField>>, out: &mut Vec<String>) {
+        let name = match ty {
+            TypeExpr::Named(n) => Some(n.clone()),
+            TypeExpr::Ref(inner) | TypeExpr::RefMut(inner) => {
+                if let TypeExpr::Named(n) = inner.as_ref() { Some(n.clone()) } else { None }
+            }
+            _ => None,
+        };
+        if let Some(n) = name {
+            if structs.contains_key(&n) && !out.contains(&n) { out.push(n); }
+        }
+    }
+    let mut out = Vec::new();
+    for f in fns {
+        for p in &f.params { note(&p.ty, structs, &mut out); }
+        if let Some(r) = &f.return_type { note(r, structs, &mut out); }
+    }
+    out
+}
+
+/// Like `c_decl`, but a struct-typed parameter/return that's passed
+/// *by pointer* (`&`/`&mut`) uses the real struct name (`MyStruct*`)
+/// instead of `type_to_c`'s bare-name fallback (`void*`) — everything
+/// else is unchanged.
+fn c_decl_with_structs(f: &ExternFn, structs: &std::collections::HashMap<String, Vec<hsharp_parser::ast::StructField>>) -> String {
+    let type_str = |t: &TypeExpr| -> String {
+        match t {
+            TypeExpr::Ref(inner) | TypeExpr::RefMut(inner) => {
+                if let TypeExpr::Named(n) = inner.as_ref() {
+                    if structs.contains_key(n) { return format!("{}*", n); }
+                }
+                type_to_c(t)
+            }
+            TypeExpr::Named(n) if structs.contains_key(n) => n.clone(),
+            _ => type_to_c(t),
+        }
+    };
+    let ret = match &f.return_type {
+        None    => "void".to_string(),
+        Some(t) => type_str(t),
+    };
+    let mut params: Vec<String> = f.params.iter()
+        .map(|p| format!("{} {}", type_str(&p.ty), p.name))
+        .collect();
+    if f.variadic { params.push("...".to_string()); }
+    let params_str = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+    format!("{} {}({});", ret, f.name, params_str)
+}
+
 // ─── Rust ─────────────────────────────────────────────────────────────────────
 
 /// Build a Rust `extern "C"` fn declaration line (no surrounding block).
@@ -92,6 +334,64 @@ pub fn rust_extern_block(fns: &[ExternFn]) -> String {
     }
     out.push('}');
     out
+}
+
+/// Same as `rust_extern_block`, but also emits a `struct_rust_def` for
+/// every H# struct type referenced (by name or through `&`/`&mut`) in
+/// `fns`' signatures, and uses the real struct name instead of
+/// `type_to_rust`'s `*mut c_void` fallback for a pointer to one — mirrors
+/// `c_header_block_with_structs`; see `struct_c_def`'s doc comment for
+/// the layout/limitation details (they apply identically here).
+pub fn rust_extern_block_with_structs(
+    fns: &[ExternFn],
+    structs: &std::collections::HashMap<String, Vec<hsharp_parser::ast::StructField>>,
+) -> String {
+    let mut out = String::new();
+    for name in referenced_struct_names(fns, structs) {
+        if let Some(fields) = structs.get(&name) {
+            out.push_str(&struct_rust_def(&name, fields));
+            out.push('\n');
+        }
+    }
+    out.push_str("unsafe extern \"C\" {\n");
+    for f in fns {
+        out.push_str(&rust_extern_decl_with_structs(f, structs));
+        out.push('\n');
+    }
+    out.push('}');
+    out
+}
+
+/// Like `rust_extern_decl`, but a struct-typed parameter/return passed
+/// *by pointer* uses `*const MyStruct`/`*mut MyStruct` instead of
+/// `type_to_rust`'s bare-name fallback (`*mut std::ffi::c_void`).
+fn rust_extern_decl_with_structs(f: &ExternFn, structs: &std::collections::HashMap<String, Vec<hsharp_parser::ast::StructField>>) -> String {
+    let type_str = |t: &TypeExpr| -> String {
+        match t {
+            TypeExpr::Ref(inner) => {
+                if let TypeExpr::Named(n) = inner.as_ref() {
+                    if structs.contains_key(n) { return format!("*const {}", n); }
+                }
+                type_to_rust(t)
+            }
+            TypeExpr::RefMut(inner) => {
+                if let TypeExpr::Named(n) = inner.as_ref() {
+                    if structs.contains_key(n) { return format!("*mut {}", n); }
+                }
+                type_to_rust(t)
+            }
+            _ => type_to_rust(t),
+        }
+    };
+    let ret = match &f.return_type {
+        None    => String::new(),
+        Some(t) => format!(" -> {}", type_str(t)),
+    };
+    let mut params: Vec<String> = f.params.iter()
+        .map(|p| format!("{}: {}", p.name, type_str(&p.ty)))
+        .collect();
+    if f.variadic { params.push("...".to_string()); }
+    format!("    pub fn {}({}){};", f.name, params.join(", "), ret)
 }
 
 // ─── Python trampolines ───────────────────────────────────────────────────────
