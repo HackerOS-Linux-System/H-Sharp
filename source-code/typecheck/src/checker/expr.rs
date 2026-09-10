@@ -140,11 +140,17 @@ impl TypeChecker {
             Expr::TupleLit(elems, _) => {
                 HType::Tuple(elems.iter().map(|e| self.infer_expr(e)).collect())
             }
-            Expr::If { then_body, .. } => {
-                then_body.last().map(|s| match s {
-                    Stmt::Expr(e, _) => self.infer_expr(e),
-                                     _ => HType::Void,
-                }).unwrap_or(HType::Void)
+            Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+                self.infer_expr(condition);
+                let then_val = self.check_block_value(then_body);
+                for (cond, body) in elsif_branches {
+                    self.infer_expr(cond);
+                    self.check_block_value(body);
+                }
+                if let Some(else_body) = else_body {
+                    self.check_block_value(else_body);
+                }
+                then_val
             }
             Expr::Cast(inner, ty, span) => {
                 let from = self.infer_expr(inner);
@@ -193,13 +199,63 @@ impl TypeChecker {
             Expr::Match { subject, arms, span } => {
                 let subj_ty = self.infer_expr(subject);
                 self.check_match_exhaustive(&subj_ty, arms, span);
-                arms.first().and_then(|arm| arm.body.last()).map(|s| match s {
-                    Stmt::Expr(e, _) => self.infer_expr(e),
-                                                                 _ => HType::Any,
-                }).unwrap_or(HType::Any)
+                let mut result = HType::Any;
+                for (i, arm) in arms.iter().enumerate() {
+                    if let Some(g) = &arm.guard { self.infer_expr(g); }
+                    let val = self.check_block_value(&arm.body);
+                    if i == 0 { result = val; }
+                }
+                result
             }
+            // `while`/`for`/`do` don't produce a value the way `if`/`match`
+            // do (nothing reads "the value of a while loop"), but their
+            // bodies still need every statement checked — previously these
+            // fell to the catch-all `_ => HType::Any` below, meaning a
+            // `return` (or a nested `if`'s `return`s) inside a loop body
+            // was never checked against the enclosing function's declared
+            // return type at all. `check_block_value`'s result is
+            // discarded here on purpose; only the checking side effects
+            // (diagnostics) matter for these three.
+            Expr::While { condition, body, .. } => {
+                self.infer_expr(condition);
+                self.check_block_value(body);
+                HType::Void
+            }
+            Expr::For { iterable, body, .. } => {
+                self.infer_expr(iterable);
+                self.check_block_value(body);
+                HType::Void
+            }
+            Expr::Do { body, .. } => self.check_block_value(body),
             _ => HType::Any,
         }
+    }
+
+    /// Run `check_stmt` over every statement in a nested block (an
+    /// `if`/`match`/`while`/`for`/`do` body), returning the last
+    /// statement's value for tail-expression position — the same "value
+    /// of a block = value of its last statement" rule `Expr::If`/
+    /// `Expr::Match` always used, kept intact here.
+    ///
+    /// BUG FIX: previously `Expr::If`'s value came from peeking at
+    /// `then_body.last()` directly with a tiny local match (and
+    /// `Expr::Match`/`Expr::While`/`Expr::For`/`Expr::Do` didn't recurse
+    /// into their bodies for checking *at all* — they fell through to the
+    /// catch-all `_ => HType::Any` at the bottom of `infer_expr`). That
+    /// meant `check_stmt`'s per-statement checks — most importantly the
+    /// return-type-mismatch check in its `Stmt::Return` arm — only ever
+    /// ran on a function's *top-level* statements (the ones `check_fn`
+    /// iterates directly). A `return` nested inside an `if`, `while`,
+    /// `for`, `match` arm, or `do` block was silently never checked
+    /// against the function's declared return type, no matter how wrong
+    /// it was. Routing every nested block through this one function
+    /// (instead of ad hoc last-statement peeking) fixes that uniformly.
+    pub(super) fn check_block_value(&mut self, body: &[Stmt]) -> HType {
+        let mut result = HType::Void;
+        for stmt in body {
+            result = self.check_stmt(stmt);
+        }
+        result
     }
 
     pub(super) fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
