@@ -34,6 +34,12 @@ pub struct TypeChecker {
     /// then falls through here before giving up to the lenient `HType::Any`).
     consts: HashMap<String, HType>,
     current_fn_return: Option<HType>,
+    /// The name of the function `check_stmt`/`infer_expr` are currently
+    /// inside — used only to name the function in a return-type-mismatch
+    /// message (see `check_stmt`'s `Stmt::Return` arm). Saved/restored
+    /// (not just set) around a nested nested `fn` definition's own check —
+    /// see `check_fn`'s doc comment for why that distinction matters.
+    current_fn_name: Option<String>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -47,6 +53,7 @@ impl TypeChecker {
             enums:             HashMap::new(),
             consts:            HashMap::new(),
             current_fn_return: None,
+            current_fn_name:   None,
             diagnostics:       Vec::new(),
             derived_impls:     HashMap::new(),
             deprecated_items:  HashMap::new(),
@@ -542,6 +549,58 @@ please install h# utils for HackerOS use:\n\
                             ),
                         )
                     );
+                }
+            }
+
+            // `use "bytes -> name[/version]"` (optionally `dynamic use
+            // ...`) resolution — same "missing/broken import is a hard
+            // compile error" policy as `std ->` above, checked against
+            // the on-disk package cache(s) `bytes install` fills in (see
+            // `bytes_resolve.rs`'s module doc comment for the full
+            // search-order story). Resolved from the current working
+            // directory: `hsharp check` (this typechecker's only caller)
+            // is always invoked from within the project being checked,
+            // the same assumption `hsharp-interpreter::interp`'s
+            // `BytesRepo` handling makes.
+            if let ImportKind::BytesRepo { name, version, link, .. } = import_kind {
+                let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let project_root = crate::bytes_resolve::find_bytes_project_root(&start_dir);
+                let lock = crate::bytes_resolve::read_bytes_lockfile(&project_root);
+
+                if matches!(link, ImportLinkKind::Dynamic) && !lock.contains_key(name) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span.clone(),
+                        crate::bytes_resolve::bytes_pkg_not_locked_message(name),
+                    ));
+                    continue;
+                }
+
+                if let Some(wanted) = version {
+                    if let Some(locked) = lock.get(name) {
+                        if !locked.version.is_empty() && &locked.version != wanted {
+                            self.diagnostics.push(Diagnostic::error(
+                                span.clone(),
+                                crate::bytes_resolve::bytes_pkg_version_mismatch_message(name, wanted, &locked.version),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+
+                match crate::bytes_resolve::find_bytes_pkg_entry(name, &start_dir) {
+                    Ok(_) => {}
+                    Err(crate::bytes_resolve::BytesResolveError::NotFound(tried)) => {
+                        self.diagnostics.push(Diagnostic::error(
+                            span.clone(),
+                            crate::bytes_resolve::bytes_pkg_missing_message(name, &tried),
+                        ));
+                    }
+                    Err(crate::bytes_resolve::BytesResolveError::NoEntry(dir)) => {
+                        self.diagnostics.push(Diagnostic::error(
+                            span.clone(),
+                            crate::bytes_resolve::bytes_pkg_no_entry_message(name, &dir),
+                        ));
+                    }
                 }
             }
         }
