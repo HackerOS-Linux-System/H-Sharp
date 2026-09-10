@@ -42,14 +42,29 @@ impl TypeChecker {
 
         self.push_scope();
         let ret_ty = f.return_type.as_ref().map(HType::from_type_expr).unwrap_or(HType::Void);
+        // Save (not discard) the enclosing function's return-checking
+        // context. BUG FIX: this used to unconditionally set
+        // `current_fn_return = None` when `check_fn` finished — correct
+        // when `f` is a top-level function (nothing enclosing to restore),
+        // but wrong for a nested `fn` defined inside another function's
+        // body (`Stmt::Item(Item::FnDef(nested))`, reached via
+        // `check_stmt`'s `Stmt::Item` arm): after checking the nested
+        // function, this wiped out the *outer* function's return type too,
+        // silently disabling return-type-mismatch checking for every
+        // `return` statement in the outer function that textually follows
+        // the nested `fn` definition. Save/restore instead of clear, so
+        // checking a nested function is transparent to its enclosing one.
+        let saved_return = self.current_fn_return.take();
+        let saved_name = self.current_fn_name.take();
         self.current_fn_return = Some(ret_ty.clone());
+        self.current_fn_name = Some(f.name.clone());
 
         for param in &f.params {
             let ty = HType::from_type_expr(&param.ty);
             self.define(&param.name, ty, param.mutable);
         }
 
-        for stmt in &f.body { self.check_stmt(stmt, &f.name); }
+        for stmt in &f.body { self.check_stmt(stmt); }
 
         // §13: `@pointers`/`@arc` builtin gating — see check_mem_mode_block.
         self.check_mem_mode_block(&f.body, f.mem_mode, false, &f.name);
@@ -72,7 +87,8 @@ impl TypeChecker {
         }
 
         self.pop_scope();
-        self.current_fn_return = None;
+        self.current_fn_return = saved_return;
+        self.current_fn_name = saved_name;
     }
 
     // ── §13: MemoryMode enforcement ─────────────────────────────────────────
@@ -223,18 +239,27 @@ impl TypeChecker {
         }
     }
 
-    fn check_stmt(&mut self, stmt: &Stmt, fn_name: &str) {
+    /// Checks one statement and returns its "value" in tail-expression
+    /// position — used by `check_block_value` (expr.rs) so that an
+    /// `if`/`match`/`while`/`for`/`do` block used as a value (e.g. `let x
+    /// = if cond is 1 else 2 end`) still infers from its last statement,
+    /// exactly as before, while *every* statement in the block (not just
+    /// the last) now actually gets checked — see `check_block_value`'s
+    /// doc comment for the bug this fixes.
+    pub(super) fn check_stmt(&mut self, stmt: &Stmt) -> HType {
         match stmt {
             Stmt::Let { name, ty, mutable, value, .. } => {
                 let inferred = value.as_ref().map(|e| self.infer_expr(e));
                 let declared = ty.as_ref().map(HType::from_type_expr);
                 let final_ty = declared.or(inferred).unwrap_or(HType::Any);
                 self.define(name, final_ty, *mutable);
+                HType::Void
             }
             Stmt::Return(expr, span) => {
                 if let Some(ret_ty) = &self.current_fn_return.clone() {
                     let expr_ty = expr.as_ref().map(|e| self.infer_expr(e)).unwrap_or(HType::Void);
                     if !expr_ty.compatible_with(ret_ty) {
+                        let fn_name = self.current_fn_name.clone().unwrap_or_else(|| "<unknown>".to_string());
                         self.err_hint(
                             span.clone(),
                                       format!("return type mismatch in `{}`: expected `{}`, found `{}`", fn_name, ret_ty.display(), expr_ty.display()),
@@ -242,10 +267,11 @@ impl TypeChecker {
                         );
                     }
                 }
+                HType::Void
             }
-            Stmt::Expr(e, _) => { self.infer_expr(e); }
-            Stmt::Item(item) => self.check_item(item),
-            _ => {}
+            Stmt::Expr(e, _) => self.infer_expr(e),
+            Stmt::Item(item) => { self.check_item(item); HType::Void }
+            _ => HType::Void,
         }
     }
 }
