@@ -1,7 +1,166 @@
-;; H# Standard Library — std -> audio
-pub fn load(path: string) -> string is return "" end
-pub fn play(audio: string) is end
-pub fn stop(audio: string) is end
-pub fn duration_ms(audio: string) -> int is return 0 end
-pub fn to_wav(audio: string, path: string) is end
-pub fn to_mp3(audio: string, path: string) is end
+use "std -> fs" from "fs"
+
+;; A decoded (or freshly-built) PCM audio clip. `pcm` is raw
+;; little-endian sample data exactly as WAV stores it: for 16-bit audio,
+;; every 2 bytes is one signed little-endian sample; frames are
+;; interleaved per channel (LRLRLR... for stereo).
+struct Audio is
+    pub sample_rate:     int
+    pub channels:        int
+    pub bits_per_sample: int
+    pub pcm:             bytes
+    ;; false if `load` couldn't parse the file at all (not a WAV, or a
+    ;; WAV missing a `fmt `/`data` chunk) — every other field is
+    ;; meaningless when this is false.
+    pub valid:           bool
+end
+
+fn empty_audio() -> Audio is
+    return Audio { sample_rate: 0, channels: 0, bits_per_sample: 0, pcm: string_to_bytes(""), valid: false }
+end
+
+;; Read a little-endian unsigned integer `width` bytes wide (1, 2, or 4)
+;; out of a decoded `[int]` byte array at offset `off`.
+fn le_bytes_to_int(b: [int], off: int, width: int) -> int is
+    let mut n = 0
+    let mut i = width - 1
+    while i >= 0 is
+        n = (n << 8) | b[off + i]
+        i -= 1
+    end
+    return n
+end
+
+;; Encode `n` as `width` little-endian bytes.
+fn int_to_le_bytes(n: int, width: int) -> [int] is
+    let mut out: [int] = []
+    let mut i = 0
+    while i < width is
+        out.push((n >> (i * 8)) & 255)
+        i += 1
+    end
+    return out
+end
+
+fn chunk_id_is(b: [int], off: int, a: int, c: int, d: int, e: int) -> bool is
+    return b[off] == a && b[off + 1] == c && b[off + 2] == d && b[off + 3] == e
+end
+
+;; Parse a .wav file into a real `Audio` clip. Walks every RIFF chunk
+;; (not just the first two) so `fmt `/`data` are found even behind extra
+;; chunks (`LIST`, `fact`, ...) real-world WAV files often have.
+;; Returns `Audio.valid == false` (never a crash) for anything that
+;; isn't a well-formed WAV — including any other audio format (mp3,
+;; ogg, flac, ...), which this cannot decode.
+pub fn load(path: string) -> Audio is
+    let raw: bytes = fs::read_bytes(path)
+    let b: [int] = __builtin_bytes_to_ints(raw)
+    if b.len() < 12 is return empty_audio() end
+    if !chunk_id_is(b, 0, 82, 73, 70, 70) is return empty_audio() end   ;; "RIFF"
+    if !chunk_id_is(b, 8, 87, 65, 86, 69) is return empty_audio() end   ;; "WAVE"
+
+    let mut off = 12
+    let mut channels = 0
+    let mut sample_rate = 0
+    let mut bits_per_sample = 0
+    let mut data_off = 0
+    let mut data_len = 0
+    let mut found_fmt = false
+    let mut found_data = false
+
+    while off + 8 <= b.len() is
+        let chunk_size = le_bytes_to_int(b, off + 4, 4)
+        let body = off + 8
+        if chunk_id_is(b, off, 102, 109, 116, 32) is  ;; "fmt "
+            channels        = le_bytes_to_int(b, body + 2,  2)
+            sample_rate     = le_bytes_to_int(b, body + 4,  4)
+            bits_per_sample = le_bytes_to_int(b, body + 14, 2)
+            found_fmt = true
+        end
+        if chunk_id_is(b, off, 100, 97, 116, 97) is  ;; "data"
+            data_off = body
+            data_len = chunk_size
+            found_data = true
+        end
+        ;; Chunks are word-aligned: an odd-sized chunk has one pad byte
+        ;; after it that isn't part of any chunk's declared size.
+        off = body + chunk_size + (chunk_size % 2)
+    end
+
+    if !found_fmt || !found_data || channels == 0 || sample_rate == 0 is
+        return empty_audio()
+    end
+
+    let mut pcm_ints: [int] = []
+    let mut i = 0
+    while i < data_len && (data_off + i) < b.len() is
+        pcm_ints.push(b[data_off + i])
+        i += 1
+    end
+
+    return Audio {
+        sample_rate:     sample_rate,
+        channels:        channels,
+        bits_per_sample: bits_per_sample,
+        pcm:             __builtin_bytes_from_ints(pcm_ints),
+        valid:           true,
+    }
+end
+
+;; Genuinely play the clip — **not implemented**: the H# runtime has no
+;; cross-platform audio output primitive to call. Kept as a documented
+;; no-op (rather than removed) so existing call sites keep compiling;
+;; unlike the previous version, this doesn't pretend `Audio` is a live
+;; "handle" to something actually playing.
+pub fn play(audio: Audio) is end
+
+;; See `play` — nothing is ever actually playing, so there's nothing to
+;; stop either.
+pub fn stop(audio: Audio) is end
+
+;; Real duration from the decoded fields — `0` only for an
+;; invalid/empty clip (`bits_per_sample`/`channels` would otherwise
+;; divide by zero).
+pub fn duration_ms(audio: Audio) -> int is
+    if !audio.valid || audio.channels == 0 || audio.bits_per_sample == 0 is
+        return 0
+    end
+    let bytes_per_frame = audio.channels * (audio.bits_per_sample / 8)
+    if bytes_per_frame == 0 is return 0 end
+    let total_frames = __builtin_bytes_len(audio.pcm) / bytes_per_frame
+    return (total_frames * 1000) / audio.sample_rate
+end
+
+;; Write a real, valid, round-trippable little-endian PCM .wav file —
+;; any real audio tool (ffplay, Audacity, a browser's `<audio>` tag, ...)
+;; can open what this produces.
+pub fn to_wav(audio: Audio, path: string) is
+    if !audio.valid is return end
+    let data_len = __builtin_bytes_len(audio.pcm)
+    let byte_rate = audio.sample_rate * audio.channels * (audio.bits_per_sample / 8)
+    let block_align = audio.channels * (audio.bits_per_sample / 8)
+    let riff_size = 36 + data_len
+
+    let mut header: [int] = []
+    header = header + [82, 73, 70, 70]                    ;; "RIFF"
+    header = header + int_to_le_bytes(riff_size, 4)
+    header = header + [87, 65, 86, 69]                    ;; "WAVE"
+    header = header + [102, 109, 116, 32]                 ;; "fmt "
+    header = header + int_to_le_bytes(16, 4)              ;; fmt chunk size
+    header = header + int_to_le_bytes(1, 2)               ;; PCM
+    header = header + int_to_le_bytes(audio.channels, 2)
+    header = header + int_to_le_bytes(audio.sample_rate, 4)
+    header = header + int_to_le_bytes(byte_rate, 4)
+    header = header + int_to_le_bytes(block_align, 2)
+    header = header + int_to_le_bytes(audio.bits_per_sample, 2)
+    header = header + [100, 97, 116, 97]                  ;; "data"
+    header = header + int_to_le_bytes(data_len, 4)
+
+    let out = __builtin_bytes_concat(__builtin_bytes_from_ints(header), audio.pcm)
+    fs::write_bytes(path, out)
+end
+
+;; **Not implemented** — a real MP3 encoder needs a full psychoacoustic
+;; model and isn't something a std-lib wrapper can provide. Writes
+;; nothing rather than silently emitting a fake/corrupt .mp3.
+pub fn to_mp3(audio: Audio, path: string) is end
