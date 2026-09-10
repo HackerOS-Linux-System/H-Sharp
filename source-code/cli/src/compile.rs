@@ -134,20 +134,26 @@ pub fn run(
     }
     pb2.finish_with_message(format!("{} Parsed", "✓".green()));
 
-    // ── Resolve `mod X` declarations ─────────────────────────────────────────
+    // ── Resolve `mod X`, `use "std -> x"` and `use "bytes -> x"` ─────────────
     // `mod cli` (etc.) previously did nothing: ModuleResolver::expand_module
     // existed in modules.rs but was never called anywhere in the pipeline, so
     // every item declared in a submodule file was silently absent from the
     // compiled program — any function in it would fail later as
     // "undefined fn: ..." with no indication the real problem was an
-    // unresolved `mod` declaration. Expand submodules into the top-level
-    // module's item list right after parsing, before anything downstream
-    // (typecheck/codegen) ever sees it.
+    // unresolved `mod` declaration. `use "std -> x"` / `use "bytes -> x"`
+    // had the exact same gap: `expand_program` (which additionally
+    // resolves those, via `resolve_std_import`/`resolve_bytes_import`)
+    // existed but wasn't wired in here either — this used to call the
+    // narrower `expand_module` directly. Go through `expand_program` (the
+    // documented single front-end entry point) so `mod`, `std ->`, and
+    // `bytes ->` are all inlined into the top-level module's item list
+    // right after parsing, before anything downstream (typecheck/codegen)
+    // ever sees it.
     let mut module = parsed.module.clone();
     {
         let mut resolver = hsharp_compiler::modules::ModuleResolver::new(src_path);
         let entry_dir = src_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        match resolver.expand_module(module.items, entry_dir) {
+        match resolver.expand_program(&module, entry_dir) {
             Ok(items) => module.items = items,
             Err(e) => {
                 pb2.finish_and_clear();
