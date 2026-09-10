@@ -38,7 +38,7 @@ pub fn run(file: Option<PathBuf>) {
     let mut module = result.module;
     let mut resolver = hsharp_compiler::modules::ModuleResolver::new(&src_path);
     let entry_dir = src_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
-    match resolver.expand_module(module.items, &entry_dir) {
+    match resolver.expand_program(&module, &entry_dir) {
         Ok(items) => module.items = items,
         Err(e) => {
             eprintln!("{} {}", "Error:".red().bold(), e);
