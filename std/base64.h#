@@ -8,6 +8,18 @@ pub fn decode(s: string) -> string is
     return __builtin_base64_decode(s)
 end
 
+;; Decode base64 straight to `bytes`, with no lossy UTF-8 step —
+;; **use this, not `decode`, whenever the original data wasn't text**
+;; (an image, audio, or any other binary format). `decode` forces the
+;; result through `String::from_utf8_lossy`, which silently replaces
+;; any byte sequence that isn't valid UTF-8 with U+FFFD — harmless for
+;; base64 of actual text, but real data corruption for base64 of binary
+;; data (this is exactly what `std/image.h#`'s `to_base64`/`from_base64`
+;; round-trip needs, since it re-encodes a whole .bmp through base64).
+pub fn decode_bytes(s: string) -> bytes is
+    return __builtin_base64_decode_bytes(s)
+end
+
 ;; Encode a UTF-8 string's bytes as base64 (convenience over `encode`
 ;; for when you already have a `string`, not `bytes`).
 pub fn encode_str(s: string) -> string is
