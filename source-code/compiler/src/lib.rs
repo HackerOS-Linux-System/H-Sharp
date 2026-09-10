@@ -1,6 +1,7 @@
 pub mod derive_codegen;
 pub mod lifetimes;
 pub mod modules;
+pub mod bytes_resolve;
 pub mod traits;
 pub mod regions;
 pub mod ffi;
