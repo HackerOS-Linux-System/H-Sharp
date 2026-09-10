@@ -61,11 +61,27 @@ impl Interpreter {
         // `core` stays statically embedded in this runtime, unaffected by
         // this whole mechanism (see `helpers.rs` module doc comment).
         for (kind, alias, _span) in &module.imports {
-            if let hsharp_parser::ast::ImportKind::Std { path, .. } = kind {
-                let lib = path.last().cloned().unwrap_or_default();
-                if lib.is_empty() { continue; }
-                let ns = alias.clone().unwrap_or_else(|| lib.clone());
-                self.load_std_module(&lib, &ns)?;
+            match kind {
+                hsharp_parser::ast::ImportKind::Std { path, .. } => {
+                    let lib = path.last().cloned().unwrap_or_default();
+                    if lib.is_empty() { continue; }
+                    let ns = alias.clone().unwrap_or_else(|| lib.clone());
+                    self.load_std_module(&lib, &ns)?;
+                }
+                // `use "bytes -> name"` / `dynamic use "bytes -> name"` —
+                // see `load_bytes_module`'s doc comment for the full
+                // resolution story. Resolved from the current working
+                // directory since (unlike `load_std_module`, which always
+                // reads a fixed absolute path) a `bytes ->` package lives
+                // relative to *this run's* project, and the interpreter
+                // has no other notion of "the entry file's directory"
+                // available at this call site.
+                hsharp_parser::ast::ImportKind::BytesRepo { name, version, alias: _, link } => {
+                    let ns = alias.clone().unwrap_or_else(|| name.clone());
+                    let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    self.load_bytes_module(name, version.as_deref(), *link, &start_dir, &ns)?;
+                }
+                _ => {}
             }
         }
 
@@ -168,6 +184,86 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Resolve and load one `use "bytes -> name[/version]"` (or
+    /// `dynamic use "bytes -> name[/version]"`) import: find the package
+    /// via `helpers::resolve_bytes_use` (project-local
+    /// `build/cache/packages/<name>` first, then the global
+    /// `~/.hackeros/H#/build/cache/packages/<name>`, cross-checked against
+    /// `bytes.lock`), parse its entry file, and register its public
+    /// functions under the `{ns}::{fn}` namespace — same shape
+    /// `load_std_module` already gives `use "std -> lib"`, and the same
+    /// `register_mod_items` machinery underneath, so `pkg::do_thing(...)`-
+    /// style call sites work identically whether `pkg` came from `std` or
+    /// from `bytes`.
+    ///
+    /// A `Static` (the default) and a `Dynamic` (`dynamic use ...`) import
+    /// are resolved identically *here* — the interpreter is a tree-walker
+    /// with no separate "already linked into the binary" state to speak
+    /// of, so the distinction only changes which errors are hard-required
+    /// up front (`Dynamic` additionally demands a `bytes.lock` entry —
+    /// see `resolve_bytes_use` — since its whole contract is "already
+    /// installed on this host", not merely "a folder with the right name
+    /// happens to exist"). The LLVM/AOT backend, which genuinely does
+    /// choose between inlining a package's code at compile time versus
+    /// deferring to the running machine, is where `Static` vs. `Dynamic`
+    /// actually diverges — see `hsharp-compiler`'s `modules.rs`.
+    ///
+    /// Like `load_std_module`, a missing/unresolvable/version-mismatched
+    /// package is a hard error (via `helpers::resolve_bytes_use`'s own
+    /// messages), never a silent stub — and, like `load_std_module`, this
+    /// recurses into the package's own `use "std -> x"` / `use "bytes ->
+    /// y"` imports (resolved from the package's own directory) before
+    /// registering its functions, so its internal calls into another
+    /// module see that module already loaded.
+    pub fn load_bytes_module(
+        &mut self,
+        name: &str,
+        version: Option<&str>,
+        link: ImportLinkKind,
+        start_dir: &std::path::Path,
+        ns: &str,
+    ) -> Result<(), RuntimeError> {
+        let path = crate::helpers::resolve_bytes_use(name, version, link, start_dir)
+            .map_err(RuntimeError::Custom)?;
+
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| RuntimeError::Custom(format!("cannot read bytes package '{}' at {}: {}", name, path.display(), e)))?;
+
+        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(name));
+        if result.has_errors() {
+            return Err(RuntimeError::Custom(format!(
+                "parse errors while loading bytes package '{}' ({}):\n{}",
+                name, path.display(), result.render_errors()
+            )));
+        }
+
+        let pkg_dir = path.parent().map(|p| p.to_path_buf())
+            .unwrap_or_else(|| start_dir.to_path_buf());
+
+        // This package's own imports, resolved before its functions are
+        // registered — so its internal calls into `std` or into another
+        // `bytes` package see that module already loaded, exactly like
+        // `load_std_module` does for a std file's own `use "std -> x"`.
+        for (kind, sub_alias, _span) in &result.module.imports {
+            match kind {
+                ImportKind::Std { path: sub_path, .. } => {
+                    let sub_lib = sub_path.last().cloned().unwrap_or_default();
+                    if sub_lib.is_empty() { continue; }
+                    let sub_ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
+                    self.load_std_module(&sub_lib, &sub_ns)?;
+                }
+                ImportKind::BytesRepo { name: sub_name, version: sub_version, alias: _, link: sub_link } => {
+                    let sub_ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
+                    self.load_bytes_module(sub_name, sub_version.as_deref(), *sub_link, &pkg_dir, &sub_ns)?;
+                }
+                _ => {}
+            }
+        }
+
+        self.register_mod_items(ns, &result.module.items);
+        Ok(())
+    }
+
     /// Directly invoke a top-level function by name with no arguments —
     /// the shape every `#[test] fn name() is ... end` function has. Returns
     /// the RuntimeError (e.g. a failed `assert_eq`) on failure so callers
@@ -250,12 +346,44 @@ impl Interpreter {
             Stmt::Expr(expr, _) => {
                 match expr {
                     Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+                        // BUG FIX: this used to `return Ok(r)` unconditionally
+                        // for whatever `exec_block` produced — including a
+                        // *plain trailing expression value* from
+                        // `exec_block`'s own "last statement in a block is
+                        // an implicit tail value" behavior (see its doc
+                        // comment), not just a genuine `return`/`break`/
+                        // `continue` signal. Since a statement-position
+                        // `if` (this arm — not `eval_expr`'s separate
+                        // `Expr::If`, used when an `if` appears in
+                        // *expression* position, e.g. `let x = if ... end`,
+                        // where treating the tail value as "the result" is
+                        // exactly correct) has nowhere to put that value,
+                        // forwarding it here made the *enclosing* block's
+                        // `if let Some(v) = self.exec_stmt(stmt)? { return
+                        // Ok(Some(v)); }` treat it as an early-return
+                        // signal — silently discarding every statement
+                        // after the `if` for the extremely common case of
+                        // an `if` block whose last line is a plain call
+                        // (`if cond is do_thing() end` followed by more
+                        // code — `do_thing()`'s return value would abort
+                        // the whole enclosing function). `While`/`For`/
+                        // `Unsafe` right below already learned this lesson
+                        // (see their own match-on-`r`/comment) — `If` was
+                        // just never updated to match.
+                        let propagate = |r: Option<crate::value::Value>| -> Option<crate::value::Value> {
+                            match r {
+                                Some(v @ crate::value::Value::Return(_))
+                                | Some(v @ crate::value::Value::Break)
+                                | Some(v @ crate::value::Value::Continue) => Some(v),
+                                _ => None,
+                            }
+                        };
                         let cond_val = self.eval_expr(condition)?;
                         if cond_val.is_truthy() {
                             self.env.push();
                             let r = self.exec_block(then_body)?;
                             self.env.pop();
-                            return Ok(r);
+                            return Ok(propagate(r));
                         }
                         for (ec, eb) in elsif_branches {
                             let cv = self.eval_expr(ec)?;
@@ -263,14 +391,14 @@ impl Interpreter {
                                 self.env.push();
                                 let r = self.exec_block(eb)?;
                                 self.env.pop();
-                                return Ok(r);
+                                return Ok(propagate(r));
                             }
                         }
                         if let Some(else_b) = else_body {
                             self.env.push();
                             let r = self.exec_block(else_b)?;
                             self.env.pop();
-                            return Ok(r);
+                            return Ok(propagate(r));
                         }
                         Ok(None)
                     }
