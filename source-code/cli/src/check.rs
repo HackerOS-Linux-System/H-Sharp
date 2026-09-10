@@ -41,7 +41,7 @@ pub fn run(file: Option<PathBuf>) {
             let mut module = result.module;
             let mut resolver = hsharp_compiler::modules::ModuleResolver::new(src_path);
             let entry_dir = src_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-            match resolver.expand_module(module.items, entry_dir) {
+            match resolver.expand_program(&module, entry_dir) {
                 Ok(items) => module.items = items,
                 Err(e) => {
                     eprintln!("{} {}: {}", "Error:".red().bold(), src_path.display(), e);
@@ -51,7 +51,18 @@ pub fn run(file: Option<PathBuf>) {
             }
             // check_module now returns Vec<Diagnostic> (not Result) — collect all errors
             let mut tc = hsharp_compiler::typechecker::TypeChecker::new();
-            let diags = tc.check_module(&module);
+            let mut diags = tc.check_module(&module);
+            // `hsharp check` previously only ran the plain typechecker,
+            // never `features::check_module_features` — meaning it could
+            // report "no errors found" for code that would then fail to
+            // *build* (a closure literal, a struct passed by value across
+            // `extern`, `await` outside an async runtime, ...), since
+            // those are backend-capability errors, not type errors. Since
+            // `check` exists specifically to catch what `build` would
+            // reject before spending time on a full compile, it needs the
+            // same feature-support pass `hsharp build` runs (see
+            // `compiler/src/lib.rs`'s own compile pipeline).
+            diags.extend(hsharp_compiler::features::check_module_features(&module, hsharp_compiler::builtins_registry::Backend::Llvm));
             let errs: Vec<_> = diags.iter().filter(|d| d.severity == hsharp_compiler::Severity::Error).collect();
             if errs.is_empty() {
                 println!("  {} {}", "✓".green(), src_path.display());
@@ -98,7 +109,7 @@ pub fn run_multi(files: Vec<std::path::PathBuf>) {
                 let mut module = result.module;
                 let mut resolver = hsharp_compiler::modules::ModuleResolver::new(src_path);
                 let entry_dir = src_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-                match resolver.expand_module(module.items, entry_dir) {
+                match resolver.expand_program(&module, entry_dir) {
                     Ok(items) => module.items = items,
                     Err(e) => {
                         eprintln!("{} {}: {}", "Error:".red().bold(), src_path.display(), e);
@@ -107,7 +118,8 @@ pub fn run_multi(files: Vec<std::path::PathBuf>) {
                     }
                 }
                 let mut tc = hsharp_compiler::typechecker::TypeChecker::new();
-                let diags = tc.check_module(&module);
+                let mut diags = tc.check_module(&module);
+                diags.extend(hsharp_compiler::features::check_module_features(&module, hsharp_compiler::builtins_registry::Backend::Llvm));
                 let errs: Vec<_> = diags.iter().filter(|d| d.severity == hsharp_compiler::Severity::Error).collect();
                 if errs.is_empty() {
                     println!("  {} {}", "✓".green().bold(), src_path.display().to_string().dimmed());
