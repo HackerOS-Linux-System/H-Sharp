@@ -62,8 +62,25 @@ impl Diagnostic {
 /// ```
 ///
 /// `source` is the full text of `file` (read by the caller — this function
-/// does no I/O so it works the same whether the source came from disk, a
-/// REPL buffer, or an in-memory test fixture).
+/// avoids extra I/O for the common case where every diagnostic's span
+/// belongs to `file` itself).
+///
+/// A diagnostic's `span.file` is **not always** `file`, though: once
+/// `ModuleResolver::expand_program` inlines a `mod X` declaration, a
+/// `use "std -> x"` import, or a `use "bytes -> x"` import (see
+/// `hsharp-compiler`'s `modules.rs`), the inlined items keep the `Span`s
+/// they were originally parsed with — `file` pointing at *that* module's
+/// own source path, not the entry file's. Previously this function always
+/// printed `source`/`file` regardless, so a real type error inside an
+/// inlined module rendered as complete nonsense: the entry file's name in
+/// the banner, the entry file's text (at an unrelated line number) as
+/// "context", and — since `check_stmt`'s `fn_name` came from whatever
+/// function the checker actually was inside — a function name that
+/// doesn't appear anywhere near the shown location. The error itself was
+/// real; only its presentation was garbled beyond use. Fixed by resolving
+/// each diagnostic against its *own* `span.file`, reading it from disk
+/// (memoized — many diagnostics commonly share one non-primary file) when
+/// it differs from `file`.
 pub fn print_diagnostics(diags: &[Diagnostic], source: &str, file: &str) {
     const RESET:  &str = "\x1b[0m";
     const BOLD:   &str = "\x1b[1m";
@@ -72,9 +89,27 @@ pub fn print_diagnostics(diags: &[Diagnostic], source: &str, file: &str) {
     const YELLOW: &str = "\x1b[33m";
     const CYAN:   &str = "\x1b[36m";
 
-    let lines: Vec<&str> = source.lines().collect();
+    // Lazily-read cache of non-primary source files a diagnostic's span
+    // might point into. `None` means "tried and failed to read" (e.g. the
+    // path was relative to a working directory that no longer applies, or
+    // it's a synthetic span like `Span::dummy()`'s `"<unknown>"`) — cached
+    // too, so a bad path is only attempted once even if many diagnostics
+    // share it.
+    let mut other_sources: std::collections::HashMap<&str, Option<String>> = std::collections::HashMap::new();
 
     for diag in diags {
+        let diag_file = diag.span.file.as_str();
+        let owned_other;
+        let lines: Vec<&str> = if diag_file == file {
+            source.lines().collect()
+        } else {
+            owned_other = other_sources
+                .entry(diag_file)
+                .or_insert_with(|| std::fs::read_to_string(diag_file).ok())
+                .clone();
+            owned_other.as_deref().map(|s| s.lines().collect()).unwrap_or_default()
+        };
+
         let (kind, accent) = match diag.severity {
             Severity::Error   => ("TYPE ERROR", RED),
             Severity::Warning => ("WARNING", YELLOW),
@@ -84,8 +119,8 @@ pub fn print_diagnostics(diags: &[Diagnostic], source: &str, file: &str) {
             Severity::Warning => "Warning",
         };
 
-        println!("{}{}-- {} ({}) -------{}", accent, BOLD, kind, file, RESET);
-        println!("{}--> {}:{}:{}{}", CYAN, file, diag.span.start.line, diag.span.start.col, RESET);
+        println!("{}{}-- {} ({}) -------{}", accent, BOLD, kind, diag_file, RESET);
+        println!("{}--> {}:{}:{}{}", CYAN, diag_file, diag.span.start.line, diag.span.start.col, RESET);
         println!();
 
         let line_no   = diag.span.start.line;
@@ -95,6 +130,14 @@ pub fn print_diagnostics(diags: &[Diagnostic], source: &str, file: &str) {
             (line_no + 1).to_string().len()
         ) + 1;
 
+        if lines.is_empty() {
+            // The span's own file couldn't be read (moved/deleted since
+            // parsing, or a synthetic span) — show the message without
+            // fabricating context from an unrelated file, rather than
+            // silently falling back to `source` the way this used to.
+            println!("{}  (source not available for context){}", DIM, RESET);
+            println!();
+        } else {
         // Line before (context), if any
         if line_no >= 2 {
             if let Some(prev) = lines.get(line_no - 2) {
@@ -113,6 +156,7 @@ pub fn print_diagnostics(diags: &[Diagnostic], source: &str, file: &str) {
             println!("{}  {:>width$} | {}{}", DIM, line_no + 1, next, RESET, width = gutter_w);
         }
         println!();
+        }
 
         println!("{}{}{}:{} {}", accent, BOLD, label, RESET, diag.message);
         for hint in &diag.hints {
