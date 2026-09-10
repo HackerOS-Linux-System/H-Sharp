@@ -5548,6 +5548,10 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let call = self.call_coerced(self.builtins.hsh_print, &[s.into()], "iop");
                            Ok(self.unwrap_call(call))
                        }
+                       "io_flush" => {
+                           self.call_coerced(self.builtins.hsh_flush, &[], "ioflush");
+                           Ok(self.ctx.i64_type().const_zero().into())
+                       }
                        "time_ms" => {
                            let call = self.call_coerced(self.builtins.hsh_now_ms, &[], "tms");
                            Ok(self.unwrap_call(call))
