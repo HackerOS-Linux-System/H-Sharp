@@ -350,6 +350,24 @@ BuiltinSpec {
     doc: "encoding::base64 decode.",
 },
 BuiltinSpec {
+    names: &["__builtin_base64_decode_bytes"],
+    params: || vec![HType::Str],
+    ret: || HType::Bytes,
+    c_symbol: None,
+    // Interpreter only for now: the LLVM-side `base64_decode`
+    // (`hsh_base64_decode`) already exists and is genuinely binary-safe
+    // in C (no forced UTF-8 validation the way a Rust `String` requires)
+    // — but wiring a `bytes`-returning variant through to H#'s LLVM
+    // `bytes` runtime representation is separate follow-up work, not
+    // done here. See `base64_decode`'s doc comment in call.rs (the
+    // interpreter's `"base64_decode_bytes"` arm) for why this exists at
+    // all: `base64_decode` forces its result through
+    // `String::from_utf8_lossy`, corrupting non-UTF8 binary data (e.g.
+    // `std/image.h#`'s `from_base64`, round-tripping a whole .bmp).
+    backends: &[Backend::Interpreter],
+    doc: "encoding::base64 decode straight to `bytes`, with no lossy UTF-8 step — use this instead of `base64_decode` for base64 of binary (non-text) data.",
+},
+BuiltinSpec {
     names: &["url_encode"],
     params: || vec![HType::Str],
     ret: || HType::Str,
@@ -1110,9 +1128,21 @@ BuiltinSpec {
     names: &["__builtin_conv_str_to_int"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Parse int, 0 on failure. Interpreter only — AOT's parse_int has different (Option-shaped) semantics.",
+    c_symbol: Some("hsh_str_to_int"),
+    // Was Interpreter-only ("AOT's parse_int has different (Option-shaped)
+    // semantics" — true of `parse_int`, but irrelevant here: this isn't
+    // `parse_int`). The LLVM backend already has a *separately*-registered
+    // builtin, `str_to_int` (see below, `hsh_str_to_int` in runtime/core.c),
+    // with the exact same "parse a leading base-10 int, 0 if none found,
+    // never crashes" contract — it just never got this dunder name wired
+    // up as an alias in codegen.rs's dispatch, so every std file calling
+    // `__builtin_conv_str_to_int` directly (config.h#, net_ip.h#, cli.h#,
+    // yaml.h#, redis.h#, money.h#, toml.h#, color.h#, semver.h# — this is
+    // not a rare path) hit a hard "not supported by the LLVM backend"
+    // compile error. Fixed by adding this exact name as another alias in
+    // codegen.rs's `"conv_str_to_int" | "str_to_int" => ...` arm.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Parse int, 0 on failure. Same operation as `str_to_int`/`conv_str_to_int` (hsh_str_to_int) on the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_conv_str_to_float"],
@@ -1310,9 +1340,16 @@ BuiltinSpec {
     names: &["__builtin_io_read_line"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Read a line from stdin. Interpreter only — AOT programs currently have no stdin-reading builtin at all.",
+    c_symbol: Some("hsh_readline"),
+    // Was Interpreter-only ("AOT programs currently have no stdin-reading
+    // builtin at all" — not true anymore, and arguably not true even
+    // then: `hsh_readline` in runtime/core.c, and the `"io_readline"`
+    // dispatch arm in codegen.rs calling it, both already existed; this
+    // dunder name just wasn't wired to that arm as an alias). Newline is
+    // stripped the same way the interpreter's `io_read_line` strips it,
+    // so both backends agree on trailing-newline handling.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Read a line from stdin (trailing newline stripped). Same operation as the `io_readline` builtin on the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_io_read_char"],
@@ -1325,18 +1362,30 @@ BuiltinSpec {
 BuiltinSpec {
     names: &["__builtin_io_write_no_nl"],
     params: || vec![HType::Str],
-    ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Write to stdout without a trailing newline. Interpreter only.",
+    ret: || HType::Void,
+    c_symbol: Some("hsh_print"),
+    // Was Interpreter-only, `ret: HType::Bool` (neither backend actually
+    // returns a bool here — the interpreter's `io_write_no_nl` arm
+    // returns `Value::Nil`, and `hsh_print`/`io_print` return `void` — so
+    // the declared return type was wrong on top of being incomplete).
+    // Real AOT arm already existed under `"io_print"` (same operation,
+    // no module prefix); just needed this dunder name as an alias.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Write to stdout without a trailing newline. Same operation as the `io_print` builtin on the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_io_flush"],
     params: || vec![],
-    ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Flush stdout. Interpreter only.",
+    ret: || HType::Void,
+    c_symbol: Some("hsh_flush"),
+    // Was Interpreter-only, `ret: HType::Bool` (the interpreter's own
+    // `io_flush` arm returns `Value::Nil`, not a bool, same declared-type
+    // slip as `__builtin_io_write_no_nl` above). Added alongside the
+    // `hsh_flush`/`io_flush` LLVM arm (builtins.rs/codegen.rs/core.c) so
+    // `std/io.h#`'s `read_line(prompt)` can flush a no-newline prompt
+    // before blocking on stdin on the LLVM backend too.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Flush stdout. Same operation as the `io_flush` builtin on the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_math_asin"],
@@ -1980,6 +2029,23 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         "db_close" => "sqlite_close",
         "path_exists"    => "fs_exists",
         "process_shell"  => "shell",
+        // ── conv / io — real AOT arms already existed under a different
+        // bare name (codegen.rs's `"conv_str_to_int" | "str_to_int"`,
+        // `"io_readline"`, `"io_print"` arms — see each's own C runtime
+        // function, `hsh_str_to_int`/`hsh_readline`/`hsh_print` in
+        // runtime/core.c); these three dunder spellings just never had an
+        // entry here, so every std file calling them directly (not
+        // through a backend-specific workaround wrapper) hit a hard
+        // "not supported by the LLVM backend" error despite the real
+        // implementation already existing one name away. Confirmed via
+        // a real build failure (hco-core, config/net_ip/cli/yaml/redis/
+        // money/toml/color/semver.h# all call `__builtin_conv_str_to_int`
+        // directly; `std/cli.h#`'s own `io_read_line`/`write_no_nl_priv`
+        // call the other two directly).
+        "conv_str_to_int" => "str_to_int",
+        "io_read_line"    => "io_readline",
+        "io_write_no_nl"  => "io_print",
+        "io_flush"        => "io_flush",
         _ => return None,
     })
 }
