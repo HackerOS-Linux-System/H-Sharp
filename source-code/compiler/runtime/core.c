@@ -1617,6 +1617,14 @@ char *hsh_readline(void) {
     return buf;
 }
 
+/* ── hsh_flush — flush stdout ─────────────────────────────────────────────
+ * Paired with hsh_readline: a `write_no_nl(prompt)` immediately followed
+ * by a blocking `read_line()` needs the prompt actually on the terminal
+ * (or pipe) before the read blocks, same reason the interpreter's own
+ * `io_read_line`/`io_write_no_nl` arms (call.rs) explicitly flush
+ * std::io::stdout() around a real read. */
+void hsh_flush(void) { fflush(stdout); }
+
 /* ── hsh_scan_port_net — already declared, stub if not present ───────────────*/
 #ifndef HSH_SCAN_PORT_DEFINED
 int64_t hsh_scan_port_net(const char *host, int64_t port, int64_t timeout_ms) {
