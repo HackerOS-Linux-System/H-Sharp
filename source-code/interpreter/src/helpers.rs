@@ -49,6 +49,322 @@ please install h# utils for HackerOS use:\n\
     )
 }
 
+// ─── bytes package resolution (`use "bytes -> pkg"`) ───────────────────────
+//
+// Mirrors the `std -> lib` machinery above, but resolves against packages
+// installed by the `bytes` package manager (a separate H#-written project;
+// see its `installer.h#`/`lockfile.h#`/`isolation.h#`) instead of the fixed
+// HackerOS std layout. `bytes install` fetches a dependency into one of two
+// caches:
+//
+//   <project>/build/cache/packages/<name>       (project-local, per
+//                                                 `installer.h#::pkg_cache_dir`)
+//   ~/.hackeros/H#/build/cache/packages/<name>   (global, per
+//                                                 `isolation.h#::hackeros_cache_base`)
+//
+// and records exactly what got installed (name/version/url/checksum) in a
+// `bytes.lock` JSON file next to the project's `Bytes.hk` (see
+// `lockfile.h#`). A `use "bytes -> name[/version]"` import (optionally
+// `dynamic use ...`, see `ImportLinkKind`) resolves against those two
+// caches, in that order, cross-checked against the lockfile when one
+// exists — a missing package, a broken/entry-less one, or a version that
+// doesn't match what's locked is a hard, actionable error, never a silent
+// stub, exactly like `std -> lib` above.
+//
+// NOTE ON DUPLICATION: same story as `STD_LIB_ROOT` above — this is
+// intentionally re-implemented, not shared via a common crate, in
+// `hsharp-compiler`'s `modules.rs` (`resolve_bytes_import`) and
+// `hsharp-typecheck`'s `checker/mod.rs` (`check_module`'s import pass), so
+// the tree-walking interpreter, the LLVM/AOT backend, and the typechecker
+// all agree on where a `bytes ->` package lives and what counts as
+// "installed". Any change to the search order or lockfile format here
+// must be mirrored in both of those.
+
+/// One entry out of `bytes.lock`'s `"packages"` object.
+#[derive(Debug, Clone)]
+pub struct LockedBytesPkg {
+    pub version: String,
+    #[allow(dead_code)]
+    pub url: String,
+    #[allow(dead_code)]
+    pub checksum: String,
+}
+
+/// Why `find_bytes_pkg_entry` couldn't resolve a package to a usable entry
+/// file — kept distinct from a plain `String` so callers (interpreter vs.
+/// compiler) can format the two very different situations ("nothing here
+/// at all" vs. "something's here, but it's not a valid H# package") with
+/// their own wording while sharing the same search logic.
+pub enum BytesResolveError {
+    /// No directory or flat `<name>.h#` file exists in any searched cache.
+    NotFound(Vec<std::path::PathBuf>),
+    /// A package directory exists (so `bytes install` clearly ran) but it
+    /// has neither a manifest `[build] -> entry` nor any of the
+    /// conventional entry file names.
+    NoEntry(std::path::PathBuf),
+}
+
+/// `~/.hackeros/H#/build/cache/packages` — the global package cache
+/// `bytes`'s `isolation.h#::hackeros_cache_base()` writes into. Falls back
+/// to `/tmp/.hackeros/H#/build/cache/packages` if `$HOME` isn't set, the
+/// same fallback that H# function itself uses.
+pub fn bytes_global_cache_dir() -> std::path::PathBuf {
+    let base = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".hackeros/H#/build/cache"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/.hackeros/H#/build/cache"));
+    base.join("packages")
+}
+
+/// Walk upward from `start_dir` looking for `Bytes.hk`/`bytes.hk` (the
+/// project manifest `bytes` itself reads — see `config.h#::find_hk`), so a
+/// `use "bytes -> x"` resolves against *that* project's local package
+/// cache even when the file declaring the import isn't at the project
+/// root (e.g. `src/foo.h#` still finds the same `build/cache/packages`
+/// as `src/main.h#` would — and, just as importantly, so a nested
+/// `use "bytes -> y"` *inside* an already-fetched package `x` walks back
+/// up through `build/cache/packages/x/...` and finds the same top-level
+/// project manifest, since `bytes` flat-installs every dependency into one
+/// shared cache rather than giving each package its own nested one).
+/// Capped at 8 parent directories, mirroring `config.h#::find_hk_upward`'s
+/// own depth limit. Returns `start_dir` itself if no manifest is found
+/// anywhere above it (the lookup then simply won't find anything under
+/// `<start_dir>/build/cache/...`, which is correct for a standalone
+/// script with no project at all).
+pub fn find_bytes_project_root(start_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = start_dir.to_path_buf();
+    for _ in 0..8 {
+        if dir.join("Bytes.hk").is_file() || dir.join("bytes.hk").is_file() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    start_dir.to_path_buf()
+}
+
+/// The two package-cache roots a `bytes -> name` import is searched
+/// against, project-local first (so a project-pinned version wins over
+/// whatever happens to be globally installed).
+pub fn bytes_pkg_cache_roots(start_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let project_root = find_bytes_project_root(start_dir);
+    vec![project_root.join("build/cache/packages"), bytes_global_cache_dir()]
+}
+
+/// Very small, dependency-free `bytes.lock` reader. The real format
+/// (written by `lockfile.h#::lockfile_write`) is plain JSON:
+/// `{"version":1,"packages":{"name":{"version":"..","url":"..","checksum":".."}}}`
+/// — parsed here with `serde_json` (already a dependency of this crate)
+/// rather than the hand-rolled string-splitting `lockfile.h#` itself has
+/// to use (H# has no JSON library of its own to lean on). A missing or
+/// unparseable lockfile is treated as "nothing locked yet", not an error
+/// — plenty of valid `bytes ->` lookups happen before `bytes install` has
+/// ever run once (e.g. a fresh `hsharp check` right after `bytes add`).
+pub fn read_bytes_lockfile(project_root: &std::path::Path) -> HashMap<String, LockedBytesPkg> {
+    let mut out = HashMap::new();
+    let path = project_root.join("bytes.lock");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    let json: Json = match serde_json::from_str(&content) {
+        Ok(j) => j,
+        Err(_) => return out,
+    };
+    let pkgs = match json.get("packages").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return out,
+    };
+    for (name, entry) in pkgs {
+        let version = entry.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let checksum = entry.get("checksum").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        out.insert(name.clone(), LockedBytesPkg { version, url, checksum });
+    }
+    out
+}
+
+/// Pull `-> entry => ...` out of a package's own `Bytes.hk`/`bytes.hk`
+/// `[build]` section (falling back to `[package]`) — the same key
+/// `config.h#::build_entry` reads project-side. Returns `None` if the
+/// package has no manifest at all (e.g. the bare single-file stub `bytes`
+/// creates when a name isn't in the registry yet — see
+/// `installer.h#::install_bytes_dep`) or its declared entry doesn't
+/// actually exist on disk, in which case the caller falls back to the
+/// fixed candidate list.
+fn bytes_pkg_manifest_entry(pkg_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let manifest = ["Bytes.hk", "bytes.hk"]
+        .iter()
+        .map(|n| pkg_dir.join(n))
+        .find(|p| p.is_file())?;
+    let content = std::fs::read_to_string(&manifest).ok()?;
+    let mut section = String::new();
+    let mut build_entry: Option<String> = None;
+    let mut package_entry: Option<String> = None;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].to_string();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("->") {
+            if let Some((key, val)) = rest.split_once("=>") {
+                let key = key.trim();
+                let val = val.trim().trim_matches('"');
+                if key == "entry" {
+                    match section.as_str() {
+                        "build" => build_entry = Some(val.to_string()),
+                        "package" => package_entry = Some(val.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let entry = build_entry.or(package_entry)?;
+    let candidate = pkg_dir.join(&entry);
+    if candidate.is_file() { Some(candidate) } else { None }
+}
+
+/// Resolve one `use "bytes -> name[/version]"` import to an on-disk entry
+/// file. Tries, per cache root (project-local, then global — see
+/// `bytes_pkg_cache_roots`): the manifest-declared entry point
+/// (`Bytes.hk`'s `[build] -> entry`) inside `<cache>/<name>/`; then the
+/// conventional fallback candidates a bare `bytes new`-scaffolded package
+/// would have (`src/lib.h#`, `src/main.h#`, `lib.h#`, `main.h#`,
+/// `<name>.h#`); then finally the flat `<cache>/<name>.h#` single-file
+/// layout `install_bytes_dep`'s registry-miss stub writes when a name
+/// isn't in the registry index yet.
+pub fn find_bytes_pkg_entry(name: &str, start_dir: &std::path::Path) -> Result<std::path::PathBuf, BytesResolveError> {
+    let mut tried = Vec::new();
+    let mut broken: Option<std::path::PathBuf> = None;
+    for cache in bytes_pkg_cache_roots(start_dir) {
+        let pkg_dir = cache.join(name);
+        if pkg_dir.is_dir() {
+            tried.push(pkg_dir.clone());
+            if let Some(entry) = bytes_pkg_manifest_entry(&pkg_dir) {
+                return Ok(entry);
+            }
+            for candidate in ["src/lib.h#", "src/main.h#", "lib.h#", "main.h#"] {
+                let p = pkg_dir.join(candidate);
+                if p.is_file() { return Ok(p); }
+            }
+            let named = pkg_dir.join(format!("{}.h#", name));
+            if named.is_file() { return Ok(named); }
+            broken.get_or_insert(pkg_dir);
+        } else {
+            tried.push(pkg_dir);
+        }
+        let flat = cache.join(format!("{}.h#", name));
+        tried.push(flat.clone());
+        if flat.is_file() { return Ok(flat); }
+    }
+    match broken {
+        Some(dir) => Err(BytesResolveError::NoEntry(dir)),
+        None => Err(BytesResolveError::NotFound(tried)),
+    }
+}
+
+/// The message shown when `use "bytes -> name"` can't find the package
+/// anywhere on disk at all — mirrors `std_lib_missing_message`'s "loud,
+/// actionable error, not a silent stub" policy, but points at `bytes
+/// add`/`bytes install` (the package manager) rather than `hacker unpack`,
+/// since a `bytes ->` dependency is per-project, not part of the fixed
+/// HackerOS layout.
+pub fn bytes_pkg_missing_message(name: &str, tried: &[std::path::PathBuf]) -> String {
+    let locations = tried.iter().map(|p| format!("  - {}", p.display())).collect::<Vec<_>>().join("\n");
+    format!(
+        "bytes package '{name}' not found. Looked in:\n{locations}\n\n\
+install it first:\n\
+  bytes add {name}\n\
+  bytes install\n",
+        name = name, locations = locations,
+    )
+}
+
+/// The message shown when a `bytes ->` package's directory exists but has
+/// no resolvable entry point — distinct from "not found" because the
+/// install clearly happened, but the fetched tree isn't a valid H#
+/// package (or its `Bytes.hk` points at an entry file that doesn't exist).
+pub fn bytes_pkg_no_entry_message(name: &str, pkg_dir: &std::path::Path) -> String {
+    format!(
+        "bytes package '{name}' was found at {dir} but has no usable entry point.\n\n\
+expected one of (relative to that directory):\n\
+  a `Bytes.hk`/`bytes.hk` with `[build] -> entry => ...`\n\
+  src/lib.h#, src/main.h#, lib.h#, main.h#, or {name}.h#\n",
+        name = name, dir = pkg_dir.display(),
+    )
+}
+
+/// The message for `dynamic use "bytes -> name"` when the package isn't
+/// recorded in `bytes.lock`. A `dynamic` import's whole contract (see
+/// `ast.rs`'s `ImportLinkKind` doc comment) is "the host machine already
+/// ran `bytes install`" — a package with no lockfile entry hasn't, even
+/// if a stray directory with the right name happens to exist in the cache
+/// (e.g. left over from a `bytes remove` that only edited
+/// `Bytes.hk`/`bytes.lock` and never touched the on-disk cache).
+pub fn bytes_pkg_not_locked_message(name: &str) -> String {
+    format!(
+        "dynamic bytes package '{name}' is not recorded in bytes.lock.\n\n\
+`dynamic use \"bytes -> {name}\"` requires it to have already been installed\n\
+by the bytes package manager on this machine:\n\
+  bytes add {name}\n\
+  bytes install\n",
+        name = name,
+    )
+}
+
+/// The message for a version mismatch between what the source code
+/// requests (`use "bytes -> name/1.2.3"`) and what `bytes.lock` actually
+/// has installed. A mismatch is worth a loud error rather than quietly
+/// building/running against the wrong version.
+pub fn bytes_pkg_version_mismatch_message(name: &str, wanted: &str, locked: &str) -> String {
+    format!(
+        "bytes package '{name}' version mismatch: code requests '{wanted}', but \
+bytes.lock has '{locked}' installed.\n\n\
+run one of:\n\
+  bytes update {name}          ;; re-lock to the latest matching version\n\
+  bytes add {name}/{wanted}    ;; explicitly re-pin and reinstall\n",
+        name = name, wanted = wanted, locked = locked,
+    )
+}
+
+/// Full resolution for one `use`/`dynamic use "bytes -> name[/version]"`
+/// import: checks the lockfile contract for `dynamic` imports, checks a
+/// requested version against what's locked, then finds the on-disk entry
+/// file — folding `find_bytes_pkg_entry`'s two-shaped error and the
+/// lockfile checks above into the single `Result<PathBuf, String>` shape
+/// `load_bytes_module` (interpreter) wants to hand straight to
+/// `RuntimeError::Custom`.
+pub fn resolve_bytes_use(
+    name: &str,
+    version: Option<&str>,
+    link: hsharp_parser::ast::ImportLinkKind,
+    start_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let project_root = find_bytes_project_root(start_dir);
+    let lock = read_bytes_lockfile(&project_root);
+
+    if matches!(link, hsharp_parser::ast::ImportLinkKind::Dynamic) && !lock.contains_key(name) {
+        return Err(bytes_pkg_not_locked_message(name));
+    }
+
+    if let Some(wanted) = version {
+        if let Some(locked) = lock.get(name) {
+            if !locked.version.is_empty() && locked.version != wanted {
+                return Err(bytes_pkg_version_mismatch_message(name, wanted, &locked.version));
+            }
+        }
+    }
+
+    match find_bytes_pkg_entry(name, start_dir) {
+        Ok(entry) => Ok(entry),
+        Err(BytesResolveError::NotFound(tried)) => Err(bytes_pkg_missing_message(name, &tried)),
+        Err(BytesResolveError::NoEntry(dir)) => Err(bytes_pkg_no_entry_message(name, &dir)),
+    }
+}
+
 /// Bridge for the `__builtin_*` names that `std/*.h#` wrapper functions
 /// call internally (e.g. `strings.h#`'s `trim()` calling
 /// `__builtin_str_trim(s)`). These are NOT stdlib aliases (see
@@ -211,6 +527,7 @@ pub fn resolve_builtin_dunder(name: &str) -> Option<&'static str> {
         // ── base64 / url encoding ────────────────────────────────────
         "base64_encode" => "base64_encode",
         "base64_decode" => "base64_decode",
+        "base64_decode_bytes" => "base64_decode_bytes",
         "base64url_encode" => "base64url_encode",
         "base64url_decode" => "base64url_decode",
         "hmac_sha256_b64url" => "hmac_sha256_b64url",
