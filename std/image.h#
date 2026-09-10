@@ -1,10 +1,346 @@
-;; H# Standard Library — std -> image
-pub fn load(path: string) -> string is return "" end
-pub fn save(img: string, path: string) is end
-pub fn width(img: string) -> int is return 0 end
-pub fn height(img: string) -> int is return 0 end
-pub fn resize(img: string, w: int, h: int) -> string is return "" end
-pub fn crop(img: string, x: int, y: int, w: int, h: int) -> string is return "" end
-pub fn to_grayscale(img: string) -> string is return "" end
-pub fn to_base64(img: string) -> string is return "" end
-pub fn from_base64(data: string) -> string is return "" end
+use "std -> fs" from "fs"
+use "std -> base64" from "b64"
+
+;; Decoded (or freshly-built) image: `pixels` is raw RGB, 3 bytes per
+;; pixel (red, green, blue — *not* BMP's on-disk BGR order, and
+;; *not* bottom-up — `pixels[0..3]` is always the top-left pixel), row
+;; by row, `width * 3` bytes per row with no padding. `load`/`save`
+;; handle the BGR/bottom-up/row-padding conversion to and from BMP's
+;; on-disk layout so every other function here only ever deals with
+;; plain top-down RGB.
+struct Image is
+    pub width:  int
+    pub height: int
+    pub pixels: bytes
+    pub valid:  bool
+end
+
+fn empty_image() -> Image is
+    return Image { width: 0, height: 0, pixels: string_to_bytes(""), valid: false }
+end
+
+fn le_bytes_to_int(b: [int], off: int, width: int) -> int is
+    let mut n = 0
+    let mut i = width - 1
+    while i >= 0 is
+        n = (n << 8) | b[off + i]
+        i -= 1
+    end
+    return n
+end
+
+fn int_to_le_bytes(n: int, width: int) -> [int] is
+    let mut out: [int] = []
+    let mut i = 0
+    while i < width is
+        out.push((n >> (i * 8)) & 255)
+        i += 1
+    end
+    return out
+end
+
+;; Parse a 24-bit uncompressed .bmp into a real `Image`. Returns
+;; `Image.valid == false` (never a crash) for anything else, including
+;; compressed/paletted BMPs and any non-BMP format (png, jpg, ...),
+;; which this cannot decode.
+pub fn load(path: string) -> Image is
+    let raw: bytes = fs::read_bytes(path)
+    let b: [int] = __builtin_bytes_to_ints(raw)
+    if b.len() < 54 is return empty_image() end
+    if b[0] != 66 || b[1] != 77 is return empty_image() end   ;; "BM"
+
+    let pixel_offset  = le_bytes_to_int(b, 10, 4)
+    let dib_header_sz = le_bytes_to_int(b, 14, 4)
+    let width         = le_bytes_to_int(b, 18, 4)
+    let height_raw    = le_bytes_to_int(b, 22, 4)
+    let bpp           = le_bytes_to_int(b, 28, 2)
+    let compression   = le_bytes_to_int(b, 30, 4)
+
+    ;; Only the common case: BITMAPINFOHEADER (40-byte DIB header),
+    ;; 24 bits/pixel, uncompressed (BI_RGB). Anything else (paletted,
+    ;; 32bpp with alpha, RLE compression, OS/2 headers, ...) is a clean
+    ;; "not supported" rather than a wrong decode.
+    if dib_header_sz != 40 || bpp != 24 || compression != 0 is return empty_image() end
+    if width <= 0 is return empty_image() end
+
+    ;; A negative height means the pixel array is already stored
+    ;; top-down; positive (the common case) means bottom-up.
+    let mut top_down = false
+    let mut height = height_raw
+    if height_raw < 0 is
+        top_down = true
+        height = 0 - height_raw
+    end
+    if height <= 0 is return empty_image() end
+
+    ;; Each BMP row is padded to a multiple of 4 bytes.
+    let row_bytes = width * 3
+    let row_padded = row_bytes + ((4 - (row_bytes % 4)) % 4)
+
+    let mut pixels: [int] = []
+    let mut out_row = 0
+    while out_row < height is
+        ;; `pixels` must end up top-down regardless of the file's own
+        ;; row order.
+        let mut src_row = out_row
+        if !top_down is src_row = height - 1 - out_row end
+        let row_start = pixel_offset + (src_row * row_padded)
+        let mut x = 0
+        while x < width is
+            let px = row_start + (x * 3)
+            ;; BMP stores BGR on disk; `Image.pixels` is always RGB.
+            let blue  = b[px]
+            let green = b[px + 1]
+            let red   = b[px + 2]
+            pixels.push(red)
+            pixels.push(green)
+            pixels.push(blue)
+            x += 1
+        end
+        out_row += 1
+    end
+
+    return Image { width: width, height: height, pixels: __builtin_bytes_from_ints(pixels), valid: true }
+end
+
+;; Write a real, standard, top-down-in-memory-but-bottom-up-on-disk
+;; 24-bit uncompressed .bmp.
+pub fn save(img: Image, path: string) is
+    if !img.valid is return end
+    let row_bytes = img.width * 3
+    let pad = (4 - (row_bytes % 4)) % 4
+    let row_padded = row_bytes + pad
+    let pixel_data_size = row_padded * img.height
+    let file_size = 54 + pixel_data_size
+
+    let mut out: [int] = []
+    ;; File header (14 bytes)
+    out = out + [66, 77]                          ;; "BM"
+    out = out + int_to_le_bytes(file_size, 4)
+    out = out + int_to_le_bytes(0, 4)              ;; reserved
+    out = out + int_to_le_bytes(54, 4)             ;; pixel data offset
+    ;; DIB header — BITMAPINFOHEADER (40 bytes)
+    out = out + int_to_le_bytes(40, 4)
+    out = out + int_to_le_bytes(img.width, 4)
+    out = out + int_to_le_bytes(img.height, 4)     ;; positive: bottom-up on disk
+    out = out + int_to_le_bytes(1, 2)              ;; planes
+    out = out + int_to_le_bytes(24, 2)             ;; bpp
+    out = out + int_to_le_bytes(0, 4)              ;; BI_RGB, uncompressed
+    out = out + int_to_le_bytes(pixel_data_size, 4)
+    out = out + int_to_le_bytes(2835, 4)           ;; ~72 DPI
+    out = out + int_to_le_bytes(2835, 4)
+    out = out + int_to_le_bytes(0, 4)              ;; colors used
+    out = out + int_to_le_bytes(0, 4)              ;; important colors
+
+    let src: [int] = __builtin_bytes_to_ints(img.pixels)
+    let mut file_row = 0
+    while file_row < img.height is
+        ;; Pixel data is bottom-up on disk; `img.pixels` is top-down.
+        let src_row = img.height - 1 - file_row
+        let row_start = src_row * row_bytes
+        let mut x = 0
+        while x < img.width is
+            let px = row_start + (x * 3)
+            let red   = src[px]
+            let green = src[px + 1]
+            let blue  = src[px + 2]
+            out.push(blue)
+            out.push(green)
+            out.push(red)
+            x += 1
+        end
+        let mut p = 0
+        while p < pad is
+            out.push(0)
+            p += 1
+        end
+        file_row += 1
+    end
+
+    fs::write_bytes(path, __builtin_bytes_from_ints(out))
+end
+
+pub fn width(img: Image) -> int is return img.width end
+pub fn height(img: Image) -> int is return img.height end
+
+;; Nearest-neighbor resize on the real RGB pixel array.
+pub fn resize(img: Image, w: int, h: int) -> Image is
+    if !img.valid || w <= 0 || h <= 0 is return empty_image() end
+    let src: [int] = __builtin_bytes_to_ints(img.pixels)
+    let mut out: [int] = []
+    let mut y = 0
+    while y < h is
+        let src_y = (y * img.height) / h
+        let mut x = 0
+        while x < w is
+            let src_x = (x * img.width) / w
+            let px = (src_y * img.width + src_x) * 3
+            out.push(src[px])
+            out.push(src[px + 1])
+            out.push(src[px + 2])
+            x += 1
+        end
+        y += 1
+    end
+    return Image { width: w, height: h, pixels: __builtin_bytes_from_ints(out), valid: true }
+end
+
+;; Crop to the real `w x h` rectangle starting at `(x, y)`, clamped to
+;; the source image's bounds (never reads out of range).
+pub fn crop(img: Image, x: int, y: int, w: int, h: int) -> Image is
+    if !img.valid || w <= 0 || h <= 0 is return empty_image() end
+    let src: [int] = __builtin_bytes_to_ints(img.pixels)
+    let mut out: [int] = []
+    let mut row = 0
+    while row < h is
+        let src_y = y + row
+        let mut col = 0
+        while col < w is
+            let src_x = x + col
+            if src_x >= 0 && src_x < img.width && src_y >= 0 && src_y < img.height is
+                let px = (src_y * img.width + src_x) * 3
+                out.push(src[px])
+                out.push(src[px + 1])
+                out.push(src[px + 2])
+            else is
+                out.push(0)
+                out.push(0)
+                out.push(0)
+            end
+            col += 1
+        end
+        row += 1
+    end
+    return Image { width: w, height: h, pixels: __builtin_bytes_from_ints(out), valid: true }
+end
+
+;; Real per-pixel luminance conversion (Rec. 601 weights), not a stub —
+;; still an RGB image afterward (R == G == B per pixel), matching what
+;; every other image library's "grayscale" filter produces.
+pub fn to_grayscale(img: Image) -> Image is
+    if !img.valid is return empty_image() end
+    let src: [int] = __builtin_bytes_to_ints(img.pixels)
+    let mut out: [int] = []
+    let n = img.width * img.height
+    let mut i = 0
+    while i < n is
+        let px = i * 3
+        let r = src[px]
+        let g = src[px + 1]
+        let bch = src[px + 2]
+        let lum = ((r * 299) + (g * 587) + (bch * 114)) / 1000
+        out.push(lum)
+        out.push(lum)
+        out.push(lum)
+        i += 1
+    end
+    return Image { width: img.width, height: img.height, pixels: __builtin_bytes_from_ints(out), valid: true }
+end
+
+;; Base64 of the image re-encoded as a real .bmp (in memory, no temp
+;; file) — round-trips through `from_base64`.
+pub fn to_base64(img: Image) -> string is
+    if !img.valid is return "" end
+    return b64::encode(bmp_encode_bytes(img))
+end
+
+;; Inverse of `to_base64`. Uses `base64::decode_bytes` (not `decode`) —
+;; a .bmp is binary, and `decode`'s `string`-shaped result would corrupt
+;; it (see `decode_bytes`'s doc comment in `std/base64.h#`).
+pub fn from_base64(data: string) -> Image is
+    let bmp: bytes = b64::decode_bytes(data)
+    return bmp_decode_bytes(bmp)
+end
+
+;; `save`/`load`'s encoder/decoder, factored out so `to_base64`/
+;; `from_base64` don't need a temp file on disk.
+fn bmp_encode_bytes(img: Image) -> bytes is
+    let row_bytes = img.width * 3
+    let pad = (4 - (row_bytes % 4)) % 4
+    let row_padded = row_bytes + pad
+    let pixel_data_size = row_padded * img.height
+    let file_size = 54 + pixel_data_size
+
+    let mut out: [int] = []
+    out = out + [66, 77]
+    out = out + int_to_le_bytes(file_size, 4)
+    out = out + int_to_le_bytes(0, 4)
+    out = out + int_to_le_bytes(54, 4)
+    out = out + int_to_le_bytes(40, 4)
+    out = out + int_to_le_bytes(img.width, 4)
+    out = out + int_to_le_bytes(img.height, 4)
+    out = out + int_to_le_bytes(1, 2)
+    out = out + int_to_le_bytes(24, 2)
+    out = out + int_to_le_bytes(0, 4)
+    out = out + int_to_le_bytes(pixel_data_size, 4)
+    out = out + int_to_le_bytes(2835, 4)
+    out = out + int_to_le_bytes(2835, 4)
+    out = out + int_to_le_bytes(0, 4)
+    out = out + int_to_le_bytes(0, 4)
+
+    let src: [int] = __builtin_bytes_to_ints(img.pixels)
+    let mut file_row = 0
+    while file_row < img.height is
+        let src_row = img.height - 1 - file_row
+        let row_start = src_row * row_bytes
+        let mut x = 0
+        while x < img.width is
+            let px = row_start + (x * 3)
+            out.push(src[px + 2])
+            out.push(src[px + 1])
+            out.push(src[px])
+            x += 1
+        end
+        let mut p = 0
+        while p < pad is
+            out.push(0)
+            p += 1
+        end
+        file_row += 1
+    end
+    return __builtin_bytes_from_ints(out)
+end
+
+fn bmp_decode_bytes(raw: bytes) -> Image is
+    let b: [int] = __builtin_bytes_to_ints(raw)
+    if b.len() < 54 is return empty_image() end
+    if b[0] != 66 || b[1] != 77 is return empty_image() end
+
+    let pixel_offset  = le_bytes_to_int(b, 10, 4)
+    let dib_header_sz = le_bytes_to_int(b, 14, 4)
+    let width         = le_bytes_to_int(b, 18, 4)
+    let height_raw    = le_bytes_to_int(b, 22, 4)
+    let bpp           = le_bytes_to_int(b, 28, 2)
+    let compression   = le_bytes_to_int(b, 30, 4)
+    if dib_header_sz != 40 || bpp != 24 || compression != 0 is return empty_image() end
+    if width <= 0 is return empty_image() end
+
+    let mut top_down = false
+    let mut height = height_raw
+    if height_raw < 0 is
+        top_down = true
+        height = 0 - height_raw
+    end
+    if height <= 0 is return empty_image() end
+
+    let row_bytes = width * 3
+    let row_padded = row_bytes + ((4 - (row_bytes % 4)) % 4)
+
+    let mut pixels: [int] = []
+    let mut out_row = 0
+    while out_row < height is
+        let mut src_row = out_row
+        if !top_down is src_row = height - 1 - out_row end
+        let row_start = pixel_offset + (src_row * row_padded)
+        let mut x = 0
+        while x < width is
+            let px = row_start + (x * 3)
+            pixels.push(b[px + 2])
+            pixels.push(b[px + 1])
+            pixels.push(b[px])
+            x += 1
+        end
+        out_row += 1
+    end
+    return Image { width: width, height: height, pixels: __builtin_bytes_from_ints(pixels), valid: true }
+end
