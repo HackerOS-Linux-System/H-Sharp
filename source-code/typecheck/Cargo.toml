@@ -11,3 +11,9 @@ path = "src/lib.rs"
 [dependencies]
 hsharp-parser = { path = "../parser" }
 thiserror     = "=1.0.56"
+# Only used to read `bytes.lock` (a plain JSON file written by the
+# `bytes` package manager) when checking `use "bytes -> pkg"` imports —
+# see `bytes_resolve.rs`. Still pure Rust / wasm32-compatible, so this
+# doesn't compromise the "zero LLVM/native dependencies" goal in the
+# crate description above.
+serde_json    = "=1.0.108"
