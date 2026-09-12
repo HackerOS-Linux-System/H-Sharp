@@ -838,8 +838,8 @@ impl LlvmCodegen {
         for p in &f.params {
             if p.name == "self" { continue; }
             if let TypeExpr::Named(n) = &p.ty {
-                if structs.contains_key(n) {
-                    var_types.insert(p.name.clone(), n.clone());
+                if let Some(bare) = resolve_struct_name(structs, n) {
+                    var_types.insert(p.name.clone(), bare.to_string());
                 }
             }
             if let TypeExpr::Tuple(elems) = &p.ty {
@@ -847,8 +847,8 @@ impl LlvmCodegen {
             }
             if let TypeExpr::Array(elem) = &p.ty {
                 if let TypeExpr::Named(n) = elem.as_ref() {
-                    if structs.contains_key(n) {
-                        array_elem_types.insert(p.name.clone(), n.clone());
+                    if let Some(bare) = resolve_struct_name(structs, n) {
+                        array_elem_types.insert(p.name.clone(), bare.to_string());
                     }
                 }
                 if let Some(elem_llvm) = htype_to_llvm(ctx, elem) {
@@ -2116,6 +2116,34 @@ struct FnCx<'ctx, 'a> {
     loop_stack: Vec<(inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
 }
 
+// BUG FIX: every `TypeExpr::Named(n) if structs.contains_key(n) => ...`
+// check in this file (there were six of them: function params, the two
+// `infer_struct_name`/`infer_array_elem_type` FieldAccess arms, the Call
+// arm, and the two `let`-binding struct/array-elem trackers) looked the
+// annotated/declared type name up in `structs` *verbatim*. But `structs`
+// is built from `StructDef::name`, which is always the bare, unqualified
+// name a struct was declared with (see the `structs.insert(sd.name...)`
+// collection pass) — never `module::Name`. So the moment a type was
+// written or declared as a module-qualified name (`let x:
+// progress::MemberStatus = ...`, or a struct field whose own declared
+// type is `some_mod::Foo`), every one of those six checks failed, the
+// variable/field never got tracked, and every later `.field` access on
+// it fell through to the noisy "guessing by scanning all structs"
+// fallback — even though the type was right there, fully annotated.
+// `FieldAccess`'s own struct *lookup* (a few lines below, in
+// `infer_struct_name`) already knew to strip the `module::` prefix
+// before indexing into `structs` (`bare`/`.or_else(...)`); this just
+// centralizes that same fallback so every classification site benefits,
+// not only the one call site that happened to already need it.
+fn resolve_struct_name<'s>(structs: &HashMap<String, Vec<StructField>>, n: &'s str) -> Option<&'s str> {
+    if structs.contains_key(n) {
+        Some(n)
+    } else {
+        let bare = n.rsplit("::").next().unwrap_or(n);
+        if structs.contains_key(bare) { Some(bare) } else { None }
+    }
+}
+
 impl<'ctx, 'a> FnCx<'ctx, 'a> {
     // ── `@arc` branch-depth bookkeeping (see `branch_depth`'s doc comment) ────
     fn enter_branch(&self) { self.branch_depth.set(self.branch_depth.get() + 1); }
@@ -2250,6 +2278,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
 
     fn infer_struct_name(&self, e: &Expr) -> Option<String> {
         match e {
+
             Expr::StructLit(name, _, _) => Some(name.clone()),
             Expr::Ident(name, _) => self.var_types.get(name).cloned(),
             Expr::FieldAccess(inner, field, _) => {
@@ -2261,7 +2290,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 let fields = self.structs.get(bare).or_else(|| self.structs.get(&inner_struct))?;
                 let field_def = fields.iter().find(|f| &f.name == field)?;
                 match &field_def.ty {
-                    TypeExpr::Named(n) if self.structs.contains_key(n) => Some(n.clone()),
+                    TypeExpr::Named(n) => resolve_struct_name(&self.structs, n).map(|s| s.to_string()),
                     _ => None,
                 }
             }
@@ -2314,7 +2343,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     _ => None,
                 };
                 match fn_name.and_then(|n| self.fn_ret_types.get(&n)) {
-                    Some(TypeExpr::Named(n)) if self.structs.contains_key(n) => Some(n.clone()),
+                    Some(TypeExpr::Named(n)) => resolve_struct_name(&self.structs, n).map(|s| s.to_string()),
                     _ => None,
                 }
             }
@@ -2338,7 +2367,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 let field_def = fields.iter().find(|f| &f.name == field)?;
                 match &field_def.ty {
                     TypeExpr::Array(elem) => match elem.as_ref() {
-                        TypeExpr::Named(n) if self.structs.contains_key(n) => Some(n.clone()),
+                        TypeExpr::Named(n) => resolve_struct_name(&self.structs, n).map(|s| s.to_string()),
                         _ => None,
                     },
                     _ => None,
@@ -2951,7 +2980,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 // `x.field` against the *actual* struct instead of scanning
                 // every struct definition for a same-named field.
                 let inferred = match ty {
-                    Some(TypeExpr::Named(n)) if self.structs.contains_key(n) => Some(n.clone()),
+                    Some(TypeExpr::Named(n)) => resolve_struct_name(&self.structs, n)
+                        .map(|s| s.to_string())
+                        .or_else(|| value.as_ref().and_then(|e| self.infer_struct_name(e))),
                     _ => value.as_ref().and_then(|e| self.infer_struct_name(e)),
                 };
                 match inferred {
@@ -3017,8 +3048,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     _ => None,
                 };
                 match elem_ty {
-                    Some(TypeExpr::Named(n)) if self.structs.contains_key(n) => {
-                        self.array_elem_types.insert(name.clone(), n.clone());
+                    Some(TypeExpr::Named(n)) if resolve_struct_name(&self.structs, n).is_some() => {
+                        let bare = resolve_struct_name(&self.structs, n).unwrap().to_string();
+                        self.array_elem_types.insert(name.clone(), bare);
                     }
                     _ => {
                         if let Some(Expr::ArrayLit(items, _)) = value {
