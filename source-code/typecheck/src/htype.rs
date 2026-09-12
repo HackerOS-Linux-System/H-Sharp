@@ -92,6 +92,23 @@ impl HType {
         if let HType::Optional(inner) = other {
             return self.compatible_with(inner);
         }
+        // BUG FIX: an empty array literal `[]` has no elements to infer an
+        // element type from, so `infer_expr` falls back to `Array(Any)`
+        // (see `Expr::ArrayLit` in checker/expr.rs). That's the *only*
+        // realistic way an `Array(Any)` shows up here — but the top-level
+        // `matches!(self, HType::Any)` check above only ever looks at the
+        // outermost type, so it never catches `Any` nested one level down
+        // inside an `Array`. The result was that `return []` could never
+        // satisfy any concrete array-typed return (`[string]`, `[int]`,
+        // etc.) even though `[]` is obviously a valid empty value for any
+        // of them — this broke the extremely common `if x == "" is return
+        // [] end` idiom used throughout std/ and every downstream project
+        // (bytes, etc.). Recurse element-wise so `Array(Any)` behaves like
+        // `Any` does everywhere else: compatible with any element type, in
+        // either direction, including for nested arrays like `[[int]]`.
+        if let (HType::Array(a), HType::Array(b)) = (self, other) {
+            return a.compatible_with(b);
+        }
         false
     }
 
