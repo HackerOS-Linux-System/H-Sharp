@@ -182,13 +182,97 @@
 (ensure-dir (string stage "/usr"))
 (ensure-dir bin-dir)
 
-(def dest (string bin-dir "/hsharp"))
+# Pakiet Zenit ma dawać w /usr/bin WYŁĄCZNIE `h#` -- bez osobnej binarki
+# `hsharp` obok (to inaczej niż debian/arch/macos, które trzymają
+# `hsharp` + symlink `h#`; tu celowo zostaje tylko jedna nazwa na PATH).
+(def dest (string bin-dir "/h#"))
 (spit dest (slurp bin-path))
 (run (string "chmod +x " dest))
 
-# `h#` to symlink do `hsharp`, nie kopia -- ta sama konwencja co w
-# config/packaging/debian/build.sh i config/packaging/arch/PKGBUILD.
-(run (string "ln -sf hsharp " bin-dir "/h#"))
+# ---------------------------------------------------------------------
+# std -- kopiujemy zawartość repo-root/std do
+# /usr/lib/HackerOS/H#/std wewnątrz stage'a (czyli finalnie do
+# /usr/lib/HackerOS/H#/std na docelowym systemie). To DOKŁADNIE ścieżka,
+# pod którą hsharp-compiler/hsharp-interpreter/hsharp-typecheck
+# rozwiązują `use "std -> lib"` (patrz stała STD_LIB_ROOT w
+# source-code/interpreter/src/helpers.rs oraz identyczny literał w
+# source-code/compiler/src/modules.rs) -- bez tego katalogu `h#`
+# zbudowany przez tę receptę nie potrafi skompilować/uruchomić NICZEGO,
+# co robi `use "std -> ..."`, łącznie z `bytes` niżej.
+# ---------------------------------------------------------------------
+(def std-src (string repo-root "/std"))
+(unless (os/stat std-src :mode)
+  (fail (string "nie znaleziono katalogu std w repo: " std-src)))
+
+(def hackeros-hsharp-dir (string stage "/usr/lib/HackerOS/H#"))
+(ensure-dir-p hackeros-hsharp-dir)
+# `cp -r` z katalogiem docelowym, który już istnieje, kopiuje `std` DO
+# środka niego (nie nadpisuje go samego) -- stąd wynik to
+# .../HackerOS/H#/std/*.h#, a nie .../HackerOS/H#/*.h# bezpośrednio.
+(run (string "cp -r " std-src " " hackeros-hsharp-dir))
+
+# ---------------------------------------------------------------------
+# Ta sama std musi też fizycznie istnieć pod /usr/lib/HackerOS/H#/std
+# na MASZYNIE BUDUJĄCEJ (nie tylko w stage'u) -- świeżo zbudowany `h#`
+# szuka jej pod tą stałą, wpisaną na sztywno ścieżką, żeby móc
+# skompilować `bytes` w kroku poniżej, zanim jeszcze cokolwiek z tego
+# pakietu trafi do instalatora użytkownika. Ten sam wzorzec co
+# ensure-cargo/ensure-llvm wyżej: dogaduj brakującą zależność builda,
+# zamiast zakładać, że ktoś zrobił to ręcznie wcześniej.
+# ---------------------------------------------------------------------
+(defn ensure-host-std []
+  (def host-std-dir "/usr/lib/HackerOS/H#/std")
+  (unless (os/stat host-std-dir :mode)
+    (eprint "recipe.janet: brak " host-std-dir " na hoście -- instaluję z ./std, żeby świeżo zbudowany h# mógł skompilować 'bytes'...")
+    (def sudo (sudo-))
+    (run (string sudo "mkdir -p /usr/lib/HackerOS/H#"))
+    (run (string sudo "cp -r " std-src " /usr/lib/HackerOS/H#"))))
+
+(ensure-host-std)
+
+# ---------------------------------------------------------------------
+# Manager pakietów `bytes` -- klonujemy Bytes-Repository/bytes, budujemy
+# go świeżo zbudowanym `h#` (nie systemowym -- w tym momencie pakiet
+# jeszcze nie jest zainstalowany, więc na PATH nic o nazwie `h#` nie
+# musi w ogóle istnieć) i wynikową binarkę `build/main` wstawiamy do
+# stage'a jako /usr/bin/bytes. Cały ten krok dzieje się TERAZ, w
+# recepcie budującej pakiet -- w finalnym .zpk ląduje już gotowa,
+# skompilowana binarka `bytes`, nic więcej się nie klonuje ani nie
+# kompiluje na maszynie użytkownika przy instalacji.
+# ---------------------------------------------------------------------
+(defn ensure-git []
+  (unless (have? "git")
+    (eprint "recipe.janet: brak 'git' -- próbuję zainstalować (" (detect-pm) ")...")
+    (pm-install {:apt "git" :dnf "git" :pacman "git" :zypper "git" :apk "git" :brew "git"}))
+  (unless (have? "git")
+    (fail "nie udało się zapewnić 'git' -- zainstaluj ręcznie i uruchom ponownie")))
+
+(ensure-git)
+
+(def bytes-workdir
+  (let [r (shell-out "mktemp -d")]
+    (if (r 0) (r 1) (fail "nie udało się utworzyć katalogu tymczasowego dla 'bytes'"))))
+
+(run (string "git clone https://github.com/Bytes-Repository/bytes.git " bytes-workdir "/bytes"))
+
+(def bytes-dir (string bytes-workdir "/bytes"))
+
+# `bin-path` to jeszcze niespakowana binarka `hsharp` (ta sama, którą
+# wyżej skopiowaliśmy do stage'a jako `h#`) -- wołamy ją bezpośrednio po
+# pełnej ścieżce, więc nie zależy to od tego, czy `h#`/`hsharp` jest
+# gdziekolwiek na PATH tej maszyny.
+(run (string "cd " bytes-dir " && " bin-path " compile src/main.h#"))
+
+(def bytes-bin-path (string bytes-dir "/build/main"))
+(unless (os/stat bytes-bin-path :mode)
+  (fail (string "'bytes' skompilowane, ale nie znaleziono wynikowej binarki: " bytes-bin-path)))
+
+(def bytes-dest (string bin-dir "/bytes"))
+(spit bytes-dest (slurp bytes-bin-path))
+(run (string "chmod +x " bytes-dest))
+
+# Sprzątanie katalogu tymczasowego -- best effort, nie przerywa builda.
+(try-run (string "rm -rf " bytes-workdir))
 
 # Licencja -- ta sama konwencja co PKGBUILD (usr/share/licenses/<pkg>/LICENSE).
 (def license-src (string repo-root "/LICENSE"))
