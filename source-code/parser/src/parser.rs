@@ -795,14 +795,66 @@ impl Parser {
         let mut library = None;
         if matches!(self.current().kind, TokenKind::LBracket) {
             self.advance();
-            let s = if let TokenKind::Ident(ref ss) = self.current().kind { ss.clone() } else { String::new() };
+            let mut s = if let TokenKind::Ident(ref ss) = self.current().kind { ss.clone() } else { String::new() };
+            // Only advance if we actually consumed an identifier here —
+            // previously this unconditionally called `self.advance()`
+            // even when `s` came back empty (current token wasn't an
+            // `Ident` at all, e.g. `[, "lib"]`), silently eating
+            // whatever token happened to be sitting there instead of
+            // leaving it for the `,`/`]` checks below to react to.
+            if !s.is_empty() { self.advance(); }
+            // BUG FIX (infinite-loop hang in `hsharp compile`/`check`/
+            // `lib build` on any `extern dynamic [c++, ...]` block —
+            // reproduced live: the process spins forever, burning
+            // memory, right after printing the version banner, on
+            // *any* command that parses a file with a `c++` extern
+            // tag, e.g. `examples/showcase.h#`).
+            //
+            // The lexer has no dedicated `++` token (see lexer.rs's
+            // `Some('+')` arm — only `+` and `+=` exist), so the source
+            // text `c++` tokenizes as three separate tokens: `Ident("c")`,
+            // `Plus`, `Plus`. This match only ever looked at the single
+            // current `Ident` token, saw `"c"` (not `"c++"`), silently
+            // fell through to the `_ => ExternLang::C` default, then
+            // unconditionally advanced past just the `c` — leaving the
+            // *two* `Plus` tokens completely unconsumed. Neither the
+            // `,`/`]` checks below nor the `is`/`fn`/`end` checks further
+            // down recognize a bare `Plus` token, so control fell into
+            // this function's `while !matches!(.., End | EOF)` loop with
+            // current-token stuck on that first `Plus` forever: every
+            // iteration's `skip_newlines()` and `if .. Fn ..` both no-op
+            // on a `Plus`, and — this was the actual hang — nothing in
+            // that loop ever called `self.advance()` in the fallback
+            // case, so the parser span-scanned the exact same token on
+            // every pass, allocating a fresh `Vec`/token clone each time
+            // (matching the climbing `mmap`/`mremap` calls seen under
+            // `strace` on the real hang) without ever making progress or
+            // reaching `End`/`EOF`.
+            //
+            // Fix: recognize the specific two-`Plus`-token tail right
+            // after a bare `c` identifier and fold it back into the
+            // single logical name `"c++"` before matching — the only
+            // language spelling the lexer can't hand back as one token.
+            // The defensive fallback added to the function-list loop
+            // below (search `unexpected token .. inside \`extern\` block`)
+            // additionally guarantees this specific class of bug can
+            // never hang the compiler again, even for some other
+            // not-yet-discovered malformed extern header: any stray
+            // token that isn't consumed here now becomes a normal parse
+            // error instead of an infinite loop.
+            if s == "c" && matches!(self.current().kind, TokenKind::Plus)
+                && matches!(self.peek_at(1).kind, TokenKind::Plus)
+            {
+                self.advance(); // first '+'
+                self.advance(); // second '+'
+                s = "c++".to_string();
+            }
             lang = match s.as_str() {
                 "rust" | "Rust"     => ExternLang::Rust,
                 "cpp" | "c++"       => ExternLang::Cpp,
                 "python" | "py"     => ExternLang::Python,
                 _                   => ExternLang::C,
             };
-            self.advance();
             if matches!(self.current().kind, TokenKind::Comma) {
                 self.advance();
                 if let TokenKind::StringLit(s) = &self.current().kind.clone() { library = Some(s.clone()); self.advance(); }
@@ -834,6 +886,29 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
                 let ret = if matches!(self.current().kind, TokenKind::Arrow) { self.advance(); Some(self.parse_type()?) } else { None };
                 functions.push(ExternFnDecl { name, params, return_type: ret, variadic, span: fspan });
+            } else {
+                // HANG GUARD: this branch used to not exist at all, so
+                // any token here that wasn't `fn`/`end`/EOF (e.g. the
+                // two stray `Plus` tokens left over from an unhandled
+                // `c++` language tag — see the fix note above on the
+                // `[LBracket]` language parsing) left `self.current()`
+                // completely unchanged, `skip_newlines()` a no-op on a
+                // non-newline token, and the loop condition still
+                // false — spinning on the identical token forever and
+                // slowly exhausting memory as each pass allocated fresh
+                // spans/errors, instead of ever reaching `End`/`EOF` or
+                // returning an error. A hang is unrecoverable for every
+                // caller (`compile`, `check`, `lib build`, the LSP); a
+                // clear parse error is not. Guarantee forward progress
+                // (or termination) on *every* iteration by turning any
+                // unrecognized token here into a hard parse error.
+                return Err(self.error(
+                    format!(
+                        "unexpected token `{}` inside `extern` block — expected `fn <name>(...) -> Type` or `end`",
+                        self.current().text
+                    ),
+                    vec!["only `fn` declarations are allowed inside an `extern` block body".to_string()],
+                ));
             }
             self.skip_newlines();
         }
@@ -2398,6 +2473,38 @@ fn token_kind_name(kind: &TokenKind) -> &'static str {
 fn parse_use_path(path: &str, alias: Option<String>, link: ImportLinkKind) -> Option<ImportKind> {
     let arrow = " -> ";
 
+    if path.starts_with("workspace") && path.contains(arrow) {
+        // use "workspace -> member" [from "module -> *" | from "module -> item" | from "module"]
+        //
+        // e.g. `use "workspace -> parser" from "ast -> *"` — H#'s
+        // equivalent of Rust's `use hsharp_parser::ast::*;`. Resolved by
+        // `ModuleResolver::resolve_workspace_import` in the compiler
+        // crate (see `compiler::modules`/`compiler::bytes_resolve`),
+        // against the enclosing project's `[workspace] -> members` list
+        // in its root `Bytes.hk`/`bytes.hk` — the very same file/section
+        // `bytes` itself reads to drive `bytes build --release` across
+        // a multi-member workspace.
+        let member = path.splitn(2, arrow).nth(1)?.trim().to_string();
+        let (module, item) = match alias {
+            None => (None, None),
+            Some(from_str) => {
+                if from_str.contains(arrow) {
+                    let mut it = from_str.splitn(2, arrow);
+                    let m = it.next().unwrap_or("").trim().to_string();
+                    let i = it.next().unwrap_or("*").trim().to_string();
+                    (Some(m), Some(i))
+                } else {
+                    // `from "ast"` with no `-> item` at all defaults to a
+                    // full glob import of that one module — same as
+                    // writing `from "ast -> *"` explicitly.
+                    let m = from_str.trim().to_string();
+                    if m.is_empty() { (None, None) } else { (Some(m), Some("*".to_string())) }
+                }
+            }
+        };
+        if member.is_empty() { return None; }
+        return Some(ImportKind::Workspace { member, module, item });
+    }
     if path.starts_with("bytes") && path.contains(arrow) {
         let rest = path.splitn(2, arrow).nth(1)?.trim();
         let (name, ver) = split_name_ver(rest);
