@@ -512,6 +512,10 @@ pub fn resolve_builtin_dunder(name: &str) -> Option<&'static str> {
         "os_kernel_version" => "os_kernel_version",
         // ── process ──────────────────────────────────────────────────
         "process_run"      => "proc_run",
+        // `std -> async`'s `timeout(handle, ms)` — see call.rs's
+        // `"task_wait_timeout"` case for why this backend's answer is
+        // simply "always ready".
+        "task_wait_timeout" => "task_wait_timeout",
         "process_run_args" => "proc_run_args",
         "process_spawn"    => "proc_spawn",
         "process_kill"     => "proc_kill",
