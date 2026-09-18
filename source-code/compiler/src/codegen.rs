@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use inkwell::{
     AddressSpace,
@@ -230,11 +230,36 @@ impl LlvmCodegen {
 
         // Pass 1: declare signatures for H#-defined functions/methods
         let fns = self.collect_fns(m);
+        let mut async_fns: HashSet<String> = HashSet::new();
         for f in &fns {
             let sig = self.build_fn_type(ctx, f);
             let fv  = module.add_function(&f.name, sig, None);
             mark_nounwind(fv); // H# has no unwinding (panic = abort/exit) — see llvm_optimize.rs
             func_vals.insert(f.name.clone(), fv);
+
+            // ── async fn: also declare the hidden "real body" function ──
+            // `<name>` above (already declared) becomes a thin wrapper —
+            // filled in later, in the new Pass 3 below — that spawns the
+            // *actual* logic on a pthread instead of running it directly.
+            // That actual logic is compiled (by the ordinary Pass 2 below,
+            // completely unchanged) into this second function instead,
+            // under a hidden `__hsh_async_<name>` symbol, with the exact
+            // same signature (so its params/return type are still exactly
+            // what the source declared — only the *public* `<name>` symbol
+            // takes on task-handle semantics). Declaring both here, in the
+            // same declare-only pass, means mutually-recursive async fns
+            // (`a` calling `b` calling `a`) resolve correctly regardless of
+            // source order, exactly like every other H# function already
+            // does — see `emit_async_wrapper`'s doc comment for the full
+            // design and PASS 3, further down, for where the wrapper and
+            // its trampoline actually get their bodies filled in.
+            if f.is_async {
+                let body_name = format!("__hsh_async_{}", f.name);
+                let body_fv   = module.add_function(&body_name, sig, None);
+                mark_nounwind(body_fv);
+                func_vals.insert(body_name, body_fv);
+                async_fns.insert(f.name.clone());
+            }
         }
 
         // Function name -> declared return type, so `let x = some_fn()`
@@ -254,11 +279,34 @@ impl LlvmCodegen {
             }
         }
 
-        // Pass 2: compile bodies
+        // Pass 2: compile bodies. An `async fn`'s *real* logic compiles,
+        // completely normally, into its hidden `__hsh_async_<name>` body
+        // function (declared above in Pass 1) rather than into the public
+        // `<name>` symbol — see Pass 3, right after this loop, for what
+        // actually goes into `<name>` instead.
         for f in &fns {
+            if f.is_async {
+                let body_fv = func_vals[&format!("__hsh_async_{}", f.name)];
+                self.compile_fn(ctx, &module, &builder, &builtins, f, body_fv,
+                                &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity, &async_fns)?;
+                continue;
+            }
             let fv = func_vals[&f.name];
             self.compile_fn(ctx, &module, &builder, &builtins, f, fv,
-                            &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity)?;
+                            &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity, &async_fns)?;
+        }
+
+        // Pass 3: for every `async fn`, fill in its public wrapper
+        // (`<name>`, declared but left bodyless in Pass 1) and its
+        // trampoline (a brand-new function, declared here) — see
+        // `emit_async_wrapper`'s doc comment for exactly what each does.
+        // Run after Pass 2 so `body_fv` already has real IR in it that the
+        // trampoline can safely call.
+        for f in &fns {
+            if !f.is_async { continue; }
+            let body_fv    = func_vals[&format!("__hsh_async_{}", f.name)];
+            let wrapper_fv = func_vals[&f.name];
+            self.emit_async_wrapper(ctx, &module, &builder, f, body_fv, wrapper_fv)?;
         }
 
         // Target machine. Cross-compiling (`--target ...` naming
@@ -824,6 +872,7 @@ impl LlvmCodegen {
         structs:     &HashMap<String, Vec<StructField>>,
         fn_ret_types: &HashMap<String, TypeExpr>,
         enums:       &HashMap<String, usize>,
+        async_fns:   &HashSet<String>,
     ) -> R<()> {
         let entry = ctx.append_basic_block(fv, "entry");
         builder.position_at_end(entry);
@@ -877,7 +926,7 @@ impl LlvmCodegen {
             ctx, module, builder, builtins, func_vals, str_globals,
             vars, fn_name: f.name.clone(), ret_type: f.return_type.clone(),
             structs, var_types, var_tuple_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
-            fn_ret_types, enums,
+            fn_ret_types, enums, async_fns,
             fn_aliases: HashMap::new(),
             arc_owned: std::cell::RefCell::new(Vec::new()),
             branch_depth: std::cell::Cell::new(0),
@@ -957,25 +1006,23 @@ impl LlvmCodegen {
             }
         }
 
-        // ── async fn: wrap body in a pthread-based task launcher ─────────────
-        // An `async fn foo(...)` compiles as:
-        //   1. A normal `__hsh_async_foo(...)` that does the real work.
-        //   2. A thin wrapper `foo(...)` that calls `hsh_task_spawn(__hsh_async_foo, args)`
-        //      and returns an opaque *i64 task handle. `await` on that handle calls
-        //      `hsh_task_wait(handle)` which joins the pthread.
-        // For now we mark the fn with a special prefix so the linker can find both.
-        // The spawn/wait ABI is implemented in the runtime C layer (hsh_async_rt.c).
-        if f.is_async {
-            // The function body compiles normally inside the `__hsh_async_` prefixed fn.
-            // The public `foo` wrapper is generated separately in `emit_async_wrapper`.
-            // Here we just ensure the entry block is built.
-        }
-
         // ── Inject argc/argv storage at the top of main() ─────────────────────
         // We emit:
         //   extern int _hsh_argc; extern char** _hsh_argv;
         //   _hsh_argc = argc; _hsh_argv = argv;
         // so that hsh_env_args() in core.c can retrieve them later.
+        //
+        // KNOWN LIMITATION: `async fn main()` is not a meaningfully
+        // supported program shape — this still fires based on `f.name`
+        // alone, so it would inject this store into `__hsh_async_main`'s
+        // body (which never actually receives the process's real argc/
+        // argv as parameters; only the real C `main`, which for an async
+        // `main` would be the auto-generated spawn-and-immediately-
+        // `await`-nothing wrapper, does). Nothing about this backend
+        // gives `async fn main()` a sensible meaning in the first place
+        // (there is no event loop to keep the process alive after
+        // `main` "returns" a task handle), so this is left as a
+        // documented gap rather than special-cased away.
         if f.name == "main" {
             let ptr_ty  = ctx.ptr_type(inkwell::AddressSpace::default());
             let i32_ty  = ctx.i32_type();
@@ -1003,54 +1050,169 @@ impl LlvmCodegen {
         Ok(())
     }
 
-    /// Emit a thin async wrapper function `name(...)` that launches the
-    /// real async body `__hsh_async_name(...)` on a pthread and returns
-    /// an opaque `*i8` task handle.  `await` on that handle calls
-    /// `hsh_task_wait(handle)` which joins the thread.
+    /// Fill in the bodies of an `async fn`'s two hidden LLVM-level
+    /// pieces — its trampoline and its public wrapper — now that the
+    /// real logic has already been compiled, completely normally, by
+    /// the ordinary Pass 2 in `build_module` into `body_fv`
+    /// (`__hsh_async_<name>`, declared back in Pass 1 alongside the
+    /// wrapper itself). Called once per `async fn`, after Pass 2, from
+    /// `build_module`'s Pass 3.
     ///
-    /// Called once per `async fn` after the body function is compiled.
+    /// PREVIOUS VERSION OF THIS FUNCTION WAS DEAD CODE / NON-FUNCTIONAL:
+    /// nothing in `build_module` ever called it (confirmed — there was
+    /// no call site anywhere in this file), and `f.is_async`'s only
+    /// other effect was an empty `if` block with no code in it at all.
+    /// So every `async fn` actually compiled as a perfectly ordinary,
+    /// synchronous function under its own real name — zero threading,
+    /// ever — and `await` on its result passed through unchanged
+    /// (since `hsh_task_wait` treats any non-task-handle value as a
+    /// no-op passthrough — see that function's own doc comment). Async
+    /// functions with a matching, correct-by-accident return type could
+    /// therefore appear to "work" (right answer, zero concurrency), but
+    /// this old version was *also* fundamentally broken for the
+    /// concurrent case it was clearly meant to implement: it always
+    /// spawned with a hardcoded `nullptr` in place of the real
+    /// arguments ("for now pass nullptr — args encoding is done by the
+    /// runtime layer", which no code anywhere actually did), so any
+    /// `async fn` taking one or more parameters — e.g. this project's
+    /// own `tests/interpreter/async_test.h#`'s `async fn compute(x:
+    /// int) -> int` — would, the moment this dead code *was* wired up,
+    /// have silently run on garbage/uninitialized argument data.
+    ///
+    /// This version fixes both problems for real:
+    ///   - Real arguments: packed into a flat, heap-allocated
+    ///     `int64_t[n]` block (via the small `hsh_args_*` runtime
+    ///     helpers in `async_rt.c`) that the trampoline unpacks on the
+    ///     other side of the pthread boundary — matching this
+    ///     backend's existing convention (see `htype_to_llvm`'s and
+    ///     `llvm_types.rs`'s own doc comments) of keeping *all* memory
+    ///     layout in small, easily-audited C runtime helpers rather
+    ///     than emitting raw struct/GEP IR by hand.
+    ///   - Real return type: `box_to_i64`/`unbox_i64_as` (this file)
+    ///     losslessly round-trip any of the three LLVM value shapes
+    ///     `htype_to_llvm` can ever produce (int/float/pointer) through
+    ///     the single `int64_t` slot `HshTask`/`hsh_task_wait` carry —
+    ///     so `await fetch_data(id)` (an `async fn ... -> string`) gets
+    ///     back a real, usable string pointer, not raw integer bits
+    ///     misinterpreted as one. See `Expr::Await`'s codegen (in
+    ///     `expr()`, this file) for the awaiting side of this same fix.
     fn emit_async_wrapper<'ctx>(
         &self,
-        ctx:       &'ctx Context,
-        module:    &Module<'ctx>,
-        builder:   &Builder<'ctx>,
-        f:         &FnDef,
-        body_fn:   FunctionValue<'ctx>,
-    ) -> R<FunctionValue<'ctx>> {
-        // Wrapper has the same signature as the body function
-        let fn_ty  = body_fn.get_type();
-        let wrapper = module.add_function(&f.name, fn_ty, None);
-        let entry   = ctx.append_basic_block(wrapper, "entry");
-        builder.position_at_end(entry);
+        ctx:        &'ctx Context,
+        module:     &Module<'ctx>,
+        builder:    &Builder<'ctx>,
+        f:          &FnDef,
+        body_fv:    FunctionValue<'ctx>,
+        wrapper_fv: FunctionValue<'ctx>,
+    ) -> R<()> {
+        let i8ptr = ctx.ptr_type(inkwell::AddressSpace::default());
+        let i64_t = ctx.i64_type();
 
-        // Look up hsh_task_spawn(fn_ptr: *i8, args: *i8) -> *i8
-        let i8ptr    = ctx.ptr_type(inkwell::AddressSpace::default());
+        let param_llvm_types: Vec<BasicTypeEnum> = f.params.iter()
+            .filter(|p| p.name != "self")
+            .filter_map(|p| htype_to_llvm(ctx, &p.ty))
+            .collect();
+        let n_params = param_llvm_types.len();
+
+        // `hsh_args_alloc(n) -> *i8`, `hsh_args_set(args, i, v)`,
+        // `hsh_args_get(args, i) -> i64`, `hsh_args_free(args)` — see
+        // `async_rt.c`. A flat heap block of `n` `int64_t` slots is
+        // enough to carry arguments of *any* H# type, in any number,
+        // because every one of them fits losslessly into one 64-bit
+        // slot via `box_to_i64`/`unbox_i64_as` below.
+        let alloc_fn = module.get_function("hsh_args_alloc").unwrap_or_else(|| {
+            module.add_function("hsh_args_alloc", i8ptr.fn_type(&[i64_t.into()], false), None)
+        });
+        let set_fn = module.get_function("hsh_args_set").unwrap_or_else(|| {
+            module.add_function("hsh_args_set", ctx.void_type().fn_type(&[i8ptr.into(), i64_t.into(), i64_t.into()], false), None)
+        });
+        let get_fn = module.get_function("hsh_args_get").unwrap_or_else(|| {
+            module.add_function("hsh_args_get", i64_t.fn_type(&[i8ptr.into(), i64_t.into()], false), None)
+        });
+        let free_fn = module.get_function("hsh_args_free").unwrap_or_else(|| {
+            module.add_function("hsh_args_free", ctx.void_type().fn_type(&[i8ptr.into()], false), None)
+        });
+
+        // ── Trampoline: fn(*i8) -> *i8 — the one fixed shape
+        // `hsh_task_spawn` (and the pthread it starts) can call. Unpacks
+        // the args block, calls the real body with its actual typed
+        // signature, boxes whatever comes back.
+        let tramp_ty = i8ptr.fn_type(&[i8ptr.into()], false);
+        let tramp_fv = module.add_function(&format!("__hsh_async_{}_tramp", f.name), tramp_ty, None);
+        mark_nounwind(tramp_fv);
+        builder.position_at_end(ctx.append_basic_block(tramp_fv, "entry"));
+
+        let raw_args = tramp_fv.get_nth_param(0).unwrap().into_pointer_value();
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(n_params);
+        for (i, ty) in param_llvm_types.iter().enumerate() {
+            let idx  = i64_t.const_int(i as u64, false);
+            let slot = builder.build_call(get_fn, &[raw_args.into(), idx.into()], "argslot").unwrap();
+            let raw_i64 = unwrap_call(ctx, slot).into_int_value();
+            call_args.push(unbox_i64_as(ctx, builder, raw_i64, *ty).into());
+        }
+        if n_params > 0 {
+            // Safe to free right here, unlike an H#-level struct/array
+            // value that might be aliased elsewhere: this block is
+            // private to exactly one spawned task and nothing else in
+            // the program ever sees or holds a pointer to it.
+            builder.build_call(free_fn, &[raw_args.into()], "free_args").unwrap();
+        }
+        let body_call  = builder.build_call(body_fv, &call_args, "async_body_result").unwrap();
+        let result_val = unwrap_call(ctx, body_call);
+        let boxed_i64  = box_to_i64(ctx, builder, result_val);
+        let boxed_ptr  = builder.build_int_to_ptr(boxed_i64, i8ptr, "boxed_result").unwrap();
+        builder.build_return(Some(&boxed_ptr)).unwrap();
+
+        // ── Wrapper: the symbol every ordinary call site actually
+        // calls under this async fn's real name. Packs its real
+        // arguments into a fresh args block, spawns the trampoline on a
+        // pthread via `hsh_task_spawn`, and returns the resulting task
+        // handle *in place of* a real value — boxed into whatever LLVM
+        // shape this fn's own declared return type has, so every
+        // existing call site (which still expects that declared type
+        // back) keeps compiling and linking correctly. `await` (see
+        // `Expr::Await`'s codegen) is what actually blocks for, and
+        // unboxes, the real result later.
+        builder.position_at_end(ctx.append_basic_block(wrapper_fv, "entry"));
+
+        let args_ptr = if n_params == 0 {
+            i8ptr.const_null()
+        } else {
+            let n_val      = i64_t.const_int(n_params as u64, false);
+            let alloc_call = builder.build_call(alloc_fn, &[n_val.into()], "args_mem").unwrap();
+            let ptr        = unwrap_call(ctx, alloc_call).into_pointer_value();
+            for i in 0..n_params {
+                let param_val = wrapper_fv.get_nth_param(i as u32).unwrap();
+                let boxed     = box_to_i64(ctx, builder, param_val);
+                let idx       = i64_t.const_int(i as u64, false);
+                builder.build_call(set_fn, &[ptr.into(), idx.into(), boxed.into()], "argset").unwrap();
+            }
+            ptr
+        };
+
         let spawn_ty = i8ptr.fn_type(&[i8ptr.into(), i8ptr.into()], false);
         let spawn_fn = module.get_function("hsh_task_spawn")
             .unwrap_or_else(|| module.add_function("hsh_task_spawn", spawn_ty, None));
-
-        // Cast body_fn pointer to *i8 (opaque pointer — bit_cast is a no-op
-        // under LLVM's opaque-pointer model but keeps the IR builder happy
-        // across inkwell versions that still require an explicit cast).
-        let fn_ptr_i8 = builder.build_bit_cast(
-            body_fn.as_global_value().as_pointer_value(),
-            i8ptr,
-            "fn_ptr"
+        // Opaque-pointer model: no real cast needed, but keep the
+        // explicit bit_cast (a no-op under opaque pointers) for clarity
+        // and for older-inkwell-API consistency with the rest of this
+        // file (see the original version of this function).
+        let tramp_ptr_i8 = builder.build_bit_cast(
+            tramp_fv.as_global_value().as_pointer_value(), i8ptr, "tramp_ptr"
         ).unwrap();
+        let handle_call = builder.build_call(spawn_fn, &[tramp_ptr_i8.into(), args_ptr.into()], "task_handle").unwrap();
+        let handle = unwrap_call(ctx, handle_call).into_pointer_value();
 
-        // Pack args into a heap struct via hsh_task_pack_args (runtime helper)
-        // For now pass nullptr (args encoding is done by the runtime layer)
-        let null_args = i8ptr.const_null();
+        match wrapper_fv.get_type().get_return_type() {
+            None => { builder.build_return(None).unwrap(); }
+            Some(ret_ty) => {
+                let handle_bits = builder.build_ptr_to_int(handle, i64_t, "handle_bits").unwrap();
+                let ret_val = unbox_i64_as(ctx, builder, handle_bits, ret_ty);
+                builder.build_return(Some(&ret_val)).unwrap();
+            }
+        }
 
-        let handle = builder.build_call(
-            spawn_fn,
-            &[fn_ptr_i8.into(), null_args.into()],
-            "task_handle"
-        ).unwrap();
-
-        let handle_val = unwrap_call(ctx, handle);
-        builder.build_return(Some(&handle_val)).unwrap();
-        Ok(wrapper)
+        Ok(())
     }
 
     fn zero_val<'ctx>(&self, ctx: &'ctx Context, ty: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
@@ -1911,6 +2073,79 @@ fn unwrap_call<'ctx>(ctx: &'ctx Context, r: inkwell::values::CallSiteValue<'ctx>
     }
 }
 
+/// Coerce any of the three LLVM value shapes `htype_to_llvm` ever
+/// produces — see that function's own exhaustive doc comment in
+/// `llvm_types.rs`: every H# type maps to exactly one of
+/// `IntValue`/`FloatValue`/`PointerValue`, never a raw aggregate — down
+/// into a single `i64`, preserving its exact bits. Used by
+/// `emit_async_wrapper` both to pack an `async fn`'s real arguments into
+/// the flat `int64_t[]` block the `hsh_args_*` runtime helpers manage,
+/// and to box that same async fn's real return value into the single
+/// `int64_t` slot `HshTask`/`hsh_task_wait` carry (see `async_rt.c`).
+/// `unbox_i64_as`, right below, is this function's exact inverse.
+fn box_to_i64<'ctx>(
+    ctx:     &'ctx Context,
+    builder: &Builder<'ctx>,
+    val:     BasicValueEnum<'ctx>,
+) -> inkwell::values::IntValue<'ctx> {
+    let i64_t = ctx.i64_type();
+    match val {
+        BasicValueEnum::IntValue(iv) => {
+            if iv.get_type().get_bit_width() < 64 {
+                builder.build_int_z_extend(iv, i64_t, "box_zext").unwrap()
+            } else {
+                iv
+            }
+        }
+        BasicValueEnum::FloatValue(fv) => {
+            // Widen f32 to f64 first so every float return uses the
+            // exact same 64-bit boxing path regardless of declared
+            // width — mirrors the int case's zero-extend above.
+            let as_f64 = if fv.get_type() == ctx.f32_type() {
+                builder.build_float_ext(fv, ctx.f64_type(), "box_f32_to_f64").unwrap()
+            } else {
+                fv
+            };
+            builder.build_bit_cast(as_f64, i64_t, "box_float_bits").unwrap().into_int_value()
+        }
+        BasicValueEnum::PointerValue(pv) => builder.build_ptr_to_int(pv, i64_t, "box_ptr").unwrap(),
+        // Never actually produced by `htype_to_llvm` (see its doc
+        // comment) — box as zero rather than panic if that invariant
+        // is ever violated by some future type.
+        _ => i64_t.const_zero(),
+    }
+}
+
+/// Inverse of `box_to_i64`: reconstruct a value of `target_ty` — which
+/// must be one of the three shapes `htype_to_llvm` can produce — from a
+/// raw `i64` that was boxed by it.
+fn unbox_i64_as<'ctx>(
+    ctx:       &'ctx Context,
+    builder:   &Builder<'ctx>,
+    raw:       inkwell::values::IntValue<'ctx>,
+    target_ty: BasicTypeEnum<'ctx>,
+) -> BasicValueEnum<'ctx> {
+    match target_ty {
+        BasicTypeEnum::IntType(it) => {
+            if it.get_bit_width() < 64 {
+                builder.build_int_truncate(raw, it, "unbox_trunc").unwrap().into()
+            } else {
+                raw.into()
+            }
+        }
+        BasicTypeEnum::FloatType(ft) => {
+            let as_f64 = builder.build_bit_cast(raw, ctx.f64_type(), "unbox_f64").unwrap().into_float_value();
+            if ft == ctx.f32_type() {
+                builder.build_float_trunc(as_f64, ctx.f32_type(), "unbox_f32").unwrap().into()
+            } else {
+                as_f64.into()
+            }
+        }
+        BasicTypeEnum::PointerType(pt) => builder.build_int_to_ptr(raw, pt, "unbox_ptr").unwrap().into(),
+        _ => raw.into(),
+    }
+}
+
 // ── Per-function compile context ──────────────────────────────────────────
 
 use inkwell::types::BasicMetadataTypeEnum;
@@ -2012,6 +2247,15 @@ struct FnCx<'ctx, 'a> {
     /// comment for the broader "avoid the scan-every-struct guess" goal
     /// this and `array_elem_types` are both part of.
     fn_ret_types: &'a HashMap<String, TypeExpr>,
+    /// Names of every `async fn` in this module — lets `Expr::Await`
+    /// codegen distinguish "this is a call to a known async fn, whose
+    /// public wrapper hands back a boxed task handle that needs
+    /// unboxing (see `emit_async_wrapper`'s doc comment) via
+    /// `fn_ret_types`'s matching entry" from "this is anything else
+    /// (a plain value, a non-async call, a variable already holding a
+    /// handle)", which keeps the old, safe passthrough-through-
+    /// `hsh_task_wait` behavior unchanged.
+    async_fns: &'a HashSet<String>,
     /// Enum variant name -> arity (number of positional/tuple fields),
     /// collected once from the module's `Item::EnumDef` items (see
     /// `build_module`), keyed by *bare* variant name (matching how
@@ -4097,15 +4341,82 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            Ok(val)
                        }
                        // ── await expr ──────────────────────────────────────────
-                       // Compiled model: an async fn returns an opaque *i64 handle
-                       // (pointer to a heap-allocated HshTask).  `await expr` calls
-                       // the runtime helper `hsh_task_wait(handle) -> i64` which
-                       // blocks the calling pthread until the task completes and
-                       // returns the payload.  For synchronous values (non-task
-                       // pointers) `hsh_task_wait` is a no-op and returns the value
-                       // unchanged — so `await non_async_fn()` is safe and free.
+                       // Compiled model (see `emit_async_wrapper`'s doc comment
+                       // for the full design): an `async fn`'s public wrapper
+                       // spawns the real work on a pthread via `hsh_task_spawn`
+                       // and hands back an opaque task handle *boxed into
+                       // whatever LLVM shape its declared return type has*
+                       // (int/float/pointer — the only three `htype_to_llvm`
+                       // ever produces). `await expr` unboxes that handle back
+                       // to a real pointer, calls `hsh_task_wait(handle) -> i64`
+                       // (blocks until the spawned pthread finishes and hands
+                       // back its boxed result), then — when `expr` is a
+                       // recognizable call to a *known* async fn — reverses
+                       // that same boxing using that fn's own declared return
+                       // type (`unbox_i64_as`), so `await fetch_data(id)`
+                       // actually comes back as a real `string` pointer rather
+                       // than the raw integer bits underneath it, and likewise
+                       // for `f64`/`bool`/every other return type. When `expr`
+                       // isn't recognized as a known async fn call (a plain
+                       // value, a variable already holding a handle, a call to
+                       // a non-async fn), this keeps the old, safe int64
+                       // passthrough — `hsh_task_wait` is a no-op on a
+                       // non-task pointer, so `await non_async_fn()` remains
+                       // safe and free exactly as before this fix.
                        Expr::Await(inner, _) => {
-                           let task_ptr = self.expr(inner, hint)?;
+                           let async_ret_llvm_ty: Option<BasicTypeEnum> = if let Expr::Call(callee, _, _) = inner.as_ref() {
+                               let fn_name = match callee.as_ref() {
+                                   Expr::Ident(n, _) => Some(n.clone()),
+                                   Expr::Path(segments, _) => {
+                                       let snake = segments.join("_");
+                                       if self.async_fns.contains(&snake) { Some(snake) } else { segments.last().cloned() }
+                                   }
+                                   _ => None,
+                               };
+                               fn_name
+                                   .filter(|n| self.async_fns.contains(n))
+                                   .and_then(|n| self.fn_ret_types.get(&n).cloned())
+                                   .and_then(|rt| htype_to_llvm(self.ctx, &rt))
+                           } else {
+                               None
+                           };
+
+                           // Decide how to unbox `hsh_task_wait`'s raw i64
+                           // result: prefer the statically-known return
+                           // type of a *recognized* async fn call (most
+                           // precise — `async_ret_llvm_ty`, above); when
+                           // `inner` isn't a direct call to one (e.g. a
+                           // plain variable holding a handle obtained
+                           // earlier, such as `std -> async`'s `await_`
+                           // helper's own `handle` parameter), fall back
+                           // to whatever type this `await` expression's
+                           // *own* surrounding context expects it to
+                           // produce (`hint` — e.g. the enclosing `return`
+                           // statement's declared type, or a `let x:
+                           // T = await ...`'s annotation). Only when
+                           // neither is available does this fall back
+                           // further still to the raw, untyped i64 — the
+                           // same passthrough behavior this always had.
+                           let target_ty = async_ret_llvm_ty.or(hint);
+
+                           let task_val = self.expr(inner, hint)?;
+                           // Whatever shape the wrapper boxed its handle into
+                           // (see above), get a real `*i8` back out of it
+                           // before calling `hsh_task_wait`, which always
+                           // takes/returns through a plain pointer.
+                           let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
+                           let task_ptr = match task_val {
+                               BasicValueEnum::PointerValue(pv) => pv,
+                               BasicValueEnum::IntValue(iv) => {
+                                   self.builder.build_int_to_ptr(iv, ptr_ty, "await_handle_ptr").unwrap()
+                               }
+                               BasicValueEnum::FloatValue(fv) => {
+                                   let bits = self.builder.build_bit_cast(fv, self.ctx.i64_type(), "await_f_bits")
+                                       .unwrap().into_int_value();
+                                   self.builder.build_int_to_ptr(bits, ptr_ty, "await_handle_ptr").unwrap()
+                               }
+                               _ => ptr_ty.const_null(),
+                           };
                            // Call hsh_task_wait(task_ptr) -> i64
                            let wait_fn = self.func_vals.get("hsh_task_wait")
                                .copied()
@@ -4116,11 +4427,16 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                    &[task_ptr.into()],
                                    "await_result"
                                );
-                               Ok(self.unwrap_call(call))
+                               let raw = self.unwrap_call(call);
+                               match (target_ty, raw) {
+                                   (Some(t), BasicValueEnum::IntValue(iv)) =>
+                                       Ok(unbox_i64_as(self.ctx, self.builder, iv, t)),
+                                   _ => Ok(raw),
+                               }
                            } else {
                                // hsh_task_wait not linked yet — fall back to passthrough
                                // (handles synchronous callers gracefully)
-                               Ok(task_ptr)
+                               Ok(task_val)
                            }
                        }
                        Expr::Range(start, _, _, _) => self.expr(start, hint),
@@ -4883,6 +5199,37 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let port = if let Some(e) = args.get(1) { self.expr(e, Some(self.ctx.i64_type().into()))? } else { self.ctx.i64_type().const_zero().into() };
                            let timeout = if let Some(e) = args.get(2) { self.expr(e, Some(self.ctx.i64_type().into()))? } else { self.ctx.i64_type().const_int(500, false).into() };
                            let r = self.call_coerced(self.builtins.hsh_scan_port, &[host.into(), port.into(), timeout.into()], "scanport");
+                           Ok(self.unwrap_call(r))
+                       }
+                       // `std -> async`'s `timeout(handle, ms)` (see
+                       // `std/async.h#`): `handle` is whatever an
+                       // unawaited `async fn` call returned (a real task
+                       // handle, disguised as that fn's own declared
+                       // return type — see `emit_async_wrapper`'s doc
+                       // comment in this file), so it's read here with
+                       // the same `i8ptr` hint `str_arg!` already uses
+                       // for every other pointer-shaped builtin arg.
+                       // Bounded, real `pthread_cond_timedwait` under the
+                       // hood (see `hsh_task_wait_timeout` in
+                       // `async_rt.c`) — returns `1` if the task finished
+                       // within `ms`, `0` otherwise. Does **not** consume
+                       // the task either way; the caller still needs a
+                       // real `await`/`hsh_task_wait` afterward to
+                       // actually fetch its result and free it (this
+                       // split — "peek", then "consume" — is what makes
+                       // a bounded wait possible at all without changing
+                       // `hsh_task_wait`'s own existing, simpler,
+                       // unbounded contract).
+                       "task_wait_timeout" => {
+                           let handle = str_arg!(0);
+                           let ms = if let Some(e) = args.get(1) {
+                               let v = self.expr(e, Some(self.ctx.i64_type().into()))?;
+                               match v { BasicValueEnum::IntValue(i) => i, _ => self.ctx.i64_type().const_zero() }
+                           } else { self.ctx.i64_type().const_zero() };
+                           let fn_ty = self.ctx.i64_type().fn_type(&[i8ptr.into(), self.ctx.i64_type().into()], false);
+                           let f = self.module.get_function("hsh_task_wait_timeout")
+                               .unwrap_or_else(|| self.module.add_function("hsh_task_wait_timeout", fn_ty, None));
+                           let r = self.call_coerced(f, &[handle.into(), ms.into()], "task_ready");
                            Ok(self.unwrap_call(r))
                        }
                        // ── Dynamic array builtins ──────────────────────────
