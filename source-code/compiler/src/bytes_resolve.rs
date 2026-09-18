@@ -70,8 +70,7 @@ pub fn read_bytes_lockfile(project_root: &Path) -> HashMap<String, LockedBytesPk
 }
 
 /// See `hsharp-interpreter::helpers::bytes_pkg_manifest_entry`.
-fn manifest_entry(pkg_dir: &Path) -> Option<PathBuf> {
-    let manifest = ["Bytes.hk", "bytes.hk"]
+fn manifest_entry(pkg_dir: &Path) -> Option<PathBuf> {    let manifest = ["Bytes.hk", "bytes.hk"]
         .iter()
         .map(|n| pkg_dir.join(n))
         .find(|p| p.is_file())?;
@@ -168,4 +167,88 @@ run one of:\n\
   bytes add {name}/{wanted}    ;; explicitly re-pin and reinstall\n",
         name = name, wanted = wanted, locked = locked,
     )
+}
+
+/// Parse a manifest's `[workspace] -> members => [...]` list — used to
+/// resolve `use "workspace -> member"` imports (see `modules.rs`'s
+/// `resolve_workspace_import`). Deliberately reads *only* the members
+/// list, with the same permissive line-based approach `manifest_entry`
+/// (above) already uses for `[build] -> entry` — good enough to stay
+/// compatible with whatever `bytes`'s own richer manifest parser
+/// (`config.h#`) accepts, without this Rust compiler needing to embed a
+/// full H#-source-format config parser of its own just to find a sibling
+/// directory on disk. Matches the exact shape `bytes`'s own workspace
+/// manifests use, e.g.:
+///
+/// ```text
+/// [workspace]
+/// -> name    => isolator-workspace
+/// -> version => 0.7
+/// -> mode    => standard
+/// -> members => ["source-code", "isolated", "builder", "daemon"]
+/// ```
+pub fn read_workspace_members(project_root: &Path) -> Vec<String> {
+    let manifest = match ["Bytes.hk", "bytes.hk"].iter().map(|n| project_root.join(n)).find(|p| p.is_file()) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&manifest) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut section = String::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].to_string();
+            continue;
+        }
+        if section != "workspace" { continue; }
+        if let Some(rest) = line.strip_prefix("->") {
+            if let Some((key, val)) = rest.split_once("=>") {
+                if key.trim() == "members" {
+                    let raw = val.trim().trim_start_matches('[').trim_end_matches(']');
+                    return raw
+                        .split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Resolve one workspace member name (as written in `use "workspace ->
+/// NAME"`, e.g. `"parser"`) to that member's directory on disk, by
+/// matching it against the root manifest's `[workspace] -> members`
+/// list — matching either the full listed path (`"source-code/parser"`)
+/// or just its final path component (`"parser"`), so `use "workspace ->
+/// parser"` keeps working whether the member is listed as `"parser"` or
+/// nested under `"source-code/parser"`.
+pub fn find_workspace_member_dir(project_root: &Path, member: &str) -> Option<PathBuf> {
+    let members = read_workspace_members(project_root);
+    for m in &members {
+        let base = m.rsplit('/').next().unwrap_or(m);
+        if m == member || base == member {
+            let dir = project_root.join(m);
+            if dir.is_dir() { return Some(dir); }
+        }
+    }
+    // Fall back to a plain same-named subdirectory even if the workspace
+    // manifest hasn't (yet) listed it under `-> members` — keeps `use
+    // "workspace -> x"` usable while a project is still being scaffolded,
+    // rather than hard-failing just because the manifest is a step behind
+    // the source tree.
+    let guess = project_root.join(member);
+    if guess.is_dir() { Some(guess) } else { None }
+}
+
+/// Resolve a workspace member's build entry file (`[build] -> entry`,
+/// default `src/main.h#`) — reuses the exact same manifest-parsing logic
+/// as a `bytes ->` package's `manifest_entry`, since a workspace member's
+/// own `Bytes.hk` is the same file shape as a standalone package's.
+pub fn workspace_member_entry(member_dir: &Path) -> PathBuf {
+    manifest_entry(member_dir).unwrap_or_else(|| member_dir.join("src/main.h#"))
 }
