@@ -72,8 +72,26 @@ pub enum LangFeature {
 impl LangFeature {
     fn supported_on(&self, backend: Backend) -> bool {
         match self {
-            LangFeature::Await | LangFeature::AsyncFn =>
-            backend == Backend::Interpreter,
+            // EXPANSION: `async fn`/`await` are now real on the LLVM
+            // backend too, not just the interpreter — see codegen.rs's
+            // `emit_async_wrapper` (the actual pthread-spawn/task-handle
+            // codegen) and `Expr::Await`'s arm in `FnCx::expr()` (the
+            // matching unbox-on-await side), plus the new `hsh_args_*`
+            // runtime helpers in `compiler/runtime/async_rt.c` that let
+            // an async fn's real arguments (of any type, any count) and
+            // real return type actually survive the trip across the
+            // pthread boundary — the two concrete gaps that made the
+            // *previous* version of this codegen non-functional (see
+            // `emit_async_wrapper`'s doc comment for the full history).
+            // This gate is what used to make that fine, in a sense: with
+            // it here, `hsharp compile`/`lib build` always refused an
+            // `async fn`/`await` file with a clear, loud compile error
+            // *before* ever reaching that broken codegen, rather than
+            // silently emitting a binary that (at best) ran synchronously
+            // or (for any async fn taking parameters) read garbage
+            // arguments. Gating is only lifted here now that there is
+            // real, working codegen behind it to lift the gate *for*.
+            LangFeature::Await | LangFeature::AsyncFn => true,
             LangFeature::UnsafeArena | LangFeature::UnsafeManual =>
             backend == Backend::Llvm,
             LangFeature::Closures =>
