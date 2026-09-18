@@ -72,6 +72,33 @@ pub enum ImportKind {
     /// use "mod -> name" — deprecated, use `mod name` syntax
     #[allow(deprecated)]
     ModFile { path: String, alias: Option<String> },
+    /// use "workspace -> member" [from "module -> *" | from "module -> item"]
+    ///
+    /// Imports from another member of the *same* `Bytes.hk`/`bytes.hk`
+    /// workspace — e.g. `use "workspace -> parser" from "ast -> *"` is
+    /// H#'s equivalent of Rust's `use hsharp_parser::ast::*;`, and a
+    /// bare `use "workspace -> parser"` (no `from`) imports that
+    /// member's own entry/root module, the way `use hsharp_parser::*;`
+    /// would. Resolved by `ModuleResolver::resolve_workspace_import`
+    /// (see `compiler::modules` and `compiler::bytes_resolve`), which
+    /// reads the workspace root's `[workspace] -> members` list to find
+    /// the member's directory, then that member's own `Bytes.hk` for
+    /// `[build] -> entry` to find its source tree — the exact same two
+    /// manifest fields `bytes` itself (`config.h#`/`workspace.h#`) uses
+    /// to drive `bytes build --release` across a multi-member project.
+    ///
+    /// `module`/`item` come from the `from "..."` string, split on the
+    /// same `->` arrow used everywhere else in this syntax:
+    ///   - no `from` at all           → import the member's entry module, whole.
+    ///   - `from "ast -> *"`          → import every `pub` item of that
+    ///                                  member's `ast` module.
+    ///   - `from "ast -> SomeItem"`   → import just `SomeItem` from `ast`
+    ///                                  (best-effort — see resolver notes
+    ///                                  on cross-item dependencies).
+    /// Imported items are namespaced under the member's name by default
+    /// (`parser::foo(...)`), matching how every other `ImportKind` here
+    /// mangles/namespaces inlined items.
+    Workspace { member: String, module: Option<String>, item: Option<String> },
 }
 
 // ─── Literals ─────────────────────────────────────────────────────────────────
