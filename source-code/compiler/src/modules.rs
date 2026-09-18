@@ -421,6 +421,166 @@ fix one of:\n\
         })])
     }
 
+    /// Resolve one `use "workspace -> member"` import (optionally with
+    /// `from "module -> item_or_*"`): find the named member inside the
+    /// current project's `[workspace] -> members` list (root
+    /// `Bytes.hk`/`bytes.hk` — see `bytes_resolve::read_workspace_members`),
+    /// parse either that member's own build entry (`module: None`, e.g.
+    /// `use "workspace -> parser"` alone) or one specific module file
+    /// inside it (`module: Some("ast")`, from `from "ast -> *"`),
+    /// recursively resolve *that* file's own imports, mangle its items
+    /// under `alias` — same as every other `resolve_*_import` here — and
+    /// return the resulting flat item list.
+    ///
+    /// This is what makes `use "workspace -> parser" from "ast -> *"`
+    /// H#'s equivalent of Rust's `use hsharp_parser::ast::*;`: `parser`
+    /// is resolved as a workspace member (like a Cargo workspace crate),
+    /// `ast` as a module file inside it, and `*` as "bring in everything
+    /// `pub` or otherwise defined there", matching how a `mod`/`std ->`
+    /// import already inlines a whole file's item list.
+    ///
+    /// `item: Some(name)` (a *specific* name after the arrow, not `*`)
+    /// is a best-effort single-item import: only the one item whose own
+    /// name matches is kept after mangling. This is intentionally
+    /// simplistic — it does **not** trace that item's own dependencies
+    /// within the same file, so a single-item import of something that
+    /// calls a private helper defined alongside it in the same module
+    /// will fail to link. Prefer `from "module -> *"` for anything with
+    /// in-module dependencies; single-item imports are best suited to
+    /// standalone leaf functions, structs, or enums.
+    pub fn resolve_workspace_import(
+        &mut self,
+        member: &str,
+        module: Option<&str>,
+        item: Option<&str>,
+        alias: &str,
+        start_dir: &Path,
+    ) -> Result<Vec<Item>, String> {
+        let project_root = bytes_resolve::find_bytes_project_root(start_dir);
+        let member_dir = bytes_resolve::find_workspace_member_dir(&project_root, member)
+            .ok_or_else(|| format!(
+                "workspace member '{member}' not found under {root}.\n\n\
+hint: `use \"workspace -> {member}\"` looks for `{member}` in the root \
+`Bytes.hk`'s `[workspace] -> members => [...]` list (either listed exactly \
+as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{member}\") \
+— check {root}/Bytes.hk (or bytes.hk).\n",
+                member = member, root = project_root.display(),
+            ))?;
+
+        // Resolve the file to parse: either the member's own build entry
+        // (`[build] -> entry`, default `src/main.h#` — same manifest field
+        // `bytes` itself uses to drive a build), or one module file inside
+        // that entry's directory, found the exact same way a plain `mod
+        // <name>` would be (`name.h#` / `name/mod.h#` / `name/main.h#`).
+        let entry = bytes_resolve::workspace_member_entry(&member_dir);
+        let src_dir = entry.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| member_dir.clone());
+
+        let path: PathBuf = match module {
+            None => {
+                if !entry.exists() {
+                    return Err(format!(
+                        "workspace member '{member}''s build entry {entry} does not exist \
+(checked `[build] -> entry` in {member_dir}/Bytes.hk).",
+                        member = member, entry = entry.display(), member_dir = member_dir.display(),
+                    ));
+                }
+                entry.clone()
+            }
+            Some(m) => {
+                let candidates = [format!("{m}.h#"), format!("{m}/mod.h#"), format!("{m}/main.h#")];
+                candidates
+                    .iter()
+                    .map(|c| src_dir.join(c))
+                    .find(|p| p.is_file())
+                    .ok_or_else(|| format!(
+                        "workspace member '{member}': module '{m}' not found \
+(expected {m}.h#, {m}/mod.h#, or {m}/main.h# under {dir})",
+                        member = member, m = m, dir = src_dir.display(),
+                    ))?
+            }
+        };
+
+        // Same "only inline once, program-wide" dedup every other import
+        // kind here needs (see `inlined_files`'s doc comment) — a
+        // workspace member/module commonly gets `use`d from more than one
+        // file in the same program.
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !self.inlined_files.insert(canonical) {
+            return Ok(Vec::new());
+        }
+
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(member));
+        if result.has_errors() {
+            return Err(format!(
+                "parse errors in workspace member '{}' ({}):\n{}",
+                member, path.display(), result.render_errors()
+            ));
+        }
+        let sub_module = result.module;
+        let sub_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(src_dir);
+
+        // This module file's own `use "std -> x"` / `use "bytes -> y"` /
+        // `use "hlib -> z"` / `use "workspace -> other"` imports, resolved
+        // before its own items are filtered/mangled/appended — mirrors
+        // `resolve_bytes_import`'s identical recursion, one level down,
+        // so a workspace member's module can freely depend on std, on
+        // another bytes package, on a `.hlib`, or on *another* workspace
+        // member, exactly like its own top-level entry file could.
+        let mut out = Vec::new();
+        for (kind, sub_alias, _span) in &sub_module.imports {
+            match kind {
+                ImportKind::Std { path: sub_path, .. } => {
+                    let sub_lib = sub_path.last().cloned().unwrap_or_default();
+                    if sub_lib.is_empty() { continue; }
+                    let ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
+                    out.extend(self.resolve_std_import(&sub_lib, &ns)?);
+                }
+                ImportKind::BytesRepo { name: sub_name, version: sub_version, link: sub_link, .. } => {
+                    let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
+                    out.extend(self.resolve_bytes_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
+                }
+                ImportKind::Hlib { name: sub_name, version: sub_version, .. } => {
+                    let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
+                    out.extend(self.resolve_hlib_import(sub_name, sub_version.as_deref(), &ns, &sub_dir)?);
+                }
+                ImportKind::Workspace { member: sub_member, module: sub_mod, item: sub_item } => {
+                    out.extend(self.resolve_workspace_import(sub_member, sub_mod.as_deref(), sub_item.as_deref(), sub_member, &sub_dir)?);
+                }
+                _ => {}
+            }
+        }
+
+        // Best-effort single-item filter (see doc comment above): keep
+        // only the item whose own name matches, dropping everything else
+        // from this file before mangling/appending. `item == Some("*")`
+        // (or no `from` at all) keeps every item, same as a `mod`/`std ->`
+        // import always has.
+        let raw_items = match item {
+            Some(name) if name != "*" => sub_module.items
+                .into_iter()
+                .filter(|it| item_name(it) == Some(name))
+                .collect::<Vec<_>>(),
+            _ => sub_module.items,
+        };
+        if raw_items.is_empty() {
+            if let Some(name) = item {
+                if name != "*" {
+                    return Err(format!(
+                        "workspace member '{member}', module '{m}': no item named '{name}' found",
+                        member = member, m = module.unwrap_or(""), name = name,
+                    ));
+                }
+            }
+        }
+
+        let mangled = mangle_module_items(raw_items, alias);
+        let expanded = self.expand_module(mangled, &sub_dir)?;
+        out.extend(expanded);
+        Ok(out)
+    }
+
     /// The single front-end entry point every caller (`hsharp preview`,
     /// `hsharp build`/`compile`, `hsharp check`) should use instead of
     /// calling `expand_module` directly: resolves this module's
@@ -446,6 +606,21 @@ fix one of:\n\
                 ImportKind::Hlib { name, version, .. } => {
                     let ns = alias.clone().unwrap_or_else(|| name.clone());
                     items.extend(self.resolve_hlib_import(name, version.as_deref(), &ns, entry_dir)?);
+                }
+                ImportKind::Workspace { member, module: sub_module, item } => {
+                    // NOTE: unlike every other `ImportKind` here, the
+                    // generic `alias` tuple field is *not* usable as a
+                    // namespace override for `Workspace` — it's the raw,
+                    // unparsed `from "..."` string (e.g. `"ast -> *"`),
+                    // already fully consumed above into `sub_module`/
+                    // `item` by `parse_use_path`. There is currently no
+                    // surviving syntax slot left to *also* specify a
+                    // custom namespace, so the member's own name is
+                    // always the namespace: `use "workspace -> parser"
+                    // from "ast -> *"` imports as `parser::foo(...)`.
+                    items.extend(self.resolve_workspace_import(
+                        member, sub_module.as_deref(), item.as_deref(), member, entry_dir,
+                    )?);
                 }
                 _ => {}
             }
@@ -780,6 +955,24 @@ fn abi_type_to_type_expr(t: &hsharp_hlib::AbiType) -> TypeExpr {
         AbiType::Void => TypeExpr::Void,
         AbiType::Ptr => TypeExpr::Bytes,
         AbiType::Opaque { struct_name } => TypeExpr::Ref(Box::new(TypeExpr::Named(struct_name.clone()))),
+    }
+}
+
+/// Best-effort item name extractor for `use "workspace -> x" from "mod ->
+/// SomeItem"` single-item imports (see `resolve_workspace_import`) — the
+/// only `Item` variants worth importing by name on their own. `ImplBlock`,
+/// `ModDecl`, and type aliases have no single obviously-right "name" to
+/// match a bare item request against, so they're not selectable this way
+/// (use `from "mod -> *"` instead, which takes every item regardless).
+fn item_name(item: &Item) -> Option<&str> {
+    match item {
+        Item::FnDef(f) => Some(f.name.as_str()),
+        Item::StructDef(s) => Some(s.name.as_str()),
+        Item::EnumDef(e) => Some(e.name.as_str()),
+        Item::TraitDef(t) => Some(t.name.as_str()),
+        Item::TypeAlias { name, .. } => Some(name.as_str()),
+        Item::ConstDef { name, .. } => Some(name.as_str()),
+        _ => None,
     }
 }
 
