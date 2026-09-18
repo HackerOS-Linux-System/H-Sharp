@@ -1,12 +1,70 @@
-;; H# Standard Library — std -> async
-;; Async/await runtime (placeholder dla v0.3)
-
-struct Future is
-    pub id: int
+pub async fn spawn(command: string) -> string is
+    return __builtin_process_run(command)
 end
 
-pub fn spawn(task: string) -> Future is return Future { id: 0 } end
-pub fn await_(f: Future) -> string is return "" end
-pub fn sleep_async(ms: int) -> Future is return Future { id: 0 } end
-pub fn join_all(tasks: string) -> string is return "" end
-pub fn timeout(f: Future, ms: int) -> bool is return false end
+;; Block until `handle` (a value returned by an unawaited async call,
+;; such as `spawn`) finishes, and return what it produced. Equivalent
+;; to the `await` keyword itself — provided as a plain function for the
+;; places the keyword form doesn't fit as naturally: a handle pulled
+;; out of an array or struct field at runtime (as `join_all` and
+;; `timeout`, both below, do), or anywhere you'd rather pass "the
+;; awaiting operation" around as a value than write `await` inline.
+pub fn await_(handle: string) -> string is
+    return await handle
+end
+
+;; Real async sleep: offloads the wait onto its own background task
+;; instead of blocking the calling thread outright. `await
+;; sleep_async(1000)` blocks *this* task for 1000ms while any other
+;; already-spawned task keeps making progress concurrently — unlike
+;; `time::sleep_ms`, which blocks whatever thread calls it directly,
+;; with nothing else able to run on that thread until it returns.
+pub async fn sleep_async(ms: int) -> int is
+    __builtin_time_sleep_ms(ms)
+    return ms
+end
+
+;; Wait for every handle in `handles`, returning their results in the
+;; same order. Each one has already been running concurrently on its
+;; own thread from the moment it was spawned — long before this
+;; function ever sees it — so waiting on them in this order costs the
+;; same wall-clock time any other order (or a "true" parallel select)
+;; would: the total is bounded by whichever task finishes *last*, not
+;; by the sum of all of them.
+pub fn join_all(handles: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(handles) is
+        out = array_push(out, await_(handles[i]))
+        i += 1
+    end
+    return out
+end
+
+struct TimeoutResult is
+    ;; True if `handle` finished within the deadline. `value` only
+    ;; holds a real result when this is true — it's `""` otherwise,
+    ;; not a partial or default value of whatever `handle` would have
+    ;; actually produced.
+    pub ready: bool
+    pub value: string
+end
+
+;; Wait for `handle`, but give up after `ms` milliseconds if it hasn't
+;; finished yet. The task itself is **not** cancelled — it keeps
+;; running to completion in the background regardless (see this
+;; module's doc comment above) — this only bounds how long *this
+;; caller* waits for it; a later, separate `await_(handle)` on the same
+;; handle still works and will get its real result once it's done.
+;;
+;; This is a real bounded wait — `pthread_cond_timedwait` under the
+;; hood (see `hsh_task_wait_timeout` in async_rt.c) — not a fixed
+;; sleep-then-poll loop: it returns the moment `handle` finishes, or
+;; the moment the deadline passes, whichever comes first.
+pub fn timeout(handle: string, ms: int) -> TimeoutResult is
+    let ready: bool = __builtin_task_wait_timeout(handle, ms)
+    if ready is
+        return TimeoutResult { ready: true, value: await_(handle) }
+    end
+    return TimeoutResult { ready: false, value: "" }
+end
