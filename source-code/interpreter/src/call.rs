@@ -1556,6 +1556,30 @@ impl Interpreter {
             // is intentionally left to a future revision of
             // `std/process.h#` rather than smuggled into this one as a
             // stringly-typed hack.
+            // `std -> async`'s `timeout(handle, ms)` (see std/async.h#)
+            // — bounded wait for a task to finish. On *this*
+            // interpreter, though, an unawaited async fn call is a
+            // lazily-deferred, run-when-you-await-it thunk
+            // (`Value::AsyncTask(AsyncTaskState::Pending{..})` — see
+            // `Expr::Await`'s own handling in eval_expr.rs, which just
+            // calls the real function synchronously, right then, the
+            // moment anything awaits it), not something already
+            // running concurrently in the background the way the
+            // AOT/LLVM backend's real pthread-per-task model is (see
+            // `hsh_task_wait_timeout` in async_rt.c, which this
+            // mirrors on that backend). There is nothing to actually
+            // time out on here: by the time anyone could ask "is it
+            // done yet", it either hasn't been awaited at all yet
+            // (and awaiting it now would simply run it to completion
+            // synchronously, however long that takes) or it's already
+            // `Ready`. Reporting "always ready" is the honest answer
+            // for this backend's execution model, not a shortcut — a
+            // caller that then calls `await_`/`await` on it next still
+            // gets a real result either way, exactly as `timeout`'s
+            // own contract promises.
+            "task_wait_timeout" => {
+                return Ok(Value::Bool(true));
+            }
             "proc_run" => {
                 let cmd = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output();
