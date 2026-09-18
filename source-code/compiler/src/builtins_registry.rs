@@ -461,12 +461,19 @@ BuiltinSpec {
     params: || vec![HType::Any],
     ret: || HType::Any,
     c_symbol: None,
-    // Interpreter-only — `h#` (LLVM) has no async runtime. A call site
-    // using `await` when compiling with `h#` should error via
-    // features.rs rather than silently treating it as a synchronous
-    // no-op.
-    backends: &[Backend::Interpreter],
-    doc: "Await an async expression. Interpreter only until h# gains an async runtime.",
+    // EXPANSION: `async fn`/`await` now have real codegen on the LLVM
+    // backend too (see codegen.rs's `emit_async_wrapper` and the
+    // `Expr::Await` arm in `FnCx::expr()`), not just the interpreter —
+    // this list widened to match. In practice the `await` *keyword*
+    // (`await expr`) parses straight to the dedicated `Expr::Await` AST
+    // node and never goes through this `BuiltinSpec` at all (`await` is
+    // a keyword token, not a plain identifier, so a call-syntax
+    // `await(x)` isn't reachable through normal parsing either) — this
+    // entry exists for whatever other lookup path (e.g. builtin-name
+    // enumeration/completion) consults the registry by name, so it's
+    // kept accurate rather than removed.
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Await an async expression — real on both the interpreter and the LLVM backend.",
 },
 BuiltinSpec {
     names: &["__builtin_crypto_random_bytes"],
@@ -2052,6 +2059,10 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         // `hsh_scan_port_net(host, port, timeout_ms)` — same argument
         // order `std/tcp.h#`'s `scan_port` already uses.
         "tcp_scan_port"    => "scan_port",
+        // `std -> async`'s `timeout(handle, ms)` — see codegen.rs's
+        // `"task_wait_timeout"` dispatch arm and `hsh_task_wait_timeout`
+        // in async_rt.c.
+        "task_wait_timeout" => "task_wait_timeout",
         // ── math (only the subset with a real AOT arm — see codegen.rs;
         // asin/acos/atan/atan2/round/trunc/log/log2/log10/exp are
         // genuine gaps, registered below in BUILTINS instead) ──────────
