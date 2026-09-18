@@ -123,12 +123,54 @@ void* hsh_task_spawn(void* fn_ptr, void* args) {
     return (void*)t;
 }
 
+/* BUG FIX (real, newly-reachable crash — see this function's own git
+ * history / this session's notes): `hsh_task_wait` always did
+ * `((HshTask*)handle)->magic` on *any* incoming value before checking
+ * whether it looked like a real pointer at all. That's fine for a
+ * genuine (if wrong) pointer, but `await` on a plain small value —
+ * `await 42`, `await some_bool_returning_call()`, any non-async-fn
+ * value under roughly 64KB when reinterpreted as an address — hits an
+ * unmapped low page and segfaults the whole process, exactly
+ * contradicting this function's own doc comment ("await non_async_fn()
+ * is safe and free"). This was always a latent bug, but was never
+ * actually reachable on the LLVM backend until `async fn`/`await` were
+ * wired up for real there (see `features.rs`) — the interpreter has
+ * its own, separate, dynamically-typed `runtime_async.rs` that never
+ * goes through this C function at all, so it never hit this path
+ * either. Real heap pointers from `calloc` (what `hsh_task_spawn`
+ * allocates a `HshTask` with) are never this small in practice on any
+ * mainstream 64-bit OS, so checking the raw address is comfortably
+ * above a low threshold *before* ever dereferencing it turns this from
+ * "usually safe, sometimes segfaults" into "always safe" for the
+ * overwhelmingly common case (small ints, bools, chars) this
+ * passthrough path exists for — see `hsh_looks_like_task_ptr`'s own
+ * doc comment for the (rare, inherent-to-this-design) case it still
+ * can't fully cover. */
+static int hsh_looks_like_task_ptr(void* handle) {
+    /* A real heap allocation is essentially never found this low in a
+     * process's address space; a plain scalar value that was never a
+     * pointer at all (an int, a bool, a small enum tag, ...) almost
+     * certainly is. This can't be made *perfectly* precise without a
+     * real tagged/boxed value representation for every H# value (a
+     * much larger change) — an unawaited async fn's own real result
+     * happening to be a huge integer that lands above this threshold
+     * by coincidence would still (incorrectly, and rarely) be treated
+     * as a task pointer. In practice this threshold eliminates the
+     * crash for every realistic non-task value `await`/`timeout` sees. */
+    return handle != NULL && (uintptr_t)handle >= (uintptr_t)0x10000;
+}
+
 int64_t hsh_task_wait(void* handle) {
     if (!handle) return 0;
 
     /* Safety: if `handle` is a plain i64 value accidentally passed to
-     * await (e.g. `await non_async_fn()`), the magic check prevents us
-     * from treating it as a HshTask*.  We return it as-is.            */
+     * await (e.g. `await non_async_fn()`), don't even attempt to read
+     * it as a pointer — see `hsh_looks_like_task_ptr`'s doc comment for
+     * exactly why the old version of this check (dereference first,
+     * ask questions later) could crash on this same input.            */
+    if (!hsh_looks_like_task_ptr(handle)) {
+        return (int64_t)(uintptr_t)handle;
+    }
     HshTask* t = (HshTask*)handle;
     if (t->magic != HSH_TASK_MAGIC) {
         return (int64_t)(uintptr_t)handle;
@@ -148,6 +190,48 @@ int64_t hsh_task_wait(void* handle) {
     return result;
 }
 
+/* ── async fn argument packing ────────────────────────────────────
+ * Carries an `async fn`'s real arguments across the pthread boundary —
+ * the only thing `hsh_task_spawn`'s fixed `void*(*)(void*)` trampoline
+ * shape can pass through as `args`. A flat `int64_t[n]` block is
+ * enough for arguments of *any* H# type, in any number: every value
+ * this backend's LLVM codegen can produce is exactly one of a plain
+ * integer, a float (bit-cast to its raw 64-bit pattern), or a pointer
+ * (reinterpreted as its integer address) — see codegen.rs's
+ * `box_to_i64`/`unbox_i64_as`, which do that boxing/unboxing on the
+ * LLVM side of this same block. This mirrors this codebase's existing
+ * "keep all real memory-layout work in a small, easily-audited C
+ * helper, not hand-written LLVM struct/GEP IR" convention (see
+ * `hsh_struct_new`/`hsh_struct_get`/`hsh_struct_set` in core.c for the
+ * same pattern applied to H#'s own struct values).
+ *
+ * BUG FIX this directly enables: `emit_async_wrapper`'s previous
+ * version always spawned with a hardcoded `nullptr` in place of the
+ * real arguments ("args encoding is done by the runtime layer" — which
+ * nothing anywhere actually did), so any `async fn` taking one or more
+ * parameters ran on garbage/uninitialized argument data the moment
+ * that dead code path was ever wired up. `hsh_args_alloc`/`_set`/`_get`/
+ * `_free` are that missing runtime layer.
+ */
+void* hsh_args_alloc(int64_t n) {
+    if (n <= 0) return NULL;
+    return calloc((size_t)n, sizeof(int64_t));
+}
+
+void hsh_args_set(void* args, int64_t i, int64_t v) {
+    if (!args || i < 0) return;
+    ((int64_t*)args)[i] = v;
+}
+
+int64_t hsh_args_get(void* args, int64_t i) {
+    if (!args || i < 0) return 0;
+    return ((int64_t*)args)[i];
+}
+
+void hsh_args_free(void* args) {
+    free(args);
+}
+
 /* ── join(a, b, ...) helper ─────────────────────────────────────── */
 
 /*
@@ -164,6 +248,39 @@ int64_t* hsh_task_join_all(void** handles, int n) {
         results[i] = hsh_task_wait(handles[i]);
     }
     return results;
+}
+
+/* Bounded wait — returns 1 if the task finishes within `ms`
+ * milliseconds, 0 if it times out first. The task itself keeps running
+ * regardless (this runtime has no cooperative cancellation); either
+ * way, does NOT consume/free the task — call hsh_task_wait(handle)
+ * afterward (whether this returned 1 or 0) to actually fetch its
+ * result and release its resources, exactly as if this bounded check
+ * had never happened. This split (bounded "peek", then unbounded
+ * "consume") is what lets `std -> async`'s `timeout()` exist at all
+ * without changing `hsh_task_wait`'s own simpler, unbounded contract —
+ * see `codegen.rs`'s `"task_wait_timeout"` dispatch arm. */
+int64_t hsh_task_wait_timeout(void* handle, int64_t ms) {
+    if (!handle) return 1; /* nothing to wait for -> "ready" */
+    if (!hsh_looks_like_task_ptr(handle)) return 1; /* see hsh_looks_like_task_ptr's doc comment */
+    HshTask* t = (HshTask*)handle;
+    if (t->magic != HSH_TASK_MAGIC) return 1; /* not a task; treat as ready */
+    if (ms < 0) ms = 0;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += ms / 1000;
+    ts.tv_nsec += (ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+
+    pthread_mutex_lock(&t->mu);
+    while (!t->done) {
+        int rc = pthread_cond_timedwait(&t->cv, &t->mu, &ts);
+        if (rc != 0) break; /* ETIMEDOUT (or spurious error) — give up waiting */
+    }
+    int ready = t->done;
+    pthread_mutex_unlock(&t->mu);
+    return ready ? 1 : 0;
 }
 
 /* ── Convenience: spawn a shell command as async task ───────────── */
