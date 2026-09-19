@@ -1025,19 +1025,41 @@ impl Parser {
             TokenKind::Ident(name) => {
                 let mut name = name.clone(); self.advance();
                 // Module-qualified type path: `module::Type` or
-                // `a::b::Type` (e.g. `c: helpers::Colors`). H# struct and
-                // enum names are looked up globally by their *bare* name
-                // everywhere in the typechecker and codegen (mod-file
-                // inlining does not currently namespace type definitions —
-                // only call sites use the `module::` prefix). We therefore
-                // accept the qualified syntax for readability at the
-                // call/declaration site but only keep the final segment,
-                // which is what the struct/enum is actually registered
-                // under.
+                // `a::b::Type` (e.g. `c: helpers::Colors`).
+                //
+                // BUG FIX: this used to keep only the final segment
+                // (`git_info::GitInfo` -> `GitInfo`) on the documented
+                // assumption that "mod-file inlining does not currently
+                // namespace type definitions — only call sites use the
+                // `module::` prefix". That assumption is stale:
+                // `hsharp-compiler::modules::mangle_module_items` was
+                // later extended to *also* rename every top-level
+                // struct/enum in an inlined `mod`/`use "std -> x"`/
+                // `use "bytes -> x"` file to `{prefix}_{Name}` (see that
+                // function's doc comment — added to stop two same-named
+                // structs from different inlined files, e.g. two
+                // `TcpStream`s, from colliding), exactly like it already
+                // did for functions. A type *annotation* written as
+                // `git_info::GitInfo`, though, was still resolved to the
+                // bare `GitInfo` right here — so it stopped matching the
+                // now-mangled `git_info_GitInfo` struct/return type,
+                // which showed up as spurious "return type mismatch"
+                // errors for the *correct* code (`fn f() -> git_info::GitInfo
+                // is ... return git_info::git_fetch_info() end`, expected
+                // `GitInfo`, found `git_info_GitInfo`).
+                //
+                // Fix: join every segment with `_`, exactly the
+                // `{prefix}_{name}` convention `mangle_module_items`
+                // uses for the definition and `checker/expr.rs`'s
+                // `Expr::Call`/`Expr::Path` arm (and codegen's own
+                // call-dispatch) already use for *calls* via
+                // `segments.join("_")`. A bare, unqualified name (no
+                // `::` at all) is left exactly as before — only
+                // qualified paths change.
                 while matches!(self.current().kind, TokenKind::ColonColon) {
                     self.advance();
                     if let TokenKind::Ident(seg) = &self.current().kind {
-                        name = seg.clone();
+                        name = format!("{}_{}", name, seg);
                         self.advance();
                     } else {
                         return Err(self.error(
@@ -1587,25 +1609,27 @@ impl Parser {
                 }
                 self.expect(&TokenKind::RBrace)?;
                 let s = start.merge(&self.current().span);
-                // [FIXED] This used to keep the FULL joined path
-                // (`segments.join("::")`, e.g. "git_info::GitInfo") as the
-                // struct literal's type name — inconsistent with
-                // `parse_type_base` just above, which deliberately keeps
-                // only the *last* segment for a qualified type reference,
-                // since (per that function's own comment) struct/enum
-                // names are looked up globally by their bare name
-                // everywhere in the typechecker and codegen; mod-file
-                // inlining doesn't namespace type definitions. The
-                // mismatch meant `fn f() -> git_info::GitInfo is ... return
-                // git_info::GitInfo { ... } end` failed to typecheck: the
-                // declared return type correctly resolved to bare
-                // `GitInfo`, but the struct literal's inferred type stayed
-                // the distinct, never-matching `Named("git_info::GitInfo")`
-                // — "expected `GitInfo`, found `git_info::GitInfo`" even
-                // though it's the exact same struct. Same fix: keep only
-                // the last segment, matching every other qualified-name
-                // lookup in this compiler.
-                let full_name = segments.last().cloned().unwrap_or_default();
+                // BUG FIX (real root cause, not the one the removed
+                // comment here used to describe): a prior change made
+                // this keep only the *last* path segment
+                // (`git_info::GitInfo { .. }` -> struct name `"GitInfo"`),
+                // to match `parse_type_base`'s qualified-type handling —
+                // but `parse_type_base`'s "keep only the last segment"
+                // behavior was itself the bug (see its doc comment,
+                // fixed alongside this one): `mangle_module_items`
+                // (compiler/src/modules.rs) renames every top-level
+                // struct/enum inlined from a `mod`/`use "std -> x"`/
+                // `use "bytes -> x"` file to `{prefix}_{Name}`, so the
+                // struct's *actual* registered name after inlining is
+                // the underscore-joined form (`git_info_GitInfo`), not
+                // the bare last segment. Joining with `_` here matches
+                // that mangling convention — and now matches the fixed
+                // `parse_type_base` too, so `fn f() -> git_info::GitInfo
+                // is ... return git_info::GitInfo { .. } end` infers the
+                // literal's type as `git_info_GitInfo`, exactly what the
+                // (now correctly `git_info_GitInfo`-resolving) return
+                // type annotation expects.
+                let full_name = segments.join("_");
                 return Ok(Expr::StructLit(full_name, fields, s));
             }
 
