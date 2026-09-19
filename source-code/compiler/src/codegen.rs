@@ -1594,12 +1594,44 @@ AOT backend grows its own native bridge for these two."
             let src_path = if let Some(ref dir) = rt_dir {
                 dir.join(fname)
             } else {
-                // Last resort: write from embedded fallback string
-                // (only core.c has a fallback; regex/sqlite don't need one
-                // since if rt_dir is missing they also aren't being compiled)
+                // BUG FIX: this comment used to say "only core.c has a
+                // fallback; regex/sqlite don't need one since if rt_dir
+                // is missing they also aren't being compiled" — true for
+                // regex.c/sqlite.c (removed from `rt_files` entirely,
+                // see the comment above this loop), but by the time
+                // `async_rt.c` was added to `rt_files` as
+                // `always_include: true` (needed for every build, not
+                // conditionally like regex/db were), this fallback
+                // branch was never updated to match: it only ever wrote
+                // `core.c`'s embedded source, via
+                // `crate::runtime::runtime_c_source()`. When `rt_dir` is
+                // `None` (e.g. an installed compiler binary with no
+                // `runtime/` directory sitting next to it — exactly what
+                // happened here), `core.c`'s fallback correctly wrote
+                // `/tmp/hsharp_rt_<pid>.core.c.c` before compiling it
+                // (hence that file existing in `/tmp`), but
+                // `async_rt.c`'s fallback fell through this same branch,
+                // matched neither the (nonexistent) `rt_dir` case nor the
+                // `"core.c"` check, and returned the intended
+                // `/tmp/hsharp_rt_<pid>.async_rt.c.c` path *without ever
+                // writing it* — so `cc` was invoked on a file that was
+                // never created: "No such file or directory". This is
+                // exactly why `crate::runtime::async_rt_c_source()`
+                // existed (`include_str!`-embedding `async_rt.c` the
+                // same way `runtime_c_source()` embeds `core.c`) but was
+                // never actually called anywhere — dead code, added for
+                // exactly this fallback and then never wired up.
+                //
+                // Fix: write each file's *own* embedded fallback source,
+                // matched by name, instead of hard-coding just `core.c`.
                 let p = tmp_base.with_extension(format!("{}.c", fname));
-                if *fname == "core.c" {
-                    std::fs::write(&p, crate::runtime::runtime_c_source())?;
+                let embedded_source = match *fname {
+                    "core.c"     => Some(crate::runtime::runtime_c_source()),
+                    "async_rt.c" => Some(crate::runtime::async_rt_c_source()),
+                    _            => None,
+                };
+                if let Some(src) = embedded_source {
+                    std::fs::write(&p, src)?;
                 }
                 p
             };
