@@ -195,6 +195,13 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_map_remove: FunctionValue<'ctx>,
     pub hsh_map_len:    FunctionValue<'ctx>,
     pub hsh_map_keys:   FunctionValue<'ctx>,
+    /// EXPANSION: values counterpart to hsh_map_keys — see core.c's
+    /// hsh_map_values doc comment. Backs the `hashmap_values(...)` bare
+    /// call added alongside the rest of the `hashmap_*`/`hashset_*`
+    /// bridge in codegen.rs's call_fn (there was no surface-syntax path
+    /// to this before; `map_keys`/`map_*` themselves were already wired
+    /// up, just not `map_values`, since nothing needed it yet).
+    pub hsh_map_values: FunctionValue<'ctx>,
     pub hsh_map_clear:  FunctionValue<'ctx>,
     pub hsh_is_dir:        FunctionValue<'ctx>,
     /// Real C implementations that already existed in `core.c`
@@ -254,6 +261,10 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_struct_set:    FunctionValue<'ctx>,
     // ── Extra string helpers ──────────────────────────────────────────────
     pub hsh_string_split:  FunctionValue<'ctx>,
+    /// EXPANSION: the join counterpart to hsh_string_split, which never
+    /// had one — nothing needed to reassemble a split array back into a
+    /// string before. Backs `.join(sep)` in the MethodCall dispatch.
+    pub hsh_array_join:    FunctionValue<'ctx>,
     pub hsh_string_find:   FunctionValue<'ctx>,
     pub hsh_string_rfind:  FunctionValue<'ctx>,
     pub hsh_string_slice:  FunctionValue<'ctx>,
@@ -265,6 +276,55 @@ pub struct LlvmBuiltins<'ctx> {
     pub hsh_to_int_from_hex: FunctionValue<'ctx>,
     pub hsh_to_float_fn:   FunctionValue<'ctx>,
     pub hsh_proc_id:       FunctionValue<'ctx>,
+    // EXPANSION: sys:: — native machine/process introspection (see
+    // core.c's own "── sys:: ──" section doc comment for the full
+    // rationale: direct syscalls/`/proc` reads instead of shelling out,
+    // for exact behavioral parity with hsharp-interpreter's own sys_*
+    // arms in call.rs).
+    pub hsh_sys_cpu_count:         FunctionValue<'ctx>,
+    pub hsh_sys_memory_total:      FunctionValue<'ctx>,
+    pub hsh_sys_memory_free:       FunctionValue<'ctx>,
+    pub hsh_sys_uptime:            FunctionValue<'ctx>,
+    pub hsh_sys_load_avg:          FunctionValue<'ctx>,
+    pub hsh_sys_disk_total:        FunctionValue<'ctx>,
+    pub hsh_sys_disk_free:         FunctionValue<'ctx>,
+    pub hsh_sys_page_size:         FunctionValue<'ctx>,
+    pub hsh_sys_get_uid:           FunctionValue<'ctx>,
+    pub hsh_sys_get_gid:           FunctionValue<'ctx>,
+    pub hsh_sys_get_ppid:          FunctionValue<'ctx>,
+    pub hsh_sys_is_64bit:          FunctionValue<'ctx>,
+    pub hsh_sys_is_little_endian:  FunctionValue<'ctx>,
+    pub hsh_sys_sysname:           FunctionValue<'ctx>,
+    pub hsh_sys_machine:           FunctionValue<'ctx>,
+    pub hsh_sys_kernel_version:    FunctionValue<'ctx>,
+    // EXPANSION: regex:: — grep/sed-backed regex (see core.c's own
+    // "── regex:: ──" section doc comment: mirrors
+    // hsharp-interpreter::call.rs's own grep -P/sed -E subprocess
+    // approach exactly, for identical observable behavior — `hsh` uses
+    // this for secret redaction in security.h#, so behavioral parity
+    // with the interpreter matters more here than almost anywhere else
+    // in this runtime).
+    //
+    // NOTE: `hsh_regex_match`/`hsh_regex_find`/`hsh_regex_replace`
+    // themselves are declared just below already (pre-existing fields) —
+    // they were already wired up to real `Backend::Llvm` dispatch arms
+    // in codegen.rs, but the C functions those declarations pointed at
+    // never actually existed in core.c (their `builtins_registry.rs`
+    // doc strings — since corrected — described a "PCRE2... $1/$2
+    // capture group" implementation that must have been removed at some
+    // point, per the "libpcre2 was removed from the AOT runtime"
+    // comment elsewhere in this codebase, without anyone updating these
+    // three back to interpreter-only or replacing the implementation).
+    // Any program calling `regex::is_match`/`find`/`replace` — without
+    // also calling `find_all`/`replace_all`/`split`, which *were*
+    // correctly marked interpreter-only and caught this earlier, before
+    // ever reaching the link stage — would have hit a dangling
+    // `undefined reference to hsh_regex_match` linker error instead.
+    // core.c's new grep/sed-based implementations now back all three of
+    // these pre-existing declarations for real, in addition to the two
+    // genuinely new ones below.
+    pub hsh_regex_find_all:   FunctionValue<'ctx>,
+    pub hsh_regex_split:      FunctionValue<'ctx>,
     pub hsh_file_delete:   FunctionValue<'ctx>,
     pub hsh_dir_create:    FunctionValue<'ctx>,
     pub hsh_dir_exists:    FunctionValue<'ctx>,
@@ -475,6 +535,7 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_map_remove: decl("hsh_map_remove", i64t.fn_type(&[ptr.into(), i64t.into()], false)),
             hsh_map_len:    pi("hsh_map_len"),
             hsh_map_keys:   pp("hsh_map_keys"),
+            hsh_map_values: pp("hsh_map_values"),
             hsh_map_clear:  decl("hsh_map_clear", void.fn_type(&[ptr.into()], false)),
             hsh_is_dir:        pi("hsh_is_dir"),
             hsh_is_file:       pi("hsh_is_file"),
@@ -525,6 +586,7 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_struct_set:    decl("hsh_struct_set", ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false)),
             // Extra string helpers
             hsh_string_split:  ppp("hsh_string_split"),
+            hsh_array_join:    ppp("hsh_array_join"),
             hsh_string_find:   ppi("hsh_string_find"),
             hsh_string_rfind:  ppi("hsh_string_rfind"),
             hsh_string_slice:  decl("hsh_string_slice", ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false)),
@@ -536,6 +598,24 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_to_int_from_hex: pi("hsh_to_int_from_hex"),
             hsh_to_float_fn:   decl("hsh_to_float", f64t.fn_type(&[ptr.into()], false)),
             hsh_proc_id:       ni("hsh_proc_id"),
+            hsh_sys_cpu_count:        ni("hsh_sys_cpu_count"),
+            hsh_sys_memory_total:     ni("hsh_sys_memory_total"),
+            hsh_sys_memory_free:      ni("hsh_sys_memory_free"),
+            hsh_sys_uptime:           ni("hsh_sys_uptime"),
+            hsh_sys_load_avg:         decl("hsh_sys_load_avg", f64t.fn_type(&[], false)),
+            hsh_sys_disk_total:       pi("hsh_sys_disk_total"),
+            hsh_sys_disk_free:        pi("hsh_sys_disk_free"),
+            hsh_sys_page_size:        ni("hsh_sys_page_size"),
+            hsh_sys_get_uid:          ni("hsh_sys_get_uid"),
+            hsh_sys_get_gid:          ni("hsh_sys_get_gid"),
+            hsh_sys_get_ppid:         ni("hsh_sys_get_ppid"),
+            hsh_sys_is_64bit:         ni("hsh_sys_is_64bit"),
+            hsh_sys_is_little_endian: ni("hsh_sys_is_little_endian"),
+            hsh_sys_sysname:          np("hsh_sys_sysname"),
+            hsh_sys_machine:          np("hsh_sys_machine"),
+            hsh_sys_kernel_version:   np("hsh_sys_kernel_version"),
+            hsh_regex_find_all: ppp("hsh_regex_find_all"),
+            hsh_regex_split:    ppp("hsh_regex_split"),
             hsh_file_delete:   pi("hsh_file_delete"),
             hsh_dir_create:    pi("hsh_dir_create"),
             hsh_dir_exists:    pi("hsh_dir_exists"),
