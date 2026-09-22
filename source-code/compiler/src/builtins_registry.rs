@@ -84,7 +84,19 @@ BuiltinSpec {
     ret: || HType::Bool,
     c_symbol: Some("hsh_regex_match"),
     backends: &[Backend::Llvm],
-    doc: "PCRE2 regex match (§11) — full lookahead/lookbehind/non-greedy support.",
+    // EXPANSION: doc corrected — used to claim "full lookahead/
+    // lookbehind/non-greedy support" from a real libpcre2 C binding
+    // that, per the "libpcre2 was removed from the AOT runtime"
+    // comment elsewhere in this codebase, doesn't exist anymore; this
+    // `c_symbol` was pointing at a C function that was never actually
+    // defined in `core.c` (a dangling reference, only surfacing as a
+    // linker error). `core.c` now backs this with `grep -qP` — genuinely
+    // PCRE-flavored (grep's `-P` really is PCRE), so lookahead/
+    // lookbehind/non-greedy *do* still work; it's just a subprocess
+    // call instead of a linked library, mirroring
+    // `hsharp-interpreter::call.rs`'s own `grep -P`-based `regex_match`
+    // exactly.
+    doc: "grep -P-based regex match (§11) — PCRE syntax via grep, same as the interpreter's own implementation.",
 },
 BuiltinSpec {
     names: &["regex_find"],
@@ -92,7 +104,7 @@ BuiltinSpec {
     ret: || HType::Str,
     c_symbol: Some("hsh_regex_find"),
     backends: &[Backend::Llvm],
-    doc: "PCRE2 regex find — returns first match or empty string.",
+    doc: "grep -oP-based regex find — first match, or empty string. Same grep -P backing as regex_match.",
 },
 BuiltinSpec {
     names: &["regex_replace"],
@@ -100,7 +112,17 @@ BuiltinSpec {
     ret: || HType::Str,
     c_symbol: Some("hsh_regex_replace"),
     backends: &[Backend::Llvm],
-    doc: "PCRE2 regex replace (global, supports $1/$2 capture group refs).",
+    // EXPANSION: doc corrected — was "PCRE2... $1/$2 capture group
+    // refs" from the same removed libpcre2 binding described on
+    // `regex_match`'s entry above. `core.c` now backs this with
+    // `sed -E 's{d}pattern{d}repl{d}g'`, so backreferences are sed's own
+    // `\1`/`\2` syntax, not PCRE2's `$1`/`$2` — matching what `hsh`'s
+    // own `security.h#` redaction patterns already write
+    // (`"\\1[REDACTED]"`) and what the interpreter's own sed-based
+    // `regex_replace` already expects. Global by construction (the `g`
+    // flag), which is also why `replace`/`replace_all` are the same
+    // operation on this backend.
+    doc: "sed -E-based regex replace (global; sed's \\1/\\2 backreferences, not PCRE2's $1/$2).",
 },
 BuiltinSpec {
     names: &["db_query_bind"],
@@ -403,7 +425,21 @@ BuiltinSpec {
 BuiltinSpec {
     names: &["map_get", "map_get_int"],
     params: || vec![HType::Any, HType::Any],
-    ret: || HType::Int,
+    // EXPANSION: was `HType::Int`. Widened to `HType::Any` — a strictly
+    // backward-compatible relaxation (`Any` is compatible with every
+    // type per `HType::compatible_with`, so anything that already
+    // type-checked against `Int` still does) — so `map_get(...)` can
+    // also be used to retrieve a non-string, non-int value out of a
+    // hashmap (an array, a struct pointer, ...) without a spurious
+    // type-mismatch on the call site that receives it. Concretely:
+    // `hsh`'s `execute.h#` stores `[Stmt]` function bodies (not
+    // strings) as hashmap values (`sh.functions.insert(name,
+    // stmt.body)`) — retrieving those needs the *generic* i64 slot
+    // back, coerced to whatever pointer type the receiving context
+    // expects (`call_coerced`/`coerce_basic_value` already do exactly
+    // this int<->ptr coercion generically for every call), not a value
+    // hard-typed as `Str` or `Int`.
+    ret: || HType::Any,
     c_symbol: Some("hsh_map_get"),
     backends: &[Backend::Llvm],
     doc: "map_get(map, key) — 0 if absent; use map_has to distinguish absence from a stored 0.",
@@ -895,120 +931,120 @@ BuiltinSpec {
     names: &["__builtin_sys_cpu_count"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_cpu_count"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "/proc/cpuinfo CPU count. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_memory_total"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_memory_total"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "/proc/meminfo total. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_memory_free"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_memory_free"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "/proc/meminfo available. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_uptime"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_uptime"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "/proc/uptime. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_load_avg"],
     params: || vec![],
     ret: || HType::F64,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_load_avg"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "/proc/loadavg 1-minute average. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_disk_total"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_disk_total"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`df -k` total. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_disk_free"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_disk_free"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`df -k` available. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_page_size"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_page_size"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`getconf PAGESIZE`. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_get_uid"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_get_uid"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`id -u`. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_get_gid"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_get_gid"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`id -g`. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_get_ppid"],
     params: || vec![],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_get_ppid"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "Parent PID via `ps`. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_is_64bit"],
     params: || vec![],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_is_64bit"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "Pointer-width check. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_is_little_endian"],
     params: || vec![],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_is_little_endian"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "Endianness check. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_sysname"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_sysname"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`uname -s`. Interpreter only.",
 },
 BuiltinSpec {
     names: &["__builtin_sys_machine"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_machine"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`uname -m`. Interpreter only.",
 },
 BuiltinSpec {
@@ -1277,25 +1313,25 @@ BuiltinSpec {
     names: &["__builtin_regex_find_all"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "All non-overlapping regex matches. Interpreter only (regex.c/libpcre2 was removed from the AOT runtime — see codegen.rs's emit_binary_with_machine).",
+    c_symbol: Some("hsh_regex_find_all"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "All non-overlapping regex matches. grep -oP-based (see regex_match's doc) — every real gap here now, not a faked one.",
 },
 BuiltinSpec {
     names: &["__builtin_regex_replace_all"],
     params: || vec![HType::Str, HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Replace every regex match. Interpreter only (see __builtin_regex_find_all's doc).",
+    c_symbol: Some("hsh_regex_replace"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Replace every regex match. Same operation as regex_replace (see its doc) — the sed g flag already replaces every match.",
 },
 BuiltinSpec {
     names: &["__builtin_regex_split"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Split on a regex/whitespace pattern. Interpreter only (see __builtin_regex_find_all's doc).",
+    c_symbol: Some("hsh_regex_split"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Split on a regex/whitespace pattern. Real support is limited to \\s+/\\s* (whitespace) and literal substrings, same as the interpreter's own documented limitation — not a full regex-aware split.",
 },
 BuiltinSpec {
     names: &["__builtin_db_open"],
@@ -1710,119 +1746,142 @@ BuiltinSpec {
     backends: &[Backend::Interpreter],
     doc: "Coerce a JSON value to string. Interpreter only.",
 },
+// EXPANSION: `hashmap_new`/`hashmap_insert`/.../`hashset_*` now have a
+// real AOT/LLVM implementation too — see `codegen.rs`'s "hashmap_*/
+// hashset_* bridge (bare-call form)" section (in `call_fn`) and its
+// `MethodCall` counterpart (`.insert`/`.contains_key`/`.remove`/`.keys`)
+// for the full story. Short version: `core.c` already had a complete,
+// working, `Backend::Llvm`-registered hash table — just under the
+// `map_new`/`map_set`/`map_get`/`map_has`/`map_remove`/`map_len`/
+// `map_keys`/`map_clear` names (see those entries above), a different
+// calling convention (explicit bare calls with an explicit `string_keys`
+// flag) than what `hsharp-interpreter::call.rs` recognizes and what
+// `hsh` (and any wrapper-less, direct native-hashmap H# code) actually
+// calls. These entries below are that bridge, at the type-checking
+// level; `codegen.rs` is the executable half of it. The one addition
+// beyond pure renaming: `hsh_map_values` (paired with the pre-existing
+// `hsh_map_keys`) was added to `core.c`, since nothing needed a values
+// enumerator before.
+//
+// (The comment block above these entries, describing why the bare name
+// needed registering at all — the `check_module_features` pre-flight
+// gap — still applies and is still accurate; it's just no longer the
+// end of the story for these particular names now that a real `Llvm`
+// implementation exists to point `supported_on` at.)
 BuiltinSpec {
-    names: &["__builtin_hashmap_new"],
+    names: &["__builtin_hashmap_new", "hashmap_new"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Create a new hashmap. Interpreter only — AOT has no generic hashmap/hashset data structure in core.c yet.",
+    c_symbol: Some("hsh_map_new"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Create a new (string-keyed) hashmap. Bridges to map_new(true) — see codegen.rs's hashmap_*/hashset_* bridge.",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_insert"],
+    names: &["__builtin_hashmap_insert", "hashmap_insert"],
     params: || vec![HType::Str, HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Insert into a hashmap, returning the updated map. Interpreter only.",
+    c_symbol: Some("hsh_map_set"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Insert into a hashmap, returning the updated map. Bridges to map_set(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_get"],
+    names: &["__builtin_hashmap_get", "hashmap_get"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Look up a hashmap key. Interpreter only.",
+    c_symbol: Some("hsh_map_get"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Look up a hashmap key (0/absent on miss). Bridges to map_get(...) — use map_get_str(...) directly for a string-typed result.",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_remove"],
+    names: &["__builtin_hashmap_remove", "hashmap_remove"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Remove a hashmap key, returning the updated map. Interpreter only.",
+    c_symbol: Some("hsh_map_remove"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Remove a hashmap key, returning whether a key was actually removed. Bridges to map_remove(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_contains"],
+    names: &["__builtin_hashmap_contains", "hashmap_contains"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Whether a hashmap has a key. Interpreter only.",
+    c_symbol: Some("hsh_map_has"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Whether a hashmap has a key (distinguishes absent from stored-0/false). Bridges to map_has(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_keys"],
+    names: &["__builtin_hashmap_keys", "hashmap_keys"],
     params: || vec![HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "All keys in a hashmap. Interpreter only.",
+    c_symbol: Some("hsh_map_keys"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "All keys in a hashmap, unspecified order. Bridges to map_keys(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_values"],
+    names: &["__builtin_hashmap_values", "hashmap_values"],
     params: || vec![HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "All values in a hashmap. Interpreter only.",
+    c_symbol: Some("hsh_map_values"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "All values in a hashmap, same order as hashmap_keys for the same unmodified map. New: core.c's hsh_map_values.",
 },
 BuiltinSpec {
-    names: &["__builtin_hashmap_len"],
+    names: &["__builtin_hashmap_len", "hashmap_len"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Number of entries in a hashmap. Interpreter only.",
+    c_symbol: Some("hsh_map_len"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Number of entries in a hashmap. Bridges to map_len(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashset_new"],
+    names: &["__builtin_hashset_new", "hashset_new"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Create a new hashset. Interpreter only.",
+    c_symbol: Some("hsh_map_new"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Create a new hashset. A hashset is a string-keyed hashmap that only tracks membership (dummy value 1 per key); bridges to map_new(true).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashset_insert"],
+    names: &["__builtin_hashset_insert", "hashset_insert"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Insert into a hashset, returning the updated set. Interpreter only.",
+    c_symbol: Some("hsh_map_set"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Insert into a hashset, returning the updated set. Bridges to map_set(set, value, 1).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashset_remove"],
+    names: &["__builtin_hashset_remove", "hashset_remove"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Remove from a hashset, returning the updated set. Interpreter only.",
+    c_symbol: Some("hsh_map_remove"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Remove from a hashset, returning whether a value was actually removed. Bridges to map_remove(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashset_contains"],
+    names: &["__builtin_hashset_contains", "hashset_contains"],
     params: || vec![HType::Str, HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Whether a hashset has a value. Interpreter only.",
+    c_symbol: Some("hsh_map_has"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Whether a hashset has a value. Bridges to map_has(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashset_len"],
+    names: &["__builtin_hashset_len", "hashset_len"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Number of entries in a hashset. Interpreter only.",
+    c_symbol: Some("hsh_map_len"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Number of entries in a hashset. Bridges to map_len(...).",
 },
 BuiltinSpec {
-    names: &["__builtin_hashset_to_array"],
+    names: &["__builtin_hashset_to_array", "hashset_to_array"],
     params: || vec![HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "A hashset's entries as an array. Interpreter only.",
+    c_symbol: Some("hsh_map_keys"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "A hashset's entries as an array. Bridges to map_keys(...).",
 },
 BuiltinSpec {
+
     names: &["__builtin_sort_ints"],
     params: || vec![HType::Str],
     ret: || HType::Str,
@@ -1884,8 +1943,8 @@ BuiltinSpec {
     names: &["__builtin_sys_kernel_version"],
     params: || vec![],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
+    c_symbol: Some("hsh_sys_kernel_version"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
     doc: "`uname -r`. Interpreter only.",
 },
 BuiltinSpec {
@@ -2052,6 +2111,28 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         "os_username"      => "os_username",
         "os_platform"      => "os_platform",
         "sys_get_pid"      => "getpid",
+        // EXPANSION: the rest of sys:: — used to be Interpreter-only,
+        // now backed by real syscalls/`/proc` reads in core.c (see its
+        // own "── sys:: ──" section doc comment). Self-mapped (matching
+        // "env_get"/"env_set"/"env_args"'s own existing pattern just
+        // above) since each of these already has a same-named dispatch
+        // arm in codegen.rs's call_fn.
+        "sys_cpu_count"         => "sys_cpu_count",
+        "sys_memory_total"      => "sys_memory_total",
+        "sys_memory_free"       => "sys_memory_free",
+        "sys_uptime"            => "sys_uptime",
+        "sys_load_avg"          => "sys_load_avg",
+        "sys_disk_total"        => "sys_disk_total",
+        "sys_disk_free"         => "sys_disk_free",
+        "sys_page_size"         => "sys_page_size",
+        "sys_get_uid"           => "sys_get_uid",
+        "sys_get_gid"           => "sys_get_gid",
+        "sys_get_ppid"          => "sys_get_ppid",
+        "sys_is_64bit"          => "sys_is_64bit",
+        "sys_is_little_endian"  => "sys_is_little_endian",
+        "sys_sysname"           => "sys_sysname",
+        "sys_machine"           => "sys_machine",
+        "sys_kernel_version"    => "sys_kernel_version",
         "sys_hostname"     => "hostname",
         "time_now_unix"    => "now_unix",
         "time_now_ms"      => "now_ms",
@@ -2086,6 +2167,21 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         "regex_match"   => "regex_match",
         "regex_find"    => "regex_find",
         "regex_replace" => "regex_replace",
+        // EXPANSION: these three used to be `Interpreter`-only (see
+        // `builtins_registry.rs`'s own updated doc strings on their
+        // `BuiltinSpec` entries) — `core.c` now backs all of them with a
+        // `grep -P`/`sed -E` subprocess-based implementation, mirroring
+        // `hsharp-interpreter::call.rs`'s own approach for exact
+        // behavioral parity (see `core.c`'s "── regex:: ──" section).
+        // `regex_replace_all` maps onto the very same `regex_replace`
+        // dispatch rather than getting its own arm — `std/regex.h#`'s
+        // own doc comment already says `replace`/`replace_all` are
+        // identical on this backend, since the `g` flag in the sed
+        // script `regex_replace` builds already replaces every match,
+        // not just the first.
+        "regex_find_all"    => "regex_find_all",
+        "regex_replace_all" => "regex_replace",
+        "regex_split"        => "regex_split",
         "db_open"  => "sqlite_open",
         "db_exec"  => "sqlite_exec",
         "db_query" => "sqlite_query",
