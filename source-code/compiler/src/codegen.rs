@@ -1513,30 +1513,30 @@ impl LlvmCodegen {
         // `.h#` sources under `std/`, loaded at `use "std -> x"` time
         // (see hsharp-interpreter's `helpers.rs` / `interp.rs`).
         //
-        // The interpreter backend already resolves `regex::`/`db::` this
-        // way (`std/regex.h#` and `std/db.h#` shell out to real
-        // `grep`/`sed`/`sqlite3` via `__builtin_*` — see call.rs). The
-        // LLVM/AOT backend has no equivalent native bridge for those two
-        // yet, so rather than silently produce a binary with a dangling
-        // link against a runtime file that no longer exists (or, worse,
-        // one that resolves `regex::`/`db::` some third, different way),
-        // this fails loudly and points at the backend that *does* work.
-        if needs_regex || needs_db {
-            let which = match (needs_regex, needs_db) {
-                (true, true)  => "`regex ->` and `db ->`",
-                (true, false) => "`regex ->`",
-                _             => "`db ->`",
-            };
+        // EXPANSION: `regex::` has since grown a real native bridge —
+        // see `core.c`'s "── regex:: ──" section (a `grep -P`/`sed -E`
+        // subprocess-based implementation, mirroring
+        // `hsharp-interpreter::call.rs`'s own approach exactly, rather
+        // than re-embedding libpcre2) and the `hsh_regex_*`
+        // `BuiltinSpec` entries in `builtins_registry.rs`, all now
+        // `Backend::Llvm`. So this early, hard bail-out no longer
+        // applies to `regex::` — only `db::` (no native AOT bridge
+        // exists for that yet; a real SQL engine is a much larger
+        // undertaking than shelling out to a couple of text-processing
+        // tools, and out of scope here) still fails loudly and early
+        // rather than silently producing a binary with a dangling link
+        // against a runtime file that no longer exists.
+        if needs_db {
             return Err(CodegenError::Link(format!(
-                "this program uses {which}, which the native AOT (LLVM) backend doesn't support yet.\n\n\
-`regex.c`/`sqlite.c` — the C runtimes that used to provide these — have been removed: H# no \
-longer embeds std libraries straight into the compiler/binary. `std -> regex` and `std -> db` \
-now live purely as real source under /usr/lib/HackerOS/H#/std/{{regex,db}}.h#, and are fully \
-supported by the interpreter backend today.\n\n\
+                "this program uses `db ->`, which the native AOT (LLVM) backend doesn't support yet.\n\n\
+`sqlite.c` — the C runtime that used to provide this — has been removed: H# no longer embeds std \
+libraries straight into the compiler/binary. `std -> db` now lives purely as real source under \
+/usr/lib/HackerOS/H#/std/db.h#, and is fully supported by the interpreter backend today.\n\n\
 Run this program with `hsharp preview` (or `hsharp run`) instead of `hsharp build` until the \
-AOT backend grows its own native bridge for these two."
+AOT backend grows its own native bridge for this."
             )));
         }
+        let _ = needs_regex; // no longer gated here — see the comment above
 
         // ── Runtime link flags (built early — used by SharedLib + Binary) ────
         let mut runtime_libs: Vec<String> = Vec::new();
@@ -1574,9 +1574,12 @@ AOT backend grows its own native bridge for these two."
         // target, regardless of which functions in it a given program
         // calls.
         //
-        // `regex.c` / `sqlite.c` used to live here too — removed along
-        // with the `needs_regex`/`needs_db` early-return above; see that
-        // comment for why.
+        // `sqlite.c` used to live here too — removed along with the
+        // `needs_db` early-return above (regex's own former `regex.c`
+        // is gone too, but regex functions now live directly in
+        // `core.c` instead of a separate conditionally-included file —
+        // see this file's `needs_regex` handling above); see that
+        // comment for why `db` alone still early-returns.
         let rt_files: &[(&str, bool, &[&str])] = if self.opts.target.is_wasm() {
             &[]
         } else {
@@ -4728,7 +4731,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        }
 
                        // ── MethodCall obj.method(args) ────────────────────
-                       Expr::MethodCall(obj_e, method, method_args, _) => {
+                       Expr::MethodCall(obj_e, method, method_args, span) => {
                            let obj = self.expr(obj_e, None)?;
                            // Dispatch common methods on the object's type
                            match method.as_str() {
@@ -4768,16 +4771,240 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                        self.builtins.hsh_trim, &[obj.into()], "mtr");
                                    Ok(self.unwrap_call(call))
                                }
-                               _ => {
-                                   // Unknown method — try as a function call f(obj, args...)
-                                   let mut _all_args = vec![obj];
-                                   for a in method_args {
-                                       _all_args.push(self.expr(a, None)?);
-                                   }
-                                   let _name_slug = format!("{}_{}", "obj", method);
-                                   // method dispatch: call as module_method(obj, args...)
-                                   // Since call_fn takes &[Expr], just return zero for now
-                                   Ok(self.ctx.i64_type().const_zero().into())
+                               // EXPANSION: hashmap/hashset method-call
+                               // syntax (`.insert(k, v)`, `.contains_key(k)`,
+                               // `.remove(k)`, `.keys()`) — what `hsh`'s
+                               // `vars.h#`/`execute.h#`/`helper.h#`/
+                               // `history.h#`/`path_cache.h#` actually call
+                               // on a `hashmap_new()`-backed value.
+                               //
+                               // These delegate to the *already-existing*,
+                               // already-`Backend::Llvm`-supported
+                               // `hsh_map_set`/`hsh_map_has`/
+                               // `hsh_map_remove`/`hsh_map_keys` runtime
+                               // functions (see `core.c`'s "── HashMap ──"
+                               // section) — the exact same ones the bare
+                               // `map_set(...)`/`map_has(...)`/
+                               // `map_remove(...)`/`map_keys(...)` builtin
+                               // calls already use just above in `call_fn`.
+                               // That native hashmap was already fully
+                               // wired up end-to-end (`builtins.rs`,
+                               // `builtins_registry.rs`, `call_fn` here) —
+                               // it just wasn't reachable from `hsh`'s
+                               // actual surface syntax
+                               // (`hashmap_new()`/`.insert(...)`/
+                               // `.contains_key(...)`/method-call sugar,
+                               // matching what `hsharp-interpreter`
+                               // recognizes) before this fix, only from its
+                               // own bare `map_new`/`map_set`/... spelling.
+                               // This is a naming/calling-convention bridge,
+                               // not a new data structure — every actual
+                               // hash-table operation still runs through
+                               // the one, already-reviewed `HshMap`
+                               // implementation in `core.c`.
+                               //
+                               // `.get(key)` is deliberately **not** added
+                               // here: it would collide with the `"get"`
+                               // array-index arm just above (both take
+                               // exactly one argument, and nothing at this
+                               // point in codegen knows whether `obj` is an
+                               // array or a hashmap — `any` is opaque by
+                               // design). Silently routing a hashmap
+                               // `.get(key)` through `hsh_array_get(obj,
+                               // key)` would reinterpret a string-typed key
+                               // as an integer index — exactly the kind of
+                               // silent-wrong-answer bug this whole method
+                               // fell into before being fixed. Since this
+                               // is genuinely ambiguous from here, the two
+                               // real `.get(...)` call sites on a hashmap
+                               // in `hsh` (`vars.h#`'s `vars_get`/
+                               // `alias_get`, `execute.h#`'s
+                               // `execute_call_function`) were changed to
+                               // call the unambiguous bare `map_get_str(m,
+                               // key)` builtin instead — see `hsh-hprompt`'s
+                               // own PATCH_NOTES.md.
+                               "insert" => {
+                                   let ptr_ty = self.ctx.ptr_type(AddressSpace::default()).into();
+                                   let m = self.coerce_basic_value(obj, ptr_ty);
+                                   let kv = self.expr(&method_args[0], None)?;
+                                   let k = self.value_to_i64_bits(kv);
+                                   let vv = self.expr(&method_args[1], None)?;
+                                   let v = self.value_to_i64_bits(vv);
+                                   self.call_coerced(self.builtins.hsh_map_set, &[m.into(), k.into(), v.into()], "");
+                                   Ok(m)
+                               }
+                               "contains_key" => {
+                                   let ptr_ty = self.ctx.ptr_type(AddressSpace::default()).into();
+                                   let m = self.coerce_basic_value(obj, ptr_ty);
+                                   let kv = self.expr(&method_args[0], None)?;
+                                   let k = self.value_to_i64_bits(kv);
+                                   let call = self.call_coerced(self.builtins.hsh_map_has, &[m.into(), k.into()], "mhas");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "remove" => {
+                                   let ptr_ty = self.ctx.ptr_type(AddressSpace::default()).into();
+                                   let m = self.coerce_basic_value(obj, ptr_ty);
+                                   let kv = self.expr(&method_args[0], None)?;
+                                   let k = self.value_to_i64_bits(kv);
+                                   let call = self.call_coerced(self.builtins.hsh_map_remove, &[m.into(), k.into()], "mrm");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "keys" => {
+                                   let ptr_ty = self.ctx.ptr_type(AddressSpace::default()).into();
+                                   let m = self.coerce_basic_value(obj, ptr_ty);
+                                   let call = self.call_coerced(self.builtins.hsh_map_keys, &[m.into()], "mkeys");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               // EXPANSION: the rest of the string/array
+                               // methods `hsh`'s own source (and the H#
+                               // stdlib — see `std/strings.h#`'s
+                               // `digits.contains(...)`) actually calls,
+                               // added after the fallback fix above turned
+                               // their previous silent-zero into a build
+                               // failure and surfaced that they'd never
+                               // had a `MethodCall` arm to begin with —
+                               // only a *bare*-call one (`contains(a, b)`,
+                               // not `a.contains(b)`), which is a separate
+                               // dispatch path (see the `call_fn` match
+                               // elsewhere in this file). Every one of
+                               // these delegates to an already-existing,
+                               // already-`Backend::Llvm` C function —
+                               // `hsh_str_contains`/`hsh_starts_with`/
+                               // `hsh_ends_with` already back the bare
+                               // `contains(...)`/`starts_with(...)`/
+                               // `ends_with(...)` calls just like `push`/
+                               // `len`/`get`/`trim` above already do for
+                               // their own bare-call counterparts.
+                               "contains" => {
+                                   let n = self.expr(&method_args[0], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_str_contains, &[obj.into(), n.into()], "cont");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "starts_with" => {
+                                   let p = self.expr(&method_args[0], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_starts_with, &[obj.into(), p.into()], "startsw");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "ends_with" => {
+                                   let sfx = self.expr(&method_args[0], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_ends_with, &[obj.into(), sfx.into()], "endsw");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "index_of" => {
+                                   let n = self.expr(&method_args[0], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_str_index_of, &[obj.into(), n.into()], "sidx");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "parse_int" => {
+                                   let call = self.call_coerced(self.builtins.hsh_str_to_int, &[obj.into()], "s2i");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "split" => {
+                                   let sep = self.expr(&method_args[0], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_string_split, &[obj.into(), sep.into()], "sspl");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               // `.join(sep)` — an array-of-strings method
+                               // (`hsh`'s `v.positional.join(" ")`,
+                               // `commands.join(",")`,
+                               // `theme::theme_names().join(", ")`).
+                               // `hsh_array_join` is a genuinely new C
+                               // function (`core.c`) — `hsh_string_split`
+                               // existed but nothing reassembled a split
+                               // array back into a string before this.
+                               "join" => {
+                                   let sep = self.expr(&method_args[0], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_array_join, &[obj.into(), sep.into()], "ajoin");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               // `.trim_end()` — right-trim only (unlike
+                               // the already-handled `.trim()`, which
+                               // trims both sides). Already had a real,
+                               // already-`Backend::Llvm` C function
+                               // (`hsh_string_trim_right`, backing the
+                               // bare `string_trim_right(...)` call) —
+                               // just no `.trim_end()` method-call arm
+                               // pointing at it yet.
+                               "trim_end" => {
+                                   let call = self.call_coerced(self.builtins.hsh_string_trim_right, &[obj.into()], "str");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               // `.replace_all(from, to)` — `hsh_str_replace`
+                               // (already backing the bare
+                               // `replace(...)`/`str_replace(...)` calls)
+                               // already replaces *every* occurrence, not
+                               // just the first (see its own loop in
+                               // core.c) — so `.replace_all(...)` needs no
+                               // different C function, just this arm.
+                               "replace_all" => {
+                                   let from = self.expr(&method_args[0], None)?;
+                                   let to = self.expr(&method_args[1], None)?;
+                                   let call = self.call_coerced(self.builtins.hsh_str_replace, &[obj.into(), from.into(), to.into()], "replace");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               // BUG FIX: this arm used to be
+                               //     _ => { .. everything above .. Ok(self.ctx.i64_type().const_zero().into()) }
+                               // — i.e. *any* method name not in the short
+                               // list above (`.insert(..)`, `.contains(..)`,
+                               // `.remove(..)`, `.keys()`, `.values()`, or
+                               // any typo, on *any* receiver) silently
+                               // compiled to a no-op that always returns 0,
+                               // with no warning and no error. That's not a
+                               // missing-feature build failure like
+                               // `hashmap_new` gets — it's a *silent
+                               // miscompile*: the call site looks fine, the
+                               // build succeeds, and the resulting binary
+                               // just quietly does nothing and gets 0/nil
+                               // back, every time, for the rest of the
+                               // program's life. This is exactly the same
+                               // class of bug already fixed elsewhere in
+                               // this same function for `Expr::Closure`/
+                               // `Expr::Do`/`Expr::Unsafe` (see their own
+                               // "BUG FIX" comments above) — silently
+                               // falling through to this catch-all instead
+                               // of erroring — just not yet closed for
+                               // method calls specifically. `hsh`'s own
+                               // `vars.h#`/`execute.h#`/etc. hit exactly
+                               // this: `.insert(..)`/`.contains(..)` on a
+                               // `hashmap_new()`-backed map silently
+                               // becoming no-ops under `--release` (LLVM),
+                               // while working correctly under `hsharp
+                               // preview`/the interpreter — a correctness
+                               // divergence between backends with no
+                               // diagnostic pointing at it.
+                               //
+                               // Fix: look the method name up in the same
+                               // `builtins_registry` `features::
+                               // check_module_features` already uses for
+                               // bare `Expr::Call`s (interpreting
+                               // `obj.method(args)` as the `method(obj,
+                               // args...)` sugar the surrounding comment
+                               // already described), and turn this into a
+                               // real compile error — with the specific
+                               // "not supported by the LLVM backend" +
+                               // doc/hint message when it's a known,
+                               // interpreter-only builtin (hashmap/hashset
+                               // methods among them; see the new bare-name
+                               // aliases added in `builtins_registry.rs`),
+                               // or an honest "no LLVM codegen for method
+                               // `.foo(...)`" otherwise. Either way: loud
+                               // and correct instead of silently wrong.
+                               other => {
+                                   let msg = match crate::builtins_registry::find(other) {
+                                       Some(spec) if !spec.backends.contains(&crate::builtins_registry::Backend::Llvm) => {
+                                           format!(
+                                               "`.{}(...)` is not supported by the LLVM backend — {}\nimplemented on: {}",
+                                               other,
+                                               spec.doc,
+                                               spec.backends.iter().map(|b| b.name()).collect::<Vec<_>>().join(", "),
+                                           )
+                                       }
+                                       _ => format!(
+                                           "no LLVM codegen for method call `.{}(...)`",
+                                           other
+                                       ),
+                                   };
+                                   Err(CodegenError::Llvm(format!("{}: {}", span, msg)))
                                }
                            }
                        }
@@ -5188,7 +5415,41 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let r = self.call_coerced(self.builtins.hsh_uuid_v4, &[], "uuid");
                            Ok(self.unwrap_call(r))
                        }
-                       // ── Regex (§11 — PCRE2) ────────────────────────────────────────
+                       // ── Regex (§11) ─────────────────────────────────────────────────
+                       // EXPANSION: was genuinely "real libpcre2" at some
+                       // point (hence the doc strings on `regex_match`/
+                       // `regex_find`/`regex_replace`'s `BuiltinSpec`
+                       // entries still claiming "$1/$2 capture group
+                       // refs" — since corrected) — but that C
+                       // implementation is gone (see the "libpcre2 was
+                       // removed from the AOT runtime" comment already
+                       // present elsewhere in this codebase) and, until
+                       // this fix, nothing replaced it: these three
+                       // dispatch arms below were pointing at C functions
+                       // (`hsh_regex_match`/`_find`/`_replace`) that
+                       // simply didn't exist in `core.c`, a dangling
+                       // reference that would only have surfaced as a
+                       // linker error, and only for a program that
+                       // called one of these three without also calling
+                       // `find_all`/`replace_all`/`split` (which *were*
+                       // correctly marked interpreter-only and so failed
+                       // earlier, at the type-checking stage, before ever
+                       // reaching the link step). `core.c` now backs all
+                       // five regex functions with a `grep -P`/`sed -E`
+                       // subprocess-based implementation — see its own
+                       // "── regex:: ──" section doc comment for the
+                       // full rationale (mirrors
+                       // `hsharp-interpreter::call.rs`'s own approach
+                       // exactly, since `hsh` uses this for secret
+                       // redaction and behavioral parity with the
+                       // interpreter matters a lot here). Backreferences
+                       // in a replacement string are sed's own `\1`/`\2`
+                       // syntax (matching what `hsh`'s own
+                       // `security.h#` already writes, and what the
+                       // interpreter's sed-based `regex_replace` already
+                       // expects), not PCRE2's `$1`/`$2` — the stale doc
+                       // strings describing dollar-sign group refs never
+                       // actually matched what got shipped.
                        "regex_match" => {
                            let a = str_arg!(0); let b = str_arg!(1);
                            let r = self.call_coerced(self.builtins.hsh_regex_match, &[a.into(), b.into()], "rxmatch");
@@ -5196,6 +5457,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        }
                        "regex_find"    => call2!(self.builtins.hsh_regex_find, "rxfind"),
                        "regex_replace" => call3!(self.builtins.hsh_regex_replace, "rxrepl"),
+                       "regex_find_all" => call2!(self.builtins.hsh_regex_find_all, "rxfindall"),
+                       // `std/regex.h#`'s `split(s, pattern)` calls
+                       // `__builtin_regex_split(s, pattern)` — text
+                       // *first* (unlike match/find/replace, which take
+                       // pattern first) — matching that argument order
+                       // exactly, since `hsh_regex_split`'s own C
+                       // signature is `(text, pattern)`.
+                       "regex_split" => call2!(self.builtins.hsh_regex_split, "rxsplit"),
                        // ── SQLite (§12 — real libsqlite3, prepared statements) ────────
                        "sqlite_open"  => call1!(self.builtins.hsh_sqlite_open, "dbopen"),
                        "sqlite_exec"  => call2!(self.builtins.hsh_sqlite_exec, "dbexec"),
@@ -5353,6 +5622,78 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        }
                        "os_pid" | "getpid" => {
                            let call = self.call_coerced(self.builtins.hsh_getpid, &[], "pid");
+                           Ok(self.unwrap_call(call))
+                       }
+                       // EXPANSION: sys:: — see core.c's own "── sys:: ──"
+                       // section doc comment and builtins_registry.rs's
+                       // updated entries for the full rationale (native
+                       // syscalls/`/proc` reads, matching
+                       // hsharp-interpreter::call.rs's own sys_* arms for
+                       // exact behavioral parity).
+                       "sys_cpu_count" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_cpu_count, &[], "cpuc");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_memory_total" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_memory_total, &[], "memt");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_memory_free" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_memory_free, &[], "memf");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_uptime" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_uptime, &[], "uptm");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_load_avg" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_load_avg, &[], "load");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_disk_total" => {
+                           let p = self.expr(&args[0], None)?;
+                           let call = self.call_coerced(self.builtins.hsh_sys_disk_total, &[p.into()], "dskt");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_disk_free" => {
+                           let p = self.expr(&args[0], None)?;
+                           let call = self.call_coerced(self.builtins.hsh_sys_disk_free, &[p.into()], "dskf");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_page_size" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_page_size, &[], "pgsz");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_get_uid" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_get_uid, &[], "uid");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_get_gid" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_get_gid, &[], "gid");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_get_ppid" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_get_ppid, &[], "ppid");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_is_64bit" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_is_64bit, &[], "b64");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_is_little_endian" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_is_little_endian, &[], "lend");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_sysname" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_sysname, &[], "sysn");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_machine" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_machine, &[], "mach");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "sys_kernel_version" => {
+                           let call = self.call_coerced(self.builtins.hsh_sys_kernel_version, &[], "kver");
                            Ok(self.unwrap_call(call))
                        }
                        "time_now_unix" | "now_unix" => {
@@ -5544,6 +5885,94 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
                            self.call_coerced(self.builtins.hsh_map_clear, &[m.into()], "");
                            Ok(self.ctx.i64_type().const_zero().into())
+                       }
+                       // ── hashmap_*/hashset_* bridge (bare-call form) ──────
+                       // EXPANSION: `hashmap_new()`/`hashmap_insert(...)`/
+                       // etc. and `hashset_*` — the bare-call spelling
+                       // `hsharp-interpreter`'s `call.rs` recognizes
+                       // directly (no `std -> collections` wrapper; see
+                       // `hsh`'s own `vars.h#` comment) and that `hsh`
+                       // itself calls (`hashmap_new()` in `vars.h#`,
+                       // `execute.h#`, `helper.h#`, `history.h#`,
+                       // `path_cache.h#`, `main.h#`). Bridges to the
+                       // already-implemented, already-`Backend::Llvm`
+                       // `map_*` builtins just above — see the
+                       // `builtins_registry.rs`/`MethodCall` doc comments
+                       // for the full story (this was a naming/calling-
+                       // convention gap, not a missing data structure:
+                       // `core.c`'s `HshMap` already existed and already
+                       // worked, just wasn't reachable from this spelling).
+                       // `hashmap_new`/`hashset_new` always pass `1`
+                       // (string keys) to `hsh_map_new` — hsh (and every
+                       // other real caller of the bare, wrapper-less
+                       // `hashmap_new()` form) only ever uses string keys;
+                       // `map_new(bool)` is the explicit-flag form for
+                       // callers that need int keys instead.
+                       "hashmap_new" | "hashset_new" => {
+                           let one = self.ctx.i64_type().const_int(1, false);
+                           let call = self.call_coerced(self.builtins.hsh_map_new, &[one.into()], "hmnew");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "hashmap_insert" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let vv = self.expr(&args[2], None)?;
+                           let v = self.value_to_i64_bits(vv);
+                           self.call_coerced(self.builtins.hsh_map_set, &[m.into(), k.into(), v.into()], "");
+                           Ok(m)
+                       }
+                       "hashset_insert" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let one = self.ctx.i64_type().const_int(1, false);
+                           self.call_coerced(self.builtins.hsh_map_set, &[m.into(), k.into(), one.into()], "");
+                           Ok(m)
+                       }
+                       "hashmap_get" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_get, &[m.into(), k.into()], "hmget");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "hashmap_contains" | "hashset_contains" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_has, &[m.into(), k.into()], "hmhas");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "hashmap_remove" | "hashset_remove" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let kv = self.expr(&args[1], None)?;
+                           let k = self.value_to_i64_bits(kv);
+                           let call = self.call_coerced(self.builtins.hsh_map_remove, &[m.into(), k.into()], "hmrm");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "hashmap_len" | "hashset_len" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let call = self.call_coerced(self.builtins.hsh_map_len, &[m.into()], "hmlen");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "hashmap_keys" | "hashset_to_array" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let call = self.call_coerced(self.builtins.hsh_map_keys, &[m.into()], "hmkeys");
+                           Ok(self.unwrap_call(call))
+                       }
+                       "hashmap_values" => {
+                           let mv = self.expr(&args[0], None)?;
+                           let m = self.coerce_basic_value(mv, self.ctx.ptr_type(AddressSpace::default()).into());
+                           let call = self.call_coerced(self.builtins.hsh_map_values, &[m.into()], "hmvals");
+                           Ok(self.unwrap_call(call))
                        }
                        // ── Struct helpers ───────────────────────────────────
                        "hsh_struct_new" => {
