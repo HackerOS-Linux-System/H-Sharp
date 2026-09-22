@@ -14,6 +14,8 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <dirent.h>  /* fs::list_dir / fs::walk (added this session) */
+#include <sys/utsname.h>  /* sys::sysname/machine/kernel_version (added this session) */
+#include <sys/statvfs.h>  /* sys::disk_total/disk_free (added this session) */
 
 /* Global argc/argv storage — written by the H# main() entry point
  * (codegen emits: _hsh_argc = argc; _hsh_argv = argv;)
@@ -450,6 +452,16 @@ hsh_string hsh_date_format(int64_t ts, hsh_string fmt) {
 
 int64_t hsh_getpid(void) { return (int64_t)getpid(); }
 
+/* hsh_proc_id — backs the bare `proc_id()` builtin (codegen.rs's "proc_id"
+ * dispatch arm / builtins.rs's `hsh_proc_id` extern). This was declared and
+ * called on the compiler side but never given a runtime implementation, so
+ * any H# program that called proc_id() failed at link time with an
+ * "undefined reference to `hsh_proc_id`" error. Same value as hsh_getpid()
+ * (the current process's PID) — kept as a separate symbol rather than
+ * aliased so os::pid and the bare proc_id() builtin stay independently
+ * resolvable/overridable. */
+int64_t hsh_proc_id(void) { return (int64_t)getpid(); }
+
 hsh_string hsh_getenv(hsh_string key) {
     if (!key) return "";
     const char* v = getenv(key);
@@ -482,6 +494,153 @@ hsh_string hsh_platform(void) {
     return "unknown";
 #endif
 }
+
+/* ── sys:: — native machine/process introspection (native AOT support) ───────
+ * EXPANSION: every one of these was `Backend::Interpreter`-only before —
+ * the interpreter reads `/proc` files directly for the Linux-specific ones
+ * and shells out to `id`/`ps`/`getconf`/`uname`/`df` for the rest (see
+ * `hsharp-interpreter::call.rs`'s own `sys_*` arms, which this section
+ * mirrors for exact behavioral parity: same `/proc` files, same parsing,
+ * same fallback-to-0/1/"unknown" on failure — nothing here should ever
+ * observably disagree with what the interpreter already returns).
+ * Where native libc/syscalls give the *exact* same value more directly
+ * than shelling out to an external binary would (`getuid()` instead of
+ * spawning `id -u`, `sysconf(_SC_PAGE_SIZE)` instead of spawning
+ * `getconf PAGESIZE`, `uname()`/`statvfs()` instead of `uname`/`df`),
+ * this uses the syscall — same observable result, no subprocess, no
+ * dependency on those binaries existing in `$PATH`. Every function here
+ * is a read-only query with no meaningful failure mode worth surfacing
+ * to H# code (a shell prompt segment reading "0% used" because
+ * `/proc/meminfo` was unreadable in some exotic container is a far
+ * better failure than crashing the whole shell), so — again matching
+ * the interpreter — everything degrades to a sane default rather than
+ * erroring. */
+
+/* sys::cpu_count — number of "processor" lines in /proc/cpuinfo,
+ * minimum 1 (matches the interpreter's own `.max(1)` — a shell prompt
+ * dividing by this should never divide by zero even on some unusual
+ * system where the parse comes back empty). */
+int64_t hsh_sys_cpu_count(void) {
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (!f) return 1;
+    int64_t n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "processor", 9) == 0) n++;
+    }
+    fclose(f);
+    return n > 0 ? n : 1;
+}
+
+/* sys::memory_total / sys::memory_free — parses /proc/meminfo's
+ * "MemTotal:"/"MemAvailable:" lines (kB), returns bytes. `MemAvailable`
+ * (not `MemFree`) matches the interpreter's own choice — it's the
+ * kernel's own "actually available for a new process, including
+ * reclaimable cache" estimate, which is what a human reading "free
+ * memory" on a shell prompt actually wants, not the much smaller raw
+ * `MemFree`. */
+static int64_t hsh_sys_meminfo_kb(const char* key) {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    size_t klen = strlen(key);
+    char line[256];
+    int64_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) == 0) {
+            kb = strtoll(line + klen, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb;
+}
+int64_t hsh_sys_memory_total(void) { return hsh_sys_meminfo_kb("MemTotal:") * 1024; }
+int64_t hsh_sys_memory_free(void)  { return hsh_sys_meminfo_kb("MemAvailable:") * 1024; }
+
+/* sys::uptime — whole seconds since boot, from /proc/uptime's first field. */
+int64_t hsh_sys_uptime(void) {
+    FILE* f = fopen("/proc/uptime", "r");
+    if (!f) return 0;
+    double secs = 0.0;
+    if (fscanf(f, "%lf", &secs) != 1) secs = 0.0;
+    fclose(f);
+    return (int64_t)secs;
+}
+
+/* sys::load_avg — 1-minute load average, from /proc/loadavg's first field. */
+double hsh_sys_load_avg(void) {
+    FILE* f = fopen("/proc/loadavg", "r");
+    if (!f) return 0.0;
+    double load = 0.0;
+    if (fscanf(f, "%lf", &load) != 1) load = 0.0;
+    fclose(f);
+    return load;
+}
+
+/* sys::disk_total / sys::disk_free — statvfs() on the filesystem
+ * containing `path`, in bytes. `disk_free` uses `f_bavail` (blocks
+ * available to an unprivileged user), matching `df`'s own "Available"
+ * column (not `f_bfree`, which also counts blocks reserved for root —
+ * `df -k`'s 4th column is `f_bavail`-based, and the interpreter's own
+ * `sys_disk_free` reads exactly that column, so this matches it). Falls
+ * back to `/` if `path` can't be resolved (statvfs fails) — same
+ * fallback shape as the interpreter's own "column not found -> 0"; 0
+ * bytes total/free is a safer default for a broken/missing path than
+ * an error that could crash a shell prompt render. */
+int64_t hsh_sys_disk_total(hsh_string path) {
+    struct statvfs sv;
+    if (statvfs((path && path[0]) ? path : "/", &sv) != 0) return 0;
+    return (int64_t)sv.f_blocks * (int64_t)sv.f_frsize;
+}
+int64_t hsh_sys_disk_free(hsh_string path) {
+    struct statvfs sv;
+    if (statvfs((path && path[0]) ? path : "/", &sv) != 0) return 0;
+    return (int64_t)sv.f_bavail * (int64_t)sv.f_frsize;
+}
+
+/* sys::page_size — sysconf(_SC_PAGE_SIZE), exactly what `getconf
+ * PAGESIZE` prints, without spawning it. 4096 fallback matches the
+ * interpreter's own default for the (essentially never happens on a
+ * real system) case sysconf itself fails. */
+int64_t hsh_sys_page_size(void) {
+    long sz = sysconf(_SC_PAGE_SIZE);
+    return sz > 0 ? (int64_t)sz : 4096;
+}
+
+/* sys::get_uid / sys::get_gid / sys::get_ppid — direct syscalls,
+ * exactly what `id -u`/`id -g`/`ps -o ppid=` print without spawning
+ * them. */
+int64_t hsh_sys_get_uid(void)  { return (int64_t)getuid(); }
+int64_t hsh_sys_get_gid(void)  { return (int64_t)getgid(); }
+int64_t hsh_sys_get_ppid(void) { return (int64_t)getppid(); }
+
+/* sys::is_64bit / sys::is_little_endian — compile-time-constant checks
+ * on the actual pointer width and byte order this binary was compiled
+ * for, matching the interpreter's own `size_of::<usize>() == 8`/
+ * `cfg!(target_endian = "little")` (both properties of the *running*
+ * program, not something that could differ between backends on the
+ * same machine). */
+int64_t hsh_sys_is_64bit(void) { return sizeof(void*) == 8 ? 1 : 0; }
+int64_t hsh_sys_is_little_endian(void) {
+    const uint16_t probe = 1;
+    return (*(const unsigned char*)&probe == 1) ? 1 : 0;
+}
+
+/* sys::sysname / sys::machine / sys::kernel_version — uname(2), exactly
+ * what `uname -s`/`uname -m`/`uname -r` print without spawning them. */
+static hsh_string hsh_sys_uname_field(int which) {
+    struct utsname u;
+    if (uname(&u) != 0) return "";
+    const char* src = (which == 0) ? u.sysname : (which == 1) ? u.machine : u.release;
+    size_t n = strlen(src);
+    char* out = (char*)hsh_alloc(n + 1);
+    if (!out) return "";
+    memcpy(out, src, n + 1);
+    return out;
+}
+hsh_string hsh_sys_sysname(void)        { return hsh_sys_uname_field(0); }
+hsh_string hsh_sys_machine(void)        { return hsh_sys_uname_field(1); }
+hsh_string hsh_sys_kernel_version(void) { return hsh_sys_uname_field(2); }
 
 /* env::set(name, value) — setenv() wrapper; affects this process (and
  * anything it later shell()s/run_cmd()s) only, same scope as every
@@ -1902,8 +2061,278 @@ HshArray *hsh_string_split(const char *str, const char *sep) {
     return a;
 }
 
-/* ── proc_id ─────────────────────────────────────────────────────────────────*/
-int64_t hsh_proc_id(void) { return (int64_t)getpid(); }
+/* EXPANSION: array-of-strings join — the counterpart `hsh_string_split`
+ * never had. `.join(sep)` on `[string]` (e.g. `hsh`'s
+ * `theme::theme_names().join(", ")`, `v.positional.join(" ")`,
+ * `commands.join(",")`) had no LLVM backing at all before this; the
+ * `MethodCall` dispatch in codegen.rs now routes `.join(sep)` here.
+ * Treats every array element as a `char*` (cast back from the generic
+ * i64 slot) — same "this container doesn't care what's in the slot"
+ * convention as the rest of this runtime; a non-string element would
+ * read garbage, exactly as e.g. `hsh_array_contains` would for a
+ * mismatched element type, which is an existing, accepted trade-off in
+ * this untyped-at-the-C-level runtime, not something new here. */
+hsh_string hsh_array_join(HshArray *a, hsh_string sep) {
+    if (!a || a->len == 0) return "";
+    size_t seplen = sep ? strlen(sep) : 0;
+    size_t total = 0;
+    for (int64_t i = 0; i < a->len; i++) {
+        const char *s = (const char*)(intptr_t)a->data[i];
+        total += s ? strlen(s) : 0;
+        if (i > 0) total += seplen;
+    }
+    char *out = (char*)malloc(total + 1);
+    if (!out) return "";
+    char *w = out;
+    for (int64_t i = 0; i < a->len; i++) {
+        if (i > 0 && seplen) { memcpy(w, sep, seplen); w += seplen; }
+        const char *s = (const char*)(intptr_t)a->data[i];
+        if (s) { size_t l = strlen(s); memcpy(w, s, l); w += l; }
+    }
+    *w = '\0';
+    return out;
+}
+
+/* ── regex:: — grep/sed-backed regex support (native AOT support) ────────────
+ * EXPANSION: was `Backend::Interpreter`-only. The interpreter itself
+ * doesn't embed a real regex engine either — `hsharp-interpreter::call.rs`
+ * implements every one of these by spawning `grep -P`/`sed -E` as a
+ * subprocess and piping text through it (see its own extensive comments
+ * on *why*: portable, no new dependency, and two prior security fixes —
+ * a shell-injection hole in the old `sed` script construction, and an
+ * `std::process::exit` that was an uncatchable WASM trap under the
+ * playground target). This mirrors that exact approach for the AOT
+ * backend, for two reasons: (1) it avoids re-implementing an actual
+ * regex engine from scratch in C, which is a large amount of easy-to-
+ * get-subtly-wrong surface area for a security-sensitive feature (`hsh`
+ * uses this for *secret redaction* — `security.h#`'s `redact()`); (2) it
+ * guarantees identical observable behavior between the interpreter and
+ * the compiled binary — the same `grep -P`/`sed -E` binary, the same
+ * flags, the same PCRE-flavored pattern syntax and its quirks either
+ * way, rather than two independently-behaving regex implementations
+ * that could silently diverge on some edge-case pattern.
+ *
+ * SECURITY: every subprocess here is spawned with `fork`+`execvp` and an
+ * explicit argv array — never `system()`/`popen()` — so a pattern or
+ * replacement string containing shell metacharacters (`;`, `$(...)`,
+ * backticks, quotes, ...) is passed to `grep`/`sed` as a single literal
+ * argv element, never interpreted by a shell. This is the same guarantee
+ * Rust's `std::process::Command::new(...).args([...])` (no shell)
+ * already gives the interpreter; a C implementation using `popen()`
+ * would NOT have this guarantee (popen always runs `/bin/sh -c
+ * "..."`), which is exactly why this doesn't use it.
+ */
+
+/* Runs `argv[0]` with `argv` (NULL-terminated), writes `input`
+ * (`input_len` bytes) to its stdin, and captures all of its stdout into
+ * a fresh `hsh_alloc`'d, NUL-terminated buffer (`*out_len` excludes the
+ * NUL). Returns the child's exit status (like `system()`'s convention,
+ * but from `waitpid`'s `WEXITSTATUS` — 0 typically means success), or
+ * -1 if the child couldn't even be spawned (e.g. `grep`/`sed` missing
+ * from `$PATH`) — callers treat -1 the same way the interpreter's own
+ * `.map_err(...)` on a failed `spawn()` does: fall back to a safe
+ * default rather than propagating a hard error, since a shell prompt or
+ * a redaction filter failing outright on a machine missing `grep` is a
+ * far worse failure mode than silently doing nothing. */
+static int hsh_run_piped(char *const argv[], const char *input, size_t input_len,
+                          char **out_buf, size_t *out_len) {
+    int in_pipe[2];  /* parent writes[1] -> child reads[0] (child's stdin) */
+    int out_pipe[2]; /* child writes[1] -> parent reads[0] (child's stdout) */
+    *out_buf = NULL;
+    *out_len = 0;
+    if (pipe(in_pipe) != 0) return -1;
+    if (pipe(out_pipe) != 0) { close(in_pipe[0]); close(in_pipe[1]); return -1; }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* child */
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(in_pipe[0]);  close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        execvp(argv[0], argv);
+        _exit(127); /* execvp failed (binary not found, etc.) */
+    }
+    /* parent */
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+
+    /* Write the input, then close so the child sees EOF on its stdin —
+     * matters for `grep`/`sed`, which otherwise block waiting for more
+     * input forever. A large `input` could in principle deadlock against
+     * a child that fills its stdout pipe before we've finished writing
+     * (classic pipe-both-directions deadlock) — real `grep`/`sed` on
+     * shell-prompt/log-line/secret-scanning-sized text (this runtime's
+     * actual use cases, never megabytes) never gets remotely close to a
+     * full 64KB pipe buffer, so this keeps the simple
+     * write-everything-then-read-everything shape rather than a
+     * poll()-based one, matching the same trade-off the interpreter's
+     * blocking `Write::write_all` + `wait_with_output()` already makes. */
+    if (input && input_len > 0) {
+        size_t written = 0;
+        while (written < input_len) {
+            ssize_t w = write(in_pipe[1], input + written, input_len - written);
+            if (w <= 0) break;
+            written += (size_t)w;
+        }
+    }
+    close(in_pipe[1]);
+
+    size_t cap = 4096, len = 0;
+    char *buf = (char*)malloc(cap);
+    if (buf) {
+        for (;;) {
+            if (len + 4096 > cap) { cap *= 2; char *nb = (char*)realloc(buf, cap); if (!nb) break; buf = nb; }
+            ssize_t r = read(out_pipe[0], buf + len, cap - len);
+            if (r <= 0) break;
+            len += (size_t)r;
+        }
+    }
+    close(out_pipe[0]);
+
+    int status = -1;
+    waitpid(pid, &status, 0);
+
+    if (buf) {
+        char *owned = (char*)hsh_alloc(len + 1);
+        if (owned) { memcpy(owned, buf, len); owned[len] = '\0'; }
+        free(buf);
+        *out_buf = owned;
+        *out_len = owned ? len : 0;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* regex::is_match(text, pattern) -> bool. `grep -qP pattern`, exit 0 = matched. */
+int64_t hsh_regex_match(hsh_string pattern, hsh_string text) {
+    if (!pattern) pattern = "";
+    if (!text) text = "";
+    char *argv[] = { (char*)"grep", (char*)"-qP", (char*)pattern, NULL };
+    char *out = NULL; size_t outlen = 0;
+    int rc = hsh_run_piped(argv, text, strlen(text), &out, &outlen);
+    return (rc == 0) ? 1 : 0;
+}
+
+/* regex::find(text, pattern) -> string. `grep -oP pattern`, first line
+ * of output, trimmed (matches the interpreter's `.trim()`). "" if no
+ * match or grep itself couldn't run. */
+hsh_string hsh_regex_find(hsh_string pattern, hsh_string text) {
+    if (!pattern) pattern = "";
+    if (!text) text = "";
+    char *argv[] = { (char*)"grep", (char*)"-oP", (char*)pattern, NULL };
+    char *out = NULL; size_t outlen = 0;
+    int rc = hsh_run_piped(argv, text, strlen(text), &out, &outlen);
+    if (rc < 0 || !out) return "";
+    /* First line only, and trim (both ends, matching Rust's `.trim()`). */
+    char *nl = strchr(out, '\n');
+    if (nl) *nl = '\0';
+    return hsh_trim(out);
+}
+
+/* regex::find_all(text, pattern) -> [string]. `grep -oP pattern`, every
+ * non-empty output line becomes one array element. */
+HshArray *hsh_regex_find_all(hsh_string pattern, hsh_string text) {
+    HshArray *result = hsh_array_new();
+    if (!pattern) pattern = "";
+    if (!text) text = "";
+    char *argv[] = { (char*)"grep", (char*)"-oP", (char*)pattern, NULL };
+    char *out = NULL; size_t outlen = 0;
+    int rc = hsh_run_piped(argv, text, strlen(text), &out, &outlen);
+    if (rc < 0 || !out) return result;
+    char *p = out;
+    while (*p) {
+        char *nl = strchr(p, '\n');
+        size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        if (linelen > 0) {
+            char *line = (char*)hsh_alloc(linelen + 1);
+            if (line) { memcpy(line, p, linelen); line[linelen] = '\0'; result = hsh_array_push(result, (int64_t)(uintptr_t)line); }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return result;
+}
+
+/* regex::replace(text, pattern, repl) / regex::replace_all(...) -> string.
+ * `sed -E 's{d}pattern{d}repl{d}g'` — the `g` flag already replaces
+ * every match, which is why `replace` and `replace_all` are the same
+ * operation on this backend (matching the interpreter's own doc comment
+ * on exactly this).
+ *
+ * SECURITY: mirrors the interpreter's two fixes precisely (see
+ * `hsharp-interpreter::call.rs`'s own "SECURITY FIX" comment on
+ * `re_replace` for the full history) — reject `pattern`/`repl`
+ * containing a newline or NUL (either could inject an additional sed
+ * script line/command regardless of delimiter choice), and pick a
+ * delimiter character guaranteed absent from *both* strings instead of
+ * hardcoding one that a caller-controlled pattern/replacement could
+ * collide with. `argv`-based `execvp` (no shell) closes the other half
+ * of that hole on its own — the old vulnerability was entirely about
+ * what ends up *inside* the sed script, not shell interpretation of the
+ * `sed` invocation itself, which was never present here. */
+hsh_string hsh_regex_replace(hsh_string pattern, hsh_string repl, hsh_string text) {
+    if (!pattern) pattern = "";
+    if (!repl) repl = "";
+    if (!text) text = "";
+    if (strchr(pattern, '\n') || strchr(repl, '\n')) return text; /* refuse: same as interpreter's Err, but this fn has no Result to return through */
+    static const char delim_candidates[] = { '|', '#', '~', 1, 2, 3, 0 };
+    char delim = 0;
+    for (int i = 0; delim_candidates[i]; i++) {
+        char d = delim_candidates[i];
+        if (!strchr(pattern, d) && !strchr(repl, d)) { delim = d; break; }
+    }
+    if (!delim) return text; /* couldn't find a safe delimiter — refuse, same as the interpreter's Err */
+
+    /* "s" + delim + pattern + delim + repl + delim + "g" + NUL
+     * = 1 + 1 + P + 1 + R + 1 + 1 + 1 = P + R + 7. An earlier version of
+     * this got that arithmetic wrong (allocated 2 bytes short), which
+     * `snprintf` silently truncated into — for some pattern/repl
+     * lengths that cut the trailing `g` flag clean off the script,
+     * silently turning "replace every match" into "replace only the
+     * first". Caught by a round-trip test against known input/output,
+     * not by inspection, which is exactly why this comment now spells
+     * the arithmetic out in full rather than leaving it as a bare
+     * expression again.
+     */
+    size_t script_len = strlen(pattern) + strlen(repl) + 7;
+    char *script = (char*)malloc(script_len);
+    if (!script) return text;
+    snprintf(script, script_len, "s%c%s%c%s%cg", delim, pattern, delim, repl, delim);
+
+    char *argv[] = { (char*)"sed", (char*)"-E", script, NULL };
+    char *out = NULL; size_t outlen = 0;
+    int rc = hsh_run_piped(argv, text, strlen(text), &out, &outlen);
+    free(script);
+    if (rc < 0 || !out) return text;
+    /* Rust's `.trim_end()` — strip only trailing whitespace/newline sed
+     * adds, keep any leading whitespace the match legitimately produced. */
+    size_t n = strlen(out);
+    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r' || out[n-1] == ' ' || out[n-1] == '\t')) n--;
+    out[n] = '\0';
+    return out;
+}
+
+/* regex::split(text, pattern) -> [string]. Real regex-aware splitting
+ * needs a real regex engine to find match *positions* (not just
+ * extracted matches, which is all `grep -o` gives us) — out of scope
+ * for the same reason a full regex engine is (see this section's own
+ * top comment). Matches the interpreter's own documented, honest
+ * fallback exactly (`call.rs`'s `re_split_ta`): the extremely common
+ * `\s+`/`\s*` (whitespace) case gets real whitespace splitting, and
+ * anything else falls back to a literal-substring split rather than
+ * silently pretending to be regex-aware. */
+HshArray *hsh_regex_split(hsh_string text, hsh_string pattern) {
+    if (!text) text = "";
+    if (!pattern) pattern = "";
+    if (strcmp(pattern, "\\s+") == 0 || strcmp(pattern, "\\s*") == 0) {
+        return hsh_str_split_whitespace(text);
+    }
+    return hsh_string_split(text, pattern);
+}
 
 /* ── string_at (single char as string) ──────────────────────────────────────*/
 const char *hsh_string_at(const char *s, int64_t idx) {
@@ -2720,6 +3149,30 @@ HshArray* hsh_map_keys(HshMap* m) {
         HshMapEntry* e = &m->entries[i];
         if (e->occupied && !e->deleted) {
             a = hsh_array_push(a, e->key);
+        }
+    }
+    return a;
+}
+
+/* EXPANSION: the values counterpart to hsh_map_keys above — added so
+ * the `hashmap_new()`/`.values()` surface-syntax family (see the
+ * `hashmap_*`/`hashset_*` bridge in codegen.rs's call_fn/MethodCall
+ * dispatch, and the matching `builtins_registry.rs` entries) has a real
+ * value-side counterpart to pair with hsh_map_keys, instead of only
+ * ever being able to enumerate keys. Same "one HshArray* of i64 slots,
+ * unspecified bucket order" convention as hsh_map_keys — and critically
+ * the *same* iteration order as it, so `hsh_map_keys(m)[i]` and
+ * `hsh_map_values(m)[i]` refer to the same entry for a given `m`
+ * between calls (no mutation in between), letting callers zip them
+ * together the same way most languages' `.keys()`/`.values()` pair
+ * promises to. */
+HshArray* hsh_map_values(HshMap* m) {
+    HshArray* a = hsh_arr_alloc(m && m->count > 0 ? m->count : 1);
+    if (!m) return a;
+    for (int64_t i = 0; i < m->cap; i++) {
+        HshMapEntry* e = &m->entries[i];
+        if (e->occupied && !e->deleted) {
+            a = hsh_array_push(a, e->value);
         }
     }
     return a;
