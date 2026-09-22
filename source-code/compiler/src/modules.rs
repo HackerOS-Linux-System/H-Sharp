@@ -23,7 +23,7 @@ pub struct ModuleResolver {
     /// `mod X`. Different directories intentionally get separate cache
     /// entries — `mod helpers` from two different subdirectories can
     /// legitimately resolve to two different files.
-    cache: HashMap<(PathBuf, String), Result<(Vec<Item>, PathBuf), String>>,
+    cache: HashMap<(PathBuf, String), Result<(Vec<Item>, Vec<(ImportKind, Option<String>, Span)>, PathBuf), String>>,
     /// Absolute paths of files that have already been fully expanded and
     /// inlined into the output *once*, program-wide. A module commonly gets
     /// `mod`-declared from several different files (e.g. `mod registry`
@@ -635,7 +635,21 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
     /// directory and the cwd. Returns the parsed items and the *file*
     /// they came from (its directory is what the caller should recurse
     /// with as the new `from_dir` for any `mod` declarations inside it).
-    fn resolve(&mut self, mod_name: &str, from_dir: &Path) -> Result<(Vec<Item>, PathBuf), String> {
+    // BUG FIX: this used to return (and cache/pass through) only
+    // `sub_module.items`, silently discarding `sub_module.imports` —
+    // see `expand_module`'s `ModDecl{inline: None}` arm below for the
+    // full story on why that was a real bug (a `mod`-included local
+    // file's own `use "std -> x"`/`use "bytes -> x"`/etc. imports were
+    // never resolved at all, so e.g. `env::remove(...)` called from a
+    // `mod vars`-included `vars.h#` failed with a raw `codegen:
+    // undefined fn: remove` — `env.h#` was simply never loaded, since
+    // nothing about `vars.h#` being `mod`-included from `main.h#` ever
+    // triggered processing `vars.h#`'s *own* imports; only the entry
+    // file's top-level imports ever went through `expand_program`'s
+    // import loop). Now returns the imports too, so the caller can
+    // resolve them exactly like `expand_program` already does for the
+    // entry file.
+    fn resolve(&mut self, mod_name: &str, from_dir: &Path) -> Result<(Vec<Item>, Vec<(ImportKind, Option<String>, Span)>, PathBuf), String> {
         let key = (from_dir.to_path_buf(), mod_name.to_string());
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
@@ -647,7 +661,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
 
     /// Returns the parsed items and the resolved *file path* (not its
     /// directory — callers that need the directory call `.parent()`).
-    fn load(&self, mod_name: &str, from_dir: &Path) -> Result<(Vec<Item>, PathBuf), String> {
+    fn load(&self, mod_name: &str, from_dir: &Path) -> Result<(Vec<Item>, Vec<(ImportKind, Option<String>, Span)>, PathBuf), String> {
         // Try: name.h#, name/mod.h#, name/main.h#
         let candidates = [
             format!("{}.h#", mod_name),
@@ -698,7 +712,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                     // `inlined_files`. Falls back to the plain joined path
                     // if canonicalization fails for some reason.
                     let resolved_path = std::fs::canonicalize(&path).unwrap_or(path);
-                    return Ok((sub_module.items, resolved_path));
+                    return Ok((sub_module.items, sub_module.imports, resolved_path));
                 }
             }
         }
@@ -736,7 +750,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                     // would be a typechecker diagnostic: "field/fn `x` is
                     // private to module `y`") implemented yet.
                     match self.resolve(&name, current_dir) {
-                        Ok((raw_items, resolved_file)) => {
+                        Ok((raw_items, raw_imports, resolved_file)) => {
                             // A module can be (and commonly is) `mod`-
                             // declared from several different files. Its
                             // contents must still only end up in the
@@ -756,10 +770,80 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                             let resolved_dir = resolved_file.parent()
                                 .map(|p| p.to_path_buf())
                                 .unwrap_or_else(|| current_dir.to_path_buf());
+                            // BUG FIX: this file's *own* `use "std -> x"`/
+                            // `use "bytes -> x"`/`use "hlib -> x"`/
+                            // `use "workspace -> x"` imports used to be
+                            // silently dropped here — `resolve()` only
+                            // ever returned `raw_items`
+                            // (`sub_module.items`), never
+                            // `sub_module.imports`, and nothing else in
+                            // this function (or anywhere else reachable
+                            // from a `mod X`-inclusion, as opposed to the
+                            // top-level entry file) ever processed them.
+                            // `expand_program` — called exactly once, only
+                            // for the entry file — is the *only* place
+                            // that loop existed. So a `use` import in any
+                            // file reached via `mod` (rather than being
+                            // re-declared, redundantly, at the entry file
+                            // too) was simply never resolved: the imported
+                            // module's functions never made it into the
+                            // compiled item list at all, and any call to
+                            // one produced a confusing `codegen: undefined
+                            // fn: <bare name>` — e.g. `vars.h#` (`mod
+                            // vars`-included from `hsh`'s `main.h#`) has
+                            // its own `use "std -> env" from "env"`, and
+                            // `env::remove(...)` failed this way, even
+                            // though `env::set(...)`/`env::get(...)` from
+                            // the *same* import happened to keep working
+                            // anyway — purely because those two also
+                            // happen to have their own hard-coded,
+                            // import-independent dispatch arms in
+                            // `codegen.rs`'s `call_fn`, which `remove`
+                            // doesn't.
+                            //
+                            // Fix: resolve this file's own imports here,
+                            // exactly the way `expand_program` already
+                            // does for the entry file — added *unmangled*
+                            // by this `mod`'s own name (each import kind's
+                            // resolver already mangles under its own
+                            // alias internally), same as
+                            // `expand_program`'s two separate `items.extend(...)`
+                            // calls keep the entry file's own items and
+                            // its imports' items distinct.
+                            let mut sub_expanded = Vec::new();
+                            for (kind, alias, _span) in &raw_imports {
+                                match kind {
+                                    ImportKind::Std { path, .. } => {
+                                        let lib = path.last().cloned().unwrap_or_default();
+                                        if lib.is_empty() { continue; }
+                                        let ns = alias.clone().unwrap_or_else(|| lib.clone());
+                                        sub_expanded.extend(self.resolve_std_import(&lib, &ns)?);
+                                    }
+                                    ImportKind::BytesRepo { name: pkg_name, version, link, .. } => {
+                                        let ns = alias.clone().unwrap_or_else(|| pkg_name.clone());
+                                        sub_expanded.extend(self.resolve_bytes_import(
+                                            pkg_name, version.as_deref(), &ns, *link, &resolved_dir,
+                                        )?);
+                                    }
+                                    ImportKind::Hlib { name: pkg_name, version, .. } => {
+                                        let ns = alias.clone().unwrap_or_else(|| pkg_name.clone());
+                                        sub_expanded.extend(self.resolve_hlib_import(
+                                            pkg_name, version.as_deref(), &ns, &resolved_dir,
+                                        )?);
+                                    }
+                                    ImportKind::Workspace { member, module: sub_mod, item } => {
+                                        sub_expanded.extend(self.resolve_workspace_import(
+                                            member, sub_mod.as_deref(), item.as_deref(), member, &resolved_dir,
+                                        )?);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             // Mangle *before* recursing (see comment above).
                             let mangled = mangle_module_items(raw_items, &name);
                             let sub = self.expand_module(mangled, &resolved_dir)?;
-                            expanded.extend(sub);
+                            sub_expanded.extend(sub);
+                            expanded.extend(sub_expanded);
                         }
                         Err(e) => {
                             // Non-fatal: emit warning but continue. Cached
