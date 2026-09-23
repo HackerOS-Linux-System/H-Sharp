@@ -2652,6 +2652,36 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     _ => None,
                 }
             }
+            // `let rows = some_fn(...)` where `some_fn`'s declared return
+            // type is `[Foo]` — mirrors `infer_struct_name`'s own `Call`
+            // arm (same plain-`Ident`-callee-only scope, same
+            // `Path`-callee snake_case-join fallback lookup), just
+            // checking for an `Array(Named(_))` return instead of a bare
+            // `Named(_)` one. Previously unhandled here, so `let rules =
+            // danger_rules()` followed by `rules[i].field` always fell
+            // through to the scan-every-struct guess no matter how
+            // clearly `danger_rules`'s `-> [DangerRule]` was annotated.
+            Expr::Call(callee, _, _) => {
+                let fn_name = match callee.as_ref() {
+                    Expr::Ident(n, _) => Some(n.clone()),
+                    Expr::Path(segments, _) => {
+                        let snake = segments.join("_");
+                        if self.fn_ret_types.contains_key(&snake) {
+                            Some(snake)
+                        } else {
+                            segments.last().cloned()
+                        }
+                    }
+                    _ => None,
+                };
+                match fn_name.and_then(|n| self.fn_ret_types.get(&n)) {
+                    Some(TypeExpr::Array(elem)) => match elem.as_ref() {
+                        TypeExpr::Named(n) => resolve_struct_name(&self.structs, n).map(|s| s.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -3332,14 +3362,27 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                         self.array_elem_types.insert(name.clone(), bare);
                     }
                     _ => {
-                        if let Some(Expr::ArrayLit(items, _)) = value {
-                            if let Some(n) = items.first().and_then(|first| self.infer_struct_name(first)) {
-                                self.array_elem_types.insert(name.clone(), n);
-                            } else {
-                                self.array_elem_types.remove(name);
-                            }
-                        } else {
-                            self.array_elem_types.remove(name);
+                        // Unannotated `let entries = [...]` falls back to the
+                        // first literal element (as before); anything else
+                        // (`let arr = some_fn_returning_array()`, or `let
+                        // arr2 = arr1` aliasing an already-known array
+                        // variable) now goes through `infer_array_elem_type`
+                        // instead of unconditionally giving up. Without
+                        // this, re-binding a perfectly well-typed array
+                        // (e.g. a `[Foo]` function parameter aliased via
+                        // `let mut arr = hits`, or a function call's `->
+                        // [Foo]` return) silently lost the element type and
+                        // every subsequent `arr[i].field` fell through to
+                        // the scan-every-struct guess.
+                        let inferred_elem = match value {
+                            Some(Expr::ArrayLit(items, _)) =>
+                                items.first().and_then(|first| self.infer_struct_name(first)),
+                            Some(e) => self.infer_array_elem_type(e),
+                            None => None,
+                        };
+                        match inferred_elem {
+                            Some(n) => { self.array_elem_types.insert(name.clone(), n); }
+                            None    => { self.array_elem_types.remove(name); }
                         }
                     }
                 }
@@ -3871,7 +3914,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            }
                            Ok(())
                        }
-                       Expr::FieldAccess(obj_e, field_name, _span) => {
+                       Expr::FieldAccess(obj_e, field_name, span) => {
                            let obj = self.expr(obj_e, None)?;
                            let field_idx = match self.infer_struct_name(obj_e) {
                                Some(struct_name) => self.resolve_struct_field_index(&struct_name, field_name),
@@ -3883,13 +3926,39 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                    // caveat applies; kept consistent with
                                    // the read path rather than silently
                                    // diverging from it.
-                                   let mut found = 0usize;
+                                   //
+                                   // BUG FIX: unlike the read side (see
+                                   // the `Expr::FieldAccess` arm in
+                                   // `expr()`, which prints this exact
+                                   // warning whenever it falls back),
+                                   // this assignment-side copy of the
+                                   // same fallback used to do the scan
+                                   // silently — no warning ever printed,
+                                   // and `found` stays `0` with zero
+                                   // indication if no struct has a
+                                   // matching field at all. A caller
+                                   // relying on the printed warnings to
+                                   // spot every ambiguous-field site in
+                                   // their program (as this compiler's
+                                   // own message tells them to) would
+                                   // never see the assignment-side ones,
+                                   // even though they carry the same
+                                   // wrong-struct-guessed risk — and an
+                                   // outright miss (no struct has this
+                                   // field at all) silently wrote to
+                                   // field 0 of whatever `obj` was
+                                   // rather than surfacing anything.
+                                   let mut found: Option<usize> = None;
                                    'outer: for fields in self.structs.values() {
                                        for (i, f) in fields.iter().enumerate() {
-                                           if &f.name == field_name { found = i; break 'outer; }
+                                           if &f.name == field_name { found = Some(i); break 'outer; }
                                        }
                                    }
-                                   found
+                                   eprintln!(
+                                       "warning: {}: cannot statically determine the struct type of `.{}` — guessing by scanning all structs for a matching field name; add a type annotation to avoid ambiguity if multiple structs share this field name",
+                                       span, field_name
+                                   );
+                                   found.unwrap_or(0)
                                }
                            };
                            let idx_v = self.ctx.i64_type().const_int(field_idx as u64, false);
@@ -4498,6 +4567,67 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
 
                        // ── IndexAccess arr[idx] ──────────────────────────
                        Expr::IndexAccess(arr_e, idx_e, _) => {
+                           // BUG FIX — root cause of a whole class of AOT
+                           // segfaults: a *range* index (`s[a..b]`) was
+                           // handled by exactly the same path as a plain
+                           // index (`arr[i]`), below. Two compounding bugs:
+                           // (1) `Expr::Range` evaluated as a bare value
+                           // (see its own arm above, `self.expr(start,
+                           // hint)`) silently discards the end bound and
+                           // returns just `start` — so `idx` here was
+                           // never anything but the range's start; (2) the
+                           // `arr` operand then always went through
+                           // `hsh_array_get`, which reads its argument as
+                           // an `HshArray*` (a `{len, cap, data}` header
+                           // struct) — but `s[a..b]` slicing is written
+                           // pervasively throughout this codebase on
+                           // `string` values, which are plain
+                           // null-terminated `char*` with no such header.
+                           // `hsh_array_get` then read whatever raw bytes
+                           // happened to sit at the string's `len`/`data`
+                           // offsets as if they *were* a length and a data
+                           // pointer, and indexed through that — a wild
+                           // pointer dereference on essentially arbitrary
+                           // string content, not a bounds issue any
+                           // caller-side check could catch. This is what
+                           // was actually crashing `hsh-hprompt`'s
+                           // `util::is_all_digits`'s `s[cur..cur+1]`
+                           // (confirmed via `strace`/`valgrind`: the first
+                           // range-slice reached at runtime, right after
+                           // `fix_shell_pid`'s `pid_str.trim()`).
+                           //
+                           // There is no `hsh_array_slice` in the runtime
+                           // at all — this codebase (and, as far as this
+                           // compiler's runtime goes, H# generally) has no
+                           // working notion of slicing an *array* by
+                           // range, only a *string*. So routing every
+                           // `Range`-indexed `IndexAccess` through
+                           // `hsh_string_slice` rather than
+                           // `hsh_array_get` doesn't regress some other,
+                           // previously-working array-range-slice case —
+                           // there isn't one to regress; `arr[a..b]` on a
+                           // real array was already wrong before this fix
+                           // (silently returning one misinterpreted
+                           // element via bug (1) above, rather than a
+                           // sub-array), just wrong in a way that
+                           // sometimes happened not to crash.
+                           if let Expr::Range(start_e, end_e, inclusive, _) = idx_e.as_ref() {
+                               let s = self.expr(arr_e, None)?;
+                               let i64t = self.ctx.i64_type();
+                               let a = self.expr(start_e, Some(i64t.into()))?;
+                               let b = self.expr(end_e, Some(i64t.into()))?;
+                               let b = if *inclusive {
+                                   self.builder.build_int_add(
+                                       b.into_int_value(), i64t.const_int(1, false), "slice_end_incl"
+                                   ).unwrap().into()
+                               } else {
+                                   b
+                               };
+                               let call = self.call_coerced(
+                                   self.builtins.hsh_string_slice,
+                                   &[s.into(), a.into(), b.into()], "sslc");
+                               return Ok(self.unwrap_call(call));
+                           }
                            let arr = self.expr(arr_e, None)?;
                            let idx = self.expr(idx_e, None)?;
                            let call = self.call_coerced(
@@ -6545,6 +6675,42 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            Ok(self.unwrap_call(r))
                        }
                        "process_which" => call1!(self.builtins.hsh_process_which, "pwhich"),
+                       // date::format / __builtin_date_format(ts, fmt) — ts is
+                       // an int, not a string, so (unlike call2!/str_arg!)
+                       // the first arg must be pulled with an i64 type hint
+                       // instead of the i8ptr-hinted string coercion; only
+                       // the second (format string) arg goes through
+                       // str_arg!. Mirrors "char_code_to_str"'s int-arg
+                       // handling above. c_symbol: hsh_date_format (see
+                       // builtins.rs decl + core.c's strftime wrapper).
+                       "date_format" => {
+                           let ts = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.i64_type().into()))? }
+                                    else { self.ctx.i64_type().const_zero().into() };
+                           let fmt = str_arg!(1);
+                           let r = self.call_coerced(self.builtins.hsh_date_format, &[ts.into(), fmt.into()], "dfmt");
+                           Ok(self.unwrap_call(r))
+                       }
+                       // strings::sort / __builtin_sort_strings(arr) — [string]
+                       // -> [string]. Arrays are pointer-represented like
+                       // `bytes`/any other array (see "process_run_args"'s
+                       // comment above and "array_concat" just above in this
+                       // same match for the identical one-array-arg-in,
+                       // pointer-out shape), so the arg must go through
+                       // `self.expr(..., None)`, NOT `str_arg!`'s i8ptr hint.
+                       // c_symbol: hsh_sort_strings (builtins.rs decl + core.c's
+                       // qsort-based copy-and-sort).
+                       "sort_strings" => {
+                           let arr = self.expr(&args[0], None)?;
+                           let r = self.call_coerced(self.builtins.hsh_sort_strings, &[arr.into()], "ssort");
+                           Ok(self.unwrap_call(r))
+                       }
+                       // strings::split_whitespace / __builtin_str_split_whitespace(s)
+                       // — string -> [string], so (unlike sort_strings just
+                       // above) the single arg IS a plain string and does go
+                       // through str_arg!'s i8ptr hint. c_symbol:
+                       // hsh_str_split_whitespace (builtins.rs decl + core.c's
+                       // isspace()-run splitter).
+                       "str_split_whitespace" => call1!(self.builtins.hsh_str_split_whitespace, "swsplit"),
                        _ => {
                            if let Some(&fv) = self.func_vals.get(name) {
                                self.call_user_fn(fv, args, name)
