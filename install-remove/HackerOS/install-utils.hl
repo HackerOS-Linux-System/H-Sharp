@@ -1,5 +1,10 @@
 // curl
 
 ;; Package Manager
-> sudo curl -L https://github.com/Bytes-Repository/bytes/releases/download/v0.8/bytes -o /usr/bin/bytes
-> sudo chmod a+x /usr/bin/bytes
+^> curl -L https://github.com/Bytes-Repository/bytes/releases/download/v0.9/bytes -o /usr/bin/bytes
+^> curl -L https://github.com/Bytes-Repository/vira/releases/download/v0.9/vira -o /usr/bin/vira
+^> curl -L https://github.com/Bytes-Repository/fast/releases/download/v0.9/fast -o /usr/bin/fast
+
+^> chmod a+x /usr/bin/bytes
+^> chmod a+x /usr/bin/vira
+^> chmod a+x /usr/bin/fast
