@@ -1,4 +1,10 @@
+|| getit
 // curl
 
-> sudo curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.8/hsharp -o /usr/bin/h#
-> sudo chmod a+x /usr/bin/h#
+;; the H# main tool
+^> curl -L https://github.com/HackerOS-Linux-System/H-Sharp/releases/download/v0.9/hsharp -o /usr/bin/h#
+^> chmod a+x /usr/bin/h#
+
+;; std libs
+^> mkdir /usr/lib/HackerOS/H#
+^> cd /usr/lib/HackerOS/H# && getit dir https://github.com/HackerOS-Linux-System/H-Sharp/tree/main/std
