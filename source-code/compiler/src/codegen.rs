@@ -2457,12 +2457,39 @@ struct FnCx<'ctx, 'a> {
 // before indexing into `structs` (`bare`/`.or_else(...)`); this just
 // centralizes that same fallback so every classification site benefits,
 // not only the one call site that happened to already need it.
-fn resolve_struct_name<'s>(structs: &HashMap<String, Vec<StructField>>, n: &'s str) -> Option<&'s str> {
+fn resolve_struct_name(structs: &HashMap<String, Vec<StructField>>, n: &str) -> Option<String> {
     if structs.contains_key(n) {
-        Some(n)
+        Some(n.to_string())
     } else {
         let bare = n.rsplit("::").next().unwrap_or(n);
-        if structs.contains_key(bare) { Some(bare) } else { None }
+        if structs.contains_key(bare) {
+            Some(bare.to_string())
+        } else {
+            // BUG FIX: a *qualified* type reference written by hand as
+            // `some_mod::SomeStruct` (e.g. a cross-module function
+            // parameter/field like `pc: path_cache::PathCache`) never got
+            // resolved here at all. `ModuleResolver`'s `mangle_module_
+            // items` (modules.rs) renames every struct defined *inside* a
+            // `mod`-included file to `{mod_name}_{StructName}` — but only
+            // rewrites *references* to that struct from within the same
+            // file. A reference written in a *different* file (which is
+            // the only place a qualified `mod::Type` path is ever written
+            // in the first place) is left completely untouched, so by the
+            // time it reaches here the struct is registered under the
+            // mangled key (`path_cache_PathCache`) while this lookup was
+            // still trying `path_cache::PathCache` and bare `PathCache` —
+            // neither of which exist in `structs`. Silently returning
+            // `None` here is what fed `var_types`/`infer_struct_name`
+            // nothing for `pc`, which cascaded into `infer_elem_type_expr`
+            // having no way to know `pc.commands` is `[string]` — the
+            // last (of several) causes behind `helper::
+            // build_completion_words`'s `hsh_array_push` crash. Since the
+            // mangling scheme is a fixed, known `{prefix}_{name}` shape,
+            // reconstruct the same key from the qualifier and try that.
+            n.rsplit_once("::")
+                .map(|(qualifier, bare2)| format!("{}_{}", qualifier, bare2))
+                .filter(|mangled| structs.contains_key(mangled.as_str()))
+        }
     }
 }
 
@@ -5122,11 +5149,44 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            match method.as_str() {
                                // Array methods
                                "push" | "append" => {
+                                   // BUG FIX: `hsh_array_push(a, val)`
+                                   // returns a *pointer* — `HshArray` grows
+                                   // by `realloc`, which is free to move
+                                   // the block once its capacity is
+                                   // exceeded, so the returned pointer can
+                                   // legitimately differ from `obj`. This
+                                   // arm called it and just discarded that
+                                   // return value, leaving the pushed-into
+                                   // *variable* holding the stale,
+                                   // pre-realloc (potentially already-freed)
+                                   // pointer. Every subsequent use of that
+                                   // variable — another `.push()`, `.len()`,
+                                   // indexing — was then a use-after-free,
+                                   // but only once enough elements had been
+                                   // pushed to actually force a realloc, so
+                                   // this passed for any array that never
+                                   // grew past its initial capacity and
+                                   // crashed (usually inside a *later*
+                                   // `hsh_array_push` call, since that's
+                                   // typically the next thing that touches
+                                   // the stale pointer) for any array that
+                                   // did — see `hsh`'s
+                                   // `helper::build_completion_words`,
+                                   // which pushes 35 builtin names into an
+                                   // array that starts empty. Write the
+                                   // (possibly new) pointer back into
+                                   // `obj_e` — mirroring `assign_lvalue`,
+                                   // which already exists for exactly this
+                                   // "runtime call may hand back a
+                                   // different pointer" situation (see its
+                                   // own doc comment, for `hsh_array_set`).
                                    let v = self.expr(&method_args[0], None)?;
                                    let call = self.call_coerced(
                                        self.builtins.hsh_array_push,
                                        &[obj.into(), v.into()], "mpush");
-                                   Ok(self.unwrap_call(call))
+                                   let new_ptr = self.unwrap_call(call);
+                                   self.assign_lvalue(obj_e, new_ptr)?;
+                                   Ok(new_ptr)
                                }
                                "len" | "length" | "count" => {
                                    // BUG FIX: this used to call
