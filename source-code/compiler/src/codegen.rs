@@ -879,6 +879,8 @@ impl LlvmCodegen {
 
         let mut vars: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)> = HashMap::new();
         let mut var_types: HashMap<String, String> = HashMap::new();
+        let mut string_vars: HashSet<String> = HashSet::new();
+        let mut int_vars: HashSet<String> = HashSet::new();
         let mut var_tuple_types: HashMap<String, Vec<TypeExpr>> = HashMap::new();
         let mut array_elem_types: HashMap<String, String> = HashMap::new();
         let mut array_elem_llvm_ty: HashMap<String, BasicTypeEnum<'ctx>> = HashMap::new();
@@ -890,6 +892,12 @@ impl LlvmCodegen {
                 if let Some(bare) = resolve_struct_name(structs, n) {
                     var_types.insert(p.name.clone(), bare.to_string());
                 }
+            }
+            if is_string_type(&p.ty) {
+                string_vars.insert(p.name.clone());
+            }
+            if is_int_type(&p.ty) {
+                int_vars.insert(p.name.clone());
             }
             if let TypeExpr::Tuple(elems) = &p.ty {
                 var_tuple_types.insert(p.name.clone(), elems.clone());
@@ -926,6 +934,8 @@ impl LlvmCodegen {
             ctx, module, builder, builtins, func_vals, str_globals,
             vars, fn_name: f.name.clone(), ret_type: f.return_type.clone(),
             structs, var_types, var_tuple_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
+            string_vars,
+            int_vars,
             fn_ret_types, enums, async_fns,
             fn_aliases: HashMap::new(),
             arc_owned: std::cell::RefCell::new(Vec::new()),
@@ -2092,6 +2102,18 @@ fn is_float_type(ty: &TypeExpr) -> bool {
 fn is_bool_type(ty: &TypeExpr) -> bool {
     matches!(ty, TypeExpr::Bool) || matches!(ty, TypeExpr::Named(n) if n == "bool")
 }
+/// Like `is_string_type`/`is_float_type`/`is_bool_type` above, for `int`
+/// (and the fixed-width integer spellings) — added alongside
+/// `is_definitely_int`'s new `Expr::Ident` arm (see that function's doc
+/// comment) so a plain `int`-typed variable/parameter can be recognized
+/// as "definitely int" the same way a `string`-typed one is recognized
+/// by `expr_is_string`/`string_vars`.
+fn is_int_type(ty: &TypeExpr) -> bool {
+    matches!(ty, TypeExpr::I8 | TypeExpr::I16 | TypeExpr::I32 | TypeExpr::I64 | TypeExpr::I128
+        | TypeExpr::U8 | TypeExpr::U16 | TypeExpr::U32 | TypeExpr::U64 | TypeExpr::U128)
+    || matches!(ty, TypeExpr::Named(n) if n == "int" || n == "i8" || n == "i16" || n == "i32"
+        || n == "i64" || n == "i128" || n == "u8" || n == "u16" || n == "u32" || n == "u64" || n == "u128")
+}
 
 /// Free-function version of `FnCx::unwrap_call`, usable from
 /// `LlvmCodegen::compile_python_trampoline` (which has no `FnCx`).
@@ -2250,6 +2272,27 @@ struct FnCx<'ctx, 'a> {
     /// `hsh_closure_call1/2`, but never actually wired up anywhere in
     /// this file — a separate, larger follow-up).
     fn_aliases:  HashMap<String, String>,
+    /// Local variable/parameter name -> "this holds a `string`" — the
+    /// `string`-specific analogue of `var_types` (which only tracks
+    /// *struct*-typed bindings; a plain `string` was never recorded
+    /// anywhere). Needed because `string` and `[T]` (array) values are
+    /// both represented as a bare LLVM pointer with no runtime type tag,
+    /// so a polymorphic method like `.len()` — valid on *both* types —
+    /// can't tell which native helper to call (`hsh_strlen` vs
+    /// `hsh_array_len`) by inspecting the LLVM value alone; it has to
+    /// consult static type info instead. See `expr_is_string`, and the
+    /// `"len" | "length" | "count"` arm of `MethodCall` codegen, which
+    /// used to call `hsh_array_len` unconditionally — reinterpreting a
+    /// string's own bytes as an `HshArray` header and returning garbage
+    /// for every single `some_string.len()` in a natively compiled
+    /// program (the interpreter backend never had this bug: it resolves
+    /// `.len()` against the runtime `Value` enum's actual tag, not a
+    /// static guess).
+    string_vars: HashSet<String>,
+    /// `int`-typed analogue of `string_vars` — see `is_int_type`'s doc
+    /// comment for why this exists (`is_definitely_int`'s new
+    /// `Expr::Ident` arm).
+    int_vars: HashSet<String>,
     /// Companion to `var_types`, but for the *element* type of an
     /// array-typed variable/parameter (`[Foo]`) rather than the
     /// variable's own type — e.g. `entries: [HackerEntry]` records
@@ -2428,6 +2471,56 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     fn enter_branch(&self) { self.branch_depth.set(self.branch_depth.get() + 1); }
     fn exit_branch(&self)  { self.branch_depth.set(self.branch_depth.get().saturating_sub(1)); }
 
+    /// BUG FIX — "Instruction does not dominate all uses!" LLVM verifier
+    /// failure (`alloca` followed by a `load` of it rejected as invalid
+    /// IR). Every call site that introduces a *named* local variable
+    /// (`let` statements, `for`/`while` loop counters, pattern bindings
+    /// from `match`) used to call `self.builder.build_alloca(...)`
+    /// directly, which allocates at whatever block the builder happens to
+    /// be positioned in *at that point in codegen* — e.g. inside a
+    /// `match` arm's `then_bb`, or a loop's `body_b`. `self.vars` is a
+    /// flat, function-wide `HashMap` with no scope push/pop, so a name
+    /// bound this way can end up looked-up again later from a block that
+    /// isn't dominated by the block the `alloca` actually lives in (most
+    /// commonly: a `let` shadowing an outer variable of the same name
+    /// inside one arm of an `if`/`match`, then that name being resolved
+    /// again after the merge point — the merge block is reachable via the
+    /// *other* arm too, which never ran that `alloca`). LLVM's verifier
+    /// rejects that outright, exactly like the reported crash:
+    ///   %val363 = alloca ptr, align 8
+    ///   %val511 = load ptr, ptr %val363, align 8
+    ///   Instruction does not dominate all uses!
+    ///
+    /// The standard fix (same technique as LLVM's own Kaleidoscope
+    /// tutorial's `CreateEntryBlockAlloca`) is to always place a local
+    /// variable's `alloca` in the function's *entry* block instead of at
+    /// the current insertion point. The entry block dominates every other
+    /// block in the function by construction, so any later `load`/`store`
+    /// through the returned pointer — from any arm, any loop iteration,
+    /// after any merge — is always valid, regardless of which
+    /// conditional/loop block the `let`/binding was textually inside.
+    /// This mirrors what `compile_fn` already does for parameters (it
+    /// builds their `alloca`s while `builder` is still positioned at
+    /// `entry`, before any branch exists) — the bug was that later
+    /// locals introduced *after* branches/loops exist weren't held to
+    /// the same rule.
+    fn build_entry_alloca(&self, ty: BasicTypeEnum<'ctx>, name: &str) -> PointerValue<'ctx> {
+        let current_block = self.builder.get_insert_block().unwrap();
+        let function       = current_block.get_parent().unwrap();
+        let entry          = function.get_first_basic_block().unwrap();
+        match entry.get_first_instruction() {
+            Some(first_instr) => self.builder.position_before(&first_instr),
+            None               => self.builder.position_at_end(entry),
+        }
+        let alloca = self.builder.build_alloca(ty, name).unwrap();
+        // Restore the builder to wherever it actually was compiling —
+        // the alloca is hoisted, but every instruction after it (the
+        // `store` of the initial value, the rest of the branch/loop body)
+        // must still be emitted in place.
+        self.builder.position_at_end(current_block);
+        alloca
+    }
+
     // ── Struct field resolution ───────────────────────────────────────────────
     // H# structs store fields as ordered HshArray slots.
     // We look up the StructDef in self.structs (populated once per module in
@@ -2524,6 +2617,15 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     fn is_definitely_int(&self, e: &Expr) -> bool {
         match e {
             Expr::Literal(Literal::Int(_), _) => true,
+            // A plain `int`-typed local/parameter — this arm didn't exist
+            // before: `to_string(some_int_var)` (as opposed to
+            // `to_string(some_int_fn())` or a literal) fell all the way
+            // through to the magnitude-guessing `hsh_val_to_str` fallback
+            // this function exists to avoid, crashing on any int variable
+            // whose value happened to land in the "looks like a pointer"
+            // range (e.g. `to_string(path_hash)` where `path_hash` is a
+            // hash of a directory listing — see `int_vars`'s doc comment).
+            Expr::Ident(name, _) => self.int_vars.contains(name),
             Expr::Call(callee, _, _) => {
                 let fn_name = match callee.as_ref() {
                     Expr::Ident(n, _) => Some(n.clone()),
@@ -2636,6 +2738,58 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     /// and one level of field chaining (`obj.arr_field[i]`, by resolving
     /// `obj`'s struct and checking if `arr_field`'s declared type is
     /// `[Foo]`).
+    // Full-`TypeExpr` counterpart to `infer_array_elem_type` right above
+    // (which only recovers a *struct name*, so it's blind to primitive
+    // element types) — needed for `array_elem_type_expr`/
+    // `array_elem_llvm_ty`, which `IndexAccess` codegen consults to know
+    // how to unbox an element. Without this, `let words = fn_returning_
+    // array_of_string()` (any unannotated `let` whose initializer is a
+    // function call, a field, or an alias of another array variable) left
+    // both maps empty, so indexing into it (`words[i]`) had no static
+    // element-type info at all and silently mis-decoded non-struct
+    // elements (confirmed for `string`: `words[i]` came back empty/
+    // corrupt whenever concatenated or pushed into another array — see
+    // `hsh`/`hprompt`'s `helper::build_completion_words`, which crashed
+    // in `hsh_array_push` for exactly this reason on `builtin_names()`'s
+    // `[string]` return, un-annotated at its `let builtins = ...` site).
+    fn infer_array_elem_type_expr(&self, e: &Expr) -> Option<TypeExpr> {
+        match e {
+            Expr::Ident(name, _) => self.array_elem_type_expr.get(name).cloned(),
+            Expr::FieldAccess(inner, field, _) => {
+                let inner_struct = self.infer_struct_name(inner)?;
+                let bare = inner_struct.rsplit("::").next().unwrap_or(&inner_struct);
+                let fields = self.structs.get(bare).or_else(|| self.structs.get(&inner_struct))?;
+                let field_def = fields.iter().find(|f| &f.name == field)?;
+                match &field_def.ty {
+                    TypeExpr::Array(elem) => Some(elem.as_ref().clone()),
+                    _ => None,
+                }
+            }
+            Expr::Call(callee, _, _) => {
+                let fn_name = match callee.as_ref() {
+                    Expr::Ident(n, _) => Some(n.clone()),
+                    Expr::Path(segments, _) => {
+                        let snake = segments.join("_");
+                        if self.fn_ret_types.contains_key(&snake) { Some(snake) }
+                        else { segments.last().cloned() }
+                    }
+                    _ => None,
+                };
+                match fn_name.and_then(|n| self.fn_ret_types.get(&n)) {
+                    Some(TypeExpr::Array(elem)) => Some(elem.as_ref().clone()),
+                    _ => None,
+                }
+            }
+            // See `infer_elem_type_expr`'s identical arm's doc comment —
+            // same reasoning, needed here too since this function (used
+            // at `let`-binding time to seed `array_elem_type_expr`) and
+            // that one (used at every `arr[i]` read site) don't share an
+            // implementation despite the near-identical name/purpose.
+            Expr::MethodCall(_, method, _, _) if method == "keys" => Some(TypeExpr::String),
+            _ => None,
+        }
+    }
+
     fn infer_array_elem_type(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Ident(name, _) => self.array_elem_types.get(name).cloned(),
@@ -2717,6 +2871,21 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     _ => None,
                 }
             }
+            // `map.keys()` — H#'s hashmaps (`hashmap_new()`/
+            // `hsh_map_keys`) are always string-keyed (every call site in
+            // `hsh`/`hprompt` inserts with a `string` key), so this is
+            // unconditionally `[string]`. Added because this arm didn't
+            // exist at all before: `let akeys = aliases.keys()` (any
+            // unannotated `let` binding of a `.keys()` call) left
+            // `array_elem_type_expr` unset for `akeys`, so `akeys[i]`
+            // came back as an un-unboxed raw slot — the same "looks like
+            // an int, corrupts whatever consumes it as a string" failure
+            // `expr_is_string`/the `IndexAccess` fix above exist to
+            // avoid, just for the one missing expression shape (see
+            // `hsh`'s `helper::build_completion_words`, which crashed in
+            // `hsh_array_push` pushing `to_string(akeys[cur])`'s result
+            // downstream).
+            Expr::MethodCall(_, method, _, _) if method == "keys" => Some(TypeExpr::String),
             _ => None,
         }
     }
@@ -3134,7 +3303,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
             Pattern::Ident(name, _) => {
                 if name != "_" {
                     let ty = subj.get_type();
-                    let ptr = self.builder.build_alloca(ty, name).unwrap();
+                    // See `build_entry_alloca`'s doc comment: this alloca
+                    // used to be built inline inside the match arm's own
+                    // block (`build_alloca` at the current insert point),
+                    // which is exactly the pattern that produced
+                    // "Instruction does not dominate all uses!" once this
+                    // binding's name got looked up again from a block the
+                    // arm's block doesn't dominate.
+                    let ptr = self.build_entry_alloca(ty, name);
                     self.builder.build_store(ptr, *subj).unwrap();
                     self.vars.insert(name.clone(), (ptr, ty));
                 }
@@ -3186,7 +3362,61 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
     }
 
     fn expr_is_string(&self, e: &Expr) -> bool {
-        matches!(e, Expr::Literal(Literal::String(_), _))
+        // Best-effort static "is this a `string`?" check — see
+        // `string_vars`'s doc comment for why this exists at all (`.len()`
+        // needs to pick `hsh_strlen` vs `hsh_array_len` at compile time,
+        // and a bare LLVM pointer can't tell the two apart on its own).
+        // Deliberately mirrors the structure of `infer_struct_name` right
+        // above. Not exhaustive — a miss just falls back to the old
+        // array-only behavior for that one call site — but covers every
+        // pattern `hsh`/`hprompt` actually use.
+        match e {
+            Expr::Literal(Literal::String(_), _) => true,
+            Expr::Ident(name, _) => self.string_vars.contains(name),
+            // String concatenation (`a + b`) is a `string` result the
+            // moment *either* side is — H# doesn't allow `int + string`
+            // to mean numeric add, so this can't false-positive on a
+            // plain numeric `+`.
+            Expr::BinOp(l, BinOp::Add, r, _) => {
+                self.expr_is_string(l) || self.expr_is_string(r)
+            }
+            // Method calls already known (elsewhere in this file, see the
+            // `MethodCall` arm's "String methods" section) to always
+            // return a `string`.
+            Expr::MethodCall(_, method, _, _) => matches!(
+                method.as_str(),
+                "to_upper" | "upper" | "to_lower" | "lower" | "trim"
+                    | "trim_start" | "trim_end" | "replace" | "substring"
+                    | "slice" | "reverse" | "repeat" | "pad_left"
+                    | "pad_right" | "to_string" | "join"
+            ),
+            // `let x = some_fn(...)` with no annotation — resolve via the
+            // callee's declared return type, same restriction (plain
+            // `Ident` callee only) as `infer_struct_name`'s identical arm.
+            Expr::Call(callee, _, _) => match callee.as_ref() {
+                Expr::Ident(name, _) => {
+                    self.fn_ret_types.get(name).map(is_string_type).unwrap_or(false)
+                }
+                _ => false,
+            },
+            // `arr[i]` where `arr`'s element type is itself `string`.
+            Expr::IndexAccess(arr, _, _) => match arr.as_ref() {
+                Expr::Ident(name, _) => {
+                    self.array_elem_type_expr.get(name).map(is_string_type).unwrap_or(false)
+                }
+                _ => false,
+            },
+            // `x.field` where `field`'s declared type in `x`'s struct is
+            // `string`.
+            Expr::FieldAccess(inner, field, _) => (|| {
+                let struct_name = self.infer_struct_name(inner)?;
+                let bare = struct_name.rsplit("::").next().unwrap_or(&struct_name);
+                let fields = self.structs.get(bare).or_else(|| self.structs.get(&struct_name))?;
+                let field_def = fields.iter().find(|f| &f.name == field)?;
+                Some(is_string_type(&field_def.ty))
+            })().unwrap_or(false),
+            _ => false,
+        }
     }
     fn unwrap_call(&self, r: inkwell::values::CallSiteValue<'ctx>) -> BasicValueEnum<'ctx> {
         use inkwell::values::AnyValue;
@@ -3244,12 +3474,17 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     // (and later loaded back out of, see `Expr::Ident`) a
                     // wrongly-typed slot.
                     let vty = annotated_ty.unwrap_or_else(|| v.get_type());
-                    let p = self.builder.build_alloca(vty, name).unwrap();
+                    // See `build_entry_alloca`'s doc comment — this is the
+                    // primary source of the "Instruction does not dominate
+                    // all uses!" crash: a `let` compiled inside a
+                    // conditional/loop block used to `alloca` right there
+                    // instead of in the function's entry block.
+                    let p = self.build_entry_alloca(vty, name);
                     self.builder.build_store(p, v).unwrap();
                     (p, vty)
                 } else {
                     let vty = annotated_ty.unwrap_or_else(|| self.ctx.i64_type().into());
-                    let p = self.builder.build_alloca(vty, name).unwrap();
+                    let p = self.build_entry_alloca(vty, name);
                     let z = self.zero(vty);
                     self.builder.build_store(p, z).unwrap();
                     (p, vty)
@@ -3298,6 +3533,24 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     Some(n) => { self.var_types.insert(name.clone(), n); }
                     None    => { self.var_types.remove(name); }
                 }
+                // Same idea, for `string`-typed bindings — see
+                // `string_vars`'s field doc comment for why this can't
+                // just reuse `var_types` (which only stores *struct*
+                // names) and why it matters (`.len()` codegen).
+                let is_str = match ty {
+                    Some(t) => is_string_type(t),
+                    None => value.as_ref().map(|e| self.expr_is_string(e)).unwrap_or(false),
+                };
+                if is_str { self.string_vars.insert(name.clone()); }
+                else      { self.string_vars.remove(name); }
+                // Same idea, for `int`-typed bindings — see `int_vars`'s
+                // doc comment.
+                let is_i = match ty {
+                    Some(t) => is_int_type(t),
+                    None => value.as_ref().map(|e| self.is_definitely_int(e)).unwrap_or(false),
+                };
+                if is_i { self.int_vars.insert(name.clone()); }
+                else    { self.int_vars.remove(name); }
                 // Same idea as immediately above, but for TUPLE-typed
                 // bindings — see `var_tuple_types`'s field doc comment for
                 // why this needs to be tracked completely separately from
@@ -3344,18 +3597,15 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                 // type, for `for_stmt`'s array-iteration unboxing) so
                 // `entries[i].field` and `for e in entries is ... end`
                 // both resolve correctly instead of guessing.
-                let elem_ty: Option<&TypeExpr> = match ty {
-                    Some(TypeExpr::Array(elem)) => Some(elem.as_ref()),
+                let elem_ty: Option<TypeExpr> = match ty {
+                    Some(TypeExpr::Array(elem)) => Some(elem.as_ref().clone()),
                     None => match value {
-                        // Unannotated `let entries = [...]` — nothing to
-                        // recover the *LLVM* element type from here
-                        // (that needs a real TypeExpr, not a value), but
-                        // the struct-name case can still fall back to the
-                        // first literal element for FieldAccess purposes.
-                        _ => None,
+                        Some(e) => self.infer_array_elem_type_expr(e),
+                        None => None,
                     },
                     _ => None,
                 };
+                let elem_ty = elem_ty.as_ref();
                 match elem_ty {
                     Some(TypeExpr::Named(n)) if resolve_struct_name(&self.structs, n).is_some() => {
                         let bare = resolve_struct_name(&self.structs, n).unwrap().to_string();
@@ -4006,7 +4256,10 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        let i64t  = self.ctx.i64_type();
                        let sv    = self.expr(start, Some(i64t.into()))?;
                        let ev    = self.expr(end_e,  Some(i64t.into()))?;
-                       let loop_ptr = self.builder.build_alloca(i64t, vname).unwrap();
+                       // See `build_entry_alloca`'s doc comment — a `for`
+                       // loop nested inside an `if`/`match` arm used to
+                       // `alloca` its counter in that arm's own block.
+                       let loop_ptr = self.build_entry_alloca(i64t.into(), vname);
                        self.builder.build_store(loop_ptr, sv).unwrap();
                        self.vars.insert(vname.to_string(), (loop_ptr, i64t.into()));
                        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -4090,9 +4343,11 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        let len_call = self.call_coerced(self.builtins.hsh_array_len, &[arr_v], "flen");
                        let len_v    = self.unwrap_call(len_call).into_int_value();
 
-                       let idx_ptr = self.builder.build_alloca(i64t, "for_idx").unwrap();
+                       // See `build_entry_alloca`'s doc comment — same
+                       // dominance hazard as the range-based `for` above.
+                       let idx_ptr = self.build_entry_alloca(i64t.into(), "for_idx");
                        self.builder.build_store(idx_ptr, i64t.const_zero()).unwrap();
-                       let elem_ptr = self.builder.build_alloca(elem_ty, vname).unwrap();
+                       let elem_ptr = self.build_entry_alloca(elem_ty, vname);
                        self.vars.insert(vname.to_string(), (elem_ptr, elem_ty));
 
                        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -4874,8 +5129,25 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                    Ok(self.unwrap_call(call))
                                }
                                "len" | "length" | "count" => {
-                                   let call = self.call_coerced(
-                                       self.builtins.hsh_array_len, &[obj.into()], "mlen");
+                                   // BUG FIX: this used to call
+                                   // `hsh_array_len` unconditionally,
+                                   // regardless of whether `obj` was
+                                   // actually an array or a `string` —
+                                   // both are a bare LLVM pointer with no
+                                   // runtime type tag, so calling it on a
+                                   // string reinterpreted the string's
+                                   // own bytes as an `HshArray` struct
+                                   // header and returned garbage for
+                                   // *every* `some_string.len()` in a
+                                   // natively compiled program (see
+                                   // `expr_is_string`'s doc comment).
+                                   let call = if self.expr_is_string(obj_e) {
+                                       self.call_coerced(
+                                           self.builtins.hsh_strlen, &[obj.into()], "mlen")
+                                   } else {
+                                       self.call_coerced(
+                                           self.builtins.hsh_array_len, &[obj.into()], "mlen")
+                                   };
                                    Ok(self.unwrap_call(call))
                                }
                                "get" => {
@@ -5294,14 +5566,66 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    })
                }
 
+               // Thin public entry point: a direct call site in H# source
+               // always goes through here, so a genuine user-defined
+               // function still shadows a built-in of the same name (see
+               // `call_fn_impl`'s `check_user_shadow` doc comment for why
+               // that check must NOT also apply to the internal
+               // `__builtin_*` bridge recursion below).
                fn call_fn(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>, call_span: &Span) -> R<BasicValueEnum<'ctx>> {
+                   self.call_fn_impl(name, args, _hint, call_span, true)
+               }
+
+               // BUG FIX: this used to be `call_fn` itself, with the
+               // `__builtin_*` → real-name bridge below recursing back into
+               // `call_fn` — which re-ran the `func_vals` shadow check on
+               // the *resolved* name. That is correct for a name typed by
+               // the programmer, but the resolved name here is an internal
+               // implementation detail: many `std/*.h#` wrapper functions
+               // (e.g. `env.h#`'s `pub fn get(key) -> __builtin_env_get(key)`)
+               // get inlined by `ModuleResolver::resolve_std_import` and
+               // *mangled to exactly that resolved name* (`env::get` under
+               // namespace `env` becomes the function `env_get` —
+               // see `mangle_module_items` — the same bare name
+               // `resolve_builtin_dunder_llvm("__builtin_env_get")` returns).
+               // So the recursive `call_fn` call found *its own caller*
+               // sitting in `func_vals` and "shadowed" the real native
+               // primitive with itself: `env_get` called `env_get` called
+               // `env_get` — unconditional infinite recursion, a
+               // guaranteed stack-overflow segfault on every single
+               // `env::get` (and, identically, `env::set`, `env::args`,
+               // `fs::read`, `fs::write`, `fs::exists`, `fs::size`,
+               // `fs::remove`, `fs::rename`, `fs::chdir`, `fs::append`,
+               // `date::format`, `strings::sort`,
+               // `strings::split_whitespace`, and every other std wrapper
+               // whose `resolve_builtin_dunder_llvm` target happens to
+               // equal its own mangled name) compiled by this LLVM/AOT
+               // backend — invisible on the interpreter backend, which
+               // resolves `__builtin_*` through a separate, non-colliding
+               // table (`helpers::resolve_builtin_dunder`) that never
+               // re-consults user-defined functions.
+               //
+               // Fix: `check_user_shadow` is only ever `true` for a call
+               // site that came straight from H# source (via `call_fn`
+               // above); the `__builtin_*` bridge always recurses with
+               // `false`, so it can never again re-discover — and call —
+               // the very wrapper function it exists to answer for. A
+               // real user function named e.g. `env_get` still correctly
+               // shadows any *direct* call to `env_get` in user code,
+               // since that always enters through `call_fn`/`true` first.
+               fn call_fn_impl(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>, call_span: &Span, check_user_shadow: bool) -> R<BasicValueEnum<'ctx>> {
                    // A user-defined H# function always shadows a built-in of the
                    // same name — otherwise `fn len(...)`/`fn print(...)`/etc. in
                    // user code would be silently unreachable forever, since the
                    // big `match name { ... }` below used to run unconditionally
-                   // before we ever checked `func_vals`.
-                   if let Some(&fv) = self.func_vals.get(name) {
-                       return self.call_user_fn(fv, args, name);
+                   // before we ever checked `func_vals`. Only consulted for a
+                   // genuine source-level call (`check_user_shadow`) — see this
+                   // function's doc comment above for why the `__builtin_*`
+                   // bridge recursion just below must skip it.
+                   if check_user_shadow {
+                       if let Some(&fv) = self.func_vals.get(name) {
+                           return self.call_user_fn(fv, args, name);
+                       }
                    }
                    // `__builtin_*` → real dispatch name bridge. Every
                    // `std/*.h#` wrapper (once inlined by
@@ -5333,7 +5657,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    // diagnostic *before* codegen ever runs, rather than
                    // a cryptic linker error surfacing here.
                    if let Some(real) = crate::builtins_registry::resolve_builtin_dunder_llvm(name) {
-                       return self.call_fn(real, args, _hint, call_span);
+                       return self.call_fn_impl(real, args, _hint, call_span, false);
                    }
                    let i8ptr = self.ctx.ptr_type(AddressSpace::default());
                    macro_rules! str_arg {
@@ -6890,6 +7214,43 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                // Not meaningful for pointers (Sub/Mul/etc)
                                // — fall back to the previous behavior
                                // (zero) rather than guessing.
+                               _ => self.ctx.i64_type().const_zero().into(),
+                           }
+                       }
+                       // BUG FIX: `x == nil` / `x != nil` where `x` is a
+                       // string (or any other pointer-shaped value) used
+                       // to fall straight through to the catch-all `_`
+                       // arm below, because `nil` as a bare *expression*
+                       // (as opposed to a `match` pattern — see the
+                       // `Literal::Nil` arm a few thousand lines up,
+                       // which already gets this right via
+                       // `build_is_null` for pattern matches) always
+                       // compiles to a plain `i64` constant zero, never
+                       // an actual null pointer — so `lv`/`rv` arrive
+                       // here as one genuine `PointerValue` and one
+                       // `IntValue`, matching neither the
+                       // `(IntValue,IntValue)` nor the
+                       // `(PointerValue,PointerValue)` arm above. The
+                       // catch-all then unconditionally returned a
+                       // constant `0` for *any* operator on a type
+                       // mismatch like this — which for `==`/`!=` reads
+                       // as "always false" (`0` is falsy), so `x == nil`
+                       // was silently *always false* and `x != nil`
+                       // *always true*, no matter what `x` actually held
+                       // — never a crash, just a condition that always
+                       // goes the same way regardless of the real value.
+                       // Treat a comparison against a constant-zero
+                       // int operand, when the other side is a genuine
+                       // pointer, as the null check it's actually meant
+                       // to be.
+                       (BasicValueEnum::PointerValue(p), BasicValueEnum::IntValue(i))
+                       | (BasicValueEnum::IntValue(i), BasicValueEnum::PointerValue(p))
+                           if i.is_const() && i.get_zero_extended_constant() == Some(0) =>
+                       {
+                           let is_null = self.builder.build_is_null(p, "nileq").unwrap();
+                           match op {
+                               BinOp::Eq    => is_null.into(),
+                               BinOp::NotEq => self.builder.build_not(is_null, "nilne").unwrap().into(),
                                _ => self.ctx.i64_type().const_zero().into(),
                            }
                        }
