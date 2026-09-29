@@ -67,7 +67,7 @@ impl Diagnostic {
 ///
 /// A diagnostic's `span.file` is **not always** `file`, though: once
 /// `ModuleResolver::expand_program` inlines a `mod X` declaration, a
-/// `use "std -> x"` import, or a `use "bytes -> x"` import (see
+/// `use "std -> x"` import, or a `use "bit -> x"` import (see
 /// `hsharp-compiler`'s `modules.rs`), the inlined items keep the `Span`s
 /// they were originally parsed with — `file` pointing at *that* module's
 /// own source path, not the entry file's. Previously this function always
