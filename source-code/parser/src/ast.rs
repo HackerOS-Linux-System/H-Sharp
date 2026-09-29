@@ -30,10 +30,10 @@ pub enum TypeExpr {
 /// directly into the compiled binary at build time: nothing extra needs to
 /// exist on the machine that later runs the binary.
 ///
-/// `Dynamic` (written as `dynamic use "..."`) instead records the package as
-/// a *runtime* dependency: the binary expects the `bytes` package manager to
-/// have already run `bytes install <name>` on the host machine before the
-/// binary is executed. Only valid for `bytes -> pkg` imports — `std` and
+/// `Dynamic` (written as `dynamic use "..."`) instead records the library as
+/// a *runtime* dependency: the binary expects the `bit` package manager to
+/// have already run `bit install <name>` on the host machine before the
+/// binary is executed. Only valid for `bit -> lib` imports — `std` and
 /// `core` are always statically linked, since they ship with the compiler
 /// itself and dynamically resolving them would defeat the point of a
 /// batteries-included standard library.
@@ -55,9 +55,14 @@ pub enum ImportKind {
     Github { name: String, alias: Option<String> },
     /// use "python -> numpy" from "np"
     Python { name: String, version: Option<String>, alias: Option<String> },
-    /// use "bytes -> pkgname" from "alias"
-    /// dynamic use "bytes -> pkgname" from "alias" → `link: Dynamic`
-    BytesRepo { name: String, version: Option<String>, alias: Option<String>, link: ImportLinkKind },
+    /// use "bit -> libname" from "alias"
+    /// dynamic use "bit -> libname" from "alias" → `link: Dynamic`
+    ///
+    /// A library installed by the `bit` package manager (bit.io):
+    /// `~/.hackeros/libs/<name>/<commit>/`, a project's `cache/libs/`, or a
+    /// `path` dependency from `Bit.hk`. See `bit_resolve` in the compiler,
+    /// typecheck and interpreter crates for the exact search order.
+    BitRepo { name: String, version: Option<String>, alias: Option<String>, link: ImportLinkKind },
     /// use "hlib -> libname" from "alias" — imports a `.hlib` (HackerOS
     /// Lib) archive. Resolved by `ModuleResolver` (see
     /// `compiler::hlib_resolve`): when the archive carries an `ast`
@@ -74,18 +79,18 @@ pub enum ImportKind {
     ModFile { path: String, alias: Option<String> },
     /// use "workspace -> member" [from "module -> *" | from "module -> item"]
     ///
-    /// Imports from another member of the *same* `Bytes.hk`/`bytes.hk`
+    /// Imports from another member of the *same* `Bit.hk`/`bit.hk`
     /// workspace — e.g. `use "workspace -> parser" from "ast -> *"` is
     /// H#'s equivalent of Rust's `use hsharp_parser::ast::*;`, and a
     /// bare `use "workspace -> parser"` (no `from`) imports that
     /// member's own entry/root module, the way `use hsharp_parser::*;`
     /// would. Resolved by `ModuleResolver::resolve_workspace_import`
-    /// (see `compiler::modules` and `compiler::bytes_resolve`), which
+    /// (see `compiler::modules` and `compiler::bit_resolve`), which
     /// reads the workspace root's `[workspace] -> members` list to find
-    /// the member's directory, then that member's own `Bytes.hk` for
-    /// `[build] -> entry` to find its source tree — the exact same two
-    /// manifest fields `bytes` itself (`config.h#`/`workspace.h#`) uses
-    /// to drive `bytes build --release` across a multi-member project.
+    /// the member's directory, then that member's own `Bit.hk`
+    /// (`[layout] -> src` / `hsharp-lib-entry`) to find its source tree —
+    /// the same manifest fields `bit` itself (`project.h#`) uses to drive
+    /// `bit build` across a multi-member project.
     ///
     /// `module`/`item` come from the `from "..."` string, split on the
     /// same `->` arrow used everywhere else in this syntax:
