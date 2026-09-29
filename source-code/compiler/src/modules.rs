@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use hsharp_parser::ast::*;
 use hsharp_parser::span::Span;
-use crate::bytes_resolve;
+use crate::bit_resolve;
 
 /// Resolved module: parsed AST + source path
 pub struct ResolvedModule {
@@ -46,7 +46,7 @@ impl ModuleResolver {
     /// checked first) and "the current working directory" (always the
     /// last resort). This is what lets a `mod X` in one project resolve
     /// into *another* project's source tree — e.g. `isolated`'s
-    /// `Bytes.hk` declaring `-> include => ../source-code/src`, so
+    /// `Bit.hk` declaring `-> include => ../source-code/src`, so
     /// `isolated/src/main.h#`'s `mod config` (etc.) can resolve straight
     /// into `source-code/src/config.h#` without a physical copy ever
     /// existing under `isolated/`. See `hsharp-cli`'s `--include`/`-I`
@@ -160,31 +160,33 @@ please install h# utils for HackerOS use:\n\
         Ok(out)
     }
 
-    /// Resolve one `use "bytes -> name[/version]"` (or `dynamic use
-    /// "bytes -> name[/version]"`) import: find the package in the
-    /// on-disk cache(s) the `bytes` package manager fills in, parse its
-    /// entry file, recursively resolve *its* own `use`/`mod` declarations,
-    /// mangle its items under `alias` (exactly like `resolve_std_import`
-    /// does for a std file), and return the resulting flat item list.
+    /// Resolve one `use "bit -> name[/version]"` (or `dynamic use
+    /// "bit -> name[/version]"`) import: find the library `bit` installed
+    /// (see `bit_resolve`'s module docs for the exact search order —
+    /// project `cache/libs`, `path` dependencies from `Bit.hk`,
+    /// `~/.hackeros/libs/<name>/<commit>`, ...), parse its entry file,
+    /// recursively resolve *its* own `use`/`mod` declarations, mangle its
+    /// items under `alias` (exactly like `resolve_std_import` does for a std
+    /// file), and return the resulting flat item list.
     ///
     /// Static and Dynamic links diverge here in a way they don't for the
     /// tree-walking interpreter (see `hsharp-interpreter::interp`'s
-    /// `load_bytes_module` doc comment): a `Static` (the default) import
-    /// genuinely gets its code baked into the compiled binary, so it's
-    /// resolved and inlined exactly like a std/`mod` file. A `Dynamic`
-    /// import's whole contract (`ast.rs`'s `ImportLinkKind` doc comment)
-    /// is "the code stays on the host machine, not in the binary" — doing
-    /// that properly means emitting a runtime loader/dlopen-style stub in
-    /// the generated code, which this LLVM backend does not implement yet
-    /// (only `extern dynamic [c]` FFI blocks get real dynamic dispatch,
-    /// via `ffi_linker`/libc `dlopen`, not arbitrary `.h#` packages). So a
-    /// `dynamic use "bytes -> x"` is a **hard compile error** here, with
-    /// an actionable way out, rather than silently degrading to a static
-    /// inline (which would contradict what the programmer asked for) or
-    /// silently doing nothing (which would produce "undefined fn" errors
-    /// with no indication why). The interpreter (`hsharp run`/`preview`)
-    /// has no such limitation and supports `dynamic use` fully.
-    pub fn resolve_bytes_import(
+    /// `load_bit_module` doc comment): a `Static` (the default — and the
+    /// only mode `bit` itself supports) import genuinely gets its code
+    /// baked into the compiled binary, so it's resolved and inlined exactly
+    /// like a std/`mod` file. A `Dynamic` import's whole contract
+    /// (`ast.rs`'s `ImportLinkKind` doc comment) is "the code stays on the
+    /// host machine, not in the binary" — doing that properly means
+    /// emitting a runtime loader/dlopen-style stub in the generated code,
+    /// which this LLVM backend does not implement yet (only `extern dynamic
+    /// [c]` FFI blocks get real dynamic dispatch, via `ffi_linker`/libc
+    /// `dlopen`, not arbitrary `.h#` libraries). So a `dynamic use "bit ->
+    /// x"` is a **hard compile error** here, with an actionable way out,
+    /// rather than silently degrading to a static inline (which would
+    /// contradict what the programmer asked for) or silently doing nothing.
+    /// The interpreter (`hsharp run`/`preview`) has no such limitation and
+    /// supports `dynamic use` fully.
+    pub fn resolve_bit_import(
         &mut self,
         name: &str,
         version: Option<&str>,
@@ -194,38 +196,23 @@ please install h# utils for HackerOS use:\n\
     ) -> Result<Vec<Item>, String> {
         if matches!(link, ImportLinkKind::Dynamic) {
             return Err(format!(
-                "dynamic use \"bytes -> {name}\" cannot be compiled to a native binary yet: \
-the LLVM/AOT backend has no runtime package loader (unlike `extern dynamic [c]` \
-FFI blocks, which do dispatch through libc `dlopen`).\n\n\
+                "dynamic use \"bit -> {name}\" cannot be compiled to a native binary yet: \
+the LLVM/AOT backend has no runtime library loader (unlike `extern dynamic [c]` \
+FFI blocks, which do dispatch through libc `dlopen`) — and bit links \
+libraries statically anyway.\n\n\
 fix one of:\n\
-  - drop `dynamic`: `use \"bytes -> {name}\"` links it statically into the binary\n\
+  - drop `dynamic`: `use \"bit -> {name}\"` links it statically into the binary\n\
   - run it through the interpreter instead: `hsharp run <file>` / `hsharp preview <file>`\n",
                 name = name,
             ));
         }
 
-        let project_root = bytes_resolve::find_bytes_project_root(start_dir);
-        let lock = bytes_resolve::read_bytes_lockfile(&project_root);
-        if let Some(wanted) = version {
-            if let Some(locked) = lock.get(name) {
-                if !locked.version.is_empty() && locked.version != wanted {
-                    return Err(bytes_resolve::version_mismatch_message(name, wanted, &locked.version));
-                }
-            }
-        }
-
-        let path = match bytes_resolve::find_pkg_entry(name, start_dir) {
-            Ok(p) => p,
-            Err(bytes_resolve::BytesResolveError::NotFound(tried)) => {
-                return Err(bytes_resolve::missing_message(name, &tried));
-            }
-            Err(bytes_resolve::BytesResolveError::NoEntry(dir)) => {
-                return Err(bytes_resolve::no_entry_message(name, &dir));
-            }
-        };
+        // Name check, lock/version check and entry lookup all live in
+        // `bit_resolve` so the interpreter and the type checker agree.
+        let path = bit_resolve::resolve_bit_use(name, version, link, start_dir)?;
 
         // Same "only inline once, program-wide" dedup `mod`/`std ->`
-        // resolution already needs — a `bytes ->` package commonly gets
+        // resolution already needs — a `bit ->` library commonly gets
         // `use`d from more than one file in the same program.
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if !self.inlined_files.insert(canonical) {
@@ -233,26 +220,26 @@ fix one of:\n\
         }
 
         let src = std::fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read bytes package '{}' at {}: {}", name, path.display(), e))?;
+            .map_err(|e| format!("cannot read bit library '{}' at {}: {}", name, path.display(), e))?;
         let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(name));
         if result.has_errors() {
             return Err(format!(
-                "parse errors in bytes package '{}' ({}):\n{}",
+                "parse errors in bit library '{}' ({}):\n{}",
                 name, path.display(), result.render_errors()
             ));
         }
         let sub_module = result.module;
         let sub_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
 
-        // This package's own `use "std -> x"` / `use "bytes -> y"`
+        // This library's own `use "std -> x"` / `use "bit -> y"`
         // imports, resolved before its own functions are mangled/
         // appended — mirrors `resolve_std_import`'s identical recursion,
-        // one level down. A nested `bytes ->` is resolved starting from
-        // *this* package's own directory — `find_bytes_project_root`
-        // walks back up from there and lands on the same top-level
-        // project manifest either way, since `bytes` flat-installs every
-        // dependency into one shared cache rather than nesting caches per
-        // package (see that function's doc comment for the full story).
+        // one level down. A nested `bit ->` is resolved starting from
+        // *this* library's own directory: `bit` installs every library
+        // (and each dependency of a library) flat into the one shared
+        // `~/.hackeros/libs`, so the nested lookup finds it there, while a
+        // library's own `path` dependencies are resolved against the
+        // library's own `Bit.hk` (see `bit_resolve`'s module docs).
         let mut out = Vec::new();
         for (kind, sub_alias, _span) in &sub_module.imports {
             match kind {
@@ -262,9 +249,9 @@ fix one of:\n\
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
                     out.extend(self.resolve_std_import(&sub_lib, &ns)?);
                 }
-                ImportKind::BytesRepo { name: sub_name, version: sub_version, link: sub_link, .. } => {
+                ImportKind::BitRepo { name: sub_name, version: sub_version, link: sub_link, .. } => {
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
-                    out.extend(self.resolve_bytes_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
+                    out.extend(self.resolve_bit_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
                 }
                 ImportKind::Hlib { name: sub_name, version: sub_version, .. } => {
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
@@ -292,7 +279,7 @@ fix one of:\n\
     ///      items): the archive's `ast` artifact is exactly a
     ///      `serde_json`-serialized `Vec<Item>` — the *same* `Item` type
     ///      this compiler already works with — so it's deserialized and
-    ///      mangled/inlined exactly like a `mod` file or a `bytes ->`
+    ///      mangled/inlined exactly like a `mod` file or a `bit ->`
     ///      package. Generics, structs, everything just works, because
     ///      by the time typecheck sees it, it *is* normal H# source.
     ///      This is what lets `.hlib` consumption skip `extern` entirely
@@ -424,7 +411,7 @@ fix one of:\n\
     /// Resolve one `use "workspace -> member"` import (optionally with
     /// `from "module -> item_or_*"`): find the named member inside the
     /// current project's `[workspace] -> members` list (root
-    /// `Bytes.hk`/`bytes.hk` — see `bytes_resolve::read_workspace_members`),
+    /// `Bit.hk`/`bit.hk` — see `bit_resolve::read_workspace_members`),
     /// parse either that member's own build entry (`module: None`, e.g.
     /// `use "workspace -> parser"` alone) or one specific module file
     /// inside it (`module: Some("ast")`, from `from "ast -> *"`),
@@ -456,23 +443,27 @@ fix one of:\n\
         alias: &str,
         start_dir: &Path,
     ) -> Result<Vec<Item>, String> {
-        let project_root = bytes_resolve::find_bytes_project_root(start_dir);
-        let member_dir = bytes_resolve::find_workspace_member_dir(&project_root, member)
+        // The workspace root: the nearest `Bit.hk`, promoted to the
+        // enclosing workspace when the importing file sits in one of its
+        // members (same rule as `bit`'s own `project::find_root`).
+        let project_root = bit_resolve::find_bit_workspace_root(start_dir);
+        let member_dir = bit_resolve::find_workspace_member_dir(&project_root, member)
             .ok_or_else(|| format!(
                 "workspace member '{member}' not found under {root}.\n\n\
 hint: `use \"workspace -> {member}\"` looks for `{member}` in the root \
-`Bytes.hk`'s `[workspace] -> members => [...]` list (either listed exactly \
+`Bit.hk`'s `[workspace] -> members => [...]` list (either listed exactly \
 as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{member}\") \
-— check {root}/Bytes.hk (or bytes.hk).\n",
+— check {root}/Bit.hk (or bit.hk).\n",
                 member = member, root = project_root.display(),
             ))?;
 
-        // Resolve the file to parse: either the member's own build entry
-        // (`[build] -> entry`, default `src/main.h#` — same manifest field
-        // `bytes` itself uses to drive a build), or one module file inside
+        // Resolve the file to parse: either the member's own entry
+        // (`[layout] -> hsharp-lib-entry` / `<src>/lib.h#`, else
+        // `<src>/main.h#` — the manifest fields `bit` itself uses to drive
+        // a build, see `bit_resolve::lib_dir_entry`), or one module file inside
         // that entry's directory, found the exact same way a plain `mod
         // <name>` would be (`name.h#` / `name/mod.h#` / `name/main.h#`).
-        let entry = bytes_resolve::workspace_member_entry(&member_dir);
+        let entry = bit_resolve::workspace_member_entry(&member_dir);
         let src_dir = entry.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| member_dir.clone());
 
         let path: PathBuf = match module {
@@ -480,7 +471,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                 if !entry.exists() {
                     return Err(format!(
                         "workspace member '{member}''s build entry {entry} does not exist \
-(checked `[build] -> entry` in {member_dir}/Bytes.hk).",
+(checked the entry keys of {member_dir}/Bit.hk and `<src>/lib.h#`/`<src>/main.h#`).",
                         member = member, entry = entry.display(), member_dir = member_dir.display(),
                     ));
                 }
@@ -521,12 +512,12 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
         let sub_module = result.module;
         let sub_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or(src_dir);
 
-        // This module file's own `use "std -> x"` / `use "bytes -> y"` /
+        // This module file's own `use "std -> x"` / `use "bit -> y"` /
         // `use "hlib -> z"` / `use "workspace -> other"` imports, resolved
         // before its own items are filtered/mangled/appended — mirrors
-        // `resolve_bytes_import`'s identical recursion, one level down,
+        // `resolve_bit_import`'s identical recursion, one level down,
         // so a workspace member's module can freely depend on std, on
-        // another bytes package, on a `.hlib`, or on *another* workspace
+        // another bit library, on a `.hlib`, or on *another* workspace
         // member, exactly like its own top-level entry file could.
         let mut out = Vec::new();
         for (kind, sub_alias, _span) in &sub_module.imports {
@@ -537,9 +528,9 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
                     out.extend(self.resolve_std_import(&sub_lib, &ns)?);
                 }
-                ImportKind::BytesRepo { name: sub_name, version: sub_version, link: sub_link, .. } => {
+                ImportKind::BitRepo { name: sub_name, version: sub_version, link: sub_link, .. } => {
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
-                    out.extend(self.resolve_bytes_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
+                    out.extend(self.resolve_bit_import(sub_name, sub_version.as_deref(), &ns, *sub_link, &sub_dir)?);
                 }
                 ImportKind::Hlib { name: sub_name, version: sub_version, .. } => {
                     let ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
@@ -585,7 +576,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
     /// `hsharp build`/`compile`, `hsharp check`) should use instead of
     /// calling `expand_module` directly: resolves this module's
     /// `use "std -> x"` imports (via `resolve_std_import`, above), its
-    /// `use "bytes -> x"` imports (via `resolve_bytes_import`, above),
+    /// `use "bit -> x"` imports (via `resolve_bit_import`, above),
     /// *and* its `mod X` declarations (via `expand_module`), producing one
     /// flat, fully-inlined item list — the same one, regardless of which
     /// backend eventually compiles or interprets it.
@@ -599,9 +590,9 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                     let ns = alias.clone().unwrap_or_else(|| lib.clone());
                     items.extend(self.resolve_std_import(&lib, &ns)?);
                 }
-                ImportKind::BytesRepo { name, version, link, .. } => {
+                ImportKind::BitRepo { name, version, link, .. } => {
                     let ns = alias.clone().unwrap_or_else(|| name.clone());
-                    items.extend(self.resolve_bytes_import(name, version.as_deref(), &ns, *link, entry_dir)?);
+                    items.extend(self.resolve_bit_import(name, version.as_deref(), &ns, *link, entry_dir)?);
                 }
                 ImportKind::Hlib { name, version, .. } => {
                     let ns = alias.clone().unwrap_or_else(|| name.clone());
@@ -639,7 +630,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
     // `sub_module.items`, silently discarding `sub_module.imports` —
     // see `expand_module`'s `ModDecl{inline: None}` arm below for the
     // full story on why that was a real bug (a `mod`-included local
-    // file's own `use "std -> x"`/`use "bytes -> x"`/etc. imports were
+    // file's own `use "std -> x"`/`use "bit -> x"`/etc. imports were
     // never resolved at all, so e.g. `env::remove(...)` called from a
     // `mod vars`-included `vars.h#` failed with a raw `codegen:
     // undefined fn: remove` — `env.h#` was simply never loaded, since
@@ -771,7 +762,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                                 .map(|p| p.to_path_buf())
                                 .unwrap_or_else(|| current_dir.to_path_buf());
                             // BUG FIX: this file's *own* `use "std -> x"`/
-                            // `use "bytes -> x"`/`use "hlib -> x"`/
+                            // `use "bit -> x"`/`use "hlib -> x"`/
                             // `use "workspace -> x"` imports used to be
                             // silently dropped here — `resolve()` only
                             // ever returned `raw_items`
@@ -819,9 +810,9 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                                         let ns = alias.clone().unwrap_or_else(|| lib.clone());
                                         sub_expanded.extend(self.resolve_std_import(&lib, &ns)?);
                                     }
-                                    ImportKind::BytesRepo { name: pkg_name, version, link, .. } => {
+                                    ImportKind::BitRepo { name: pkg_name, version, link, .. } => {
                                         let ns = alias.clone().unwrap_or_else(|| pkg_name.clone());
-                                        sub_expanded.extend(self.resolve_bytes_import(
+                                        sub_expanded.extend(self.resolve_bit_import(
                                             pkg_name, version.as_deref(), &ns, *link, &resolved_dir,
                                         )?);
                                     }
@@ -971,17 +962,25 @@ pub fn hoist_nested_fns(body: &mut Vec<Stmt>, enclosing_name: &str) -> Vec<FnDef
 /// silently binding to the wrong type, if that gap is ever hit.
 /// Locates a `.hlib` archive by logical name (and optional version),
 /// searching — in order — the declaring file's own `hlibs/` directory,
-/// that directory itself, the enclosing `bytes` project's `hlibs/`
-/// directory (`find_bytes_project_root` walks up to find it, same as
-/// `bytes ->` imports do), the user's personal cache
-/// (`~/.hackeros/H#/hlibs/`), and finally the system-wide location
-/// (`/usr/lib/HackerOS/H#/hlibs/`, alongside the std library — see
-/// `resolve_std_import`'s path constant).
+/// that directory itself, the enclosing `bit` project's `hlibs/`
+/// directory (`find_bit_project_root` walks up to find it, same as
+/// `bit ->` imports do), the user's personal cache
+/// (`~/.hackeros/H#/hlibs/`), the libraries `bit` installed (every
+/// directory `bit_resolve::bit_lib_candidates` knows for `name`, and their
+/// `.bit/out/` — where `bit install` puts the `.hlib` it built), and
+/// finally the system-wide location (`/usr/lib/HackerOS/H#/hlibs/`,
+/// alongside the std library — see `resolve_std_import`'s path constant).
 fn find_hlib_file(name: &str, version: Option<&str>, start_dir: &Path) -> Result<PathBuf, String> {
-    let project_root = bytes_resolve::find_bytes_project_root(start_dir);
+    let project_root = bit_resolve::find_bit_project_root(start_dir);
     let mut dirs: Vec<PathBuf> = vec![start_dir.join("hlibs"), start_dir.to_path_buf(), project_root.join("hlibs")];
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(PathBuf::from(home).join(".hackeros").join("H#").join("hlibs"));
+    }
+    if bit_resolve::valid_lib_name(name) {
+        for lib_dir in bit_resolve::bit_lib_candidates(name, start_dir) {
+            dirs.push(lib_dir.join(".bit/out"));
+            dirs.push(lib_dir);
+        }
     }
     dirs.push(PathBuf::from("/usr/lib/HackerOS/H#/hlibs"));
 
