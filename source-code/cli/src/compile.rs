@@ -71,8 +71,8 @@ pub fn run(
     // weakest of the three ways a function ends up with a `MemoryMode` —
     // its own `@mode` annotation wins, then its file's `@: mode`
     // directive, then finally this flag. Mainly meant to be set by the
-    // `bytes` package manager reading a `mem_mode` key out of `bytes.hk`,
-    // not typed by hand very often.
+    // `bit` package manager reading the `mem-mode` key of `[build]` out of
+    // `Bit.hk`, not typed by hand very often.
     let default_mem_mode = match mem_mode.as_deref() {
         None => None,
         Some("default")  => Some(hsharp_parser::ast::MemoryMode::Default),
@@ -134,19 +134,19 @@ pub fn run(
     }
     pb2.finish_with_message(format!("{} Parsed", "✓".green()));
 
-    // ── Resolve `mod X`, `use "std -> x"` and `use "bytes -> x"` ─────────────
+    // ── Resolve `mod X`, `use "std -> x"` and `use "bit -> x"` ───────────────
     // `mod cli` (etc.) previously did nothing: ModuleResolver::expand_module
     // existed in modules.rs but was never called anywhere in the pipeline, so
     // every item declared in a submodule file was silently absent from the
     // compiled program — any function in it would fail later as
     // "undefined fn: ..." with no indication the real problem was an
-    // unresolved `mod` declaration. `use "std -> x"` / `use "bytes -> x"`
+    // unresolved `mod` declaration. `use "std -> x"` / `use "bit -> x"`
     // had the exact same gap: `expand_program` (which additionally
-    // resolves those, via `resolve_std_import`/`resolve_bytes_import`)
+    // resolves those, via `resolve_std_import`/`resolve_bit_import`)
     // existed but wasn't wired in here either — this used to call the
     // narrower `expand_module` directly. Go through `expand_program` (the
     // documented single front-end entry point) so `mod`, `std ->`, and
-    // `bytes ->` are all inlined into the top-level module's item list
+    // `bit ->` are all inlined into the top-level module's item list
     // right after parsing, before anything downstream (typecheck/codegen)
     // ever sees it.
     let mut module = parsed.module.clone();
