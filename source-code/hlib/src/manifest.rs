@@ -170,7 +170,7 @@ pub enum AbiType {
 
 /// One declared dependency on another `.hlib`. Purely informational for
 /// v1 — no transitive resolver is shipped here; each language's own
-/// package manager (`bytes`, `virus`, Hacker Lang's env system) is
+/// package manager (`bit`, `virus`, Hacker Lang's env system) is
 /// expected to fetch these before the compiler tries to link.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dependency {
