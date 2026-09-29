@@ -1,7 +1,7 @@
 pub mod derive_codegen;
 pub mod lifetimes;
 pub mod modules;
-pub mod bytes_resolve;
+pub mod bit_resolve;
 pub mod traits;
 pub mod regions;
 pub mod ffi;
@@ -89,10 +89,10 @@ pub struct CompileOptions {
     /// the per-file `@: mode` directive — see ast.rs's
     /// `apply_file_mem_mode`) to every function that ends up with no
     /// `@mode` from either its own annotation or its file's `@:` line.
-    /// This is what lets `bytes.hk`'s `mem_mode` setting (see the `bytes`
-    /// package manager) apply to a whole project without editing a `@:`
-    /// line into every single source file by hand — `bytes` just passes
-    /// this flag through when it shells out to `hsharp build`/`compile`.
+    /// This is what lets `Bit.hk`'s `[build] -> mem-mode` setting (see the
+    /// `bit` package manager) apply to a whole project without editing a
+    /// `@:` line into every single source file by hand — `bit` just passes
+    /// this flag through when it shells out to `h# compile`.
     /// A function's own `@mode` still wins over this, and so does its
     /// file's `@:` directive if it has one — this is only the last,
     /// weakest fallback.
