@@ -4,6 +4,7 @@ pub mod interp;
 pub mod eval_expr;
 pub mod call;
 pub mod helpers;
+pub mod bit_resolve;
 
 // Re-export the public API so external callers keep working unchanged.
 pub use value::{Value, AsyncTaskState, Env, RuntimeError};
