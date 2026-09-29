@@ -68,18 +68,19 @@ impl Interpreter {
                     let ns = alias.clone().unwrap_or_else(|| lib.clone());
                     self.load_std_module(&lib, &ns)?;
                 }
-                // `use "bytes -> name"` / `dynamic use "bytes -> name"` —
-                // see `load_bytes_module`'s doc comment for the full
+                // `use "bit -> name"` / `dynamic use "bit -> name"` —
+                // see `load_bit_module`'s doc comment for the full
                 // resolution story. Resolved from the current working
                 // directory since (unlike `load_std_module`, which always
-                // reads a fixed absolute path) a `bytes ->` package lives
-                // relative to *this run's* project, and the interpreter
-                // has no other notion of "the entry file's directory"
-                // available at this call site.
-                hsharp_parser::ast::ImportKind::BytesRepo { name, version, alias: _, link } => {
+                // reads a fixed absolute path) a `bit ->` library is found
+                // relative to *this run's* project (`cache/libs`, `path`
+                // dependencies of `Bit.hk`), and the interpreter has no
+                // other notion of "the entry file's directory" available
+                // at this call site.
+                hsharp_parser::ast::ImportKind::BitRepo { name, version, alias: _, link } => {
                     let ns = alias.clone().unwrap_or_else(|| name.clone());
                     let start_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    self.load_bytes_module(name, version.as_deref(), *link, &start_dir, &ns)?;
+                    self.load_bit_module(name, version.as_deref(), *link, &start_dir, &ns)?;
                 }
                 _ => {}
             }
@@ -184,38 +185,38 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Resolve and load one `use "bytes -> name[/version]"` (or
-    /// `dynamic use "bytes -> name[/version]"`) import: find the package
-    /// via `helpers::resolve_bytes_use` (project-local
-    /// `build/cache/packages/<name>` first, then the global
-    /// `~/.hackeros/H#/build/cache/packages/<name>`, cross-checked against
-    /// `bytes.lock`), parse its entry file, and register its public
-    /// functions under the `{ns}::{fn}` namespace — same shape
-    /// `load_std_module` already gives `use "std -> lib"`, and the same
-    /// `register_mod_items` machinery underneath, so `pkg::do_thing(...)`-
-    /// style call sites work identically whether `pkg` came from `std` or
-    /// from `bytes`.
+    /// Resolve and load one `use "bit -> name[/version]"` (or
+    /// `dynamic use "bit -> name[/version]"`) import: find the library
+    /// via `bit_resolve::resolve_bit_use` (project-local `cache/libs` and
+    /// `cache/source`, `path` dependencies of `Bit.hk`, then the
+    /// libraries `bit install` put in `~/.hackeros/libs/<name>/<commit>`,
+    /// cross-checked against `bit.lock`), parse its entry file, and
+    /// register its public functions under the `{ns}::{fn}` namespace —
+    /// same shape `load_std_module` already gives `use "std -> lib"`, and
+    /// the same `register_mod_items` machinery underneath, so
+    /// `lib::do_thing(...)`-style call sites work identically whether
+    /// `lib` came from `std` or from `bit`.
     ///
     /// A `Static` (the default) and a `Dynamic` (`dynamic use ...`) import
     /// are resolved identically *here* — the interpreter is a tree-walker
     /// with no separate "already linked into the binary" state to speak
     /// of, so the distinction only changes which errors are hard-required
-    /// up front (`Dynamic` additionally demands a `bytes.lock` entry —
-    /// see `resolve_bytes_use` — since its whole contract is "already
+    /// up front (`Dynamic` additionally demands a `bit.lock` entry —
+    /// see `resolve_bit_use` — since its whole contract is "already
     /// installed on this host", not merely "a folder with the right name
     /// happens to exist"). The LLVM/AOT backend, which genuinely does
-    /// choose between inlining a package's code at compile time versus
+    /// choose between inlining a library's code at compile time versus
     /// deferring to the running machine, is where `Static` vs. `Dynamic`
     /// actually diverges — see `hsharp-compiler`'s `modules.rs`.
     ///
     /// Like `load_std_module`, a missing/unresolvable/version-mismatched
-    /// package is a hard error (via `helpers::resolve_bytes_use`'s own
+    /// library is a hard error (via `bit_resolve::resolve_bit_use`'s own
     /// messages), never a silent stub — and, like `load_std_module`, this
-    /// recurses into the package's own `use "std -> x"` / `use "bytes ->
-    /// y"` imports (resolved from the package's own directory) before
+    /// recurses into the library's own `use "std -> x"` / `use "bit ->
+    /// y"` imports (resolved from the library's own directory) before
     /// registering its functions, so its internal calls into another
     /// module see that module already loaded.
-    pub fn load_bytes_module(
+    pub fn load_bit_module(
         &mut self,
         name: &str,
         version: Option<&str>,
@@ -223,16 +224,16 @@ impl Interpreter {
         start_dir: &std::path::Path,
         ns: &str,
     ) -> Result<(), RuntimeError> {
-        let path = crate::helpers::resolve_bytes_use(name, version, link, start_dir)
+        let path = crate::bit_resolve::resolve_bit_use(name, version, link, start_dir)
             .map_err(RuntimeError::Custom)?;
 
         let src = std::fs::read_to_string(&path)
-            .map_err(|e| RuntimeError::Custom(format!("cannot read bytes package '{}' at {}: {}", name, path.display(), e)))?;
+            .map_err(|e| RuntimeError::Custom(format!("cannot read bit library '{}' at {}: {}", name, path.display(), e)))?;
 
         let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(name));
         if result.has_errors() {
             return Err(RuntimeError::Custom(format!(
-                "parse errors while loading bytes package '{}' ({}):\n{}",
+                "parse errors while loading bit library '{}' ({}):\n{}",
                 name, path.display(), result.render_errors()
             )));
         }
@@ -240,9 +241,9 @@ impl Interpreter {
         let pkg_dir = path.parent().map(|p| p.to_path_buf())
             .unwrap_or_else(|| start_dir.to_path_buf());
 
-        // This package's own imports, resolved before its functions are
+        // This library's own imports, resolved before its functions are
         // registered — so its internal calls into `std` or into another
-        // `bytes` package see that module already loaded, exactly like
+        // `bit` library see that module already loaded, exactly like
         // `load_std_module` does for a std file's own `use "std -> x"`.
         for (kind, sub_alias, _span) in &result.module.imports {
             match kind {
@@ -252,9 +253,9 @@ impl Interpreter {
                     let sub_ns = sub_alias.clone().unwrap_or_else(|| sub_lib.clone());
                     self.load_std_module(&sub_lib, &sub_ns)?;
                 }
-                ImportKind::BytesRepo { name: sub_name, version: sub_version, alias: _, link: sub_link } => {
+                ImportKind::BitRepo { name: sub_name, version: sub_version, alias: _, link: sub_link } => {
                     let sub_ns = sub_alias.clone().unwrap_or_else(|| sub_name.clone());
-                    self.load_bytes_module(sub_name, sub_version.as_deref(), *sub_link, &pkg_dir, &sub_ns)?;
+                    self.load_bit_module(sub_name, sub_version.as_deref(), *sub_link, &pkg_dir, &sub_ns)?;
                 }
                 _ => {}
             }
