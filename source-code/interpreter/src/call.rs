@@ -2175,8 +2175,8 @@ impl Interpreter {
             // process exit code, and a silently-ignored assertion never
             // produces a nonzero exit. These builtins raise a real
             // RuntimeError::Panic on failure so a failing assertion
-            // actually fails the test (and fails `bytes test`'s
-            // `hsharp preview` subprocess check).
+            // actually fails the test (and fails the
+            // `hsharp preview` subprocess check of a test runner).
             "assert_eq" => {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
@@ -2283,7 +2283,7 @@ impl Interpreter {
                 // Skipping isn't distinguished from passing at this layer
                 // (no separate "skipped" exit-code channel) — treat as a
                 // no-op success. A real skip-tracking mechanism belongs in
-                // the bytes test_runner, which already has its own
+                // a test runner, which already has its own
                 // per-function subprocess invocation it could extend.
                 return Ok(Value::Nil);
             }
