@@ -137,7 +137,7 @@ impl HlibArchive {
     /// and the embedded public key would still "verify" against itself.
     /// Real trust comes from the caller comparing this key against a
     /// key it already trusts (a lockfile pin, a project's declared
-    /// publisher key, etc.), same as `bytes.lock`/`virus` pin package
+    /// publisher key, etc.), same as `bit.lock`/`virus` pin package
     /// hashes today.
     pub fn verify_signature(&self, expected_public_key_hex: &str) -> Result<()> {
         let sig_bytes = self.entries.get(SIGNATURE_ENTRY).ok_or(HlibError::Unsigned)?;
