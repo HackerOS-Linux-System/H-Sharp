@@ -253,8 +253,8 @@ impl Parser {
     fn parse_import(&mut self) -> Result<(ImportKind, Option<String>, Span), ParseError> {
         let start = self.current().span.clone();
 
-        // Optional `dynamic` modifier right before `use`: `dynamic use "bytes -> pkg"`.
-        // Only meaningful for `bytes -> pkg` imports — `std`/`core` always ship
+        // Optional `dynamic` modifier right before `use`: `dynamic use "bit -> lib"`.
+        // Only meaningful for `bit -> lib` imports — `std`/`core` always ship
         // baked into the compiler and are rejected below if tagged dynamic.
         let dynamic = if let TokenKind::Ident(ref s) = self.current().kind {
             s == "dynamic"
@@ -263,7 +263,7 @@ impl Parser {
         if dynamic && !matches!(self.current().kind, TokenKind::Use) {
             return Err(self.error(
                 "expected `use` after `dynamic`",
-                vec![r#"write: dynamic use "bytes -> pkgname""#.to_string()],
+                vec![r#"write: dynamic use "bit -> libname""#.to_string()],
             ));
         }
 
@@ -287,14 +287,29 @@ impl Parser {
 
         let span = start.merge(&self.current().span);
 
-        if dynamic && !path_tok.trim_start().starts_with("bytes") {
+        // The `bytes` package manager was removed in favour of `bit`
+        // (bit.io). Say so explicitly instead of a generic "invalid use path".
+        if use_path_head(&path_tok) == Some("bytes") {
             return Err(ParseError::new(
-                ParseErrorKind::Custom("dynamic use is only valid for bytes imports".into()),
+                ParseErrorKind::Custom("the `bytes` package manager was removed".into()),
+                span.clone(),
+                format!("`use \"{}\"` is no longer supported", path_tok),
+                vec![
+                    "`bytes` was replaced by `bit` (bit.io) — H# libraries now come from bit".to_string(),
+                    format!("write: use \"bit -> {}\"", path_tok.splitn(2, " -> ").nth(1).unwrap_or("libname").trim()),
+                    "install libraries with: bit install <name>".to_string(),
+                ],
+            ));
+        }
+
+        if dynamic && use_path_head(&path_tok) != Some("bit") {
+            return Err(ParseError::new(
+                ParseErrorKind::Custom("dynamic use is only valid for bit imports".into()),
                 span.clone(),
                 format!("`dynamic use \"{}\"` is not allowed", path_tok),
                 vec![
                     "std and core are always statically linked into the compiler".to_string(),
-                    r#"only "bytes -> pkgname" imports may be dynamic"#.to_string(),
+                    r#"only "bit -> libname" imports may be dynamic"#.to_string(),
                 ],
             ));
         }
@@ -305,7 +320,7 @@ impl Parser {
             ParseErrorKind::Custom("invalid use path".into()),
                                        span.clone(),
                                        format!("cannot parse use path `{}`", path_tok),
-                                           vec![r#"valid forms: "std -> module", "bytes -> pkg/1.0", "github -> owner/repo""#.to_string()],
+                                           vec![r#"valid forms: "std -> module", "bit -> lib/1.0", "github -> owner/repo""#.to_string()],
         ))?;
         Ok((kind, alias, span))
     }
@@ -1035,7 +1050,7 @@ impl Parser {
                 // `hsharp-compiler::modules::mangle_module_items` was
                 // later extended to *also* rename every top-level
                 // struct/enum in an inlined `mod`/`use "std -> x"`/
-                // `use "bytes -> x"` file to `{prefix}_{Name}` (see that
+                // `use "bit -> x"` file to `{prefix}_{Name}` (see that
                 // function's doc comment — added to stop two same-named
                 // structs from different inlined files, e.g. two
                 // `TcpStream`s, from colliding), exactly like it already
@@ -1092,7 +1107,7 @@ impl Parser {
 
     pub fn parse_stmt(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.skip_newlines();
-        // `dynamic use "bytes -> pkg"` inside a function body — same import
+        // `dynamic use "bit -> lib"` inside a function body — same import
         // statement as top-level, just checked here first since `dynamic`
         // lexes as a plain identifier and would otherwise fall through to
         // the expression-statement arm below.
@@ -1619,7 +1634,7 @@ impl Parser {
                 // fixed alongside this one): `mangle_module_items`
                 // (compiler/src/modules.rs) renames every top-level
                 // struct/enum inlined from a `mod`/`use "std -> x"`/
-                // `use "bytes -> x"` file to `{prefix}_{Name}`, so the
+                // `use "bit -> x"` file to `{prefix}_{Name}`, so the
                 // struct's *actual* registered name after inlining is
                 // the underscore-joined form (`git_info_GitInfo`), not
                 // the bare last segment. Joining with `_` here matches
@@ -2503,11 +2518,11 @@ fn parse_use_path(path: &str, alias: Option<String>, link: ImportLinkKind) -> Op
         // e.g. `use "workspace -> parser" from "ast -> *"` — H#'s
         // equivalent of Rust's `use hsharp_parser::ast::*;`. Resolved by
         // `ModuleResolver::resolve_workspace_import` in the compiler
-        // crate (see `compiler::modules`/`compiler::bytes_resolve`),
+        // crate (see `compiler::modules`/`compiler::bit_resolve`),
         // against the enclosing project's `[workspace] -> members` list
-        // in its root `Bytes.hk`/`bytes.hk` — the very same file/section
-        // `bytes` itself reads to drive `bytes build --release` across
-        // a multi-member workspace.
+        // in its root `Bit.hk`/`bit.hk` — the very same file/section
+        // `bit` itself reads to drive `bit build` across a multi-member
+        // workspace.
         let member = path.splitn(2, arrow).nth(1)?.trim().to_string();
         let (module, item) = match alias {
             None => (None, None),
@@ -2529,10 +2544,13 @@ fn parse_use_path(path: &str, alias: Option<String>, link: ImportLinkKind) -> Op
         if member.is_empty() { return None; }
         return Some(ImportKind::Workspace { member, module, item });
     }
-    if path.starts_with("bytes") && path.contains(arrow) {
+    if use_path_head(path) == Some("bit") {
+        // use "bit -> mold" from "alias"   (also "bit -> mold/1.2.0" or a
+        // commit id: "bit -> mold/a1b2c3d4e5f6")
         let rest = path.splitn(2, arrow).nth(1)?.trim();
-        let (name, ver) = split_name_ver(rest);
-        return Some(ImportKind::BytesRepo { name, version: ver, alias, link });
+        let (name, ver) = split_bit_name_ver(rest);
+        if name.is_empty() { return None; }
+        return Some(ImportKind::BitRepo { name, version: ver, alias, link });
     }
     if path.starts_with("hlib") && path.contains(arrow) {
         // use "hlib -> mylib" from "alias"   (also accepts "hlib -> mylib/1.2.0")
@@ -2571,6 +2589,26 @@ fn parse_use_path(path: &str, alias: Option<String>, link: ImportLinkKind) -> Op
         return Some(ImportKind::Std { path: parts, alias });
     }
     None
+}
+
+/// The word before the first ` -> ` of a use path (`"bit -> mold"` → `bit`),
+/// or `None` when the path has no arrow. Compared for equality (not
+/// `starts_with`), so `"bitmap -> x"` is never mistaken for `bit`.
+fn use_path_head(path: &str) -> Option<&str> {
+    let (head, _) = path.split_once(" -> ")?;
+    Some(head.trim())
+}
+
+/// `mold` → (`mold`, None); `mold/1.2.0`, `mold/v1.2` or `mold/a1b2c3d4e5f6`
+/// (a bit "version" is a release tag or a commit id, so — unlike
+/// `split_name_ver` — the part after the slash need not start with a digit).
+/// bit library names never contain `/`, so the first one splits.
+fn split_bit_name_ver(s: &str) -> (String, Option<String>) {
+    match s.split_once('/') {
+        Some((n, v)) if !v.trim().is_empty() => (n.trim().to_string(), Some(v.trim().to_string())),
+        Some((n, _)) => (n.trim().to_string(), None),
+        None => (s.trim().to_string(), None),
+    }
 }
 
 fn split_name_ver(s: &str) -> (String, Option<String>) {
