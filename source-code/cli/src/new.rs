@@ -19,7 +19,40 @@ pub fn run(name: String, template: String) {
         "dependencies": {}
     });
     std::fs::write(project_dir.join("h#.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
-    std::fs::write(project_dir.join(".gitignore"), "build/\n*.c\n.cache/\n").unwrap();
+    std::fs::write(project_dir.join(".gitignore"), "build/\n*.c\n.cache/\ncache/\n.bit/\n").unwrap();
+
+    // `Bit.hk` — the manifest of the `bit` package manager (bit.io). With it
+    // a bare `bit` builds the project, `bit add <lib>` records dependencies
+    // and `use "bit -> <lib>"` finds the installed libraries.
+    let is_lib = template == "lib";
+    let bit_hk = format!(
+        "[package]\n\
+-> name        => {name}\n\
+-> version     => 0.1.0\n\
+-> lang        => h#\n\
+\n\
+[layout]\n\
+-> src => src\n\
+{lib_layout}\
+\n\
+[build]\n\
+-> link => static\n\
+{lib_out}\
+\n\
+! what a bare `bit` / `bit build` does\n\
+[default-build]\n\
+-> profile => release\n\
+-> emit    => {emit}\n\
+\n\
+! libraries: `bit add <name>` installs one and records it here;\n\
+! use it in code with:  use \"bit -> <name>\"\n\
+[dependencies]\n",
+        name = name,
+        lib_layout = if is_lib { "-> hsharp-lib-entry => src/main.h#\n" } else { "" },
+        lib_out = if is_lib { "\n[lib]\n-> output => hlib\n" } else { "" },
+        emit = if is_lib { "hlib" } else { "bin" },
+    );
+    std::fs::write(project_dir.join("Bit.hk"), bit_hk).unwrap();
 
     let (main_src, readme_src, test_src) = match template.as_str() {
         "cybersec" | "security" => (TEMPLATE_CYBERSEC, README_CYBERSEC, TEST_CYBERSEC),
@@ -40,11 +73,14 @@ pub fn run(name: String, template: String) {
     println!("  {} {}/tests/main_test.h#", "Created:".green(), name);
     println!("  {} {}/README.md", "Created:".green(), name);
     println!("  {} {}/h#.json", "Created:".green(), name);
+    println!("  {} {}/Bit.hk", "Created:".green(), name);
     println!("\n  {}", "Get started:".bold());
     println!("    cd {}", name);
     println!("    h# preview src/main.h#    # run in interpreter mode");
     println!("    h# compile src/main.h#    # compile to native binary");
-    println!("    bytes test                # run tests");
+    println!("    bit                       # build with bit (reads Bit.hk)");
+    println!("    bit check                 # syntax + type check");
+    println!("    bit add <lib>             # add a library, then: use \"bit -> <lib>\"");
 }
 
 // ── Templates — App ──────────────────────────────────────────────────────────
@@ -84,9 +120,10 @@ h# preview src/main.h#
 h# compile src/main.h# --release -o build/app
 ```
 
-## Test
+## Build & check with bit
 ```bash
-bytes test
+bit          # build (reads Bit.hk)
+bit check    # syntax + type check
 ```
 "#;
 
