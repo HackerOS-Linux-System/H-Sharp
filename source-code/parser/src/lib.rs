@@ -65,7 +65,7 @@ pub fn parse(source: &str, file: &str) -> ParseResult {
 // `-> execute::Shell`). See `parser::parse_type_base`'s and
 // `parser::parse_ident_expr_from`'s (struct-literal arm) doc comments for
 // the full root-cause explanation: `hsharp-compiler::modules::mangle_module_items`
-// renames an inlined `mod`/`std ->`/`bytes ->` file's own structs/enums to
+// renames an inlined `mod`/`std ->`/`bit ->` file's own structs/enums to
 // `{prefix}_{Name}`, so a qualified type annotation or struct literal has
 // to resolve to that same joined spelling, not just the bare last segment.
 #[cfg(test)]
@@ -139,5 +139,90 @@ mod qualified_module_type_tests {
             }
             other => panic!("expected `return git_info_GitInfo {{ .. }}`, got {:?}", other),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `use "bit -> lib"` imports (the `bytes` package manager was replaced by
+// `bit`, bit.io). `bytes -> x` is rejected with an explicit message.
+#[cfg(test)]
+mod bit_import_tests {
+    use super::*;
+    use ast::{ImportKind, ImportLinkKind};
+
+    fn first_import(src: &str) -> ImportKind {
+        let result = parse(src, "test.h#");
+        assert!(!result.has_errors(), "unexpected parse errors: {}", result.render_errors());
+        result.module.imports.first().expect("no import parsed").0.clone()
+    }
+
+    #[test]
+    fn plain_bit_import() {
+        match first_import("use \"bit -> mold\"\nfn main() is end\n") {
+            ImportKind::BitRepo { name, version, alias, link } => {
+                assert_eq!(name, "mold");
+                assert_eq!(version, None);
+                assert_eq!(alias, None);
+                assert_eq!(link, ImportLinkKind::Static);
+            }
+            other => panic!("expected BitRepo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bit_import_with_alias_and_release_version() {
+        match first_import("use \"bit -> tui/1.0.2\" from \"t\"\nfn main() is end\n") {
+            ImportKind::BitRepo { name, version, alias, .. } => {
+                assert_eq!(name, "tui");
+                assert_eq!(version.as_deref(), Some("1.0.2"));
+                assert_eq!(alias.as_deref(), Some("t"));
+            }
+            other => panic!("expected BitRepo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bit_import_with_tag_or_commit_version() {
+        for (spec, want) in [("mold/v1.0", "v1.0"), ("mold/a1b2c3d4e5f6", "a1b2c3d4e5f6")] {
+            let src = format!("use \"bit -> {}\"\nfn main() is end\n", spec);
+            match first_import(&src) {
+                ImportKind::BitRepo { name, version, .. } => {
+                    assert_eq!(name, "mold");
+                    assert_eq!(version.as_deref(), Some(want));
+                }
+                other => panic!("expected BitRepo, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_bit_import() {
+        match first_import("dynamic use \"bit -> mold\"\nfn main() is end\n") {
+            ImportKind::BitRepo { link, .. } => assert_eq!(link, ImportLinkKind::Dynamic),
+            other => panic!("expected BitRepo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dynamic_std_is_still_rejected() {
+        let result = parse("dynamic use \"std -> io\"\nfn main() is end\n", "test.h#");
+        assert!(result.has_errors());
+        assert!(result.render_errors().contains("bit"));
+    }
+
+    #[test]
+    fn bytes_import_is_removed_with_a_helpful_error() {
+        let result = parse("use \"bytes -> scanner\"\nfn main() is end\n", "test.h#");
+        assert!(result.has_errors());
+        let rendered = result.render_errors();
+        assert!(rendered.contains("bytes"), "{}", rendered);
+        assert!(rendered.contains("use \"bit -> scanner\""), "{}", rendered);
+    }
+
+    #[test]
+    fn bit_prefix_is_not_confused_with_other_heads() {
+        // `bitmap` is not `bit`; it is simply not a known import kind.
+        let result = parse("use \"bitmap -> x\"\nfn main() is end\n", "test.h#");
+        assert!(result.has_errors());
     }
 }
