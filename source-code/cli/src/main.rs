@@ -79,8 +79,8 @@ pub enum Command {
         /// Project-wide default MemoryMode fallback (weaker than a
         /// function's own @mode and weaker than its file's `@: mode`
         /// directive — see CompileOptions::default_mem_mode). Mainly set
-        /// by the `bytes` package manager from `bytes.hk`'s `mem_mode`
-        /// key, not typed by hand.
+        /// by the `bit` package manager from the `mem-mode` key of
+        /// `[build]` in `Bit.hk`, not typed by hand.
         /// Valid: default, safety, arc, arena, pointers
         #[arg(long = "mem-mode", value_name = "MODE")]
         mem_mode: Option<String>,
