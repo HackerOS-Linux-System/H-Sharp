@@ -1,10 +1,6 @@
 // curl
 
 ;; Package Manager
-^> curl -L https://github.com/Bytes-Repository/bytes/releases/download/v0.9/bytes -o /usr/bin/bytes
-^> curl -L https://github.com/Bytes-Repository/vira/releases/download/v0.9/vira -o /usr/bin/vira
-^> curl -L https://github.com/Bytes-Repository/fast/releases/download/v0.9/fast -o /usr/bin/fast
+^> curl -L https://github.com/HackerOS-Linux-System/bit/releases/download/v0.9/bit -o /usr/bin/bit
 
-^> chmod a+x /usr/bin/bytes
-^> chmod a+x /usr/bin/vira
-^> chmod a+x /usr/bin/fast
+^> chmod a+x /usr/bin/bit
