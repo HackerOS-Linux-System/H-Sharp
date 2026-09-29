@@ -54,7 +54,7 @@ fn cmd_build(
         die("parsing failed.");
     }
 
-    // ── Resolve `mod`/`use "std -> x"`/`use "bytes -> x"` ───────────────
+    // ── Resolve `mod`/`use "std -> x"`/`use "bit -> x"` ─────────────────
     let mut module = parsed.module.clone();
     {
         let mut resolver = hsharp_compiler::modules::ModuleResolver::new(&file);
