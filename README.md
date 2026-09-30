@@ -21,15 +21,6 @@ end
 ### HackerOS
 ```bash
 hacker unpack h#          # kompilator + interpreter
-hacker unpack h#-utils    # bytes + h# check/new/targets
-```
-
-### Manualna
-```bash
-tar -xzf h-sharp-0.8.0.tar.gz && cd h-sharp-0.8
-sudo ./install.sh
-# Std library
-sudo cp std/*.h# /usr/lib/HackerOS/H#/std/
 ```
 
 ### Z kodu źródłowego (wymaga LLVM 21 + Rust 1.85+)
@@ -44,7 +35,7 @@ LLVM_SYS_210_PREFIX=/usr/lib/llvm-21 cargo build --release
 | Narzędzie | Opis | Backend |
 |-----------|------|---------|
 | `h#` | Kompilator + interpreter CLI | LLVM 21 (release) / interpreter (preview) |
-| `bytes` | JIT package manager | RAM-based JIT (Cranelift) |
+| `hhc` | Kompilator | Na bazie gcc |
 
 ### Komendy
 
@@ -76,19 +67,6 @@ h# new myapp --template lib
 
 # Dostępne targety
 h# targets
-
-# JIT (bytes)
-bytes new myapp && cd myapp
-bytes run
-bytes run --tier interpreter   # czysty interpreter
-bytes run --tier jit           # Cranelift JIT (domyślny)
-bytes add scanner              # dodaj pakiet H#
-bytes python numpy             # dodaj bibliotekę Python
-bytes test                     # uruchom testy
-bytes fmt                      # formatuj kod
-bytes doc                      # generuj dokumentację HTML
-```
-
 ---
 
 ## Składnia H#
@@ -374,8 +352,6 @@ H# wspiera wbudowany system testów. Uruchamianie testów:
 
 ```bash
 h# check tests/            # weryfikacja składni i typów
-bytes test                 # uruchomienie wszystkich testów
-bytes test tests/core/     # testy wybranego katalogu
 ```
 
 Pisanie testów:
@@ -403,38 +379,6 @@ fn test_error_handling() is
     assert_err(result)
 end
 ```
-
----
-
-## Znane ograniczenia (v0.7)
-
-Poniższe ograniczenia zostały zidentyfikowane podczas audytu i **większość naprawiona** w tej wersji. Poniżej lista tego, co **nadal** pozostaje otwarte:
-
-- **Mutowalne przechwytywanie w closures** — closure może *odczytać* zmienną z otaczającego scope (`let f = |x| x * outer_var`), ale mutacja przechwyconej zmiennej wewnątrz closure (`let f = || counter += 1`) nie jest widoczna po powrocie z `f()`. Naprawienie wymaga zmiany `Env` na `Rc<RefCell<...>>` per-zmienna — architektoniczna zmiana zaplanowana na v0.8.
-- **LLVM codegen — pełna weryfikacja** — backen LLVM obsługuje Path calls (`module::function()`) na poziomie kodu, ale nie był uruchamiany z pełnym zestawem stdlib bindings (LLVM kompiluje do maszynowego kodu, interpreter jest do preview/test). To normalne: LLVM target to produkcja, interpreter to dev.
-
-### Co zostało naprawione w v0.7
-
-Poniższe punkty były w poprzedniej liście "znanych ograniczeń" i zostały **całkowicie wdrożone**:
-
-- ✅ **`crypto::hmac_sha256`** — prawdziwy HMAC-SHA256 przez `sha2`/`hmac` crates (native Rust, zero zależności od shella)
-- ✅ **`crypto::sha256`/`sha512`/`md5`/`sha1`** — wszystkie przepisane z shella (`sha256sum`) na native Rust  
-- ✅ **`sec::rot13`** — native Rust implementation
-- ✅ **`fs::is_file`** — prawdziwe `Path::is_file()` odróżniające plik od katalogu (wcześniej błędny alias do `fs_exists`)
-- ✅ **Literalne `{{`/`}}`** w stringach — poprawnie redukują się do `{`/`}`, w tym stringi zawierające **wyłącznie** escaped klamry bez żadnej prawdziwej interpolacji (np. literały JSON)
-- ✅ **`module::function()` parsing** — `col::HashMap::new()`, `async::spawn()`, `fs::write()` i każda inna `keyword::fn()` ścieżka parsuje się poprawnie
-- ✅ **`fn(int) -> int` jako typ parametru** — powodowało hang; teraz parsuje się do `TypeExpr::Fn` i jest obsługiwane przez typechecker i interpreter
-- ✅ **Pełne pattern matching** — `match c is Color::Red =>`, `Color::Custom(_, _, _) =>`, struct patterns, range patterns — wszystkie działają
-- ✅ **Enum wartości** — `Color::Red`, `Color::Custom(255, 0, 0)` jako wyrażenia tworzą runtime `Value::Struct`
-- ✅ **`impl` method dispatch** — `p.distance_to(other)`, `Type::new(x, y)` i wszystkie user-defined metody na struct działają przez interpreter
-- ✅ **`arr.push(x)`/`map.insert(k,v)` mutacja** — mutujące metody faktycznie modyfikują zmienną w scope (write-back do env)
-- ✅ **`let (a, b) = swap(1, 2)`** — tuple destructuring w `let` przez desugar do tymczasowej zmiennej
-- ✅ **`|| -> T is ... end`** (zero-param closures) — parser poprawnie rozróżnia `||` (Or token) jako pustą listę parametrów
-- ✅ **`!expr.method()` precedencja** — krytyczny bug: `!map.contains_key("k")` parsowało się jako `(!map).contains_key("k")` zamiast `!(map.contains_key("k"))` — naprawiony przez `parse_expr(29)` zamiast `parse_prefix()`
-- ✅ **`match arm => assignment`** — `match x is 1 => handled = true end` nie wykonywało przypisania (omijało `exec_stmt`); naprawione przez zawsze przechodzenie przez `exec_block`
-- ✅ **Operator `?` short-circuit** — `let r = fn()?` nie przerywał funkcji przy `nil`, bo `Stmt::Let` nie sprawdzał `Value::Return` sygnału; naprawione
-- ✅ **`assert_eq`/`assert_true`/etc.** — wszystkie wcześniej **cicho ignorowane** (catch-all `Ok(Nil)`); teraz prawdziwe buildiny z `RuntimeError::Panic`
-- ✅ **`json::parse`/`json::get_str`/etc.** — brakowało aliasów `json::X → json_X`; wszystkie 19 funkcji json:: teraz poprawnie zmapowane
 
 ---
 
