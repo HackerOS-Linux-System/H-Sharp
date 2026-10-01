@@ -1,0 +1,35 @@
+struct Counter is
+    pub n: int
+    pub name: string
+end
+
+impl Counter is
+    fn new(name: string) -> Counter is
+        return Counter { n: 0, name: name }
+    end
+
+    fn value(self) -> int is
+        return self.n
+    end
+
+    fn label(self) -> string is
+        return self.name
+    end
+
+    fn add(self, d: int) -> int is
+        return self.value() + d
+    end
+end
+
+#[test]
+fn test_self_field_access() is
+    let c = Counter::new("c1")
+    assert_eq(c.value(), 0)
+    assert_eq(c.label(), "c1")
+end
+
+#[test]
+fn test_self_method_calls_self_method() is
+    let c = Counter::new("c2")
+    assert_eq(c.add(5), 5)
+end
