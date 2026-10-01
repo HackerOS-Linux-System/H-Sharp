@@ -950,16 +950,15 @@ pub fn hoist_nested_fns(body: &mut Vec<Stmt>, enclosing_name: &str) -> Vec<FnDef
 /// closes that gap generally, not just for the one collision that
 /// happened to be found by hand.
 ///
-/// Known remaining limitation: this does NOT rewrite `Pattern::Struct`/
-/// `Pattern::Enum` (destructuring a struct or matching an enum variant
-/// in a `match` arm) — those still reference the *original* type name.
-/// This is safe-but-incomplete rather than silently wrong: a local
-/// struct/enum that's only ever constructed and field-accessed (which
-/// covers every struct in this stdlib today — plain data records, no
-/// pattern-matched enums) mangles correctly; one that's pattern-matched
-/// would need that additional rewrite too, and will currently fail to
-/// typecheck/resolve loudly (a clear "unknown type" error) rather than
-/// silently binding to the wrong type, if that gap is ever hit.
+/// `Pattern::Enum { qualified_type }` / `Pattern::Struct { name }` and the
+/// first segment of `Expr::Path` (`Shape::Rect(..)`, `Shape::new()`) are
+/// rewritten too (`rename_pattern` / the `Expr::Path` arm), so enums that
+/// are constructed and pattern-matched survive inlining.
+///
+/// Still NOT rewritten (see RUST-HSHARP-TODO.md): a bare `Expr::Ident`
+/// naming a local fn used as a *value* (`map(xs, helper)`), `Stmt::Let`
+/// destructuring patterns, closure parameter types, and trait-side names
+/// of `impl Trait for Local`.
 /// Locates a `.hlib` archive by logical name (and optional version),
 /// searching — in order — the declaring file's own `hlibs/` directory,
 /// that directory itself, the enclosing `bit` project's `hlibs/`
@@ -1255,6 +1254,7 @@ fn rename_calls_in_expr(expr: &mut Expr, local_fns: &HashSet<String>, local_type
         Expr::Match { subject, arms, .. } => {
             rename_calls_in_expr(subject, local_fns, local_types, prefix);
             for arm in arms.iter_mut() {
+                rename_pattern(&mut arm.pattern, local_types, prefix);
                 if let Some(g) = &mut arm.guard { rename_calls_in_expr(g, local_fns, local_types, prefix); }
                 rename_calls_in_stmts(&mut arm.body, local_fns, local_types, prefix);
             }
@@ -1271,7 +1271,53 @@ fn rename_calls_in_expr(expr: &mut Expr, local_fns: &HashSet<String>, local_type
         Expr::Closure { body, .. } => rename_calls_in_stmts(body, local_fns, local_types, prefix),
         Expr::Unsafe(body, _, _)   => rename_calls_in_stmts(body, local_fns, local_types, prefix),
         Expr::Return(Some(e), _)   => rename_calls_in_expr(e, local_fns, local_types, prefix),
+        // `Shape::Rect(1, 2)` / `Shape::new()` -- the first segment names a
+        // *local* enum/struct that was just renamed to `{prefix}_Shape`, so
+        // the path has to follow it, or enum construction and static-method
+        // calls silently resolve to nothing after inlining (this is what
+        // broke every `use "workspace -> x"` / `use "bit -> x"` library
+        // that constructs its own enums).
+        Expr::Path(segments, _) => {
+            if segments.len() >= 2 {
+                if let Some(first) = segments.first_mut() {
+                    if local_types.contains(first.as_str()) {
+                        *first = format!("{}_{}", prefix, first);
+                    }
+                }
+            }
+        }
         Expr::Literal(..) | Expr::Ident(..) | Expr::SelfExpr(_) |
-        Expr::Path(..) | Expr::Return(None, _) => {}
+        Expr::Return(None, _) => {}
+    }
+}
+
+/// Rewrites the type names a `match` pattern mentions so they follow the
+/// `{prefix}_{Name}` renaming of `mangle_module_items`: the qualifier of
+/// `Shape::Rect(w, h)` and the name of a `Point { x, y }` destructure.
+/// Recurses through tuples, or-patterns, ranges and nested payloads.
+fn rename_pattern(pat: &mut Pattern, local_types: &HashSet<String>, prefix: &str) {
+    match pat {
+        Pattern::Enum { qualified_type, inner, .. } => {
+            if let Some(qt) = qualified_type {
+                if local_types.contains(qt.as_str()) {
+                    *qt = format!("{}_{}", prefix, qt);
+                }
+            }
+            for p in inner.iter_mut() { rename_pattern(p, local_types, prefix); }
+        }
+        Pattern::Struct { name, fields, .. } => {
+            if local_types.contains(name.as_str()) {
+                *name = format!("{}_{}", prefix, name);
+            }
+            for (_, p) in fields.iter_mut() { rename_pattern(p, local_types, prefix); }
+        }
+        Pattern::Tuple(ps, _) | Pattern::Or(ps, _) => {
+            for p in ps.iter_mut() { rename_pattern(p, local_types, prefix); }
+        }
+        Pattern::Range(lo, hi, _, _) => {
+            rename_pattern(lo, local_types, prefix);
+            rename_pattern(hi, local_types, prefix);
+        }
+        Pattern::Wildcard(_) | Pattern::Ident(..) | Pattern::Literal(..) => {}
     }
 }
