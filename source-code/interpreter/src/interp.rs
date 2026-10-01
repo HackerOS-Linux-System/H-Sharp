@@ -484,6 +484,22 @@ impl Interpreter {
                             _ => Ok(None),
                         }
                     }
+                    // A statement-position `match` whose arm did `return`/
+                    // `break`/`continue`: `eval_expr` hands that back as a
+                    // `Value::Return`/`Break`/`Continue` *value*. It used to be
+                    // dropped here, so `match x is A => return 1 end` followed
+                    // by any other statement fell through and kept running
+                    // (it only worked when the `match` was the block's last
+                    // statement, via the implicit-tail path in `exec_block`).
+                    Expr::Match { .. } => {
+                        let v = self.eval_expr(expr)?;
+                        match v {
+                            crate::value::Value::Return(_)
+                            | crate::value::Value::Break
+                            | crate::value::Value::Continue => Ok(Some(v)),
+                            _ => Ok(None),
+                        }
+                    }
                     _ => {
                         self.eval_expr(expr)?;
                         Ok(None)
