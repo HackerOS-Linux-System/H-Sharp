@@ -1,3 +1,4 @@
+use crate::value::HArr;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use crate::value::{Value, RuntimeError};
@@ -470,7 +471,7 @@ pub fn compute_mutated_container(obj: &Value, method: &str, args: &[Value]) -> O
         }
         (Value::Array(arr), "clear") => {
             let _ = arr;
-            Some(Value::Array(Vec::new()))
+            Some(Value::Array(HArr::from(Vec::new())))
         }
         (Value::Array(arr), "sort") => {
             let mut new_arr = arr.clone();
@@ -496,7 +497,7 @@ pub fn compute_mutated_container(obj: &Value, method: &str, args: &[Value]) -> O
         // ── HashSet ──────────────────────────────────────────────────────
         (Value::Struct { name, fields }, "insert") if name == "__hashset" => {
             let val = args.first().cloned().unwrap_or(Value::Nil);
-            let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+            let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
             let mut new_items = items;
             if !new_items.iter().any(|v| values_equal(v, &val)) {
                 new_items.push(val);
@@ -507,23 +508,23 @@ pub fn compute_mutated_container(obj: &Value, method: &str, args: &[Value]) -> O
         }
         (Value::Struct { name, fields }, "remove") if name == "__hashset" => {
             let val = args.first().cloned().unwrap_or(Value::Nil);
-            let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+            let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
             let new_items: Vec<Value> = items.into_iter().filter(|v| !values_equal(v, &val)).collect();
             let mut new_fields = fields.clone();
-            new_fields.insert("items".to_string(), Value::Array(new_items));
+            new_fields.insert("items".to_string(), Value::Array(HArr::from(new_items)));
             Some(Value::Struct { name: name.clone(), fields: new_fields })
         }
         // ── Queue (FIFO: push appends, pop removes from the front) ────────
         (Value::Struct { name, fields }, "push") if name == "__queue" => {
             let val = args.first().cloned().unwrap_or(Value::Nil);
-            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
             items.push(val);
             let mut new_fields = fields.clone();
             new_fields.insert("items".to_string(), Value::Array(items));
             Some(Value::Struct { name: name.clone(), fields: new_fields })
         }
         (Value::Struct { name, fields }, "pop") if name == "__queue" => {
-            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
             if !items.is_empty() { items.remove(0); }
             let mut new_fields = fields.clone();
             new_fields.insert("items".to_string(), Value::Array(items));
@@ -532,14 +533,14 @@ pub fn compute_mutated_container(obj: &Value, method: &str, args: &[Value]) -> O
         // ── Stack (LIFO: push appends, pop removes from the back) ─────────
         (Value::Struct { name, fields }, "push") if name == "__stack" => {
             let val = args.first().cloned().unwrap_or(Value::Nil);
-            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
             items.push(val);
             let mut new_fields = fields.clone();
             new_fields.insert("items".to_string(), Value::Array(items));
             Some(Value::Struct { name: name.clone(), fields: new_fields })
         }
         (Value::Struct { name, fields }, "pop") if name == "__stack" => {
-            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+            let mut items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
             items.pop();
             let mut new_fields = fields.clone();
             new_fields.insert("items".to_string(), Value::Array(items));
