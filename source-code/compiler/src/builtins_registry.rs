@@ -1905,17 +1905,17 @@ BuiltinSpec {
     names: &["__builtin_test_fail"],
     params: || vec![HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "std/test.h#'s test-failure helper. Interpreter only — there is no test-runner concept on the AOT backend at all (tests run via `hsharp preview`/the interpreter).",
+    c_symbol: Some("hsh_test_fail"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "std/test.h#'s test-failure helper. Prints the message to stderr and exits with code 1 (same observable result as the interpreter's Panic). Implemented on both backends — see core.c's hsh_test_fail.",
 },
 BuiltinSpec {
     names: &["__builtin_test_skip"],
     params: || vec![HType::Str],
     ret: || HType::Bool,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "std/test.h#'s test-skip helper. Interpreter only.",
+    c_symbol: Some("hsh_test_skip"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "std/test.h#'s test-skip helper. Prints a note to stderr and returns (the test continues, like the interpreter's no-op skip). Implemented on both backends — see core.c's hsh_test_skip.",
 },
 BuiltinSpec {
     names: &["__builtin_fs_copy"],
@@ -2091,6 +2091,9 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         // `call_fn`, all under these exact bare names).
         "date_format"           => "date_format",
         "sort_strings"          => "sort_strings",
+        // std/test.h# helpers — hsh_test_fail / hsh_test_skip in core.c.
+        "test_fail"             => "test_fail",
+        "test_skip"             => "test_skip",
         "str_split_whitespace"  => "str_split_whitespace",
         "fs_read"          => "fs_read",
         "fs_write"         => "fs_write",
