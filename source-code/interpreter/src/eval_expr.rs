@@ -1,3 +1,4 @@
+use crate::value::HArr;
 use hsharp_parser::ast::*;
 use std::collections::HashMap;
 use crate::value::{Value, RuntimeError};
@@ -60,6 +61,16 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
             }
             Expr::BinOp(lhs, op, rhs, _) => {
                 let l = self.eval_expr(lhs)?;
+                // Short-circuit `&&` / `||`: the right operand must NOT be
+                // evaluated when the left already decides the result. Without
+                // this `i < n && a[i] == x` indexed out of bounds (and any
+                // side effect or error in the RHS ran unconditionally), unlike
+                // compiled code and unlike every other language H# borrows from.
+                match op {
+                    BinOp::And if !l.is_truthy() => return Ok(Value::Bool(false)),
+                    BinOp::Or if l.is_truthy() => return Ok(l),
+                    _ => {}
+                }
                 let r = self.eval_expr(rhs)?;
                 self.eval_binop(l, op, r)
             }
@@ -216,7 +227,7 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                             Value::Array(items) => {
                                 let e_clamped = e_excl.min(items.len());
                                 let s_clamped = s.min(e_clamped);
-                                Ok(Value::Array(items[s_clamped..e_clamped].to_vec()))
+                                Ok(Value::Array(HArr::from(items[s_clamped..e_clamped].to_vec())))
                             }
                             Value::Str(s_val) => {
                                 let chars: Vec<char> = s_val.chars().collect();
@@ -261,7 +272,7 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                             let e_excl = ((*last) + 1).max(0) as usize;
                             let e_clamped = e_excl.min(items.len());
                             let s_clamped = s.min(e_clamped);
-                            Ok(Value::Array(items[s_clamped..e_clamped].to_vec()))
+                            Ok(Value::Array(HArr::from(items[s_clamped..e_clamped].to_vec())))
                         } else {
                             Err(RuntimeError::TypeError("invalid slice index".into()))
                         }
@@ -287,7 +298,7 @@ pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
                 let vals: Vec<Value> = elems.iter()
                     .map(|e| self.eval_expr(e))
                     .collect::<Result<_, _>>()?;
-                Ok(Value::Array(vals))
+                Ok(Value::Array(HArr::from(vals)))
             }
             Expr::TupleLit(elems, _) => {
                 let vals: Vec<Value> = elems.iter()
