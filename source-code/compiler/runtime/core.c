@@ -1778,6 +1778,23 @@ int64_t hsh_fs_copy(hsh_string src, hsh_string dst) {
     return ok;
 }
 
+/* std/test.h# helpers. __builtin_test_fail(msg): there is no separate test
+ * runner on the AOT backend, so a failed assertion behaves exactly like the
+ * interpreter's RuntimeError::Panic — message on stderr, exit code 1.
+ * __builtin_test_skip(reason): like the interpreter, skipping is not a
+ * failure; a note goes to stderr and execution continues (returns 1). */
+int64_t hsh_test_fail(hsh_string msg) {
+    fflush(stdout);
+    fprintf(stderr, "test failed: %s\n", msg ? msg : "(no message)");
+    exit(1);
+    return 0;
+}
+
+int64_t hsh_test_skip(hsh_string reason) {
+    fprintf(stderr, "test skipped: %s\n", reason ? reason : "(no reason)");
+    return 1;
+}
+
 /* fs::rmdir(path) -> bool. Non-recursive — fails (returns 0) if the
  * directory isn't empty, deliberately NOT falling back to the
  * recursive hsh_remove_dir_recursive (see that BuiltinSpec's doc
