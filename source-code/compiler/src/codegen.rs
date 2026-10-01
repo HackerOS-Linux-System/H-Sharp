@@ -231,6 +231,18 @@ impl LlvmCodegen {
         // Pass 1: declare signatures for H#-defined functions/methods
         let fns = self.collect_fns(m);
         let mut async_fns: HashSet<String> = HashSet::new();
+        // Mangled names (`Type_method`) of every `impl` method declared with a
+        // `self` receiver — drives `recv.method(..)` dispatch in `Expr::MethodCall`.
+        let mut self_methods: HashSet<String> = HashSet::new();
+        for item in &m.items {
+            if let Item::ImplBlock(imp) = item {
+                for meth in &imp.methods {
+                    if meth.params.first().map(|p| p.name == "self").unwrap_or(false) {
+                        self_methods.insert(format!("{}_{}", imp.type_name, meth.name));
+                    }
+                }
+            }
+        }
         for f in &fns {
             let sig = self.build_fn_type(ctx, f);
             let fv  = module.add_function(&f.name, sig, None);
@@ -288,12 +300,12 @@ impl LlvmCodegen {
             if f.is_async {
                 let body_fv = func_vals[&format!("__hsh_async_{}", f.name)];
                 self.compile_fn(ctx, &module, &builder, &builtins, f, body_fv,
-                                &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity, &async_fns)?;
+                                &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity, &async_fns, &self_methods)?;
                 continue;
             }
             let fv = func_vals[&f.name];
             self.compile_fn(ctx, &module, &builder, &builtins, f, fv,
-                            &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity, &async_fns)?;
+                            &func_vals, &mut str_globals, &structs, &fn_ret_types, &enum_arity, &async_fns, &self_methods)?;
         }
 
         // Pass 3: for every `async fn`, fill in its public wrapper
@@ -785,13 +797,25 @@ impl LlvmCodegen {
                 Item::ImplBlock(imp) => {
                     for method in &imp.methods {
                         let mangled_name = format!("{}_{}", imp.type_name, method.name);
+                        // `self` is a real first parameter now (see
+                        // `build_fn_type`/`compile_fn`), and the parser gives
+                        // it the placeholder type `Self` — substitute the
+                        // impl's concrete type so `var_types` can resolve
+                        // `self.field` / `self.method()` statically.
+                        let params: Vec<Param> = method.params.iter().map(|p| {
+                            let mut p = p.clone();
+                            p.ty = subst_self_type(&p.ty, &imp.type_name);
+                            p
+                        }).collect();
+                        let ret_ty = method.return_type.as_ref()
+                            .map(|t| subst_self_type(t, &imp.type_name));
                         let mut body = method.body.clone();
                         let hoisted = crate::modules::hoist_nested_fns(&mut body, &mangled_name);
                         fns.push(FnDef {
                             attrs: vec![], type_params: vec![],
                             name:        mangled_name,
-                                 params:      method.params.clone(),
-                                 return_type: method.return_type.clone(),
+                                 params,
+                                 return_type: ret_ty,
                                  body,
                                  pub_:        method.pub_,
                                  is_async:    false,
@@ -814,7 +838,6 @@ impl LlvmCodegen {
         use inkwell::types::BasicMetadataTypeEnum;
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::new();
         for p in &f.params {
-            if p.name == "self" { continue; }
             if let Some(t) = htype_to_llvm(ctx, &p.ty) {
                 param_types.push(t.into());
             }
@@ -873,6 +896,7 @@ impl LlvmCodegen {
         fn_ret_types: &HashMap<String, TypeExpr>,
         enums:       &HashMap<String, usize>,
         async_fns:   &HashSet<String>,
+        self_methods: &HashSet<String>,
     ) -> R<()> {
         let entry = ctx.append_basic_block(fv, "entry");
         builder.position_at_end(entry);
@@ -887,7 +911,6 @@ impl LlvmCodegen {
         let mut array_elem_type_expr: HashMap<String, TypeExpr> = HashMap::new();
         let mut pidx = 0u32;
         for p in &f.params {
-            if p.name == "self" { continue; }
             if let TypeExpr::Named(n) = &p.ty {
                 if let Some(bare) = resolve_struct_name(structs, n) {
                     var_types.insert(p.name.clone(), bare.to_string());
@@ -936,7 +959,7 @@ impl LlvmCodegen {
             structs, var_types, var_tuple_types, array_elem_types, array_elem_llvm_ty, array_elem_type_expr, mem_mode: f.mem_mode,
             string_vars,
             int_vars,
-            fn_ret_types, enums, async_fns,
+            fn_ret_types, enums, async_fns, self_methods,
             fn_aliases: HashMap::new(),
             arc_owned: std::cell::RefCell::new(Vec::new()),
             branch_depth: std::cell::Cell::new(0),
@@ -1119,7 +1142,6 @@ impl LlvmCodegen {
         let i64_t = ctx.i64_type();
 
         let param_llvm_types: Vec<BasicTypeEnum> = f.params.iter()
-            .filter(|p| p.name != "self")
             .filter_map(|p| htype_to_llvm(ctx, &p.ty))
             .collect();
         let n_params = param_llvm_types.len();
@@ -2334,6 +2356,9 @@ struct FnCx<'ctx, 'a> {
     /// handle)", which keeps the old, safe passthrough-through-
     /// `hsh_task_wait` behavior unchanged.
     async_fns: &'a HashSet<String>,
+    /// Mangled `Type_method` names of `impl` methods that take a `self`
+    /// receiver (see `find_user_method`).
+    self_methods: &'a HashSet<String>,
     /// Enum variant name -> arity (number of positional/tuple fields),
     /// collected once from the module's `Item::EnumDef` items (see
     /// `build_module`), keyed by *bare* variant name (matching how
@@ -2436,6 +2461,25 @@ struct FnCx<'ctx, 'a> {
     /// `break`/`continue` branch to the correct block like every other
     /// working compiler's loop lowering.
     loop_stack: Vec<(inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)>,
+}
+
+/// Replaces the `Self` placeholder type (what the parser assigns to a `self`
+/// parameter, and what `-> Self` means inside an `impl`) with the impl's
+/// concrete type name, recursing through compound types.
+fn subst_self_type(ty: &TypeExpr, concrete: &str) -> TypeExpr {
+    let r = |t: &TypeExpr| Box::new(subst_self_type(t, concrete));
+    match ty {
+        TypeExpr::Named(n) if n == "Self" => TypeExpr::Named(concrete.to_string()),
+        TypeExpr::Generic(n, a)  => TypeExpr::Generic(n.clone(), a.iter().map(|t| subst_self_type(t, concrete)).collect()),
+        TypeExpr::Array(t)       => TypeExpr::Array(r(t)),
+        TypeExpr::Slice(t, n)    => TypeExpr::Slice(r(t), *n),
+        TypeExpr::Tuple(a)       => TypeExpr::Tuple(a.iter().map(|t| subst_self_type(t, concrete)).collect()),
+        TypeExpr::Fn(a, ret)     => TypeExpr::Fn(a.iter().map(|t| subst_self_type(t, concrete)).collect(), r(ret)),
+        TypeExpr::Optional(t)    => TypeExpr::Optional(r(t)),
+        TypeExpr::Ref(t)         => TypeExpr::Ref(r(t)),
+        TypeExpr::RefMut(t)      => TypeExpr::RefMut(r(t)),
+        other                    => other.clone(),
+    }
 }
 
 // BUG FIX: every `TypeExpr::Named(n) if structs.contains_key(n) => ...`
@@ -2689,6 +2733,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
 
             Expr::StructLit(name, _, _) => Some(name.clone()),
             Expr::Ident(name, _) => self.var_types.get(name).cloned(),
+            // `self` inside an `impl` method — registered in `var_types`
+            // by `compile_fn` from the (Self-substituted) receiver param.
+            Expr::SelfExpr(_) => self.var_types.get("self").cloned(),
             Expr::FieldAccess(inner, field, _) => {
                 // Chained access (`a.b.c`): resolve `a`'s struct, find `b`'s
                 // declared field type, and — if that type itself names a
@@ -5144,6 +5191,17 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
 
                        // ── MethodCall obj.method(args) ────────────────────
                        Expr::MethodCall(obj_e, method, method_args, span) => {
+                           // User-defined `impl` method on a statically known
+                           // struct type: `recv.m(a, b)` -> `Type_m(recv, a, b)`.
+                           // Checked BEFORE the builtin method sugar below so a
+                           // user method shadows a same-named builtin (`.len()`,
+                           // `.get()`, ...) on that type, exactly like a user fn
+                           // shadows a builtin fn in `call_fn_impl`.
+                           if let Some(target) = self.find_user_method(obj_e, method) {
+                               let fv = self.func_vals[target.as_str()];
+                               let recv = self.expr(obj_e, None)?;
+                               return self.call_user_method(fv, recv, method_args);
+                           }
                            let obj = self.expr(obj_e, None)?;
                            // Dispatch common methods on the object's type
                            match method.as_str() {
@@ -5452,6 +5510,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                // `.foo(...)`" otherwise. Either way: loud
                                // and correct instead of silently wrong.
                                other => {
+                                   // Receiver's struct type could not be inferred
+                                   // statically, but if exactly ONE struct in the
+                                   // program defines a method with this name, it
+                                   // is unambiguous — dispatch to it.
+                                   if let Some(target) = self.unique_user_method(other) {
+                                       let fv = self.func_vals[target.as_str()];
+                                       return self.call_user_method(fv, obj, method_args);
+                                   }
                                    let msg = match crate::builtins_registry::find(other) {
                                        Some(spec) if !spec.backends.contains(&crate::builtins_registry::Backend::Llvm) => {
                                            format!(
@@ -7030,6 +7096,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            Ok(self.unwrap_call(call))
                        }
                        "fs_rmdir" => call1!(self.builtins.hsh_fs_rmdir, "frmdir"),
+                       // std/test.h# helpers (__builtin_test_fail / __builtin_test_skip).
+                       // hsh_test_fail prints to stderr and exit(1)s — it never
+                       // returns at runtime, but is declared i64-returning like
+                       // the registry's `Bool` ret, so the arm just yields its value.
+                       "test_fail" => call1!(self.builtins.hsh_test_fail, "tfail"),
+                       "test_skip" => call1!(self.builtins.hsh_test_skip, "tskip"),
                        "str_to_char_code" => call1!(self.builtins.hsh_str_to_char_code, "s2cc"),
                        "char_code_to_str" => {
                            let n = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.i64_type().into()))? }
@@ -7114,6 +7186,55 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                /// Compile a call to a user-defined (H#-level) function. Shared by
                /// the shadowing check at the top of `call_fn` and by the
                /// "not a built-in" fallback at the bottom of it.
+               /// Mangled name (`Type_method`) of the user-defined `impl`
+               /// method `method` for `recv`'s statically inferred struct
+               /// type, if there is one.
+               fn find_user_method(&self, recv: &Expr, method: &str) -> Option<String> {
+                   let sn = self.infer_struct_name(recv)?;
+                   let bare = sn.rsplit("::").next().unwrap_or(&sn).to_string();
+                   [sn.clone(), bare].into_iter()
+                       .map(|t| format!("{}_{}", t, method))
+                       .find(|m| self.func_vals.contains_key(m.as_str()) && self.is_self_method(m))
+               }
+
+               /// Fallback when the receiver type is unknown: the single
+               /// struct (if exactly one) that defines a `self`-taking
+               /// method called `method`.
+               fn unique_user_method(&self, method: &str) -> Option<String> {
+                   let mut hits = self.structs.keys()
+                       .map(|st| format!("{}_{}", st, method))
+                       .filter(|m| self.func_vals.contains_key(m.as_str()) && self.is_self_method(m));
+                   let first = hits.next()?;
+                   if hits.next().is_some() { None } else { Some(first) }
+               }
+
+               /// True when the user fn takes a leading receiver, i.e. it is an
+               /// `impl` method declared with `self` (not a static `Type::new`).
+               /// Detected through the LLVM signature: `self` is param 0 and every
+               /// method call passes receiver + args, so we require arity >= 1 and
+               /// membership in `self_methods`.
+               fn is_self_method(&self, mangled: &str) -> bool {
+                   self.self_methods.contains(mangled)
+               }
+
+               /// Calls `fv` with an already-evaluated receiver as argument 0
+               /// followed by `args` compiled against the remaining param types.
+               fn call_user_method(&mut self, fv: FunctionValue<'ctx>, recv: BasicValueEnum<'ctx>, args: &[Expr]) -> R<BasicValueEnum<'ctx>> {
+                   let sig = fv.get_type();
+                   let mut avs: Vec<BasicValueEnum<'ctx>> = vec![recv];
+                   for (i, a) in args.iter().enumerate() {
+                       let expected: Option<BasicTypeEnum> = sig.get_param_types().get(i + 1)
+                           .and_then(|pt| metadata_to_basic(*pt));
+                       avs.push(self.expr(a, expected)?);
+                   }
+                   let r = self.call_coerced(fv, &avs, "mcall");
+                   if sig.get_return_type().is_none() {
+                       Ok(self.ctx.i64_type().const_zero().into())
+                   } else {
+                       Ok(self.unwrap_call(r))
+                   }
+               }
+
                fn call_user_fn(&mut self, fv: FunctionValue<'ctx>, args: &[Expr], _name: &str) -> R<BasicValueEnum<'ctx>> {
                    let sig = fv.get_type();
                    let mut avs = Vec::new();
