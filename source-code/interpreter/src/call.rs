@@ -1,3 +1,4 @@
+use crate::value::HArr;
 use hsharp_parser::ast::*;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
@@ -278,7 +279,7 @@ impl Interpreter {
                 let results: Vec<Value> = String::from_utf8_lossy(&gfao.stdout)
                     .lines().filter(|l| !l.is_empty())
                     .map(|l| Value::Str(l.to_string())).collect();
-                return Ok(Value::Array(results));
+                return Ok(Value::Array(HArr::from(results)));
             }
             "re_replace" | "regex_replace" => {
                 let pattern = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -389,11 +390,11 @@ impl Interpreter {
                 let _ = &mut p;
                 if pattern == r"\s+" || pattern == r"\s*" {
                     let parts: Vec<Value> = text.split_whitespace().map(|s| Value::Str(s.to_string())).collect();
-                    return Ok(Value::Array(parts));
+                    return Ok(Value::Array(HArr::from(parts)));
                 }
                 // Literal-substring split fallback for simple patterns.
                 let parts: Vec<Value> = text.split(pattern.as_str()).map(|s| Value::Str(s.to_string())).collect();
-                return Ok(Value::Array(parts));
+                return Ok(Value::Array(HArr::from(parts)));
             }
             // ── SQLite (v0.6) ─────────────────────────────────────────────────
             "sqlite_open" | "db_open" => {
@@ -429,12 +430,12 @@ impl Interpreter {
                             let cols: Vec<Value> = l.split(',')
                                 .map(|c| Value::Str(c.trim().to_string()))
                                 .collect();
-                            Value::Array(cols)
+                            Value::Array(HArr::from(cols))
                         })
                         .collect(),
                     Err(_) => vec![],
                 };
-                return Ok(Value::Array(rows));
+                return Ok(Value::Array(HArr::from(rows)));
             }
             "sqlite_close" | "db_close" => {
                 return Ok(Value::Nil); // SQLite files don't need explicit close
@@ -720,7 +721,7 @@ impl Interpreter {
             "str_split_whitespace" => {
                 let s = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let parts: Vec<Value> = s.split_whitespace().map(|p| Value::Str(p.to_string())).collect();
-                return Ok(Value::Array(parts));
+                return Ok(Value::Array(HArr::from(parts)));
             }
             "split" | "str_split" => {
                 let s   = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -729,7 +730,7 @@ impl Interpreter {
                 return Ok(Value::Array(parts));
             }
             "str_join" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let sep = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 let parts: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
                 return Ok(Value::Str(parts.join(&sep)));
@@ -973,7 +974,7 @@ impl Interpreter {
                 let raw = args.first().map(|v| v.to_string()).unwrap_or_default();
                 return Ok(match serde_json::from_str::<Json>(&raw) {
                     Ok(Json::Array(items)) => Value::Array(items.iter().map(json_to_value).collect()),
-                    _ => Value::Array(Vec::new()),
+                    _ => Value::Array(HArr::from(Vec::new())),
                 });
             }
             "json_stringify" => {
@@ -1144,24 +1145,24 @@ impl Interpreter {
                 if let Some(Value::Struct { fields, .. }) = args.first() {
                     return Ok(Value::Array(fields.keys().map(|k| Value::Str(k.clone())).collect()));
                 }
-                return Ok(Value::Array(Vec::new()));
+                return Ok(Value::Array(HArr::from(Vec::new())));
             }
             "hashmap_values" => {
                 if let Some(Value::Struct { fields, .. }) = args.first() {
                     return Ok(Value::Array(fields.values().cloned().collect()));
                 }
-                return Ok(Value::Array(Vec::new()));
+                return Ok(Value::Array(HArr::from(Vec::new())));
             }
             // ── HashSet (v0.8) — wraps a Value::Array of unique values ────────
             "hashset_new" => {
                 let mut fields = HashMap::new();
-                fields.insert("items".to_string(), Value::Array(Vec::new()));
+                fields.insert("items".to_string(), Value::Array(HArr::from(Vec::new())));
                 return Ok(Value::Struct { name: "__hashset".into(), fields });
             }
             "hashset_insert" => {
                 let val = args.get(1).cloned().unwrap_or(Value::Nil);
                 if let Some(Value::Struct { name, fields }) = args.first().cloned() {
-                    let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                    let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                     let mut new_items = items;
                     if !new_items.iter().any(|v| values_equal(v, &val)) {
                         new_items.push(val);
@@ -1184,10 +1185,10 @@ impl Interpreter {
             "hashset_remove" => {
                 let val = args.get(1).cloned().unwrap_or(Value::Nil);
                 if let Some(Value::Struct { name, fields }) = args.first().cloned() {
-                    let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                    let items = match fields.get("items") { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                     let new_items: Vec<Value> = items.into_iter().filter(|v| !values_equal(v, &val)).collect();
                     let mut new_fields = fields;
-                    new_fields.insert("items".to_string(), Value::Array(new_items));
+                    new_fields.insert("items".to_string(), Value::Array(HArr::from(new_items)));
                     return Ok(Value::Struct { name, fields: new_fields });
                 }
                 return Ok(Value::Nil);
@@ -1202,9 +1203,9 @@ impl Interpreter {
             }
             "hashset_to_array" => {
                 if let Some(Value::Struct { fields, .. }) = args.first() {
-                    return Ok(fields.get("items").cloned().unwrap_or(Value::Array(Vec::new())));
+                    return Ok(fields.get("items").cloned().unwrap_or(Value::Array(HArr::from(Vec::new()))));
                 }
-                return Ok(Value::Array(Vec::new()));
+                return Ok(Value::Array(HArr::from(Vec::new())));
             }
             // ── Queue / Stack (v0.8) — each wraps a Value::Array under a
             // distinct struct name so call_method/compute_mutated_container
@@ -1212,12 +1213,12 @@ impl Interpreter {
             // plain array's (and from each other).
             "queue_new" => {
                 let mut fields = HashMap::new();
-                fields.insert("items".to_string(), Value::Array(Vec::new()));
+                fields.insert("items".to_string(), Value::Array(HArr::from(Vec::new())));
                 return Ok(Value::Struct { name: "__queue".into(), fields });
             }
             "stack_new" => {
                 let mut fields = HashMap::new();
-                fields.insert("items".to_string(), Value::Array(Vec::new()));
+                fields.insert("items".to_string(), Value::Array(HArr::from(Vec::new())));
                 return Ok(Value::Struct { name: "__stack".into(), fields });
             }
             "fs_read" | "read_file" => {
@@ -1275,7 +1276,7 @@ impl Interpreter {
                 let p = args.first().map(|v| v.to_string()).unwrap_or_default();
                 let content = std::fs::read_to_string(p.as_str()).unwrap_or_default();
                 let lines: Vec<Value> = content.lines().map(|l| Value::Str(l.to_string())).collect();
-                return Ok(Value::Array(lines));
+                return Ok(Value::Array(HArr::from(lines)));
             }
             "fs_size" => {
                 let p = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -1319,7 +1320,7 @@ impl Interpreter {
                         .map(|e| Value::Str(e.file_name().to_string_lossy().to_string()))
                         .collect())
                     .unwrap_or_default();
-                return Ok(Value::Array(entries));
+                return Ok(Value::Array(HArr::from(entries)));
             }
             "fs_read_bytes" => {
                 let p = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -1342,7 +1343,7 @@ impl Interpreter {
             // all, which binary formats like MessagePack need to emit
             // freely. Backs `std/msgpack.h#`.
             "bytes_from_ints" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let data: Vec<u8> = arr.iter().map(|v| (v.to_int() & 0xff) as u8).collect();
                 return Ok(Value::Bytes(data));
             }
@@ -1352,7 +1353,7 @@ impl Interpreter {
             "bytes_to_ints" => {
                 let data: Vec<u8> = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
                 let arr: Vec<Value> = data.iter().map(|&b| Value::Int(b as i64)).collect();
-                return Ok(Value::Array(arr));
+                return Ok(Value::Array(HArr::from(arr)));
             }
             "bytes_concat" => {
                 let mut out: Vec<u8> = match args.first() { Some(Value::Bytes(b)) => b.clone(), _ => Vec::new() };
@@ -1386,7 +1387,7 @@ impl Interpreter {
                         }
                     }
                 }
-                return Ok(Value::Array(out));
+                return Ok(Value::Array(HArr::from(out)));
             }
             // `std/fs.h#`'s `modified_time(path)` — last-modified time as
             // a unix timestamp (seconds), matching `time.h#`/`date.h#`'s
@@ -1495,7 +1496,7 @@ impl Interpreter {
             }
             "env_args" => {
                 let a: Vec<Value> = std::env::args().map(Value::Str).collect();
-                return Ok(Value::Array(a));
+                return Ok(Value::Array(HArr::from(a)));
             }
             "env_home" => {
                 return Ok(std::env::var("HOME").map(Value::Str).unwrap_or(Value::Str(String::new())));
@@ -1523,7 +1524,7 @@ impl Interpreter {
             // know about that struct representation.
             "env_vars" => {
                 let vars: Vec<Value> = std::env::vars().map(|(k, v)| Value::Str(format!("{k}={v}"))).collect();
-                return Ok(Value::Array(vars));
+                return Ok(Value::Array(HArr::from(vars)));
             }
             // ── os (v0.9) ────────────────────────────────────────────────────
             "os_platform" => { return Ok(Value::Str(std::env::consts::OS.to_string())); }
@@ -1943,7 +1944,7 @@ impl Interpreter {
             // `Result` — insertion sort's comparisons are trivial to
             // thread a `?` through one at a time instead.
             "sort_by" => {
-                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let f = args.get(1).cloned();
                 let (params, body, fenv) = match &f {
                     Some(Value::Fn { params, body, env, .. }) => (params.clone(), body.clone(), env.clone()),
@@ -1964,7 +1965,7 @@ impl Interpreter {
                 return Ok(Value::Array(arr));
             }
             "iter_map" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let f = args.get(1).cloned();
                 let mut result = Vec::with_capacity(arr.len());
                 for x in arr {
@@ -1976,10 +1977,10 @@ impl Interpreter {
                     };
                     result.push(v);
                 }
-                return Ok(Value::Array(result));
+                return Ok(Value::Array(HArr::from(result)));
             }
             "iter_filter" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let f = args.get(1).cloned();
                 let mut result = Vec::new();
                 for x in arr {
@@ -1990,10 +1991,10 @@ impl Interpreter {
                     };
                     if keep { result.push(x); }
                 }
-                return Ok(Value::Array(result));
+                return Ok(Value::Array(HArr::from(result)));
             }
             "iter_reduce" => {
-                let arr  = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr  = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let init = args.get(1).cloned().unwrap_or(Value::Nil);
                 let f    = args.get(2).cloned();
                 let mut acc = init;
@@ -2007,30 +2008,30 @@ impl Interpreter {
                 return Ok(acc);
             }
             "iter_zip" => {
-                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
-                let b = match args.get(1) { Some(Value::Array(b)) => b.clone(), _ => Vec::new() };
+                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
+                let b = match args.get(1) { Some(Value::Array(b)) => b.clone(), _ => HArr::from(Vec::new()) };
                 let len = a.len().min(b.len());
                 let zipped: Vec<Value> = (0..len).map(|i| Value::Tuple(vec![a[i].clone(), b[i].clone()])).collect();
-                return Ok(Value::Array(zipped));
+                return Ok(Value::Array(HArr::from(zipped)));
             }
             "iter_chain" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
-                let b = match args.get(1) { Some(Value::Array(b)) => b.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
+                let b = match args.get(1) { Some(Value::Array(b)) => b.clone(), _ => HArr::from(Vec::new()) };
                 a.extend(b);
                 return Ok(Value::Array(a));
             }
             "iter_take" => {
-                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let n = args.get(1).map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
                 return Ok(Value::Array(a.into_iter().take(n).collect()));
             }
             "iter_skip" => {
-                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let n = args.get(1).map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
                 return Ok(Value::Array(a.into_iter().skip(n).collect()));
             }
             "iter_any" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let f = args.get(1).cloned();
                 for x in arr {
                     if let Some(Value::Fn { params, body, env, .. }) = &f {
@@ -2042,7 +2043,7 @@ impl Interpreter {
                 return Ok(Value::Bool(false));
             }
             "iter_all" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let f = args.get(1).cloned();
                 for x in arr {
                     if let Some(Value::Fn { params, body, env, .. }) = &f {
@@ -2054,22 +2055,22 @@ impl Interpreter {
                 return Ok(Value::Bool(true));
             }
             "iter_sum" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let sum: i64 = arr.iter().map(|v| v.to_int()).sum();
                 return Ok(Value::Int(sum));
             }
             "iter_product" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let prod: i64 = arr.iter().map(|v| v.to_int()).product();
                 return Ok(Value::Int(prod));
             }
             "iter_reverse" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 a.reverse();
                 return Ok(Value::Array(a));
             }
             "iter_join" => {
-                let a   = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let a   = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let sep = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 let parts: Vec<String> = a.iter().map(|v| v.to_string()).collect();
                 return Ok(Value::Str(parts.join(&sep)));
@@ -2077,31 +2078,31 @@ impl Interpreter {
             "iter_repeat" => {
                 let val = args.first().cloned().unwrap_or(Value::Nil);
                 let n   = args.get(1).map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
-                return Ok(Value::Array(vec![val; n]));
+                return Ok(Value::Array(HArr::from(vec![val; n])));
             }
             "iter_unique" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let mut result: Vec<Value> = Vec::new();
                 for x in arr {
                     if !result.iter().any(|v| values_equal(v, &x)) {
                         result.push(x);
                     }
                 }
-                return Ok(Value::Array(result));
+                return Ok(Value::Array(HArr::from(result)));
             }
             // ── sort (v0.8) ──────────────────────────────────────────────────
             "sort_ints" => {
-                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 arr.sort_by_key(|v| v.to_int());
                 return Ok(Value::Array(arr));
             }
             "sort_strings" => {
-                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 arr.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
                 return Ok(Value::Array(arr));
             }
             "binary_search" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let target = args.get(1).map(|v| v.to_int()).unwrap_or(0);
                 let mut lo: i64 = 0;
                 let mut hi: i64 = arr.len() as i64 - 1;
@@ -2114,7 +2115,7 @@ impl Interpreter {
                 return Ok(Value::Int(-1));
             }
             "binary_search_left" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let target = args.get(1).map(|v| v.to_int()).unwrap_or(0);
                 let mut lo: i64 = 0;
                 let mut hi: i64 = arr.len() as i64;
@@ -2125,16 +2126,16 @@ impl Interpreter {
                 return Ok(Value::Int(lo));
             }
             "min_int" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 return Ok(arr.iter().map(|v| v.to_int()).min().map(Value::Int).unwrap_or(Value::Nil));
             }
             "max_int" => {
-                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 return Ok(arr.iter().map(|v| v.to_int()).max().map(Value::Int).unwrap_or(Value::Nil));
             }
             "merge_sorted" => {
-                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
-                let b = match args.get(1) { Some(Value::Array(b)) => b.clone(), _ => Vec::new() };
+                let a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
+                let b = match args.get(1) { Some(Value::Array(b)) => b.clone(), _ => HArr::from(Vec::new()) };
                 let mut result: Vec<Value> = Vec::with_capacity(a.len() + b.len());
                 let (mut i, mut j) = (0usize, 0usize);
                 while i < a.len() && j < b.len() {
@@ -2143,7 +2144,7 @@ impl Interpreter {
                 }
                 result.extend_from_slice(&a[i..]);
                 result.extend_from_slice(&b[j..]);
-                return Ok(Value::Array(result));
+                return Ok(Value::Array(HArr::from(result)));
             }
             // ── async (v0.8) — this interpreter's async model runs eagerly
             // (no real cooperative scheduling), so `async::spawn(closure)`
@@ -2467,12 +2468,12 @@ impl Interpreter {
                 return Ok(Value::Int(n));
             }
             "array_push" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 a.push(args.get(1).cloned().unwrap_or(Value::Nil));
                 return Ok(Value::Array(a));
             }
             "array_pop" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 a.pop();
                 return Ok(Value::Array(a));
             }
@@ -2485,7 +2486,7 @@ impl Interpreter {
                 return Ok(v);
             }
             "array_set" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let idx = args.get(1).and_then(|v| if let Value::Int(n) = v { Some(*n) } else { None }).unwrap_or(0);
                 if idx >= 0 && (idx as usize) < a.len() {
                     a[idx as usize] = args.get(2).cloned().unwrap_or(Value::Nil);
@@ -2493,7 +2494,7 @@ impl Interpreter {
                 return Ok(Value::Array(a));
             }
             "array_remove" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let idx = args.get(1).and_then(|v| if let Value::Int(n) = v { Some(*n) } else { None }).unwrap_or(0);
                 if idx >= 0 && (idx as usize) < a.len() { a.remove(idx as usize); }
                 return Ok(Value::Array(a));
@@ -2507,7 +2508,7 @@ impl Interpreter {
                 return Ok(Value::Bool(found));
             }
             "array_concat" => {
-                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => Vec::new() };
+                let mut a = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 if let Some(Value::Array(b)) = args.get(1) { a.extend(b.iter().cloned()); }
                 return Ok(Value::Array(a));
             }
@@ -2588,7 +2589,7 @@ impl Interpreter {
                 } else {
                     s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect()
                 };
-                return Ok(Value::Array(parts));
+                return Ok(Value::Array(HArr::from(parts)));
             }
             "string_slice" => {
                 let s = args.first().map(|v| v.to_str_val()).unwrap_or_default();
@@ -2912,7 +2913,7 @@ impl Interpreter {
                 }
             }
             (Value::Struct { name, fields }, "to_array") if name == "__hashset" => {
-                Ok(fields.get("items").cloned().unwrap_or(Value::Array(Vec::new())))
+                Ok(fields.get("items").cloned().unwrap_or(Value::Array(HArr::from(Vec::new()))))
             }
             // ── Queue / Stack (v0.8) — shared read-only methods ─────────────────
             (Value::Struct { name, fields }, "len") if name == "__queue" || name == "__stack" => {
