@@ -12,7 +12,7 @@ pub enum Value {
     Str(String),
     Bytes(Vec<u8>),
     Nil,
-    Array(Vec<Value>),
+    Array(HArr),
     Tuple(Vec<Value>),
     Struct { name: String, fields: HashMap<String, Value> },
     Fn { name: String, params: Vec<Param>, body: Vec<Stmt>, env: Env, is_async: bool },
@@ -369,4 +369,45 @@ pub struct Interpreter {
     /// comment for why these are real-but-uncontended in this
     /// single-native-thread interpreter.
     pub atomics: HashMap<String, i64>,
+}
+
+
+/// Array storage with cheap clones: `Value` is cloned on every variable read
+/// and call-argument pass, so a deep `Vec<Value>` clone made anything that
+/// carries a big array (e.g. the H# parser's `PState { tokens, .. }`) cost
+/// O(array length) per operation - quadratic overall. `HArr` shares the
+/// buffer (`Arc`, since values cross threads in `runtime_async`) and copies
+/// only on mutation (`Arc::make_mut`), keeping value semantics. It derefs to
+/// `Vec<Value>`, so read and mutate sites are unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct HArr(std::sync::Arc<Vec<Value>>);
+
+impl HArr {
+    pub fn new(v: Vec<Value>) -> Self { HArr(std::sync::Arc::new(v)) }
+    pub fn into_vec(self) -> Vec<Value> {
+        std::sync::Arc::try_unwrap(self.0).unwrap_or_else(|a| (*a).clone())
+    }
+}
+impl std::ops::Deref for HArr {
+    type Target = Vec<Value>;
+    fn deref(&self) -> &Vec<Value> { &self.0 }
+}
+impl std::ops::DerefMut for HArr {
+    fn deref_mut(&mut self) -> &mut Vec<Value> { std::sync::Arc::make_mut(&mut self.0) }
+}
+impl From<Vec<Value>> for HArr {
+    fn from(v: Vec<Value>) -> Self { HArr::new(v) }
+}
+impl std::iter::FromIterator<Value> for HArr {
+    fn from_iter<I: IntoIterator<Item = Value>>(it: I) -> Self { HArr::new(it.into_iter().collect()) }
+}
+impl IntoIterator for HArr {
+    type Item = Value;
+    type IntoIter = std::vec::IntoIter<Value>;
+    fn into_iter(self) -> Self::IntoIter { self.into_vec().into_iter() }
+}
+impl<'a> IntoIterator for &'a HArr {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter() }
 }
