@@ -9,7 +9,9 @@ impl TypeChecker {
         match item {
             Item::FnDef(f) => self.check_fn(f),
             Item::ImplBlock(imp) => {
+                let saved_impl = self.current_impl.replace(imp.type_name.clone());
                 for method in &imp.methods { self.check_fn(method); }
+                self.current_impl = saved_impl;
             }
             Item::ModDecl { inline: Some(items), .. } => {
                 for sub_item in items { self.check_item(sub_item); }
@@ -60,7 +62,10 @@ impl TypeChecker {
         self.current_fn_name = Some(f.name.clone());
 
         for param in &f.params {
-            let ty = HType::from_type_expr(&param.ty);
+            let ty = match (&param.ty, &self.current_impl) {
+                (TypeExpr::Named(n), Some(imp)) if n == "Self" => HType::Named(imp.clone()),
+                _ => HType::from_type_expr(&param.ty),
+            };
             self.define(&param.name, ty, param.mutable);
         }
 
