@@ -23,7 +23,7 @@ pub fn render(tpl: string, ctx: any) -> string is
 end
 
 pub fn set_list(ctx: any, key: string, items: [string]) -> any is
-    return col::hashmap_insert(ctx, key, __builtin_str_join(items, "\n"))
+    return col::hashmap_insert(ctx, key, iter_join(items, "\n"))
 end
 
 fn render_sections(tpl: string, ctx: any) -> string is
@@ -54,7 +54,7 @@ end
 fn render_section_body(body: string, ctx: any, key: string) -> string is
     let raw = get_var(ctx, key)
     if raw == "" is return "" end
-    let items = __builtin_str_split(raw, "\n")
+    let items = str_split(raw, "\n")
     let mut out = ""
     let mut i = 0
     while i < items.len() is
