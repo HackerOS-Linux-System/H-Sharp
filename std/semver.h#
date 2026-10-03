@@ -24,7 +24,7 @@ pub fn parse(s: string) -> Version is
         prerelease = rest[dash + 1..rest.len()]
         rest = rest[0..dash]
     end
-    let parts = __builtin_str_split(rest, ".")
+    let parts = str_split(rest, ".")
     if parts.len() != 3 is
         return Version { major: 0, minor: 0, patch: 0, prerelease: "", build: "" }
     end
@@ -40,7 +40,7 @@ end
 pub fn is_valid(s: string) -> bool is
     let rest_no_build = if __builtin_str_index_of(s, "+") >= 0 is s[0..__builtin_str_index_of(s, "+")] else s end
     let rest = if __builtin_str_index_of(rest_no_build, "-") >= 0 is rest_no_build[0..__builtin_str_index_of(rest_no_build, "-")] else rest_no_build end
-    let parts = __builtin_str_split(rest, ".")
+    let parts = str_split(rest, ".")
     if parts.len() != 3 is return false end
     return is_digits(parts[0]) && is_digits(parts[1]) && is_digits(parts[2])
 end
@@ -88,8 +88,8 @@ fn sign(n: int) -> int is
 end
 
 fn compare_prerelease(a: string, b: string) -> int is
-    let ai = __builtin_str_split(a, ".")
-    let bi = __builtin_str_split(b, ".")
+    let ai = str_split(a, ".")
+    let bi = str_split(b, ".")
     let n = if ai.len() < bi.len() is ai.len() else bi.len() end
     let mut i = 0
     while i < n is
