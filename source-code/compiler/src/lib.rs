@@ -17,6 +17,7 @@ pub mod features;
 pub mod reachability;
 pub mod monomorphize;
 pub mod const_lowering;
+pub mod builtin_lowering;
 pub mod stdlib_shims;
 
 // LLVM codegen + its support modules (merged from the former
@@ -237,7 +238,14 @@ pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(
     // its name becomes a call to that thunk — so everything downstream
     // (typecheck, monomorphize, codegen) only ever sees ordinary functions
     // and calls, features it already fully supports.
+    // `#[test]` functions run under `hsharp test` (interpreter); the AOT build must not
+    // compile them (they call `assert_*`, which only exists in test mode).
+    builtin_lowering::strip_test_fns(&mut module);
     const_lowering::lower_consts(&mut module);
+
+    // ── Pass 0.55: interpreter-only string builtins -> LLVM shims ───────────
+    // `__builtin_str_split` / `__builtin_str_join` (see builtin_lowering.rs).
+    builtin_lowering::lower_string_builtins(&mut module);
 
     // ── Pass 0.6: inject stdlib shims (proc::run_cmd / run_cmd_live) ───────
     // See stdlib_shims.rs's module doc. Must run *after* const_lowering
