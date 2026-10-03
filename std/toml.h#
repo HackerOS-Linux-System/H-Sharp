@@ -1,7 +1,7 @@
 use "std -> collections" from "col"
 
 pub fn parse(data: string) -> any is
-    let lines = __builtin_str_split(data, "\n")
+    let lines = str_split(data, "\n")
     let mut map = col::hashmap_new()
     let mut section = ""
     let mut i = 0
