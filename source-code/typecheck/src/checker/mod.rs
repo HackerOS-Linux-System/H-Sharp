@@ -40,6 +40,8 @@ pub struct TypeChecker {
     /// (not just set) around a nested nested `fn` definition's own check —
     /// see `check_fn`'s doc comment for why that distinction matters.
     current_fn_name: Option<String>,
+    /// Name of the `impl` block being checked: `self`/`Self` resolve to it.
+    current_impl: Option<String>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -54,6 +56,7 @@ impl TypeChecker {
             consts:            HashMap::new(),
             current_fn_return: None,
             current_fn_name:   None,
+            current_impl:      None,
             diagnostics:       Vec::new(),
             derived_impls:     HashMap::new(),
             deprecated_items:  HashMap::new(),
