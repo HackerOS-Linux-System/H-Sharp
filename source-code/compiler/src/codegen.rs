@@ -6184,7 +6184,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let call = self.call_coerced(self.builtins.hsh_setenv, &[name.into(), val.into()], "envset");
                            Ok(self.unwrap_call(call))
                        }
-                       "env_cwd" | "os_cwd" | "cwd" | "getcwd" => {
+                       "env_cwd" | "os_cwd" | "fs_cwd" | "cwd" | "getcwd" => {
                            let call = self.call_coerced(self.builtins.hsh_getcwd, &[], "cwd");
                            Ok(self.unwrap_call(call))
                        }
