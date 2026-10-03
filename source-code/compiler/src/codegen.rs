@@ -4424,6 +4424,18 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        let elem_ptr = self.build_entry_alloca(elem_ty, vname);
                        self.vars.insert(vname.to_string(), (elem_ptr, elem_ty));
 
+                       // Static struct type of the loop variable, taken from the
+                       // iterable's element type (`for l in labels` with
+                       // `labels: [Label]` => `l: Label`). Without it every
+                       // `l.field` access fell back to the scan-every-struct
+                       // guess and warned. Restored after the loop so the name
+                       // doesn't leak its type into code that follows.
+                       let saved_var_type = self.var_types.get(vname).cloned();
+                       match self.infer_array_elem_type(iter) {
+                           Some(sname) => { self.var_types.insert(vname.to_string(), sname); }
+                           None => { self.var_types.remove(vname); }
+                       }
+
                        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                        let header = self.ctx.append_basic_block(parent, "forarr_hdr");
                        let body_b = self.ctx.append_basic_block(parent, "forarr_body");
@@ -4461,6 +4473,10 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        self.builder.build_store(idx_ptr, nxt).unwrap();
                        self.builder.build_unconditional_branch(header).unwrap();
                        self.builder.position_at_end(exit);
+                       match saved_var_type {
+                           Some(t) => { self.var_types.insert(vname.to_string(), t); }
+                           None => { self.var_types.remove(vname); }
+                       }
                    }
                    Ok(false)
                }
