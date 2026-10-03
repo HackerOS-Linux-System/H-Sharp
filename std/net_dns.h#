@@ -8,7 +8,7 @@ end
 
 pub fn resolve_all(hostname: string) -> [string] is
     let out = __builtin_process_run("getent hosts " + hostname + " 2>/dev/null | awk '{print $1}'")
-    let lines = __builtin_str_split(__builtin_str_trim(out), "\n")
+    let lines = str_split(__builtin_str_trim(out), "\n")
     let mut result: [string] = []
     let mut i = 0
     while i < lines.len() is
@@ -44,7 +44,7 @@ end
 ;; actually resolves; use `resolve` for that.
 pub fn is_valid_domain(domain: string) -> bool is
     if domain == "" || domain.len() > 253 is return false end
-    let labels = __builtin_str_split(domain, ".")
+    let labels = str_split(domain, ".")
     if labels.len() < 2 is return false end
     let mut i = 0
     while i < labels.len() is
@@ -71,7 +71,7 @@ pub fn cidr_contains(cidr: string, ip: string) -> bool is
 end
 
 fn cidr_prefix(cidr: string) -> string is
-    let parts = __builtin_str_split(cidr, "/")
+    let parts = str_split(cidr, "/")
     if parts.len() != 2 is return "32" end
     return parts[1]
 end
