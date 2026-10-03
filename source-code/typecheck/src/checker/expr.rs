@@ -217,7 +217,10 @@ impl TypeChecker {
                 to
             }
             Expr::Return(_, _)    => HType::Void,
-            Expr::SelfExpr(_)     => HType::Named("Self".into()),
+            Expr::SelfExpr(_)     => match &self.current_impl {
+                Some(t) => HType::Named(t.clone()),
+                None => HType::Named("Self".into()),
+            },
             Expr::Try(inner, _)   => {
                 let ty = self.infer_expr(inner);
                 if let HType::Optional(i) = ty { *i } else { ty }
