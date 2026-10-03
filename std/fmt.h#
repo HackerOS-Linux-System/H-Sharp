@@ -81,14 +81,14 @@ end
 
 pub fn indent(s: string, spaces: int) -> string is
     let prefix = repeat(" ", spaces)
-    let lines = __builtin_str_split(s, "\n")
+    let lines = str_split(s, "\n")
     let mut out: [string] = []
     let mut i = 0
     while i < lines.len() is
         out.push(prefix + lines[i])
         i += 1
     end
-    return __builtin_str_join(out, "\n")
+    return iter_join(out, "\n")
 end
 
 ;; Strip ANSI escape sequences (`\x1b[...m` SGR codes). Doesn't handle
