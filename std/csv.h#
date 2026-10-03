@@ -93,6 +93,6 @@ pub fn filter_rows(data: [[string]], col: string, val: string) -> [[string]] is
 end
 
 ;; ── private helpers ──────────────────────────────────────────────────
-fn split_lines(s: string) -> [string] is return __builtin_str_split(s, "\n") end
-fn split_csv_line(s: string) -> [string] is return __builtin_str_split(s, ",") end
-fn strings_join(parts: [string], sep: string) -> string is return __builtin_str_join(parts, sep) end
+fn split_lines(s: string) -> [string] is return str_split(s, "\n") end
+fn split_csv_line(s: string) -> [string] is return str_split(s, ",") end
+fn strings_join(parts: [string], sep: string) -> string is return iter_join(parts, sep) end
