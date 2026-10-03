@@ -15,7 +15,7 @@ pub fn encode(payload: string, secret: string) -> string is
 end
 
 fn split_token(token: string) -> [string] is
-    return __builtin_str_split(token, ".")
+    return str_split(token, ".")
 end
 
 ;; Verify the signature and return the decoded payload JSON, or "" if
