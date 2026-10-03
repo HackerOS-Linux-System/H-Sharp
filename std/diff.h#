@@ -1,6 +1,6 @@
 pub fn diff_lines(a: string, b: string) -> string is
-    let la = __builtin_str_split(a, "\n")
-    let lb = __builtin_str_split(b, "\n")
+    let la = str_split(a, "\n")
+    let lb = str_split(b, "\n")
     let n = la.len()
     let m = lb.len()
 
