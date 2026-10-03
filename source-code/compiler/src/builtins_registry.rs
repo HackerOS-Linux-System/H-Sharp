@@ -316,7 +316,7 @@ BuiltinSpec {
     doc: "os::platform — \"linux\" / \"macos\" / \"windows\".",
 },
 BuiltinSpec {
-    names: &["getcwd", "cwd"],
+    names: &["getcwd", "cwd", "fs_cwd"],
     params: || vec![],
     ret: || HType::Str,
     c_symbol: Some("hsh_getcwd"),
