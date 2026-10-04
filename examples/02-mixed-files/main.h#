@@ -1,0 +1,9 @@
+using "2026"
+
+mod greet
+mod counter
+
+fn main() is
+    write(greet::hello("H#"))
+    write("sum 1..10 = " + to_string(counter::sum_to(10)))
+end
