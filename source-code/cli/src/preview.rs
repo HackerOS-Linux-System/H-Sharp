@@ -29,6 +29,11 @@ pub fn run(file: Option<PathBuf>) {
     println!("{} {} (interpreter mode)", "▶ Preview:".cyan().bold(), src_path.display());
     println!("{}", "─".repeat(50).dimmed());
 
+    // The interpreter reads every file under the same per-file edition rules
+    // as the compiler (parse-time validation of `using`, per-file defaults
+    // for `mod`/`std`/`bit` imports) — `--edition`/HSHARP_EDITION/Bit.hk were
+    // already applied to the process-wide default in `main`.
+    crate::edition_cmd::begin_build();
     let result = hsharp_parser::parse(&source, &src_path.display().to_string());
     if result.has_errors() {
         eprintln!("{}", result.render_errors());
@@ -45,6 +50,7 @@ pub fn run(file: Option<PathBuf>) {
             std::process::exit(1);
         }
     }
+    crate::edition_cmd::end_build(false);
     // Same `@: mode` file-level directive the LLVM backend applies (see
     // hsharp_compiler::lib::compile / ast.rs's `apply_file_mem_mode`) —
     // without this, `hsharp run` and `hsharp build`/`compile` would
