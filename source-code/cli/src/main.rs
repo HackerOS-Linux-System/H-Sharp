@@ -13,6 +13,7 @@ mod lsp_cmd;
 mod ffi_header;
 mod hlib_export;
 mod hlib_cmd;
+mod edition_cmd;
 
 #[derive(Parser)]
 #[command(
@@ -23,6 +24,13 @@ version = env!("CARGO_PKG_VERSION"),
           long_about = None,
 )]
 pub struct Cli {
+    /// H# edition assumed for files without `using "<year>"` (default: the
+    /// project's `Bit.hk` `[edition]` when `lang => h#`, else the newest
+    /// edition). Also settable via HSHARP_EDITION. A file's own `using`
+    /// always wins for that file. Run `h# editions` to list them.
+    #[arg(long, global = true, value_name = "YEAR")]
+    edition: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -130,6 +138,10 @@ pub enum Command {
 
     /// Open the H# documentation in your browser
     Docs,
+
+    /// List the H# editions this toolchain supports and show which one is
+    /// the default for files without `using "<year>"` (and why)
+    Editions,
 
     /// Generate a companion C or Rust header for a file's `extern`
     /// blocks — including a real `typedef struct { int64_t ...; }` /
@@ -239,8 +251,19 @@ fn main() {
     // editor client. `hsharp repl` prints its own banner instead (see
     // repl.rs) so it isn't duplicated. Every other command gets the
     // normal banner.
+    // Default edition for files that don't say `using "<year>"` — resolved
+    // once, up front (flag > HSHARP_EDITION > Bit.hk [edition] > newest), so
+    // the compiler, the interpreter (`preview`/`repl`), `check`, `fmt` and
+    // `lib build` all agree. An invalid value exits here with a clear error.
+    let anchor: std::path::PathBuf = match &cli.command {
+        Command::Compile { file, .. } | Command::Preview { file } | Command::FfiHeader { file, .. } => file.clone(),
+        Command::Lib(LibCommand::Build { file, .. }) => file.clone(),
+        Command::Check { files } | Command::Fmt { files, .. } if !files.is_empty() => files[0].clone(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let edition_info = edition_cmd::init(cli.edition.clone(), &anchor);
     if !matches!(cli.command, Command::Lsp | Command::Repl) {
-        print_banner();
+        print_banner(edition_info.0);
     }
     match cli.command {
         Command::Compile { file, output, target, release, no_opt, debug, dynamic, emit_ir, emit_kind, verbose, mem_mode } =>
@@ -256,6 +279,7 @@ fn main() {
             println!("\n{}", "Usage: h# compile --target linux-aarch64 src/main.h#".dimmed());
         }
         Command::Docs => open_docs(),
+        Command::Editions => edition_cmd::list(edition_info),
         Command::FfiHeader { file, lang } => ffi_header::run(file, lang),
         Command::Repl => repl::run(),
         Command::Fmt { files, check } => fmt::run(files, check),
@@ -294,8 +318,8 @@ fn open_docs() {
     }
 }
 
-fn print_banner() {
-    println!("{}", "  H# v0.8  LLVM backend".cyan().bold());
+fn print_banner(edition: hsharp_parser::edition::Edition) {
+    println!("{}", format!("  H# v{}  LLVM backend  (default edition {})", env!("CARGO_PKG_VERSION"), edition).cyan().bold());
     println!();
 }
 
