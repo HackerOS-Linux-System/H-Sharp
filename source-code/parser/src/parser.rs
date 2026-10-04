@@ -164,6 +164,12 @@ impl Parser {
         let mut items      = Vec::new();
         let mut imports    = Vec::new();
         let mut edition: Option<String> = None;
+        let mut edition_span: Option<Span> = None;
+        // Edition bookkeeping: `using` may appear at most once, and only
+        // before the first real item (`fn`/`struct`/…). Imports and the
+        // file-level `@:` directive may sit on either side of it.
+        let mut using_seen = false;
+        let mut item_seen  = false;
         let mut file_mem_mode: Option<MemoryMode> = None;
 
         self.skip_newlines();
@@ -218,12 +224,66 @@ impl Parser {
             self.skip_newlines();
             if matches!(self.current().kind, TokenKind::EOF) { break; }
 
-            // `using "2026"` edition declaration
+            // `using "2026"` edition declaration (also accepts `using 2026`).
+            // See `crate::edition` for the contract; the payload is
+            // validated here so an unknown/malformed edition is reported as
+            // an ordinary parse error everywhere the parser is used (CLI,
+            // LSP, playground, and every imported `mod`/`bit`/`hlib` file).
             if matches!(self.current().kind, TokenKind::Using) {
+                let using_span = self.current().span.clone();
                 self.advance();
-                if let TokenKind::StringLit(ed) = &self.current().kind.clone() {
-                    edition = Some(ed.clone());
-                    self.advance();
+                let payload: Option<(String, Span)> = match &self.current().kind.clone() {
+                    TokenKind::StringLit(ed) => {
+                        let sp = self.current().span.clone();
+                        self.advance();
+                        Some((ed.clone(), sp))
+                    }
+                    TokenKind::Integer(n) => {
+                        let sp = self.current().span.clone();
+                        self.advance();
+                        Some((n.to_string(), sp))
+                    }
+                    _ => None,
+                };
+                match payload {
+                    None => self.errors.report(ParseError::new(
+                        ParseErrorKind::Custom("`using` must be followed by an edition".to_string()),
+                        using_span,
+                        "`using` must be followed by an edition".to_string(),
+                        vec![format!("write it as `using \"{}\"`", crate::edition::Edition::LATEST)],
+                    )),
+                    Some((text, sp)) => {
+                        let full = using_span.merge(&sp);
+                        if using_seen {
+                            self.errors.report(ParseError::new(
+                                ParseErrorKind::Custom("`using` edition declared more than once".to_string()),
+                                full,
+                                "`using` edition declared more than once".to_string(),
+                                vec!["a file has exactly one edition — remove the extra `using`".to_string()],
+                            ));
+                        } else if item_seen {
+                            self.errors.report(ParseError::new(
+                                ParseErrorKind::Custom("`using` must come before any item".to_string()),
+                                full,
+                                "`using` must come before any item".to_string(),
+                                vec!["move `using \"<edition>\"` to the top of the file, above the first `fn`/`struct`/`enum`".to_string()],
+                            ));
+                        } else {
+                            match crate::edition::Edition::parse(&text) {
+                                Ok(e) => {
+                                    edition = Some(e.as_str().to_string());
+                                    edition_span = Some(full);
+                                }
+                                Err(err) => self.errors.report(ParseError::new(
+                                    ParseErrorKind::Custom(err.message()),
+                                    sp,
+                                    err.message(),
+                                    err.hints(),
+                                )),
+                            }
+                        }
+                        using_seen = true;
+                    }
                 }
                 self.skip_newlines();
                 continue;
@@ -239,13 +299,14 @@ impl Parser {
             }
 
             // Top-level items
+            item_seen = true;
             match self.parse_item() {
                 Ok(item) => items.push(item),
                 Err(e)   => { self.errors.report(e); self.recover(); }
             }
         }
 
-        Module { file: self.file.clone(), edition, file_mem_mode, items, imports }
+        Module { file: self.file.clone(), edition, edition_span, file_mem_mode, items, imports }
     }
 
     // ── Import ────────────────────────────────────────────────────────────────
@@ -444,9 +505,20 @@ impl Parser {
             TokenKind::Mod    => self.parse_mod_decl(pub_),
             TokenKind::Extern => self.parse_extern_block_inline(),
             TokenKind::Using  => {
+                // A `using` that reaches here sits *after* `pub`/an attribute/
+                // an `@mode` annotation, i.e. in the middle of an item — it
+                // can never be the file's edition declaration. (It used to
+                // be skipped silently, which hid misplaced edition lines.)
+                let span = self.current().span.clone();
                 self.advance();
-                if let TokenKind::StringLit(_) = &self.current().kind.clone() { self.advance(); }
+                if let TokenKind::StringLit(_) | TokenKind::Integer(_) = &self.current().kind.clone() { self.advance(); }
                 self.skip_newlines();
+                self.errors.report(ParseError::new(
+                    ParseErrorKind::Custom("`using` must come before any item".to_string()),
+                    span,
+                    "`using` must come before any item".to_string(),
+                    vec!["`using \"<edition>\"` belongs at the top of the file, not between an annotation and its item".to_string()],
+                ));
                 self.parse_item()
             }
             other => {
