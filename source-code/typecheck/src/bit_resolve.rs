@@ -743,6 +743,100 @@ pub fn resolve_bit_use(
     Ok(entry)
 }
 
+// ─── `[edition]` (H# only) ───────────────────────────────────────────────
+//
+//   [package]
+//   -> lang => h#                 ! the section is honoured ONLY when `lang` names H#
+//
+//   [edition]
+//   -> edition => 2026            ! default edition for files without `using "<year>"`
+//
+// Precedence for a file with no `using` of its own (highest first):
+//   `--edition` flag  >  `HSHARP_EDITION`  >  the project's `[edition]`  >  newest.
+// A *dependency's* files (another Bit.hk root) use that dependency's own
+// `[edition]` instead of the importing project's default — see `edition_for_file`.
+
+/// Does the manifest's `lang` explicitly include H#? (`h#`, `hsharp`,
+/// `h-sharp`, `hsh`, `hs#`; case/space/dash/underscore/quote insensitive —
+/// the same spellings `bit` accepts. Note `hs` alone means HackerScript.)
+fn hk_lang_includes_hsharp(hk: &[HkEntry]) -> bool {
+    let raw = hk_get(hk, "package", "lang")
+        .or_else(|| hk_get(hk, "project", "lang"))
+        .or_else(|| hk_get(hk, "build", "lang"));
+    let Some(raw) = raw else { return false };
+    hk_list(raw).iter().any(|l| {
+        let t: String = l
+            .to_lowercase()
+            .chars()
+            .filter(|c| !matches!(c, ' ' | '-' | '_' | '"' | '\'' | '[' | ']'))
+            .collect();
+        matches!(t.as_str(), "h#" | "hsharp" | "hsh" | "hs#")
+    })
+}
+
+/// The `[edition] -> edition` of the `Bit.hk` in `dir`.
+///
+/// * `Ok(None)`   — no manifest, no `[edition]` section, or `lang` isn't H#
+///                  (the section is deliberately ignored for other languages);
+/// * `Ok(Some(e))` — a valid, supported edition;
+/// * `Err(msg)`   — the section is present for an H# project but its value is
+///                  not a supported edition (message names the file).
+pub fn manifest_edition(dir: &Path) -> Result<Option<hsharp_parser::edition::Edition>, String> {
+    let Some(manifest) = manifest_in(dir) else { return Ok(None) };
+    let Ok(content) = std::fs::read_to_string(&manifest) else { return Ok(None) };
+    let hk = parse_hk(&content);
+    if !hk_lang_includes_hsharp(&hk) {
+        return Ok(None);
+    }
+    let Some(raw) = hk_get(&hk, "edition", "edition") else { return Ok(None) };
+    hsharp_parser::edition::Edition::parse(raw).map(Some).map_err(|e| {
+        format!("{}: [edition] -> edition => {}: {}\n  hint: {}", manifest.display(), raw, e.message(), e.hints().join("; "))
+    })
+}
+
+/// Root of the `Bit.hk` project that owns `dir` (nearest manifest walking
+/// up), canonicalized; `None` if there is none.
+pub fn manifest_dir_of(dir: &Path) -> Option<PathBuf> {
+    nearest_manifest_dir(dir).map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+}
+
+/// Edition declared by the project governing `start_dir` (nearest `Bit.hk`
+/// walking up), if any. Used by the CLI to seed the default edition.
+pub fn project_edition(start_dir: &Path) -> Result<Option<hsharp_parser::edition::Edition>, String> {
+    match nearest_manifest_dir(start_dir) {
+        Some(dir) => manifest_edition(&dir),
+        None => Ok(None),
+    }
+}
+
+/// Default edition for `file` when it has no `using` of its own, decided by
+/// *which project owns the file*:
+///
+/// * the file belongs to the entry project (`entry_root`) → `None`, i.e. the
+///   process-wide default the CLI already resolved (flag > env > `[edition]`
+///   > newest), so a `--edition` flag really does win for your own code;
+/// * the file belongs to another `Bit.hk` root (a `bit` library, a path
+///   dependency, `-I` include) → that project's own `[edition]`, so a
+///   library written for another edition keeps compiling as itself;
+/// * no manifest, or no `[edition]` → `None`.
+///
+/// An unreadable/invalid `[edition]` in a dependency yields `None` here; the
+/// CLI surfaces invalid editions of the *entry* project up front.
+pub fn edition_for_file(file: &Path, entry_root: Option<&Path>) -> Option<hsharp_parser::edition::Edition> {
+    let dir = file.parent()?;
+    let owner = nearest_manifest_dir(dir)?;
+    if let Some(root) = entry_root {
+        let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        };
+        if same(&owner, root) {
+            return None;
+        }
+    }
+    manifest_edition(&owner).ok().flatten()
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -887,5 +981,48 @@ mod tests {
         assert_eq!(find_workspace_member_dir(&root, "cli"), Some(root.join("tools/cli")));
         assert!(workspace_member_entry(&root.join("core")).ends_with("src/lib.h#"));
         assert!(workspace_member_entry(&root.join("tools/cli")).ends_with("src/main.h#"));
+    }
+
+    #[test]
+    fn edition_section_is_read_only_for_hsharp_projects() {
+        let root = tmp("edition_lang");
+        let w = |dir: &str, body: &str| write(&root.join(dir).join("Bit.hk"), body);
+        w("a", "[package]\n-> name => a\n-> lang => h#\n[edition]\n-> edition => 2026\n");
+        w("b", "[package]\n-> name => b\n-> lang => hs\n[edition]\n-> edition => 2026\n");
+        w("c", "[package]\n-> name => c\n[edition]\n-> edition => 2026\n");
+        w("d", "[package]\n-> name => d\n-> lang => h#\n");
+        w("e", "[package]\n-> name => e\n-> lang => [\"HackerScript\", \"H-Sharp\"]\n[edition]\n-> edition => \"2026\"\n");
+        w("f", "[package]\n-> name => f\n-> lang => h#\n[edition]\n-> edition => 2099\n");
+        w("g", "[package]\n-> name => g\n-> lang => h#\n[edition]\n-> edition => soon\n");
+        let e = hsharp_parser::edition::Edition::E2026;
+        assert_eq!(manifest_edition(&root.join("a")), Ok(Some(e)));
+        assert_eq!(manifest_edition(&root.join("b")), Ok(None), "hs = HackerScript -> ignored");
+        assert_eq!(manifest_edition(&root.join("c")), Ok(None), "no lang -> ignored");
+        assert_eq!(manifest_edition(&root.join("d")), Ok(None), "no section");
+        assert_eq!(manifest_edition(&root.join("e")), Ok(Some(e)), "h# among several langs");
+        let err = manifest_edition(&root.join("f")).unwrap_err();
+        assert!(err.contains("newer") && err.contains("Bit.hk"), "{err}");
+        assert!(manifest_edition(&root.join("g")).unwrap_err().contains("four-digit"));
+        assert_eq!(manifest_edition(&root.join("nowhere")), Ok(None));
+    }
+
+    #[test]
+    fn edition_for_file_prefers_the_owning_project() {
+        let root = tmp("edition_owner");
+        let hk = "[package]\n-> name => x\n-> lang => h#\n[edition]\n-> edition => 2026\n";
+        write(&root.join("app/Bit.hk"), hk);
+        write(&root.join("app/src/main.h#"), "fn main() is end\n");
+        write(&root.join("dep/Bit.hk"), hk);
+        write(&root.join("dep/src/lib.h#"), "pub fn f() is end\n");
+        write(&root.join("loose/x.h#"), "fn x() is end\n");
+        let app = root.join("app");
+        let e = hsharp_parser::edition::Edition::E2026;
+        // entry project's own files -> process-wide default (None here)
+        assert_eq!(edition_for_file(&app.join("src/main.h#"), Some(&app)), None);
+        // a dependency's files -> that dependency's own [edition]
+        assert_eq!(edition_for_file(&root.join("dep/src/lib.h#"), Some(&app)), Some(e));
+        // no Bit.hk anywhere above -> None
+        assert_eq!(edition_for_file(&root.join("loose/x.h#"), Some(&app)), None);
+        assert_eq!(project_edition(&app.join("src")), Ok(Some(e)));
     }
 }
