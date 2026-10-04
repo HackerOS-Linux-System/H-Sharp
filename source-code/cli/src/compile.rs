@@ -124,6 +124,9 @@ pub fn run(
     };
 
     // ── Parse ───────────────────────────────────────────────────────────────
+    // Every file parsed from here on (entry + `mod`/`std`/`bit`/`hlib`) is
+    // recorded with the edition it was read under — see `end_build` below.
+    crate::edition_cmd::begin_build();
     let pb2 = crate::make_spinner(&format!("Parsing {}…", src_path.display()));
     let parsed = hsharp_parser::parse(&source, &src_path.display().to_string());
     if parsed.has_errors() {
@@ -162,6 +165,8 @@ pub fn run(
             }
         }
     }
+
+    crate::edition_cmd::end_build(verbose);
 
     // ── --emit-ir: dump IR and exit ─────────────────────────────────────────
     if emit_ir {
@@ -230,7 +235,7 @@ pub fn run(
     };
     println!("  {} {}", artifact_label.bold(), bin.cyan());
     println!("  {} {}", "Target:  ".bold(), triple.llvm_triple);
-    println!("  {} {}", "Backend: ".bold(), "LLVM (h# v0.8)".green());
+    println!("  {} {}", "Backend: ".bold(), format!("LLVM (h# v{})", env!("CARGO_PKG_VERSION")).green());
     println!("  {} {}", "Mode:    ".bold(), if optimize { "release (O3 + LTO)".yellow().to_string() } else { "debug (O0)".dimmed().to_string() });
     if !link_desc.is_empty() {
         println!("  {} {}", "Linked:  ".bold(), link_desc.yellow());
