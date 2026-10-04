@@ -8,6 +8,23 @@ use crate::error::{HlibError, Result};
 /// backwards-incompatible way.
 pub const HLIB_SPEC_VERSION: u32 = 1;
 
+/// H# editions (`using "<year>"`) this build of `hlib_core` accepts inside a
+/// `Language::Hsharp` archive, oldest first.
+///
+/// NOTE: this crate deliberately has no dependency on `hsharp-parser`, so the
+/// list is mirrored here by hand — keep it in sync with
+/// `hsharp_parser::edition::Edition::ALL` (the `hsharp-cli` crate asserts the
+/// two agree in its edition tests).
+pub const SUPPORTED_EDITIONS: &[&str] = &["2026"];
+
+/// Edition assumed for an archive whose manifest has no `edition` field —
+/// every archive written before editions existed (≤ 0.8) uses the 2026 syntax.
+pub const DEFAULT_EDITION: &str = "2026";
+
+fn default_edition() -> String {
+    DEFAULT_EDITION.to_string()
+}
+
 /// Which HackerOS language toolchain produced (and can natively consume)
 /// this `.hlib`. A single `.hlib` always has exactly one *producer*
 /// language, but is meant to be readable by all three — that's the
@@ -208,6 +225,14 @@ pub struct Manifest {
     /// archive (e.g. H#'s `0.9.0`) — informational, for diagnostics.
     #[serde(default)]
     pub language_version: String,
+    /// H# edition (`using "<year>"`) the sources packaged in this archive
+    /// were written against — the *library's* edition, independent of the
+    /// edition of whichever file imports it (editions may be mixed freely:
+    /// the consumer lowers the archive's AST under *this* edition). Only
+    /// meaningful for `Language::Hsharp` archives; defaults to
+    /// [`DEFAULT_EDITION`] when absent (pre-edition archives).
+    #[serde(default = "default_edition")]
+    pub edition: String,
     /// ABI generation of the `SharedObject` artifacts in this archive.
     /// Consumers refuse to link against a `SharedObject` whose
     /// `abi_version` they don't recognize, even if `hlib_spec_version`
@@ -243,6 +268,16 @@ impl Manifest {
             return Err(HlibError::UnsupportedSpecVersion {
                 found: self.hlib_spec_version,
                 supported: HLIB_SPEC_VERSION,
+            });
+        }
+        // An H# archive written for an edition this toolchain doesn't know
+        // (a newer one, or one that's been retired) can't be lowered into
+        // our AST — refuse it up front with the supported list. Archives
+        // from other languages carry no H# edition, so they're not checked.
+        if self.language == Language::Hsharp && !SUPPORTED_EDITIONS.contains(&self.edition.as_str()) {
+            return Err(HlibError::UnsupportedEdition {
+                found: self.edition.clone(),
+                supported: SUPPORTED_EDITIONS.join(", "),
             });
         }
         Ok(())
