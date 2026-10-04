@@ -1,0 +1,5 @@
+using "2026"
+
+pub fn hello(name: string) -> string is
+    return "Hello, " + name + " (greet.h# · edition 2026)"
+end
