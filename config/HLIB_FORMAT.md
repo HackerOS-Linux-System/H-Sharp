@@ -31,6 +31,7 @@ A `.hlib` file is a `tar` archive, whole-stream compressed with `zstd` (level 19
   "version": "1.2.0",
   "language": "hsharp",          // "hsharp" | "hackerlang" | "hackerscript"
   "language_version": "0.9.0",   // producer toolchain version, informational
+  "edition": "2026",             // H# edition (`using "<year>"`) of the packaged sources; missing = "2026"; unknown = refused on open
   "abi_version": 1,              // native-ABI generation of any `.so` artifacts
   "description": "...",
   "authors": ["..."],
