@@ -1,0 +1,5 @@
+using "2026"
+
+fn main() is
+    write("Hello from H# edition 2026")
+end
