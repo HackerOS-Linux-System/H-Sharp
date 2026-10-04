@@ -534,7 +534,16 @@ pub struct ImplBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     pub file:       String,
+    /// Canonical spelling (`"2026"`) of the file's `using "<edition>"`
+    /// declaration, or `None` if it has none (such a file is read under
+    /// `edition::default_edition()`). Already validated by the parser —
+    /// an unknown/malformed edition is a parse error and never lands here.
+    /// See the `edition` module for the full mixed-edition contract.
     pub edition:    Option<String>,
+    /// Span of the `using "<edition>"` declaration (for diagnostics that
+    /// point back at it, e.g. edition feature-gate errors).
+    #[serde(default)]
+    pub edition_span: Option<Span>,
     /// File-level `@: safety`/`@: arc`/`@: arena`/`@: pointers`/`@: default`
     /// directive (see `parse_module`'s handling of it, and
     /// `apply_file_mem_mode` below) — sets the default `MemoryMode` for
