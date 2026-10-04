@@ -5,7 +5,7 @@ const KEYWORDS: &[&str] = &[
     "fn", "let", "mut", "struct", "enum", "trait", "impl", "return",
     "if", "is", "else", "elsif", "end", "match", "while", "for", "in",
     "do", "break", "continue", "true", "false", "nil", "pub", "unsafe",
-    "extern", "mod", "use", "async", "await", "arena", "manual",
+    "extern", "mod", "use", "using", "async", "await", "arena", "manual",
 ];
 
 const BUILTINS: &[(&str, &str)] = &[
@@ -34,6 +34,13 @@ pub fn builtin_completions() -> Vec<CompletionItem> {
         label: name.to_string(),
         detail: Some(sig.to_string()),
         kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    }));
+    // `using "<edition>"` — one completion per supported edition, newest first.
+    items.extend(hsharp_parser::edition::Edition::ALL.iter().rev().map(|e| CompletionItem {
+        label: format!("using \"{}\"", e.as_str()),
+        detail: Some(format!("H# edition {} — {}", e.as_str(), e.summary())),
+        kind: Some(CompletionItemKind::SNIPPET),
         ..Default::default()
     }));
     items
@@ -82,4 +89,18 @@ pub fn completions(text: &str) -> Vec<CompletionItem> {
         }
     }
     items
+}
+
+#[cfg(test)]
+mod edition_completion_tests {
+    use super::*;
+
+    #[test]
+    fn offers_using_for_every_supported_edition() {
+        let labels: Vec<String> = builtin_completions().into_iter().map(|i| i.label).collect();
+        for e in hsharp_parser::edition::Edition::ALL {
+            assert!(labels.contains(&format!("using \"{}\"", e.as_str())), "{:?}", labels);
+        }
+        assert!(labels.contains(&"using".to_string()));
+    }
 }
