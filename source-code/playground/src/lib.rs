@@ -6,14 +6,31 @@ pub use run::{run, run_with_limit};
 use wasm_bindgen::prelude::*;
 
 /// The H# language version this playground build embeds (shown in the UI
-/// footer, e.g. "H# v0.8 · interpreter backend"). Kept in sync manually
+/// footer, e.g. "H# v0.9 · interpreter backend"). Kept in sync manually
 /// with `hsharp-cli`'s own version string rather than sharing a single
 /// source of truth, since pulling in `hsharp-cli` here would drag in its
 /// non-wasm-friendly dependencies (`clap`, `indicatif`, ...) for a single
 /// string constant.
 #[wasm_bindgen]
 pub fn version() -> String {
-    "0.8".to_string()
+    // Cargo.toml's workspace version (`0.9.0`) — shown as e.g. "v0.9".
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// JSON array of the H# editions this build understands, oldest first
+/// (`["2026"]`) — lets the playground UI offer a `using "<year>"` picker
+/// without hard-coding the list.
+#[wasm_bindgen]
+pub fn editions() -> String {
+    let years: Vec<&str> = hsharp_parser::edition::Edition::ALL.iter().map(|e| e.as_str()).collect();
+    serde_json::to_string(&years).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The newest edition this build understands (`"2026"`) — also what a
+/// snippet without `using` is read as in the playground.
+#[wasm_bindgen]
+pub fn latest_edition() -> String {
+    hsharp_parser::edition::Edition::LATEST.as_str().to_string()
 }
 
 /// Call once, as early as possible on the JS side (right after the wasm
