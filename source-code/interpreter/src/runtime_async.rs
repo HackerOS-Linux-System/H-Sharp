@@ -105,7 +105,7 @@ impl Reactor {
     pub fn spawn_http_get(&mut self, url: String) -> TaskId {
         self.spawn_io("http_get", move || {
             let out = std::process::Command::new("curl")
-                .args(["-s", "-L", "--max-time", "30", "-A", "H#/0.6", &url])
+                .args(["-s", "-L", "--max-time", "30", "-A", concat!("H#/", env!("CARGO_PKG_VERSION")), &url])
                 .output();
             crate::Value::Str(match out {
                 Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
