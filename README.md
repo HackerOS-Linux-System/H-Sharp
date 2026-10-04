@@ -232,6 +232,48 @@ end
 
 ---
 
+## Edycje (`using`)
+
+**Edycja** to nazwana migawka składni i reguł języka, wybierana **osobno dla każdego pliku**:
+
+```hsharp
+using "2026"
+
+fn main() is
+    write("Hello from H# 2026")
+end
+```
+
+Dziś istnieje tylko `2026` (obecna składnia); mechanizm jest gotowy na kolejne.
+
+- **Brak `using` = najnowsza edycja** znana kompilatorowi — stare pliki kompilują się bez zmian.
+- **Każdy plik żyje we własnej edycji**: `main.h#`, pliki `mod`, biblioteki `bit` / `hlib` / `workspace` mogą
+  być napisane w starszej lub nowszej edycji niż plik, który je importuje. Edycje nigdy nie „przeciekają”.
+- Nieznana edycja (np. `using "2099"`) to twardy błąd z podpowiedzią (też w pliku `mod`);
+  `using` musi być jedno, przed pierwszym elementem (`fn`/`struct`/…).
+- Domyślna edycja dla plików bez `using` (od najwyższego priorytetu):
+  `--edition <rok>` → `HSHARP_EDITION=<rok>` → `Bit.hk` `[edition]` → najnowsza.
+- Biblioteka z własnym `Bit.hk` używa **własnego** `[edition]`; `std` zawsze ma edycję, w której powstał;
+  `.hlib` zapisuje edycję w manifeście (`h# lib inspect`).
+
+```bash
+h# editions                          # lista edycji + skąd pochodzi domyślna
+h# preview main.h# --edition 2026    # flaga działa przy każdej komendzie (compile, check, preview, lib build…)
+h# compile main.h# --verbose         # pokazuje edycję każdego pliku; ostrzega, gdy build miesza edycje
+```
+
+W `Bit.hk` (sekcja tylko dla `lang => h#`, dla `hl`/`hs` ignorowana z ostrzeżeniem):
+
+```
+[edition]
+-> edition   => 2026     ;; domyślna edycja plików bez `using`
+-> toolchain => 0.9      ;; minimalna wersja H#: `h# --version` ≥ 0.9 — nowsza OK, starsza = błąd
+```
+
+Przykłady: [`examples/editions/`](examples/editions/README.md).
+
+---
+
 ## Standard Library (84 modułów)
 
 ```hsharp
