@@ -1,0 +1,6 @@
+using "2026"
+use "bit -> shapes"
+
+fn main() is
+    write("area of 3x4 = " + to_string(shapes::area(3, 4)))
+end
