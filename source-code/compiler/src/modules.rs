@@ -11,6 +11,10 @@ pub struct ResolvedModule {
 }
 
 /// Module resolver: loads and caches H# source files
+/// Marker prefix on a `mod`-resolution error that must abort the build
+/// (edition errors) instead of being downgraded to a `warn:`.
+const EDITION_FATAL: &str = "\u{1}edition-fatal\u{1}";
+
 pub struct ModuleResolver {
     /// Fallback search paths (entry file's directory, then cwd) — used when
     /// a `mod X` can't be found relative to the directory of the file that
@@ -34,6 +38,12 @@ pub struct ModuleResolver {
     /// (mangled) name — which corrupts codegen (duplicate/stale
     /// `FunctionValue` bindings) badly enough to crash the compiler itself.
     inlined_files: HashSet<PathBuf>,
+    /// `Bit.hk` root of the entry file's project (see
+    /// `bit_resolve::edition_for_file`): files owned by it use the
+    /// process-wide default edition (so `--edition` wins for your own code);
+    /// files owned by any *other* `Bit.hk` root are read under that
+    /// project's own `[edition]`. `None` when the entry file has no project.
+    entry_project_root: Option<PathBuf>,
 }
 
 impl ModuleResolver {
@@ -64,7 +74,24 @@ impl ModuleResolver {
         if let Ok(cwd) = std::env::current_dir() {
             search_paths.push(cwd);
         }
-        Self { search_paths, cache: HashMap::new(), inlined_files: HashSet::new() }
+        let entry_project_root = source_file
+            .parent()
+            .map(|d| if d.as_os_str().is_empty() { Path::new(".") } else { d })
+            .and_then(|d| std::fs::canonicalize(d).ok())
+            .and_then(|d| bit_resolve::manifest_dir_of(&d));
+        Self { search_paths, cache: HashMap::new(), inlined_files: HashSet::new(), entry_project_root }
+    }
+
+    /// Parse one imported file under *its own* edition: its `using`, else the
+    /// owning project's `[edition]` (dependencies), else the process default.
+    /// Bundled `std`/`core` files are always read as `STD_EDITION`.
+    fn parse_file(&self, src: &str, path: &Path, label: &str, is_std: bool) -> hsharp_parser::ParseResult {
+        let file_default = if is_std {
+            Some(hsharp_parser::edition::STD_EDITION)
+        } else {
+            bit_resolve::edition_for_file(path, self.entry_project_root.as_deref())
+        };
+        hsharp_parser::parse_with_default(src, path.to_str().unwrap_or(label), file_default)
     }
 
     /// Resolve one `use "std -> lib"` import: find and parse
@@ -125,7 +152,7 @@ please install h# utils for HackerOS use:\n\
 
         let src = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(lib));
+        let result = self.parse_file(&src, &path, lib, true);
         if result.has_errors() {
             return Err(format!(
                 "parse errors in std module '{}' ({}):\n{}",
@@ -221,7 +248,7 @@ fix one of:\n\
 
         let src = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read bit library '{}' at {}: {}", name, path.display(), e))?;
-        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(name));
+        let result = self.parse_file(&src, &path, name, false);
         if result.has_errors() {
             return Err(format!(
                 "parse errors in bit library '{}' ({}):\n{}",
@@ -502,7 +529,7 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
 
         let src = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(member));
+        let result = self.parse_file(&src, &path, member, false);
         if result.has_errors() {
             return Err(format!(
                 "parse errors in workspace member '{}' ({}):\n{}",
@@ -677,9 +704,19 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                 if path.exists() {
                     let src = std::fs::read_to_string(&path)
                         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-                    let result = hsharp_parser::parse(&src, path.to_str().unwrap_or("?"));
+                    let result = self.parse_file(&src, &path, "?", false);
                     if result.has_errors() {
-                        return Err(format!("parse errors in {}: {}", path.display(), result.render_errors()));
+                        // Edition problems (`using "2099"`, a duplicate/misplaced
+                        // `using`, a feature newer than the file's edition) must
+                        // stop the build, not degrade to a warning like other
+                        // errors in a `mod` file — see `EDITION_FATAL`.
+                        let fatal = result.errors.iter().any(|e| hsharp_parser::edition::is_edition_diagnostic(&e.message));
+                        return Err(format!(
+                            "{}parse errors in {}: {}",
+                            if fatal { EDITION_FATAL } else { "" },
+                            path.display(),
+                            result.render_errors()
+                        ));
                     }
                     let mut sub_module = result.module;
                     // Each resolved file gets its *own* `@: mode` directive
@@ -835,6 +872,9 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                             let sub = self.expand_module(mangled, &resolved_dir)?;
                             sub_expanded.extend(sub);
                             expanded.extend(sub_expanded);
+                        }
+                        Err(e) if e.starts_with(EDITION_FATAL) => {
+                            return Err(e[EDITION_FATAL.len()..].to_string());
                         }
                         Err(e) => {
                             // Non-fatal: emit warning but continue. Cached
@@ -1319,5 +1359,74 @@ fn rename_pattern(pat: &mut Pattern, local_types: &HashSet<String>, prefix: &str
             rename_pattern(hi, local_types, prefix);
         }
         Pattern::Wildcard(_) | Pattern::Ident(..) | Pattern::Literal(..) => {}
+    }
+}
+
+#[cfg(test)]
+mod edition_tests {
+    use super::*;
+
+    fn write(p: &Path, s: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, s).unwrap();
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hsharp_modules_edition_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// A project mixing `using`-declared and undeclared files across `mod`s
+    /// and a path-dependency library with its own `Bit.hk` `[edition]`:
+    /// every file is read under its own edition, none is rejected, and the
+    /// whole program expands into one canonical item list.
+    #[test]
+    fn mixed_edition_project_expands_and_records_each_file() {
+        let root = tmp("mixed");
+        let hk = "[package]\n-> name => p\n-> lang => h#\n[edition]\n-> edition => 2026\n";
+        write(&root.join("app/Bit.hk"), &format!("{}[dependencies]\n-> dep => path ../dep\n", hk));
+        write(
+            &root.join("app/src/main.h#"),
+            "using \"2026\"\nmod declared\nmod bare\nuse \"bit -> dep\"\nfn main() is\nend\n",
+        );
+        write(&root.join("app/src/declared.h#"), "using \"2026\"\npub fn a() -> int is\n    return 1\nend\n");
+        write(&root.join("app/src/bare.h#"), "pub fn b() -> int is\n    return 2\nend\n");
+        write(&root.join("dep/Bit.hk"), hk);
+        write(&root.join("dep/src/lib.h#"), "pub fn d() -> int is\n    return 3\nend\n");
+
+        let entry = root.join("app/src/main.h#");
+        hsharp_parser::edition::start_recording();
+        let src = std::fs::read_to_string(&entry).unwrap();
+        let parsed = hsharp_parser::parse(&src, entry.to_str().unwrap());
+        assert!(!parsed.has_errors(), "{}", parsed.render_errors());
+        let mut r = ModuleResolver::new(&entry);
+        let items = r.expand_program(&parsed.module, entry.parent().unwrap()).expect("expand");
+        let recs = hsharp_parser::edition::take_records();
+
+        let find = |suffix: &str| recs.iter().find(|r| r.file.ends_with(suffix)).unwrap_or_else(|| panic!("{suffix} not parsed: {recs:?}"));
+        assert!(find("main.h#").declared);
+        assert!(find("declared.h#").declared);
+        assert!(!find("bare.h#").declared, "bare.h# has no `using` -> default edition");
+        assert!(!find("dep/src/lib.h#").declared);
+        assert!(items.len() >= 3, "a, b and d must all be inlined");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unknown edition inside an imported `mod` file is a hard error that
+    /// names the file — it never silently falls back.
+    #[test]
+    fn unknown_edition_in_a_mod_file_is_reported() {
+        let root = tmp("badmod");
+        write(&root.join("main.h#"), "mod broken\nfn main() is\nend\n");
+        write(&root.join("broken.h#"), "using \"2099\"\npub fn x() is\nend\n");
+        let entry = root.join("main.h#");
+        let src = std::fs::read_to_string(&entry).unwrap();
+        let parsed = hsharp_parser::parse(&src, entry.to_str().unwrap());
+        let mut r = ModuleResolver::new(&entry);
+        let err = r.expand_program(&parsed.module, &root).unwrap_err();
+        assert!(err.contains("broken.h#") && err.contains("2099") && err.contains("newer"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
