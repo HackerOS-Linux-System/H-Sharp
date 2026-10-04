@@ -80,6 +80,7 @@ pub struct HlibBuilder {
     version: String,
     language: Language,
     language_version: String,
+    edition: String,
     description: String,
     authors: Vec<String>,
     dependencies: Vec<Dependency>,
@@ -96,6 +97,7 @@ impl HlibBuilder {
             version: version.into(),
             language,
             language_version: String::new(),
+            edition: crate::manifest::DEFAULT_EDITION.to_string(),
             description: String::new(),
             authors: Vec::new(),
             dependencies: Vec::new(),
@@ -108,6 +110,13 @@ impl HlibBuilder {
 
     pub fn set_language_version(&mut self, v: impl Into<String>) -> &mut Self {
         self.language_version = v.into();
+        self
+    }
+
+    /// Record the H# edition (`using "<year>"`) the packaged sources use.
+    /// Defaults to [`crate::manifest::DEFAULT_EDITION`].
+    pub fn set_edition(&mut self, e: impl Into<String>) -> &mut Self {
+        self.edition = e.into();
         self
     }
 
@@ -255,6 +264,7 @@ impl HlibBuilder {
             version: self.version.clone(),
             language: self.language,
             language_version: self.language_version.clone(),
+            edition: self.edition.clone(),
             abi_version: 1,
             description: self.description.clone(),
             authors: self.authors.clone(),
