@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod edition;
 pub mod error;
 pub mod lexer;
 pub mod parser;
@@ -27,6 +28,16 @@ impl ParseResult {
 }
 
 pub fn parse(source: &str, file: &str) -> ParseResult {
+    parse_with_default(source, file, None)
+}
+
+/// Like [`parse`], but a file with no `using "<edition>"` is read as
+/// `file_default` instead of the process-wide default edition. The module
+/// resolvers use this so that every imported file — a `mod`, a `bit`/`hlib`/
+/// `workspace` library (default: that library's own `Bit.hk` `[edition]`), or
+/// the bundled `std` (always [`edition::STD_EDITION`]) — is read under *its*
+/// edition, whatever edition the importing file is written in.
+pub fn parse_with_default(source: &str, file: &str, file_default: Option<edition::Edition>) -> ParseResult {
     let mut lexer = Lexer::new(source, file);
     let (tokens, lex_errors) = match lexer.tokenize() {
         Ok(t) => (t, vec![]),
@@ -47,9 +58,28 @@ pub fn parse(source: &str, file: &str) -> ParseResult {
     };
 
     let mut p = parser::Parser::new(tokens, source.to_string(), file.to_string());
-    let module = p.parse_module();
+    let mut module = p.parse_module();
     let mut errors = lex_errors;
     errors.extend(p.errors.errors);
+
+    // ── Edition handling (see `edition` module docs) ────────────────────
+    // Every file is read under its *own* edition — its `using "<year>"`, or
+    // the default for undeclared files — so entry files, `mod` files, bit/
+    // hlib/workspace/std libraries may all sit on different editions. Each
+    // file is feature-checked against, and lowered from, that edition here,
+    // so everything downstream only ever sees one canonical AST.
+    let declared = module.edition.is_some();
+    let ed = edition::effective_edition_with(&module, file_default);
+    for v in edition::check_features(&module, ed) {
+        errors.push(ParseError::new(
+            error::ParseErrorKind::Custom(v.message()),
+            v.span.clone(),
+            v.message(),
+            vec![format!("use `using \"{}\"` (or newer) at the top of the file", v.feature.since())],
+        ));
+    }
+    edition::lower_module(&mut module, ed);
+    edition::record(file, ed, declared);
 
     ParseResult {
         module,
