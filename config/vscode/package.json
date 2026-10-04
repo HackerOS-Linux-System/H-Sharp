@@ -2,7 +2,7 @@
   "name": "hsharp",
   "displayName": "H# Language Support",
   "description": "Syntax highlighting, diagnostics, hover, and completion for H# (.h#) — powered by hsharp-lsp.",
-  "version": "0.1.0",
+  "version": "0.9.0",
   "publisher": "hackeros-linux-system",
   "repository": {
     "type": "git",
