@@ -1,0 +1,12 @@
+;; No `using` here: this file is read under the default edition
+;; (--edition > HSHARP_EDITION > Bit.hk [edition] > newest).
+
+pub fn sum_to(n: int) -> int is
+    let mut total: int = 0
+    let mut i: int = 1
+    while i <= n is
+        total += i
+        i += 1
+    end
+    return total
+end
