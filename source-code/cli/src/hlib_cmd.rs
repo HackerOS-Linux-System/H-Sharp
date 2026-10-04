@@ -48,11 +48,16 @@ fn cmd_build(
     // ── Read + parse (identical to `h# compile`) ────────────────────────
     let source = std::fs::read_to_string(&file)
         .unwrap_or_else(|e| die(format!("cannot read `{}`: {}", file.display(), e)));
+    crate::edition_cmd::begin_build();
     let parsed = hsharp_parser::parse(&source, &file.display().to_string());
     if parsed.has_errors() {
         eprintln!("{}", parsed.render_errors());
         die("parsing failed.");
     }
+    // The edition the library's sources are written against (its own
+    // `using`, else the default resolved in `main`) — recorded in the
+    // manifest so consumers on any edition can tell what they're linking.
+    let lib_edition = hsharp_parser::edition::effective_edition(&parsed.module);
 
     // ── Resolve `mod`/`use "std -> x"`/`use "bit -> x"` ─────────────────
     let mut module = parsed.module.clone();
@@ -64,6 +69,8 @@ fn cmd_build(
             Err(e) => die(format!("{}", e)),
         }
     }
+
+    crate::edition_cmd::end_build(false);
 
     // ── Compile to a shared object at build/<stem>.hlib.tmp<suffix> ─────
     let tmp_stem = format!("build/.hlib-{}", stem);
@@ -104,6 +111,7 @@ fn cmd_build(
     // ── Package ──────────────────────────────────────────────────────────
     let mut builder = HlibBuilder::new(stem.clone(), lib_version, Language::Hsharp);
     builder.set_language_version(env!("CARGO_PKG_VERSION"));
+    builder.set_edition(lib_edition.as_str());
     builder.add_shared_object(&triple.llvm_triple, &so_bytes).unwrap_or_else(|e| die(format!("{e}")));
     builder.add_header(&header_json).unwrap_or_else(|e| die(format!("{e}")));
     if !summary.pub_items.is_empty() {
@@ -145,6 +153,9 @@ fn cmd_inspect(file: &Path) {
     println!("  spec version:     {}", m.hlib_spec_version);
     println!("  abi version:      {}", m.abi_version);
     println!("  built by:         {} {}", m.language.as_str(), m.language_version);
+    if m.language == Language::Hsharp {
+        println!("  edition:          {}", m.edition);
+    }
     println!("  created at:       {}", m.created_at);
     if !m.description.is_empty() {
         println!("  description:      {}", m.description);
