@@ -5,6 +5,7 @@
   "fileTypes": ["h#"],
   "patterns": [
     { "include": "#comments" },
+    { "include": "#edition" },
     { "include": "#strings" },
     { "include": "#numbers" },
     { "include": "#attributes" },
@@ -17,6 +18,18 @@
     { "include": "#operators" }
   ],
   "repository": {
+    "edition": {
+      "patterns": [
+        {
+          "name": "meta.edition.hsharp",
+          "match": "^\\s*(using)\\s+(\"\\d{4}\"|\\d{4})",
+          "captures": {
+            "1": { "name": "keyword.other.edition.hsharp" },
+            "2": { "name": "constant.numeric.edition.hsharp" }
+          }
+        }
+      ]
+    },
     "comments": {
       "patterns": [
         {
