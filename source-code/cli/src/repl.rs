@@ -2,7 +2,7 @@ use colored::Colorize;
 use std::io::Write;
 
 pub fn run() {
-    println!("{}", "  H# REPL v0.8".cyan().bold());
+    println!("{}", format!("  H# REPL v{}  (default edition {})", env!("CARGO_PKG_VERSION"), hsharp_parser::edition::default_edition()).cyan().bold());
     println!("{}", "  Type H# statements or expressions. `:help` for commands, `:quit` to exit.".dimmed());
     println!();
 
