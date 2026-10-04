@@ -162,7 +162,13 @@ impl Interpreter {
         let src = std::fs::read_to_string(&path)
             .map_err(|_| RuntimeError::Custom(crate::helpers::std_lib_missing_message(lib)))?;
 
-        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(lib));
+        // Bundled std files are always read as `STD_EDITION`, whatever
+        // edition the program importing them (or the user's default) is on.
+        let result = hsharp_parser::parse_with_default(
+            &src,
+            path.to_str().unwrap_or(lib),
+            Some(hsharp_parser::edition::STD_EDITION),
+        );
         if result.has_errors() {
             return Err(RuntimeError::Custom(format!(
                 "parse errors while loading std module '{}' ({}):\n{}",
@@ -230,7 +236,13 @@ impl Interpreter {
         let src = std::fs::read_to_string(&path)
             .map_err(|e| RuntimeError::Custom(format!("cannot read bit library '{}' at {}: {}", name, path.display(), e)))?;
 
-        let result = hsharp_parser::parse(&src, path.to_str().unwrap_or(name));
+        // A bit library is read under *its own* edition — its `using`, else
+        // its own `Bit.hk` `[edition]` — not the importing program's, so
+        // editions mix freely exactly like in the compiler (see
+        // `hsharp_parser::edition` and `bit_resolve::edition_for_file`).
+        let importer_root = crate::bit_resolve::manifest_dir_of(start_dir);
+        let lib_default = crate::bit_resolve::edition_for_file(&path, importer_root.as_deref());
+        let result = hsharp_parser::parse_with_default(&src, path.to_str().unwrap_or(name), lib_default);
         if result.has_errors() {
             return Err(RuntimeError::Custom(format!(
                 "parse errors while loading bit library '{}' ({}):\n{}",
