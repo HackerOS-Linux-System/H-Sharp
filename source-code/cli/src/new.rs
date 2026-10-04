@@ -31,6 +31,10 @@ pub fn run(name: String, template: String) {
 -> version     => 0.1.0\n\
 -> lang        => h#\n\
 \n\
+! default edition for files without `using \"<year>\"` (only read for lang => h#)\n\
+[edition]\n\
+-> edition => 2026\n\
+\n\
 [layout]\n\
 -> src => src\n\
 {lib_layout}\
@@ -64,6 +68,9 @@ pub fn run(name: String, template: String) {
         _                       => (TEMPLATE_APP,       README_APP,      TEST_APP),
     };
 
+    // Every generated source states its edition explicitly (`using "2026"`,
+    // right after the template's leading comment line).
+    let main_src = main_src.replacen('\n', "\nusing \"2026\"\n\n", 1);
     std::fs::write(project_dir.join("src").join("main.h#"), main_src).unwrap();
     std::fs::write(project_dir.join("README.md"), readme_src).unwrap();
     std::fs::write(project_dir.join("tests").join("main_test.h#"), test_src).unwrap();
@@ -403,7 +410,7 @@ fn handle_request(method: string, path: string, body: string) -> http::Response 
     if path == "/api/hello" && method == "GET" is
         let data = json::object([
             ("message", "Hello from H#!"),
-            ("version", "0.6"),
+            ("version", "0.9"),
             ("lang",    "H#")
         ])
         return http::json(200, data)
@@ -418,7 +425,7 @@ end
 
 fn html_index() -> string is
     return "<!DOCTYPE html><html><head><title>H# Web</title></head>" +
-           "<body><h1>H# Web Server</h1><p>Built with H# v0.6</p>" +
+           "<body><h1>H# Web Server</h1><p>Built with H# v0.9</p>" +
            "<p><a href=\"/api/hello\">GET /api/hello</a></p>" +
            "</body></html>"
 end
@@ -457,7 +464,7 @@ end
 fn test_json_parse() is
     ;; {{ / }} are H#'s escaped-literal-brace syntax — JSON's braces would
     ;; otherwise be parsed as string interpolation markers.
-    let raw = "{{\"name\":\"H#\",\"version\":\"0.6\"}}"
+    let raw = "{{\"name\":\"H#\",\"version\":\"0.9\"}}"
     let obj = json::parse(raw)
     assert_eq(json::get_str(obj, "name"), "H#")
 end
