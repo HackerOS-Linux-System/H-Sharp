@@ -44,6 +44,9 @@ pub enum HlibError {
     #[error("hlib spec version {found} is newer than the highest version this reader understands ({supported})")]
     UnsupportedSpecVersion { found: u32, supported: u32 },
 
+    #[error("hlib was written for H# edition \"{found}\", which this toolchain doesn't support (supported: {supported}) — upgrade H#, or rebuild the library with a supported edition")]
+    UnsupportedEdition { found: String, supported: String },
+
     #[error("unknown artifact kind `{0}`")]
     UnknownArtifactKind(String),
 
