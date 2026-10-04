@@ -462,13 +462,13 @@ fn demo_bitwise() is
     write("  a << 4    = 0x" + to_hex(a << 4))
     write("  ROL64(a,8)= 0x" + to_hex(rol64(a, 8)))
 
-    let plain:  bytes = b"H# crypto v0.8"
+    let plain:  bytes = b"H# crypto v0.9"
     let cipher: bytes = xor_byte(plain, 0x42)
     let back:   bytes = xor_byte(cipher, 0x42)
     write("  XOR 0x42: encrypt+decrypt OK")
 
-    let hash: string = sha::sha256_hex("HackerOS v0.8")
-    write("  SHA-256('HackerOS v0.8'):")
+    let hash: string = sha::sha256_hex("HackerOS v0.9")
+    write("  SHA-256('HackerOS v0.9'):")
     write("    " + hash)
 
     write("")
@@ -498,7 +498,7 @@ end
 fn main() is
     write("")
     write("\x1b[1;32m╔═══════════════════════════════════════════════════╗\x1b[0m")
-    write("\x1b[1;32m║\x1b[0m  \x1b[1;37mH# showcase.h#\x1b[0m  —  demo języka  \x1b[1;32mv0.8\x1b[0m          \x1b[1;32m║\x1b[0m")
+    write("\x1b[1;32m║\x1b[0m  \x1b[1;37mH# showcase.h#\x1b[0m  —  demo języka  \x1b[1;32mv0.9\x1b[0m          \x1b[1;32m║\x1b[0m")
     write("\x1b[1;32m╚═══════════════════════════════════════════════════╝\x1b[0m")
     write("")
 
@@ -515,6 +515,6 @@ fn main() is
     demo_compile()
 
     write("\x1b[2m─────────────────────────────────────────────────────\x1b[0m")
-    write("  \x1b[1mH# v0.8\x1b[0m  \x1b[2mLLVM · bytes PM · eiv scanner\x1b[0m")
+    write("  \x1b[1mH# v0.9\x1b[0m  \x1b[2mLLVM · bytes PM · eiv scanner\x1b[0m")
     write("")
 end
