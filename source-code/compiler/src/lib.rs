@@ -209,6 +209,7 @@ pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(
     let mut module = hsharp_parser::ast::Module {
         file:          module.file.clone(),
         edition:       module.edition.clone(),
+        edition_span:  module.edition_span.clone(),
         file_mem_mode: module.file_mem_mode,
         imports:       module.imports.clone(),
         items,
