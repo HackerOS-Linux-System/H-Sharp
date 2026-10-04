@@ -1874,7 +1874,7 @@ hsh_string hsh_val_to_str(int64_t v) {
 hsh_string hsh_http_get(hsh_string url) {
     if (!url) return "";
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "curl -s -L --max-time 15 -A 'H#/0.7' '%s' 2>/dev/null", url);
+    snprintf(cmd, sizeof(cmd), "curl -s -L --max-time 15 -A 'H#/0.9' '%s' 2>/dev/null", url);
     return hsh_shell(cmd);
 }
 
