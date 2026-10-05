@@ -531,6 +531,35 @@ pub struct ImplBlock {
 
 // ─── Module ───────────────────────────────────────────────────────────────────
 
+/// A block of consecutive `///` lines.
+///
+/// ```text
+/// /// Adds two numbers.                  <- text: "Adds two numbers.\nBoth are ints."
+/// /// Both are ints.
+/// fn add(a: int, b: int) -> int is …     <- target_line: this line
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocComment {
+    /// The lines with `///` (and one optional following space) removed,
+    /// joined with `\n`.
+    pub text: String,
+    /// From the first `///` to the end of the last one.
+    pub span: Span,
+    /// 1-based line of the first token after the block — the item it
+    /// documents — or `None` when the block ends the file.
+    pub target_line: Option<usize>,
+}
+
+impl Module {
+    /// The `///` documentation attached to the item that starts on `line`.
+    pub fn doc_for_line(&self, line: usize) -> Option<&str> {
+        self.doc_comments
+            .iter()
+            .find(|d| d.target_line == Some(line))
+            .map(|d| d.text.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     pub file:       String,
@@ -544,6 +573,12 @@ pub struct Module {
     /// point back at it, e.g. edition feature-gate errors).
     #[serde(default)]
     pub edition_span: Option<Span>,
+    /// `///` documentation comments of the file, consecutive lines merged
+    /// into one block each (see [`DocComment`]). Comments never reach the
+    /// parser's token stream, so they cannot break any construct; this list
+    /// is how tools (LSP hover, doc generators) get at them.
+    #[serde(default)]
+    pub doc_comments: Vec<DocComment>,
     /// File-level `@: safety`/`@: arc`/`@: arena`/`@: pointers`/`@: default`
     /// directive (see `parse_module`'s handling of it, and
     /// `apply_file_mem_mode` below) — sets the default `MemoryMode` for
