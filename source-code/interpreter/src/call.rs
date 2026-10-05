@@ -691,10 +691,16 @@ impl Interpreter {
             "trim" | "str_trim" => {
                 return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default().trim().to_string()));
             }
-            "to_upper" | "upper" => {
+            // `str_to_upper` / `str_to_lower` are what `std/strings.h#`'s
+            // `__builtin_str_to_upper(..)` bridge resolves to. They used to have
+            // no arm of their own, so the bridge found the std wrapper itself
+            // (`str::to_upper` is mangled to exactly `str_to_upper`) and called it
+            // again — endless recursion, a stack overflow on every `str::to_upper`
+            // / `str::to_lower` under `h# preview`.
+            "to_upper" | "upper" | "str_to_upper" => {
                 return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default().to_uppercase()));
             }
-            "to_lower" | "lower" => {
+            "to_lower" | "lower" | "str_to_lower" => {
                 return Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default().to_lowercase()));
             }
             "contains" | "str_contains" => {
