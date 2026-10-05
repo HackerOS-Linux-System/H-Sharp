@@ -33,6 +33,16 @@
     "comments": {
       "patterns": [
         {
+          "name": "comment.line.documentation.hsharp",
+          "match": "///(?!/).*$"
+        },
+        {
+          "name": "comment.block.hsharp",
+          "begin": "//",
+          "end": "\\\\\\\\",
+          "comment": "// ... \\\\  multi-line comment (closed by two backslashes)"
+        },
+        {
           "name": "comment.line.semicolon.hsharp",
           "match": ";;.*$"
         }
