@@ -906,6 +906,7 @@ impl LlvmCodegen {
         let mut string_vars: HashSet<String> = HashSet::new();
         let mut int_vars: HashSet<String> = HashSet::new();
         let mut var_tuple_types: HashMap<String, Vec<TypeExpr>> = HashMap::new();
+        let mut fn_var_types: HashMap<String, (Vec<TypeExpr>, TypeExpr)> = HashMap::new();
         let mut array_elem_types: HashMap<String, String> = HashMap::new();
         let mut array_elem_llvm_ty: HashMap<String, BasicTypeEnum<'ctx>> = HashMap::new();
         let mut array_elem_type_expr: HashMap<String, TypeExpr> = HashMap::new();
@@ -924,6 +925,9 @@ impl LlvmCodegen {
             }
             if let TypeExpr::Tuple(elems) = &p.ty {
                 var_tuple_types.insert(p.name.clone(), elems.clone());
+            }
+            if let TypeExpr::Fn(fps, fret) = &p.ty {
+                fn_var_types.insert(p.name.clone(), (fps.clone(), fret.as_ref().clone()));
             }
             if let TypeExpr::Array(elem) = &p.ty {
                 if let TypeExpr::Named(n) = elem.as_ref() {
@@ -961,6 +965,7 @@ impl LlvmCodegen {
             int_vars,
             fn_ret_types, enums, async_fns, self_methods,
             fn_aliases: HashMap::new(),
+            fn_var_types,
             arc_owned: std::cell::RefCell::new(Vec::new()),
             branch_depth: std::cell::Cell::new(0),
             loop_stack: Vec::new(),
@@ -2294,6 +2299,11 @@ struct FnCx<'ctx, 'a> {
     /// `hsh_closure_call1/2`, but never actually wired up anywhere in
     /// this file — a separate, larger follow-up).
     fn_aliases:  HashMap<String, String>,
+    /// Local/parameter name -> declared `fn(..) -> ..` signature, for
+    /// *genuine* indirect calls through a function-pointer value (a
+    /// parameter such as `handler: fn(string) -> string`, as opposed to
+    /// the compile-time-resolved `fn_aliases`). See `call_fn_ptr`.
+    fn_var_types: HashMap<String, (Vec<TypeExpr>, TypeExpr)>,
     /// Local variable/parameter name -> "this holds a `string`" — the
     /// `string`-specific analogue of `var_types` (which only tracks
     /// *struct*-typed bindings; a plain `string` was never recorded
@@ -4670,6 +4680,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                // calls, where `name` is never an alias.
                                if let Some(real_name) = self.fn_aliases.get(name).cloned() {
                                    self.call_fn(&real_name, args, hint, call_span)
+                               } else if let (Some((fps, fret)), true) = (self.fn_var_types.get(name).cloned(), self.vars.contains_key(name.as_str())) {
+                                   // Genuine indirect call through a `fn(..) -> ..`
+                                   // typed parameter (the local shadows any
+                                   // same-named top-level function).
+                                   let fp = self.expr(callee, None)?;
+                                   self.call_fn_ptr(fp, &fps, &fret, args)
                                } else {
                                    self.call_fn(name, args, hint, call_span)
                                }
@@ -5217,6 +5233,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                let fv = self.func_vals[target.as_str()];
                                let recv = self.expr(obj_e, None)?;
                                return self.call_user_method(fv, recv, method_args);
+                           }
+                           // `obj.handler(args)` where `handler` is a struct
+                           // *field* of function type (`handler: fn(string) ->
+                           // string`) — load the field, then call it indirectly.
+                           if let Some((fps, fret)) = self.fn_field_sig(obj_e, method) {
+                               let fa = Expr::FieldAccess(obj_e.clone(), method.clone(), span.clone());
+                               let fp = self.expr(&fa, None)?;
+                               return self.call_fn_ptr(fp, &fps, &fret, method_args);
                            }
                            let obj = self.expr(obj_e, None)?;
                            // Dispatch common methods on the object's type
@@ -7162,6 +7186,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let r = self.call_coerced(self.builtins.hsh_date_format, &[ts.into(), fmt.into()], "dfmt");
                            Ok(self.unwrap_call(r))
                        }
+                       // date::parse / __builtin_date_parse(s) — string -> int
+                       // (unix timestamp, UTC). c_symbol: hsh_date_parse.
+                       "date_parse" => call1!(self.builtins.hsh_date_parse, "dparse"),
+                       // http::request / __builtin_http_request(method, url,
+                       // body) — three plain strings in, a 2-slot struct
+                       // pointer {status, body} out (same layout as
+                       // std/http.h#'s `Response`). c_symbol: hsh_http_request.
+                       "http_request" => call3!(self.builtins.hsh_http_request, "httpreq"),
                        // strings::sort / __builtin_sort_strings(arr) — [string]
                        // -> [string]. Arrays are pointer-represented like
                        // `bytes`/any other array (see "process_run_args"'s
@@ -7245,6 +7277,51 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    }
                    let r = self.call_coerced(fv, &avs, "mcall");
                    if sig.get_return_type().is_none() {
+                       Ok(self.ctx.i64_type().const_zero().into())
+                   } else {
+                       Ok(self.unwrap_call(r))
+                   }
+               }
+
+               /// Declared `fn(..) -> ..` signature of `obj.field`, if `obj`'s struct
+               /// type is statically known and that field has a function type.
+               fn fn_field_sig(&self, obj_e: &Expr, field: &str) -> Option<(Vec<TypeExpr>, TypeExpr)> {
+                   let sname = self.infer_struct_name(obj_e)?;
+                   let bare = sname.rsplit("::").next().unwrap_or(&sname).to_string();
+                   let fields = self.structs.get(&bare).or_else(|| self.structs.get(&sname))?;
+                   match &fields.iter().find(|f| f.name == field)?.ty {
+                       TypeExpr::Fn(ps, r) => Some((ps.clone(), r.as_ref().clone())),
+                       _ => None,
+                   }
+               }
+
+               /// Indirect call through a function-pointer value (`fp` is the raw
+               /// pointer, or the i64 it was boxed into). The LLVM signature is
+               /// rebuilt from the declared `fn(..) -> ..` type with the same
+               /// `htype_to_llvm` mapping real function declarations use, so the
+               /// ABI matches the callee.
+               fn call_fn_ptr(&mut self, fp: BasicValueEnum<'ctx>, params: &[TypeExpr], ret: &TypeExpr, args: &[Expr]) -> R<BasicValueEnum<'ctx>> {
+                   let ptr_ty = self.ctx.ptr_type(inkwell::AddressSpace::default());
+                   let fp = match fp {
+                       BasicValueEnum::PointerValue(p) => p,
+                       BasicValueEnum::IntValue(i) => self.builder.build_int_to_ptr(i, ptr_ty, "fnp").unwrap(),
+                       _ => return Err(CodegenError::Llvm("indirect call: callee is not a function pointer".to_string())),
+                   };
+                   let mut ptys: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> = Vec::new();
+                   let mut avs: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = Vec::new();
+                   for (i, a) in args.iter().enumerate() {
+                       let want: Option<BasicTypeEnum<'ctx>> = params.get(i).and_then(|t| htype_to_llvm(self.ctx, t));
+                       let v = self.expr(a, want)?;
+                       let v = match want { Some(t) => self.coerce_basic_value(v, t), None => v };
+                       ptys.push(v.get_type().into());
+                       avs.push(v.into());
+                   }
+                   let fnty = match htype_to_llvm(self.ctx, ret) {
+                       Some(t) if !matches!(ret, TypeExpr::Void) => t.fn_type(&ptys, false),
+                       _ => self.ctx.void_type().fn_type(&ptys, false),
+                   };
+                   let r = self.builder.build_indirect_call(fnty, fp, &avs, "icall").unwrap();
+                   if fnty.get_return_type().is_none() {
                        Ok(self.ctx.i64_type().const_zero().into())
                    } else {
                        Ok(self.unwrap_call(r))
