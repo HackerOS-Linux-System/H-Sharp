@@ -97,10 +97,28 @@ pub fn begin_build() {
     edition::start_recording();
 }
 
+/// Short text for the build summary: `2026`, or `2026 + 2027 (mixed)` when
+/// the build really mixes editions. Empty when nothing was recorded.
+pub fn summarize(records: &[edition::EditionRecord]) -> String {
+    let mut editions: Vec<Edition> = records.iter().map(|r| r.edition).collect();
+    editions.sort();
+    editions.dedup();
+    match editions.len() {
+        0 => String::new(),
+        1 => editions[0].as_str().to_string(),
+        _ => format!(
+            "{} (mixed)",
+            editions.iter().map(|e| e.as_str()).collect::<Vec<_>>().join(" + ")
+        ),
+    }
+}
+
 /// Call after `expand_program`. Prints the edition mix (only when the build
-/// really mixes editions, or always with `verbose`).
-pub fn end_build(verbose: bool) {
+/// really mixes editions, or always with `verbose`). Returns the edition
+/// summary for the build report (see [`summarize`]).
+pub fn end_build(verbose: bool) -> String {
     let records = edition::take_records();
+    let summary = summarize(&records);
     if verbose {
         for r in &records {
             println!(
@@ -114,6 +132,7 @@ pub fn end_build(verbose: bool) {
     if let Some(note) = edition::describe_mix(&records) {
         eprintln!("{}", note.trim_end().yellow());
     }
+    summary
 }
 
 #[cfg(test)]
@@ -125,6 +144,13 @@ mod tests {
         let parser: Vec<&str> = Edition::ALL.iter().map(|e| e.as_str()).collect();
         assert_eq!(parser, hsharp_hlib::manifest::SUPPORTED_EDITIONS.to_vec());
         assert_eq!(Edition::LATEST.as_str(), hsharp_hlib::manifest::DEFAULT_EDITION);
+    }
+
+    #[test]
+    fn summary_shows_one_edition_or_the_mix() {
+        let rec = |f: &str, e| edition::EditionRecord { file: f.into(), edition: e, declared: true };
+        assert_eq!(summarize(&[]), "");
+        assert_eq!(summarize(&[rec("a", Edition::E2026), rec("b", Edition::E2026)]), "2026");
     }
 
     #[test]
