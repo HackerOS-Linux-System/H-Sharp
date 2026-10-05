@@ -995,8 +995,11 @@ pub fn hoist_nested_fns(body: &mut Vec<Stmt>, enclosing_name: &str) -> Vec<FnDef
 /// rewritten too (`rename_pattern` / the `Expr::Path` arm), so enums that
 /// are constructed and pattern-matched survive inlining.
 ///
-/// Still NOT rewritten (see RUST-HSHARP-TODO.md): a bare `Expr::Ident`
-/// naming a local fn used as a *value* (`map(xs, helper)`), `Stmt::Let`
+/// A bare `Expr::Ident` naming a local fn used as a *value*
+/// (`map(xs, helper)`, `on_tick: identity_tick`) IS rewritten now, unless a
+/// local binding of the same name shadows it (`SHADOWED_NAMES`).
+///
+/// Still NOT rewritten (see RUST-HSHARP-TODO.md): `Stmt::Let`
 /// destructuring patterns, closure parameter types, and trait-side names
 /// of `impl Trait for Local`.
 /// Locates a `.hlib` archive by logical name (and optional version),
@@ -1115,7 +1118,7 @@ fn mangle_module_items(items: Vec<Item>, prefix: &str) -> Vec<Item> {
 
     items.into_iter().map(|item| match item {
         Item::FnDef(mut f) => {
-            rename_calls_in_stmts(&mut f.body, &local_fns, &local_types, prefix);
+            rename_fn_body(&f.params, &mut f.body, &local_fns, &local_types, prefix);
             for p in f.params.iter_mut() {
                 rename_type_expr(&mut p.ty, &local_types, prefix);
             }
@@ -1156,7 +1159,7 @@ fn mangle_module_items(items: Vec<Item>, prefix: &str) -> Vec<Item> {
                 imp.type_name = format!("{}_{}", prefix, imp.type_name);
             }
             for m in imp.methods.iter_mut() {
-                rename_calls_in_stmts(&mut m.body, &local_fns, &local_types, prefix);
+                rename_fn_body(&m.params, &mut m.body, &local_fns, &local_types, prefix);
                 for p in m.params.iter_mut() {
                     rename_type_expr(&mut p.ty, &local_types, prefix);
                 }
@@ -1237,7 +1240,8 @@ fn rename_calls_in_expr(expr: &mut Expr, local_fns: &HashSet<String>, local_type
     match expr {
         Expr::Call(callee, args, _) => {
             match &mut **callee {
-                Expr::Ident(name, _) if local_fns.contains(name.as_str()) => {
+                Expr::Ident(name, _) if local_fns.contains(name.as_str())
+                    && !SHADOWED_NAMES.with(|s| s.borrow().contains(name.as_str())) => {
                     *name = format!("{}_{}", prefix, name);
                 }
                 other => rename_calls_in_expr(other, local_fns, local_types, prefix),
@@ -1326,9 +1330,109 @@ fn rename_calls_in_expr(expr: &mut Expr, local_fns: &HashSet<String>, local_type
                 }
             }
         }
-        Expr::Literal(..) | Expr::Ident(..) | Expr::SelfExpr(_) |
+        // A bare identifier naming a module-local fn used as a *value*
+        // (`on_tick: identity_tick`, `map(xs, helper)`) must follow the
+        // fn's `{prefix}_` renaming too — unless a parameter / `let` /
+        // loop / pattern / closure binding of the same name shadows it
+        // inside the current function (see `SHADOWED_NAMES`).
+        Expr::Ident(name, _) => {
+            if local_fns.contains(name.as_str())
+                && !SHADOWED_NAMES.with(|s| s.borrow().contains(name.as_str()))
+            {
+                *name = format!("{}_{}", prefix, name);
+            }
+        }
+        Expr::Literal(..) | Expr::SelfExpr(_) |
         Expr::Return(None, _) => {}
     }
+}
+
+thread_local! {
+    /// Names bound anywhere inside the function currently being rewritten
+    /// by `mangle_module_items` (params, `let`s, `for`/`match` pattern
+    /// bindings, closure params, nested fn params). A bare `Expr::Ident`
+    /// with one of these names is a local variable, never a fn reference.
+    static SHADOWED_NAMES: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+}
+
+fn bound_in_pattern(p: &Pattern, out: &mut HashSet<String>) {
+    match p {
+        Pattern::Ident(n, _) => { out.insert(n.clone()); }
+        Pattern::Tuple(ps, _) | Pattern::Or(ps, _) => { for q in ps { bound_in_pattern(q, out); } }
+        Pattern::Struct { fields, .. } => { for (n, q) in fields { out.insert(n.clone()); bound_in_pattern(q, out); } }
+        Pattern::Enum { inner, .. } => { for q in inner { bound_in_pattern(q, out); } }
+        Pattern::Range(a, b, _, _) => { bound_in_pattern(a, out); bound_in_pattern(b, out); }
+        Pattern::Wildcard(_) | Pattern::Literal(..) => {}
+    }
+}
+
+fn bound_in_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { name, value, .. } => {
+                out.insert(name.clone());
+                if let Some(e) = value { bound_in_expr(e, out); }
+            }
+            Stmt::Expr(e, _) | Stmt::Return(Some(e), _) | Stmt::Break(Some(e), _) => bound_in_expr(e, out),
+            Stmt::Item(Item::FnDef(f)) => {
+                for p in &f.params { out.insert(p.name.clone()); }
+                bound_in_stmts(&f.body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn bound_in_expr(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::Call(c, args, _) => { bound_in_expr(c, out); for a in args { bound_in_expr(a, out); } }
+        Expr::MethodCall(r, _, args, _) => { bound_in_expr(r, out); for a in args { bound_in_expr(a, out); } }
+        Expr::BinOp(l, _, r, _) | Expr::Range(l, r, _, _) | Expr::Assign(l, r, _) | Expr::CompoundAssign(l, _, r, _) => {
+            bound_in_expr(l, out); bound_in_expr(r, out);
+        }
+        Expr::UnOp(_, x, _) | Expr::Cast(x, _, _) | Expr::Try(x, _) | Expr::Await(x, _) |
+        Expr::FieldAccess(x, _, _) | Expr::Return(Some(x), _) => bound_in_expr(x, out),
+        Expr::IndexAccess(a, b, _) => { bound_in_expr(a, out); bound_in_expr(b, out); }
+        Expr::ArrayLit(xs, _) | Expr::TupleLit(xs, _) => { for x in xs { bound_in_expr(x, out); } }
+        Expr::StructLit(_, fs, _) => { for (_, x) in fs { bound_in_expr(x, out); } }
+        Expr::If { condition, then_body, elsif_branches, else_body, .. } => {
+            bound_in_expr(condition, out);
+            bound_in_stmts(then_body, out);
+            for (c, b) in elsif_branches { bound_in_expr(c, out); bound_in_stmts(b, out); }
+            if let Some(b) = else_body { bound_in_stmts(b, out); }
+        }
+        Expr::Match { subject, arms, .. } => {
+            bound_in_expr(subject, out);
+            for a in arms {
+                bound_in_pattern(&a.pattern, out);
+                if let Some(g) = &a.guard { bound_in_expr(g, out); }
+                bound_in_stmts(&a.body, out);
+            }
+        }
+        Expr::While { condition, body, .. } => { bound_in_expr(condition, out); bound_in_stmts(body, out); }
+        Expr::For { pattern, iterable, body, .. } => {
+            bound_in_pattern(pattern, out);
+            bound_in_expr(iterable, out);
+            bound_in_stmts(body, out);
+        }
+        Expr::Do { body, .. } | Expr::Unsafe(body, _, _) => bound_in_stmts(body, out),
+        Expr::Closure { params, body, .. } => {
+            for p in params { out.insert(p.name.clone()); }
+            bound_in_stmts(body, out);
+        }
+        _ => {}
+    }
+}
+
+/// Runs `rename_calls_in_stmts` over one function body with
+/// `SHADOWED_NAMES` set to that function's locally bound names.
+fn rename_fn_body(params: &[Param], body: &mut [Stmt], local_fns: &HashSet<String>, local_types: &HashSet<String>, prefix: &str) {
+    let mut bound = HashSet::new();
+    for p in params { bound.insert(p.name.clone()); }
+    bound_in_stmts(body, &mut bound);
+    SHADOWED_NAMES.with(|s| *s.borrow_mut() = bound);
+    rename_calls_in_stmts(body, local_fns, local_types, prefix);
+    SHADOWED_NAMES.with(|s| s.borrow_mut().clear());
 }
 
 /// Rewrites the type names a `match` pattern mentions so they follow the
