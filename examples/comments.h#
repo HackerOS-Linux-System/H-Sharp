@@ -1,0 +1,28 @@
+using "2026"
+
+;; one-line comment (as always)
+
+/// Adds two numbers.
+/// Documentation comments start with `///`; consecutive lines form one block.
+/// Editors show it on hover (LSP), and tools can read it from `Module::doc_comments`.
+fn add(a: int, b: int) -> int is
+    return a + b
+end
+
+// A comment that can span several lines:
+   everything up to the closing double backslash is ignored —
+   even `fn`, `end` and "strings" inside it. \\
+
+/// A point in 2D space.
+struct Point is
+    /// horizontal position
+    x: int
+    /// vertical position
+    y: int
+end
+
+fn main() is
+    // inline too \\ write("add(2, 3) = " + to_string(add(2, 3)))
+    let p: Point = Point { x: 1, y: 2 }
+    write("point " + to_string(p.x) + "," + to_string(p.y))
+end
