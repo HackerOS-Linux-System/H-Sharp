@@ -232,6 +232,18 @@ end
 
 ---
 
+## Komentarze
+
+| zapis | znaczenie |
+|---|---|
+| `;; tekst` | komentarz jednolinijkowy |
+| `/// tekst` | komentarz dokumentacyjny — kolejne linie `///` tworzą jeden blok opisujący następny element (funkcję, `struct`, pole, wariant `enum`); LSP pokazuje go w podpowiedzi, a narzędzia czytają go z `Module::doc_comments`. `////` to zwykły komentarz |
+| `// treść \\` | komentarz wielolinijkowy — wszystko do zamykającego `\\` jest ignorowane (także `fn`, `end`, napisy i nowe linie); może stać też w środku linii. Niezamknięty daje błąd wskazujący otwierające `//` |
+
+`h# fmt` nie rusza wnętrza komentarza wielolinijkowego. To nie jest nowa edycja — działa w `using "2026"`. Przykład: [`examples/comments.h#`](examples/comments.h#).
+
+---
+
 ## Edycje (`using`)
 
 **Edycja** to nazwana migawka składni i reguł języka, wybierana **osobno dla każdego pliku**:
