@@ -262,7 +262,12 @@ fn main() {
         _ => std::path::PathBuf::from("."),
     };
     let edition_info = edition_cmd::init(cli.edition.clone(), &anchor);
-    if !matches!(cli.command, Command::Lsp | Command::Repl) {
+    // Build-like commands print their own report (compile shows backend,
+    // edition and toolchain in its summary), so they get no banner above it.
+    if !matches!(
+        cli.command,
+        Command::Lsp | Command::Repl | Command::Compile { .. } | Command::Preview { .. } | Command::Check { .. }
+    ) {
         print_banner(edition_info.0);
     }
     match cli.command {
