@@ -715,9 +715,9 @@ BuiltinSpec {
     names: &["__builtin_http_request"],
     params: || vec![HType::Str, HType::Str, HType::Str],
     ret: || HType::Str,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Plain-HTTP/1.1 client request (std/http.h#, std/net_http.h#). Interpreter only.",
+    c_symbol: Some("hsh_http_request"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Plain-HTTP/1.1 client request (std/http.h#, std/net_http.h#). Returns a {status, body} struct (status 0 = request failed). Implemented on both backends — Llvm's is a raw-socket client in core.c (no TLS, redirects or chunked decoding, same as the interpreter).",
 },
 BuiltinSpec {
     names: &["__builtin_atomic_add"],
@@ -1187,9 +1187,9 @@ BuiltinSpec {
     names: &["__builtin_date_parse"],
     params: || vec![HType::Str],
     ret: || HType::Int,
-    c_symbol: None,
-    backends: &[Backend::Interpreter],
-    doc: "Parse \"YYYY-MM-DD[ HH:MM:SS]\". Interpreter only.",
+    c_symbol: Some("hsh_date_parse"),
+    backends: &[Backend::Interpreter, Backend::Llvm],
+    doc: "Parse \"YYYY-MM-DD[ HH:MM:SS]\" (UTC) into a unix timestamp. Implemented on both backends (hsh_date_parse in core.c).",
 },
 BuiltinSpec {
     names: &["__builtin_conv_str_to_int"],
@@ -2090,6 +2090,8 @@ pub fn resolve_builtin_dunder_llvm(name: &str) -> Option<&'static str> {
         // added this session (core.c + builtins.rs + codegen.rs's
         // `call_fn`, all under these exact bare names).
         "date_format"           => "date_format",
+        "date_parse"            => "date_parse",
+        "http_request"          => "http_request",
         "sort_strings"          => "sort_strings",
         // std/test.h# helpers — hsh_test_fail / hsh_test_skip in core.c.
         "test_fail"             => "test_fail",
