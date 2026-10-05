@@ -1,0 +1,31 @@
+using "2026"
+use "std -> test" from "test"
+
+/// Doubles a number.
+/// (a documentation comment never changes behaviour)
+fn double(n: int) -> int is
+    return n * 2
+end
+
+// this comment spans
+   several lines and mentions fn, is, end and "quotes"
+   without affecting the program \\
+
+#[test]
+fn test_doc_comment_is_transparent() is
+    assert_eq(double(21), 42)
+end
+
+#[test]
+fn test_multiline_comment_between_statements() is
+    let a: int = 1
+    // skipped \\
+    let b: int = 2
+    assert_eq(a + b, 3)
+end
+
+#[test]
+fn test_comment_markers_inside_strings_are_text() is
+    let s: string = "a /// b // c ;; d"
+    assert_eq(s, "a /// b // c ;; d")
+end
