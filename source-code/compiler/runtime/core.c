@@ -25,6 +25,9 @@ char **_hsh_argv = NULL;
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <errno.h>
 
 typedef const char* hsh_string;
 typedef int64_t     hsh_int;
@@ -448,6 +451,195 @@ hsh_string hsh_date_format(int64_t ts, hsh_string fmt) {
     memcpy(out, buf, n);
     out[n] = '\0';
     return out;
+}
+
+/* ── date::parse ─────────────────────────────────────────────────────────────
+ * Backs `__builtin_date_parse(s)`. Same contract as the interpreter's
+ * "date_parse": accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" (UTC) and
+ * returns a unix timestamp; anything that does not have exactly three
+ * date components yields 0. Missing time components default to 0. A 'T'
+ * separator is accepted as well (superset of the interpreter).
+ * Howard Hinnant's days_from_civil, no libc/timezone dependency. */
+static int64_t hsh_days_from_civil(int64_t y, int64_t m, int64_t d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t mp  = m > 2 ? m - 3 : m + 9;
+    int64_t doy = (153 * mp + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* Splits `s` on `sep` and parses up to `max` integer components; returns
+ * the number of components that parsed successfully (like the
+ * interpreter's filter_map over split().parse()). */
+static int hsh_parse_parts(const char *s, char sep, int64_t *out, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        char *end;
+        while (*s == ' ') s++;
+        errno = 0;
+        long long v = strtoll(s, &end, 10);
+        const char *next = end;
+        while (*next && *next != sep) next++;
+        if (end != s && (*end == sep || *end == '\0') && errno == 0) out[n++] = (int64_t)v;
+        s = *next ? next + 1 : next;
+    }
+    return n;
+}
+
+int64_t hsh_date_parse(hsh_string s) {
+    if (!s) return 0;
+    char buf[128];
+    size_t len = strlen(s);
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    char *sp = strchr(buf, ' ');
+    if (!sp) sp = strchr(buf, 'T');
+    const char *time_part = "00:00:00";
+    if (sp) { *sp = '\0'; time_part = sp + 1; }
+    int64_t d[3] = {0, 0, 0}, t[3] = {0, 0, 0};
+    if (hsh_parse_parts(buf, '-', d, 3) != 3) return 0;
+    int nt = hsh_parse_parts(time_part, ':', t, 3);
+    (void)nt;
+    return hsh_days_from_civil(d[0], d[1], d[2]) * 86400 + t[0] * 3600 + t[1] * 60 + t[2];
+}
+
+/* ── http::request ───────────────────────────────────────────────────────────
+ * Backs `__builtin_http_request(method, url, body)`. Plain HTTP/1.1 over a
+ * raw TCP socket (no TLS, no redirects, no chunked-transfer decoding, no
+ * keep-alive) — the same limitations as the interpreter's implementation.
+ * Returns a 2-slot H# struct { status: int, body: string } laid out like
+ * `struct Response` in std/http.h# (status = slot 0, body = slot 1).
+ * status 0 means the request itself failed; body then holds the reason. */
+int64_t *hsh_struct_new(int64_t n); /* defined in the struct helpers section below */
+static int64_t *hsh_http_make(int64_t status, const char *body, size_t blen) {
+    char *b = (char*)hsh_alloc(blen + 1);
+    memcpy(b, body, blen);
+    b[blen] = '\0';
+    int64_t *r = hsh_struct_new(2);
+    r[0] = status;
+    r[1] = (int64_t)(uintptr_t)b;
+    return r;
+}
+static int64_t *hsh_http_fail(const char *msg) { return hsh_http_make(0, msg, strlen(msg)); }
+
+int64_t *hsh_http_request(hsh_string method, hsh_string url, hsh_string body) {
+    if (!method || !method[0]) method = "GET";
+    if (!url) url = "";
+    if (!body) body = "";
+    const char *rest = url;
+    if (strncmp(url, "http://", 7) == 0) rest = url + 7;
+    else if (strncmp(url, "https://", 8) == 0)
+        return hsh_http_fail("https:// is not supported — this runtime has no TLS backend, use http:// or a reverse proxy");
+
+    const char *slash = strchr(rest, '/');
+    size_t hp_len = slash ? (size_t)(slash - rest) : strlen(rest);
+    const char *path = slash ? slash : "/";
+    char host_port[300];
+    if (hp_len == 0 || hp_len >= sizeof(host_port)) return hsh_http_fail("DNS resolution failed");
+    memcpy(host_port, rest, hp_len);
+    host_port[hp_len] = '\0';
+
+    char host[300], port[16] = "80";
+    strcpy(host, host_port);
+    char *colon = strrchr(host, ':');
+    if (colon && strchr(host, ']') == NULL) {
+        *colon = '\0';
+        long p = strtol(colon + 1, NULL, 10);
+        if (p > 0 && p < 65536) snprintf(port, sizeof(port), "%ld", p);
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) return hsh_http_fail("DNS resolution failed");
+
+    int fd = -1;
+    int saved_errno = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) { saved_errno = errno; continue; }
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            struct pollfd pfd = { fd, POLLOUT, 0 };
+            if (poll(&pfd, 1, 10000) == 1) {
+                int err = 0; socklen_t el = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                if (err == 0) rc = 0; else errno = err;
+            } else errno = ETIMEDOUT;
+        }
+        if (rc == 0) { fcntl(fd, F_SETFL, fl); break; }
+        saved_errno = errno;
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "connection failed: %s", strerror(saved_errno));
+        return hsh_http_fail(msg);
+    }
+    struct timeval tv = { 10, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    size_t blen = strlen(body);
+    size_t cap = strlen(method) + strlen(path) + strlen(host_port) + blen + 160;
+    char *req = (char*)malloc(cap);
+    if (!req) { close(fd); return hsh_http_fail("out of memory"); }
+    int hl;
+    if (blen == 0)
+        hl = snprintf(req, cap, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: hsharp\r\n\r\n", method, path, host);
+    else
+        hl = snprintf(req, cap, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: hsharp\r\nContent-Length: %zu\r\n\r\n", method, path, host, blen);
+    size_t total = (size_t)hl;
+    if (blen) { memcpy(req + total, body, blen); total += blen; }
+    size_t sent = 0;
+    while (sent < total) {
+        ssize_t w = send(fd, req + sent, total - sent, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            char msg[200]; snprintf(msg, sizeof(msg), "write failed: %s", strerror(errno));
+            free(req); close(fd); return hsh_http_fail(msg);
+        }
+        sent += (size_t)w;
+    }
+    free(req);
+
+    size_t rcap = 8192, rlen = 0;
+    char *raw = (char*)malloc(rcap);
+    if (!raw) { close(fd); return hsh_http_fail("out of memory"); }
+    for (;;) {
+        if (rlen + 4096 + 1 > rcap) {
+            rcap *= 2;
+            char *nr = (char*)realloc(raw, rcap);
+            if (!nr) { free(raw); close(fd); return hsh_http_fail("out of memory"); }
+            raw = nr;
+        }
+        ssize_t n = recv(fd, raw + rlen, 4096, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            char msg[200]; snprintf(msg, sizeof(msg), "read failed: %s", strerror(errno));
+            free(raw); close(fd); return hsh_http_fail(msg);
+        }
+        if (n == 0) break;
+        rlen += (size_t)n;
+    }
+    close(fd);
+    raw[rlen] = '\0';
+
+    int64_t status = 0;
+    char *sp1 = strchr(raw, ' ');
+    if (sp1 && strncmp(raw, "HTTP/", 5) == 0) status = (int64_t)strtoll(sp1 + 1, NULL, 10);
+    char *sep = strstr(raw, "\r\n\r\n");
+    int64_t *r;
+    if (sep) r = hsh_http_make(status, sep + 4, rlen - (size_t)(sep + 4 - raw));
+    else     r = hsh_http_make(status, "", 0);
+    free(raw);
+    return r;
 }
 
 int64_t hsh_getpid(void) { return (int64_t)getpid(); }
