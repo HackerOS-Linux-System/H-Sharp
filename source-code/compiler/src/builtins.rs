@@ -253,6 +253,8 @@ pub struct LlvmBuiltins<'ctx> {
     // `hsh_str_split_whitespace` follow `hsh_env_args`'s existing
     // `HshArray*`-of-`char*` construction immediately above.
     pub hsh_date_format: FunctionValue<'ctx>,
+    pub hsh_date_parse: FunctionValue<'ctx>,
+    pub hsh_http_request: FunctionValue<'ctx>,
     pub hsh_sort_strings: FunctionValue<'ctx>,
     pub hsh_str_split_whitespace: FunctionValue<'ctx>,
     // ── Struct helpers ────────────────────────────────────────────────────
@@ -580,6 +582,10 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             // (i64, ptr) -> ptr — no existing shorthand closure covers
             // this exact mixed shape, so declared directly.
             hsh_date_format: decl("hsh_date_format", ptr.fn_type(&[i64t.into(), ptr.into()], false)),
+            // string -> i64 (date::parse)
+            hsh_date_parse: decl("hsh_date_parse", i64t.fn_type(&[ptr.into()], false)),
+            // (method, url, body) -> struct* {status, body} (http::request)
+            hsh_http_request: decl("hsh_http_request", ptr.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false)),
             hsh_sort_strings: pp("hsh_sort_strings"),
             hsh_str_split_whitespace: pp("hsh_str_split_whitespace"),
             // Struct helpers
