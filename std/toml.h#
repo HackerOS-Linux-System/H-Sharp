@@ -10,8 +10,8 @@ pub fn parse(data: string) -> any is
         i += 1
         if line == "" || line[0..1] == "#" is continue end
         if line[0..1] == "[" is
-            let end = __builtin_str_index_of(line, "]")
-            if end > 0 is section = line[1..end] end
+            let close = __builtin_str_index_of(line, "]")
+            if close > 0 is section = line[1..close] end
             continue
         end
         let eq = __builtin_str_index_of(line, "=")
