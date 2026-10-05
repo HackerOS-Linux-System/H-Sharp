@@ -210,6 +210,7 @@ pub fn compile(module: &Module, source: &str, opts: &CompileOptions) -> Result<(
         file:          module.file.clone(),
         edition:       module.edition.clone(),
         edition_span:  module.edition_span.clone(),
+        doc_comments:  module.doc_comments.clone(),
         file_mem_mode: module.file_mem_mode,
         imports:       module.imports.clone(),
         items,
