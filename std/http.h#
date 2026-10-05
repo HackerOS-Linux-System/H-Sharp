@@ -4,7 +4,10 @@ struct Response is
 end
 
 fn wrap(raw: any) -> Response is
-    return Response { status: raw.status, body: raw.body }
+    ;; Annotated so every backend resolves `.status`/`.body` against
+    ;; `Response` statically (no scan-all-structs guess, no warning).
+    let r: Response = raw
+    return Response { status: r.status, body: r.body }
 end
 
 pub fn get(url: string) -> string is
