@@ -166,7 +166,7 @@ pub fn run(
         }
     }
 
-    crate::edition_cmd::end_build(verbose);
+    let edition_summary = crate::edition_cmd::end_build(verbose);
 
     // ── --emit-ir: dump IR and exit ─────────────────────────────────────────
     if emit_ir {
@@ -227,20 +227,26 @@ pub fn run(
 
     println!();
     println!("{}", "─".repeat(54).dimmed());
+    // One aligned `Label:  value` row per fact — labels padded to the widest.
     let artifact_label = match output_kind {
-        OutputKind::Binary    => "Binary:  ",
-        OutputKind::Object    => "Object:  ",
+        OutputKind::Binary    => "Binary:",
+        OutputKind::Object    => "Object:",
         OutputKind::SharedLib => "SharedLib:",
         OutputKind::StaticLib => "StaticLib:",
     };
-    println!("  {} {}", artifact_label.bold(), bin.cyan());
-    println!("  {} {}", "Target:  ".bold(), triple.llvm_triple);
-    println!("  {} {}", "Backend: ".bold(), format!("LLVM (h# v{})", env!("CARGO_PKG_VERSION")).green());
-    println!("  {} {}", "Mode:    ".bold(), if optimize { "release (O3 + LTO)".yellow().to_string() } else { "debug (O0)".dimmed().to_string() });
+    let row = |label: &str, value: String| println!("  {} {}", format!("{:<10}", label).bold(), value);
+    row(artifact_label, bin.cyan().to_string());
+    row("Target:", triple.llvm_triple.to_string());
+    row("Backend:", "LLVM (h#)".green().to_string());
+    row("Mode:", if optimize { "release (O3 + LTO)".yellow().to_string() } else { "debug (O0)".dimmed().to_string() });
     if !link_desc.is_empty() {
-        println!("  {} {}", "Linked:  ".bold(), link_desc.yellow());
+        row("Linked:", link_desc.yellow().to_string());
     }
-    println!("  {} {:.2?}", "Time:    ".bold(), elapsed);
+    row("Time:", format!("{:.2?}", elapsed));
+    if !edition_summary.is_empty() {
+        row("Edition:", edition_summary.cyan().to_string());
+    }
+    row("Toolchain:", format!("h# {}", env!("CARGO_PKG_VERSION")));
     println!("{}", "─".repeat(54).dimmed());
     println!("\n  {} Build complete!", "✓".green().bold());
 
