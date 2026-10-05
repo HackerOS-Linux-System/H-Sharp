@@ -134,6 +134,16 @@ pub struct Lexer {
     line:   usize,
     col:    usize,
     file:   String,
+    /// Every `///` line seen so far (comments are *not* tokens — see
+    /// [`Lexer::doc_lines`] and `group_doc_comments`).
+    docs:   Vec<DocLine>,
+}
+
+/// One `///` line: its text (without the marker) and where it sits.
+#[derive(Debug, Clone)]
+pub struct DocLine {
+    pub text: String,
+    pub span: Span,
 }
 
 impl Lexer {
@@ -144,8 +154,12 @@ impl Lexer {
             line:   1,
             col:    1,
             file:   file.into(),
+            docs:   Vec::new(),
         }
     }
+
+    /// The `///` lines collected while tokenizing, in source order.
+    pub fn doc_lines(&self) -> &[DocLine] { &self.docs }
 
     fn current(&self) -> Option<char> { self.source.get(self.pos).copied() }
     fn peek(&self, n: usize) -> Option<char> { self.source.get(self.pos + n).copied() }
@@ -508,53 +522,54 @@ impl Lexer {
                     break;
                 }
 
-                // Doc comment ///
-                Some('/') if self.peek(1) == Some('/') && self.peek(2) == Some('/') => {
+                // `///` documentation comment — to end of line. It is **not** a
+                // token: it is recorded in `self.docs` and merged into
+                // `Module::doc_comments`, so it can sit anywhere (before items,
+                // struct fields, enum variants, inside bodies…) without ever
+                // confusing the parser. (`////…` is an ordinary comment, as in Rust.)
+                Some('/') if self.peek(1) == Some('/') && self.peek(2) == Some('/') && self.peek(3) != Some('/') => {
                     self.advance(); self.advance(); self.advance();
+                    if self.current() == Some(' ') { self.advance(); }
                     let mut doc = String::new();
                     while let Some(c) = self.current() {
                         if c == '\n' { break; }
                         doc.push(self.advance().unwrap());
                     }
-                    tokens.push(Token::new(
-                        TokenKind::DocComment(doc.trim().to_string()),
-                                           Span::new(start, self.position(), self.file.clone()),
-                                           "///",
-                    ));
+                    self.docs.push(DocLine {
+                        text: doc.trim_end().to_string(),
+                        span: Span::new(start, self.position(), self.file.clone()),
+                    });
                 }
 
-                // ;; line comment
+                // `;;` line comment
                 Some(';') if self.peek(1) == Some(';') => {
                     while self.current().map(|c| c != '\n').unwrap_or(false) {
                         self.advance();
                     }
                 }
 
-                // // block comment — ends with \\
+                // `// … \\` multi-line comment: everything up to the closing
+                // double backslash is ignored (newlines included). Like `;;`, it
+                // produces no tokens. An unclosed one is an error that points at
+                // the opening `//`.
                 Some('/') if self.peek(1) == Some('/') => {
                     self.advance(); self.advance();
-                    tokens.push(Token::new(
-                        TokenKind::BlockCommentStart,
-                        Span::new(start.clone(), self.position(), self.file.clone()),
-                                           "//",
-                    ));
-                    loop {
-                        match self.current() {
-                            None => break,
-                            Some('\\') if self.peek(1) == Some('\\') => {
-                                self.advance(); self.advance();
-                                tokens.push(Token::new(
-                                    TokenKind::BlockCommentEnd,
-                                    Span::new(start, self.position(), self.file.clone()),
-                                                       "\\\\",
-                                ));
-                                break;
-                            }
-                            Some(c) => {
-                                if c == '\n' { self.line += 1; self.col = 1; }
-                                self.advance();
-                            }
+                    let mut closed = false;
+                    while let Some(c) = self.current() {
+                        if c == '\\' && self.peek(1) == Some('\\') {
+                            self.advance(); self.advance();
+                            closed = true;
+                            break;
                         }
+                        self.advance();
+                    }
+                    if !closed {
+                        errors.push(ParseError::new(
+                            ParseErrorKind::Custom("unterminated block comment".to_string()),
+                            Span::new(start.clone(), Position { line: start.line, col: start.col + 2, offset: start.offset + 2 }, self.file.clone()),
+                            "unterminated block comment",
+                            vec!["close it with `\\\\` (two backslashes), or use `;;` for a one-line comment".to_string()],
+                        ));
                     }
                 }
 
