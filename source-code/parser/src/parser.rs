@@ -306,7 +306,7 @@ impl Parser {
             }
         }
 
-        Module { file: self.file.clone(), edition, edition_span, file_mem_mode, items, imports }
+        Module { file: self.file.clone(), edition, edition_span, doc_comments: Vec::new(), file_mem_mode, items, imports }
     }
 
     // ── Import ────────────────────────────────────────────────────────────────
