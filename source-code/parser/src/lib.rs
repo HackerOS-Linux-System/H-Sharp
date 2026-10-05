@@ -39,8 +39,9 @@ pub fn parse(source: &str, file: &str) -> ParseResult {
 /// edition, whatever edition the importing file is written in.
 pub fn parse_with_default(source: &str, file: &str, file_default: Option<edition::Edition>) -> ParseResult {
     let mut lexer = Lexer::new(source, file);
+    let mut doc_lines: Vec<lexer::DocLine> = Vec::new();
     let (tokens, lex_errors) = match lexer.tokenize() {
-        Ok(t) => (t, vec![]),
+        Ok(t) => { doc_lines = lexer.doc_lines().to_vec(); (t, vec![]) }
         Err(e) => {
             // Still try to parse with partial tokens — collect what we have
             // by re-running in recovery mode
@@ -57,8 +58,10 @@ pub fn parse_with_default(source: &str, file: &str, file_default: Option<edition
         }
     };
 
+    let doc_comments = group_doc_comments(&doc_lines, &tokens);
     let mut p = parser::Parser::new(tokens, source.to_string(), file.to_string());
     let mut module = p.parse_module();
+    module.doc_comments = doc_comments;
     let mut errors = lex_errors;
     errors.extend(p.errors.errors);
 
@@ -254,5 +257,107 @@ mod bit_import_tests {
         // `bitmap` is not `bit`; it is simply not a known import kind.
         let result = parse("use \"bitmap -> x\"\nfn main() is end\n", "test.h#");
         assert!(result.has_errors());
+    }
+}
+
+/// Merge consecutive `///` lines into [`ast::DocComment`] blocks and point
+/// each at the line of the first real token that follows it.
+fn group_doc_comments(lines: &[lexer::DocLine], tokens: &[lexer::Token]) -> Vec<ast::DocComment> {
+    let mut out: Vec<ast::DocComment> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let first = &lines[i];
+        let mut j = i;
+        let mut text = vec![first.text.clone()];
+        // a block continues while the next `///` is on the very next line
+        while j + 1 < lines.len() && lines[j + 1].span.start.line == lines[j].span.end.line + 1 {
+            j += 1;
+            text.push(lines[j].text.clone());
+        }
+        let last = &lines[j];
+        let end_off = last.span.end.offset;
+        let target_line = tokens
+            .iter()
+            .find(|t| {
+                t.span.start.offset >= end_off
+                    && !matches!(t.kind, lexer::TokenKind::Newline | lexer::TokenKind::EOF)
+            })
+            .map(|t| t.span.start.line);
+        out.push(ast::DocComment {
+            text: text.join("\n"),
+            span: first.span.merge(&last.span),
+            target_line,
+        });
+        i = j + 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod comment_tests {
+    use super::*;
+
+    fn ok(src: &str) -> ParseResult {
+        let r = parse(src, "t.h#");
+        assert!(!r.has_errors(), "{}", r.render_errors());
+        r
+    }
+
+    #[test]
+    fn doc_comments_before_items_are_collected_and_attached() {
+        let r = ok("/// Adds two numbers.\n/// Both are ints.\nfn add(a: int, b: int) -> int is\n    return a + b\nend\n\n/// Entry point.\nfn main() is\nend\n");
+        assert_eq!(r.module.doc_comments.len(), 2);
+        assert_eq!(r.module.doc_comments[0].text, "Adds two numbers.\nBoth are ints.");
+        assert_eq!(r.module.doc_comments[0].target_line, Some(3));
+        assert_eq!(r.module.doc_for_line(3), Some("Adds two numbers.\nBoth are ints."));
+        assert_eq!(r.module.doc_for_line(8), Some("Entry point."));
+        assert_eq!(r.module.doc_for_line(1), None);
+    }
+
+    #[test]
+    fn doc_comments_may_sit_on_fields_variants_and_in_bodies() {
+        ok("/// A point\nstruct P is\n    /// x coord\n    x: int\n    /// y coord\n    y: int\nend\n\nenum E is\n    /// first\n    A\n    /// second\n    B\nend\n\nfn main() is\n    /// not an item, still harmless\n    let a: int = 1\nend\n");
+    }
+
+    #[test]
+    fn four_slashes_is_a_plain_comment_not_a_doc() {
+        let r = parse("//// banner \\\\\nfn main() is\nend\n", "t.h#");
+        assert!(r.module.doc_comments.is_empty());
+    }
+
+    #[test]
+    fn multiline_comment_is_ignored_even_with_keywords_inside() {
+        let r = ok("// this is a\n   multi-line comment: fn end is struct\n   \"strings\" too \\\\\nfn main() is\n    write(\"x\")\nend\n");
+        assert_eq!(r.module.items.len(), 1);
+    }
+
+    #[test]
+    fn multiline_comment_inline_and_trailing() {
+        ok("fn main() is\n    // inline \\\\ write(\"y\")\nend\n");
+        ok("fn main() is\n    write(\"a\") // trailing \\\\\nend\n");
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_not_comments() {
+        let r = ok("fn main() is\n    write(\"http://x.y /// not doc ;; nor this\")\nend\n");
+        assert!(r.module.doc_comments.is_empty());
+    }
+
+    #[test]
+    fn unterminated_multiline_comment_is_an_error_at_its_start() {
+        let r = parse("fn main() is\nend\n// never closed\nfn f() is\nend\n", "t.h#");
+        assert!(r.has_errors());
+        let msg = r.render_errors();
+        assert!(msg.contains("unterminated block comment"), "{msg}");
+        assert!(msg.contains(":3:1"), "{msg}");
+    }
+
+    #[test]
+    fn line_numbers_after_a_multiline_comment_are_exact() {
+        // the old lexer counted every newline inside `// … \\` twice
+        let src = "// line 1\nline 2 \\\\\nfn main() is\n    let x: int = = 1\nend\n";
+        let r = parse(src, "t.h#");
+        assert!(r.has_errors());
+        assert!(r.render_errors().contains(":4:"), "{}", r.render_errors());
     }
 }
