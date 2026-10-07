@@ -698,6 +698,27 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
                 dirs.push(p.as_path());
             }
         }
+        // FIX: a library file in a sub-directory (e.g. `silver/src/engine/
+        // layout.h#` doing `mod ffi_shim`, where `ffi_shim.h#` lives one level
+        // up in `silver/src/`) was never found — only the declaring dir, the
+        // entry dir and cwd were searched, giving "module 'ffi_shim' not
+        // found". Also try the ancestors of the declaring dir, stopping at the
+        // package root (the directory holding `Bit.hk`).
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        {
+            let mut cur = from_dir.parent();
+            let mut depth = 0;
+            while let Some(d) = cur {
+                if depth >= 4 || d.as_os_str().is_empty() { break; }
+                ancestors.push(d.to_path_buf());
+                if d.join("Bit.hk").exists() { break; }
+                cur = d.parent();
+                depth += 1;
+            }
+        }
+        for a in &ancestors {
+            if !dirs.iter().any(|d| *d == a.as_path()) { dirs.push(a.as_path()); }
+        }
         for dir in dirs {
             for candidate in &candidates {
                 let path = dir.join(candidate);
