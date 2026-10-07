@@ -1369,6 +1369,24 @@ impl LlvmCodegen {
         Ok(())
     }
 
+    /// Extra linker flags supplied by the user through the environment.
+    ///
+    /// FIX: `export LDFLAGS="-lm -lSDL2 ..."` was silently ignored by
+    /// `h# compile`, and the CLI has no `-l` option, so a C library that
+    /// depends on other system libraries (SDL2, SDL2_ttf, ...) could not be
+    /// linked at all. `HSHARP_LDFLAGS` is read first, then `LDFLAGS`; both
+    /// are split on whitespace and appended at the *end* of the link line
+    /// (after every static archive), which is where dependent libs must be.
+    fn user_ldflags() -> Vec<String> {
+        let mut out = Vec::new();
+        for var in ["LDFLAGS", "HSHARP_LDFLAGS"] {
+            if let Ok(v) = std::env::var(var) {
+                out.extend(v.split_whitespace().map(|s| s.to_string()));
+            }
+        }
+        out
+    }
+
     /// Detect whether we're linking on Termux (Android's bionic libc via a
     /// Termux userland), which needs a meaningfully different link recipe
     /// than a normal glibc/musl Linux desktop:
@@ -1762,15 +1780,17 @@ AOT backend grows its own native bridge for this."
                 cmd.arg(&obj_path);
                 for rt_o in &rt_objects { cmd.arg(rt_o); }
                 cmd.arg("-o").arg(&out);
-                // Same Linux-only-flags fix as the main binary link path
-                // below (see its longer comment on `linux_only_flags`).
+                for lib in &runtime_libs { cmd.arg(lib); }
+                for a in &extern_args    { cmd.arg(a); }
+                // FIX: system libs go AFTER the extern archives (a static
+                // archive's own libm/pthread/dl needs are only resolved
+                // against libs that come later on the link line).
                 if !Self::is_termux() && self.opts.target.os == crate::target::Os::Linux {
                     cmd.args(["-lm", "-lpthread", "-ldl"]);
                 } else if self.opts.target.os == crate::target::Os::MacOS {
                     cmd.arg("-lm");
                 }
-                for lib in &runtime_libs { cmd.arg(lib); }
-                for a in &extern_args    { cmd.arg(a); }
+                for a in Self::user_ldflags() { cmd.arg(a); }
                 if self.opts.optimize { cmd.arg("-O2"); }
                 let res = cmd.output()?;
                 std::fs::remove_file(&obj_path).ok();
@@ -1799,7 +1819,8 @@ AOT backend grows its own native bridge for this."
         let suffix = self.opts.target.exe_suffix();
         let out    = format!("{}{}", self.opts.output, suffix);
 
-        let extern_args = self.link_flags.borrow().to_cc_args();
+        let extern_args = self.link_flags.borrow().to_cc_args_ex(self.opts.static_link);
+        let user_ldflags = Self::user_ldflags();
 
         let mut cmd = std::process::Command::new(&cc_bin);
         cmd.args(&cc_extra);
@@ -1820,10 +1841,14 @@ AOT backend grows its own native bridge for this."
         // `cross_toolchain`'s doc comment for that half of this fix).
         let linux_only_flags = !on_termux && self.opts.target.os == crate::target::Os::Linux;
         if linux_only_flags { cmd.arg("-no-pie"); }
-        if linux_only_flags { cmd.args(["-lm", "-lpthread", "-ldl"]); }
-        else if self.opts.target.os == crate::target::Os::MacOS { cmd.arg("-lm"); } // libpthread/libdl are part of libSystem on macOS already — only libm needs to be named explicitly
         for lib in &runtime_libs { cmd.arg(lib); }
         for a in &extern_args    { cmd.arg(a); }
+        // FIX: libm/libpthread/libdl AFTER the extern archives — previously
+        // they preceded `-lsilverjs` etc., so `trunc`/`fmod`/`log`... from
+        // QuickJS stayed undefined in a static link.
+        if linux_only_flags { cmd.args(["-lm", "-lpthread", "-ldl"]); }
+        else if self.opts.target.os == crate::target::Os::MacOS { cmd.arg("-lm"); } // libpthread/libdl are part of libSystem on macOS already — only libm needs to be named explicitly
+        for a in &user_ldflags { cmd.arg(a); }
         if self.opts.optimize {
             cmd.args(["-O2", "-Wl,--gc-sections", "-Wl,--as-needed",
                      "-Wl,--strip-all", "-flto"]);
@@ -1840,15 +1865,16 @@ AOT backend grows its own native bridge for this."
             for rt_o in &rt_objects { cmd2.arg(rt_o); }
             cmd2.arg("-o").arg(&out);
             if linux_only_flags { cmd2.arg("-no-pie"); }
-            if linux_only_flags { cmd2.args(["-lm", "-lpthread", "-ldl"]); }
-            else if self.opts.target.os == crate::target::Os::MacOS { cmd2.arg("-lm"); }
             for lib in &runtime_libs { cmd2.arg(lib); }
             for a in &extern_args    { cmd2.arg(a); }
+            if linux_only_flags { cmd2.args(["-lm", "-lpthread", "-ldl"]); }
+            else if self.opts.target.os == crate::target::Os::MacOS { cmd2.arg("-lm"); }
+            for a in &user_ldflags { cmd2.arg(a); }
             if self.opts.optimize { cmd2.arg("-O2"); }
             if self.opts.static_link { cmd2.arg("-static"); }
             let r2 = cmd2.output()?;
             if !r2.status.success() {
-                let stderr = String::from_utf8_lossy(&result.stderr);
+                let stderr = String::from_utf8_lossy(&r2.stderr);
                 let hint = if stderr.contains("pcre2") {
                     "\nhint: sudo apt install libpcre2-dev"
                 } else if stderr.contains("sqlite3") {
