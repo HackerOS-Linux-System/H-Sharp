@@ -189,6 +189,18 @@ impl LinkFlags {
     ///  4. Rust staticlibs:     -Wl,--whole-archive -l<x> -Wl,--no-whole-archive
     ///  5. rpath hints
     pub fn to_cc_args(&self) -> Vec<String> {
+        self.to_cc_args_ex(false)
+    }
+
+    /// Same as [`to_cc_args`], but aware of a fully static (`-static`) link.
+    ///
+    /// FIX: with `-static`, the `-Wl,-Bstatic … -Wl,-Bdynamic` bracket flips
+    /// the linker back to *dynamic* mode for everything that follows —
+    /// including the implicit `-lc` gcc appends — so ld picked `libc.so`
+    /// (a linker script pointing at `libc.so.6`) and failed with
+    /// "attempted static link of dynamic object". In a `-static` link every
+    /// `-l` is static anyway, so the bracket is simply omitted.
+    pub fn to_cc_args_ex(&self, fully_static: bool) -> Vec<String> {
         let mut args = Vec::new();
 
         // 1. pkg-config (already fully formed flags)
@@ -196,11 +208,11 @@ impl LinkFlags {
 
         // 2. Static C/C++ libs
         if !self.static_libs.is_empty() {
-            args.push("-Wl,-Bstatic".to_string());
+            if !fully_static { args.push("-Wl,-Bstatic".to_string()); }
             for lib in &self.static_libs {
                 args.push(format!("-l{}", lib));
             }
-            args.push("-Wl,-Bdynamic".to_string());
+            if !fully_static { args.push("-Wl,-Bdynamic".to_string()); }
         }
 
         // 3. Dynamic C/C++ / Rust cdylib
