@@ -1,1 +1,9 @@
+[package]
+-> name        => H#
+-> version     => 1.1.0
+-> description => Source code for H#.
+-> author      => HackerOS Team
+-> license     => MPL-2.0
 
+[workspace]
+-> members => [source-code/parser, source-code/typecheck, source-code/hlib, source-code/interpreter, source-code/compiler, source-code/cli, source-code/lsp, source-code/playground]
