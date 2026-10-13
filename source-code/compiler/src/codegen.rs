@@ -40,6 +40,20 @@ pub enum CodegenError {
     #[error("undefined fn: {name} ({span})")]  UndefinedFn { name: String, span: Span },
     #[error("io: {0}")]            Io(#[from] std::io::Error),
     #[error("link: {0}")]          Link(String),
+    /// An H#-defined function (usually a `mod` wrapper, whose name is
+    /// mangled to `{module}_{fn}` — see `modules::mangle_module_items`)
+    /// ended up with exactly the same symbol name as a function declared
+    /// in an `extern` block. Both live in the single `func_vals` namespace,
+    /// so the wrapper silently replaced the extern: a call to the extern
+    /// symbol *inside* the wrapper became a call to the wrapper itself
+    /// (infinite recursion when the arities match, "Incorrect number of
+    /// arguments passed to called function!" from the LLVM verifier when
+    /// they don't). Reported up front with a real explanation instead.
+    #[error("function `{name}` is defined in H# but has the same name as a function declared in an `extern` block. \
+             A `mod` function `foo` inside `mod m` is mangled to `m_foo`, so `mod pool {{ fn rel2id }}` collides with \
+             `extern fn pool_rel2id`. Rename the H# function (or the module) so that `{{module}}_{{fn}}` \
+             differs from every extern symbol, e.g. `pool::rel2id` -> `pool::make_rel`.")]
+    ExternNameCollision { name: String },
     /// `@safety`'s move-after-use check escalated from a warning to a
     /// real compile error — see `check_moves_basic`'s doc comment for why
     /// `@safety` (and only `@safety`; `@default` still just warns) treats
@@ -243,7 +257,16 @@ impl LlvmCodegen {
                 }
             }
         }
+        // Names registered so far come only from `extern` blocks (C / C++ /
+        // Rust declarations and Python trampolines). An H# function must not
+        // reuse one of them: `func_vals` is a single flat namespace, so the
+        // H# definition would shadow the extern and any call to the extern
+        // symbol from inside it would resolve back to the H# function.
+        let extern_names: HashSet<String> = func_vals.keys().cloned().collect();
         for f in &fns {
+            if extern_names.contains(&f.name) {
+                return Err(CodegenError::ExternNameCollision { name: f.name.clone() });
+            }
             let sig = self.build_fn_type(ctx, f);
             let fv  = module.add_function(&f.name, sig, None);
             mark_nounwind(fv); // H# has no unwinding (panic = abort/exit) — see llvm_optimize.rs
