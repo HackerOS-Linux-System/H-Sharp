@@ -1,0 +1,29 @@
+use "std -> test" from "test"
+
+struct Item is
+    pub name: string
+    pub qty: int
+end
+
+fn make_item(name: string) -> Item? is
+    if name == "" is return nil end
+    return Item { name: name, qty: 1 }
+end
+
+fn collect(names: [string]) -> [Item] is
+    let mut out: [Item] = []
+    for n in names is
+        let parsed: Item? = make_item(n)
+        match parsed is
+            nil => is end
+            it  => is out.push(it) end
+        end
+    end
+    return out
+end
+
+#[test]
+fn test_match_nil_on_optional_struct() is
+    let items: [Item] = collect(["a", "", "b"])
+    assert_eq(items.len(), 2)
+end
