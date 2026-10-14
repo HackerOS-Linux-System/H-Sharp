@@ -3310,9 +3310,24 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                         Ok(eq.into())
                     }
                     Literal::Nil => {
-                        let sv = subj.into_pointer_value();
-                        let is_null = self.builder.build_is_null(sv, "nileq").unwrap();
-                        Ok(is_null.into())
+                        // FIX: `T?` (Optional) is lowered to `i64` by `htype_to_llvm`, while
+                        // `string`/`ptr` values are real pointers. `match opt is nil => ...`
+                        // used to call `into_pointer_value()` unconditionally and panicked
+                        // with "Found IntValue ... but expected PointerValue variant" for any
+                        // optional struct held in an i64 slot (e.g. `let p: Package? = ...`).
+                        // Compare against zero in whichever representation we actually have.
+                        match *subj {
+                            BasicValueEnum::PointerValue(sv) => {
+                                let is_null = self.builder.build_is_null(sv, "nileq").unwrap();
+                                Ok(is_null.into())
+                            }
+                            BasicValueEnum::IntValue(iv) => {
+                                let z = iv.get_type().const_zero();
+                                let eq = self.builder.build_int_compare(IntPredicate::EQ, iv, z, "nileq").unwrap();
+                                Ok(eq.into())
+                            }
+                            _ => Ok(i1t.const_zero().into()),
+                        }
                     }
                     other => Err(CodegenError::Llvm(format!(
                         "unsupported literal pattern in match arm: {:?} — only int/float/bool/string/nil literal patterns are implemented",
