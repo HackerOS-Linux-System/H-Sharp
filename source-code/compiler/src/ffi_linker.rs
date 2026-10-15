@@ -183,8 +183,8 @@ impl LinkFlags {
     /// Generate `cc` / `gcc` command-line arguments from collected flags.
     ///
     /// Order:
-    ///  1. pkg-config flags (already include -L paths)
-    ///  2. static C/C++ libs:   -Wl,-Bstatic -l<x> … -Wl,-Bdynamic
+    ///  1. pkg-config flags except `-l..` (-L paths, -I, -pthread, ...)
+    ///  2. static C/C++ libs:   -Wl,-Bstatic -l<x> … -Wl,-Bdynamic, then pkg-config `-l..` flags
     ///  3. dynamic C/C++ libs:  -l<x> …
     ///  4. Rust staticlibs:     -Wl,--whole-archive -l<x> -Wl,--no-whole-archive
     ///  5. rpath hints
@@ -203,8 +203,21 @@ impl LinkFlags {
     pub fn to_cc_args_ex(&self, fully_static: bool) -> Vec<String> {
         let mut args = Vec::new();
 
-        // 1. pkg-config (already fully formed flags)
-        args.extend(self.pkg_config_args.iter().cloned());
+        // 1. pkg-config flags that are NOT libraries (-L paths, -I, -pthread, -Wl,... ).
+        //
+        // FIX (link order): the `-l<name>` entries pkg-config returned used to be emitted
+        // HERE, i.e. before every hand-built static lib. For static archives the order
+        // matters — a library must come AFTER the archive that references it. Example: a
+        // package declares `extern static [c, "libsolvext"]` (no pkg-config hit, so it is
+        // a hand-built static lib) and `extern static [c, "expat"]` (pkg-config knows
+        // `expat`, so it became `-lexpat` at the very FRONT). ld then read libexpat.a
+        // first, pulled nothing, and `libsolvext.a(solv_xmlparser.o)` ended up with
+        // "undefined reference to `XML_ParserCreate'". The `-l` flags are now emitted
+        // after the static libs, keeping their relative order, so declaration order in the
+        // source (users first, dependencies after) is what the linker sees.
+        let (pc_libs, pc_other): (Vec<String>, Vec<String>) = self.pkg_config_args
+            .iter().cloned().partition(|a| a.starts_with("-l"));
+        args.extend(pc_other);
 
         // 2. Static C/C++ libs
         if !self.static_libs.is_empty() {
@@ -214,6 +227,9 @@ impl LinkFlags {
             }
             if !fully_static { args.push("-Wl,-Bdynamic".to_string()); }
         }
+
+        // 2b. `-l...` flags from pkg-config (see the FIX note above)
+        args.extend(pc_libs);
 
         // 3. Dynamic C/C++ / Rust cdylib
         for lib in &self.dynamic_libs {
@@ -364,6 +380,21 @@ mod tests {
         f.dynamic_libs = vec!["ssl".into(), "ssl".into(), "crypto".into()];
         f.dedup();
         assert_eq!(f.dynamic_libs, vec!["ssl", "crypto"]);
+    }
+
+    #[test]
+    fn pkg_config_libs_come_after_static_libs() {
+        // regression: `-lexpat` (pkg-config) must follow `-lsolvext` (static archive that needs it)
+        let f = LinkFlags {
+            static_libs: vec!["solvext".to_string(), "solv".to_string()],
+            pkg_config_args: vec!["-L/opt/x/lib".to_string(), "-lexpat".to_string()],
+            ..Default::default()
+        };
+        let args = f.to_cc_args_ex(true);
+        let pos = |a: &str| args.iter().position(|x| x == a).unwrap();
+        assert!(pos("-L/opt/x/lib") < pos("-lsolvext"));
+        assert!(pos("-lsolvext") < pos("-lsolv"));
+        assert!(pos("-lsolv") < pos("-lexpat"));
     }
 
     #[test]
