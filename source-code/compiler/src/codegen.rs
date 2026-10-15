@@ -101,6 +101,28 @@ impl LlvmCodegen {
     fn scan_module_features(m: &HshModule) -> (bool, bool) {
         let mut has_regex = false;
         let mut has_db    = false;
+        // FIX: a PROGRAM'S OWN module called `db` / `regex` (flattened by the module
+        // resolver into `db_<fn>` / `db_<Type>_<method>`) is not `std -> db` / `std -> regex`.
+        // The scanner used to flag every path whose first segment is "db"/"regex", so a
+        // project with its own `mod db` (e.g. hammer's pkg/db.h#) was rejected with
+        // "this program uses `db ->`, which the native AOT backend doesn't support yet".
+        // Collect the user-defined function names first; `scan_expr_features` then ignores
+        // `db::x(..)` when `db_x` is defined in the program itself.
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        fn collect_user_fns(items: &[Item], out: &mut std::collections::HashSet<String>) {
+            for it in items {
+                match it {
+                    Item::FnDef(f) => { out.insert(f.name.clone()); }
+                    Item::ImplBlock(imp) => {
+                        for mm in &imp.methods { out.insert(format!("{}_{}", imp.type_name, mm.name)); }
+                    }
+                    Item::ModDecl { inline: Some(sub), .. } => collect_user_fns(sub, out),
+                    _ => {}
+                }
+            }
+        }
+        collect_user_fns(&m.items, &mut names);
+        USER_FNS.with(|u| *u.borrow_mut() = names);
         for item in &m.items {
             scan_item_features(item, &mut has_regex, &mut has_db);
             if has_regex && has_db { break; }
@@ -1970,6 +1992,12 @@ AOT backend grows its own native bridge for this."
 /// binary — undefined reference at link time. Recognizing the real bare
 /// names fixes that without touching the (separately broken)
 /// `std -> regex`/`std -> sqlite` wrapper modules at all.
+thread_local! {
+    /// Names of every function/method defined by the program being compiled
+    /// (see `scan_module_features`).
+    static USER_FNS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
 fn is_bare_regex_builtin(name: &str) -> bool {
     // Also matches the `__builtin_`-prefixed spellings `std/regex.h#`
     // actually calls today (see `ModuleResolver::resolve_std_import` in
@@ -2043,9 +2071,13 @@ fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
             // future/other qualified callers) is the actual fix.
             match callee.as_ref() {
                 Expr::Path(segs, _) if !segs.is_empty() => {
+                    // `db::foo` / `regex::foo` defined by the program itself (flattened to
+                    // `db_foo`) is a user module, not the std library — see scan_module_features.
+                    let flat = segs.join("_");
+                    let user_defined = USER_FNS.with(|u| u.borrow().contains(&flat));
                     match segs[0].as_str() {
-                        "regex" => *has_regex = true,
-                        "db"    => *has_db = true,
+                        "regex" if !user_defined => *has_regex = true,
+                        "db"    if !user_defined => *has_db = true,
                         s if is_bare_regex_builtin(s) => *has_regex = true,
                         s if is_bare_db_builtin(s)    => *has_db = true,
                         _       => {}
@@ -2065,9 +2097,11 @@ fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
         }
         Expr::Path(segs, _) => {
             if !segs.is_empty() {
+                let flat = segs.join("_");
+                let user_defined = USER_FNS.with(|u| u.borrow().contains(&flat));
                 match segs[0].as_str() {
-                    "regex" => *has_regex = true,
-                    "db"    => *has_db = true,
+                    "regex" if !user_defined => *has_regex = true,
+                    "db"    if !user_defined => *has_db = true,
                     s if is_bare_regex_builtin(s) => *has_regex = true,
                     s if is_bare_db_builtin(s)    => *has_db = true,
                     _       => {}
