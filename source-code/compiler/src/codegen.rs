@@ -108,14 +108,25 @@ impl LlvmCodegen {
         // "this program uses `db ->`, which the native AOT backend doesn't support yet".
         // Collect the user-defined function names first; `scan_expr_features` then ignores
         // `db::x(..)` when `db_x` is defined in the program itself.
+        // We store MODULE PREFIXES (text before the first `_`) of every item the program
+        // defines — fns, structs, enums (incl. `db::Enum::Variant` value paths, which are no
+        // functions), impl types, consts, aliases. A program with its own `mod db` defines
+        // `db_*` items, so `db` is in the set and `db::...` paths are not std's `db`.
+        // (A real `use "std -> db"` is still detected through the `__builtin_db_*` calls in
+        // the inlined wrapper bodies — see `is_bare_db_builtin`.)
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        fn add_prefix(n: &str, out: &mut std::collections::HashSet<String>) {
+            if let Some(i) = n.find('_') { if i > 0 { out.insert(n[..i].to_string()); } }
+        }
         fn collect_user_fns(items: &[Item], out: &mut std::collections::HashSet<String>) {
             for it in items {
                 match it {
-                    Item::FnDef(f) => { out.insert(f.name.clone()); }
-                    Item::ImplBlock(imp) => {
-                        for mm in &imp.methods { out.insert(format!("{}_{}", imp.type_name, mm.name)); }
-                    }
+                    Item::FnDef(f) => add_prefix(&f.name, out),
+                    Item::StructDef(sd) => add_prefix(&sd.name, out),
+                    Item::EnumDef(ed) => add_prefix(&ed.name, out),
+                    Item::ImplBlock(imp) => add_prefix(&imp.type_name, out),
+                    Item::ConstDef { name, .. } => add_prefix(name, out),
+                    Item::TypeAlias { name, .. } => add_prefix(name, out),
                     Item::ModDecl { inline: Some(sub), .. } => collect_user_fns(sub, out),
                     _ => {}
                 }
@@ -2073,8 +2084,7 @@ fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
                 Expr::Path(segs, _) if !segs.is_empty() => {
                     // `db::foo` / `regex::foo` defined by the program itself (flattened to
                     // `db_foo`) is a user module, not the std library — see scan_module_features.
-                    let flat = segs.join("_");
-                    let user_defined = USER_FNS.with(|u| u.borrow().contains(&flat));
+                    let user_defined = segs.len() >= 2 && USER_FNS.with(|u| u.borrow().contains(segs[0].as_str()));
                     match segs[0].as_str() {
                         "regex" if !user_defined => *has_regex = true,
                         "db"    if !user_defined => *has_db = true,
@@ -2097,8 +2107,7 @@ fn scan_expr_features(expr: &Expr, has_regex: &mut bool, has_db: &mut bool) {
         }
         Expr::Path(segs, _) => {
             if !segs.is_empty() {
-                let flat = segs.join("_");
-                let user_defined = USER_FNS.with(|u| u.borrow().contains(&flat));
+                let user_defined = segs.len() >= 2 && USER_FNS.with(|u| u.borrow().contains(segs[0].as_str()));
                 match segs[0].as_str() {
                     "regex" if !user_defined => *has_regex = true,
                     "db"    if !user_defined => *has_db = true,
