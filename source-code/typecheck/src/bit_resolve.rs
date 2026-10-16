@@ -17,7 +17,8 @@ const MANIFESTS: [&str; 2] = ["Bit.hk", "bit.hk"];
 #[derive(Debug, Clone, Default)]
 pub struct LockedBitLib {
     pub name: String,
-    /// Short commit id (12 chars) — the directory name of the installed copy.
+    /// Directory name of the installed copy: the first 12 hex digits of the sha256 of its files
+    /// (bit >= this change; older bit wrote the short commit id here).
     pub version: String,
     pub commit: String,
     pub url: String,
@@ -517,12 +518,15 @@ pub fn bit_lib_candidates(name: &str, start_dir: &Path) -> Vec<PathBuf> {
     for libs in bit_libs_roots() {
         let base = libs.join(name);
         if let Some(l) = lock.get(name) {
+            // bit names the directory of a copy after the sha256 of its files and records
+            // that name in `version` — so that is the first place to look. Older bit versions
+            // used the short commit id (also in `version`, but kept as a fallback below).
+            if !l.version.is_empty() {
+                push(base.join(&l.version), &mut out);
+            }
             if !l.commit.is_empty() {
                 push(base.join(short_hash(&l.commit)), &mut out);
                 push(base.join(&l.commit), &mut out);
-            }
-            if !l.version.is_empty() {
-                push(base.join(&l.version), &mut out);
             }
         }
         push(base.join("current"), &mut out);
