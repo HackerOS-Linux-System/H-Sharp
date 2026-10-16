@@ -1905,9 +1905,14 @@ AOT backend grows its own native bridge for this."
         if linux_only_flags { cmd.args(["-lm", "-lpthread", "-ldl"]); }
         else if self.opts.target.os == crate::target::Os::MacOS { cmd.arg("-lm"); } // libpthread/libdl are part of libSystem on macOS already — only libm needs to be named explicitly
         for a in &user_ldflags { cmd.arg(a); }
+        // HSHARP_KEEP_SYMBOLS=1 keeps the symbol table (function names) in a release
+        // binary, so `gdb -p <pid> -batch -ex bt` / `perf` / `nm` can name the function a
+        // program is spinning in. Without it the release link is `--strip-all` and a
+        // backtrace is just addresses.
+        let keep_symbols = std::env::var("HSHARP_KEEP_SYMBOLS").map(|v| v == "1").unwrap_or(false);
         if self.opts.optimize {
-            cmd.args(["-O2", "-Wl,--gc-sections", "-Wl,--as-needed",
-                     "-Wl,--strip-all", "-flto"]);
+            cmd.args(["-O2", "-Wl,--gc-sections", "-Wl,--as-needed", "-flto"]);
+            if !keep_symbols { cmd.arg("-Wl,--strip-all"); }
         } else {
             cmd.arg("-O0");
         }
@@ -1944,7 +1949,7 @@ AOT backend grows its own native bridge for this."
             }
         }
 
-        if self.opts.optimize {
+        if self.opts.optimize && !keep_symbols {
             // Same cross-toolchain concern as `cc` (see `cross_toolchain`'s
             // doc comment) — a foreign-architecture object stripped with
             // the *host's* `strip` is lower-risk than the `cc` case (GNU
