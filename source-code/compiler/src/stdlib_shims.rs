@@ -26,11 +26,7 @@ pub fn inject_stdlib_shims(module: &mut Module) {
         module.items.push(run_cmd_fn(RUN_CMD_LIVE));
     }
 
-    let has_split = module.items.iter().any(|i| matches!(i, Item::FnDef(f) if f.name == STR_SPLIT));
-    if !has_split {
-        module.items.push(str_split_fn());
-    }
-
+    inject_fn_if_missing(module, STR_SPLIT, str_split_fn);
     inject_fn_if_missing(module, STR_COUNT, str_count_fn);
     inject_fn_if_missing(module, ITER_JOIN, iter_join_fn);
     inject_fn_if_missing(module, JSON_EMPTY_OBJECT, json_empty_object_fn);
@@ -57,10 +53,31 @@ pub fn inject_stdlib_shims(module: &mut Module) {
     }
 }
 
+/// Inject the shim `name` unless the program already defines it.
+///
+/// FIX (alias collision → infinite recursion): `use "std -> strings" from "str"` renames the
+/// std function `split` to `str_split` — exactly the name of the injected shim — and its body
+/// is `return str_split(s, delim)`, i.e. "call the shim". The old "skip if a fn with that name
+/// exists" check then saw the alias-mangled wrapper, did NOT inject the real shim, and the
+/// wrapper ended up calling ITSELF forever (LLVM -O2 turned the pure self-tail-call into
+/// `jmp .`: `hammer version` hung silently). Same for `str::count` -> `str_count`,
+/// `iter::join` -> `iter_join`, ... Now: if an existing fn of that name merely refers to its
+/// own name in its body (a self-recursive wrapper that can only have meant the shim), it is
+/// REPLACED by the real shim; a genuinely user-written function of that name is left alone.
 fn inject_fn_if_missing(module: &mut Module, name: &str, build: fn() -> Item) {
-    let exists = module.items.iter().any(|i| matches!(i, Item::FnDef(f) if f.name == name));
-    if !exists {
-        module.items.push(build());
+    let marker = format!("Ident(\"{}\"", name);
+    let pos = module.items.iter().position(|i| matches!(i, Item::FnDef(f) if f.name == name));
+    match pos {
+        None => module.items.push(build()),
+        Some(idx) => {
+            let self_wrapper = match &module.items[idx] {
+                Item::FnDef(f) => format!("{:?}", f.body).contains(&marker),
+                _ => false,
+            };
+            if self_wrapper {
+                module.items[idx] = build();
+            }
+        }
     }
 }
 
@@ -367,4 +384,39 @@ fn json_stringify_pretty_fn() -> Item {
         body: vec![let_1, let_2, let_3, ret],
         pub_: true, is_unsafe: false, is_async: false, mem_mode: MemoryMode::default(), span,
     })
+}
+
+#[cfg(test)]
+mod alias_collision_tests {
+    use super::*;
+
+    fn wrapper(name: &str) -> Item {
+        // fn <name>(s, d) -> [string] is return <name>(s, d) end   (what `use "std -> strings" from "str"` yields)
+        let span = Span::dummy();
+        let call = Expr::Call(
+            Box::new(Expr::Ident(name.to_string(), span.clone())),
+            vec![Expr::Ident("s".into(), span.clone())],
+            span.clone(),
+        );
+        Item::FnDef(FnDef {
+            attrs: vec![], type_params: vec![], name: name.to_string(),
+            params: vec![Param { name: "s".into(), ty: TypeExpr::String, mutable: false, span: span.clone() }],
+            return_type: Some(TypeExpr::Array(Box::new(TypeExpr::String))),
+            body: vec![Stmt::Return(Some(call), span.clone())],
+            pub_: true, is_unsafe: false, is_async: false, mem_mode: MemoryMode::default(), span,
+        })
+    }
+
+    #[test]
+    fn self_recursive_alias_wrapper_is_replaced_by_the_shim() {
+        let mut m = Module {
+            file: String::new(), edition: None, edition_span: None, doc_comments: Default::default(),
+            file_mem_mode: Default::default(), imports: Default::default(),
+            items: vec![wrapper(STR_SPLIT)],
+        };
+        inject_stdlib_shims(&mut m);
+        let defs: Vec<&FnDef> = m.items.iter().filter_map(|i| match i { Item::FnDef(f) if f.name == STR_SPLIT => Some(f), _ => None }).collect();
+        assert_eq!(defs.len(), 1, "exactly one str_split must remain");
+        assert!(!format!("{:?}", defs[0].body).contains("Ident(\"str_split\""), "must not call itself");
+    }
 }
