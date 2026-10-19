@@ -282,7 +282,7 @@ impl LlvmCodegen {
         }
 
         // Pass 1: declare signatures for H#-defined functions/methods
-        let fns = self.collect_fns(m);
+        let fns = self.dedupe_fns(self.collect_fns(m))?;
         let mut async_fns: HashSet<String> = HashSet::new();
         // Mangled names (`Type_method`) of every `impl` method declared with a
         // `self` receiver — drives `recv.method(..)` dispatch in `Expr::MethodCall`.
@@ -892,6 +892,70 @@ impl LlvmCodegen {
             }
         }
         fns
+    }
+
+    /// Collapses functions that appear more than once under the same (mangled) name.
+    ///
+    /// Why this exists: `module.add_function(name, ..)` silently renames a second function with
+    /// an already-used name (`foo` -> `foo.1`) while `func_vals` is keyed by the *source* name,
+    /// so the last declaration wins for every lookup. Pass 2 then compiled the FIRST body into
+    /// the LAST declaration's `FunctionValue` — a signature mismatch that surfaced as
+    /// `called Option::unwrap() on a None value` at `get_nth_param` (seen with
+    /// `install_install_raw_program` from libseccomp, whose source reached the program twice).
+    ///
+    /// * identical duplicates (same params/return/body, source positions ignored) are dropped —
+    ///   it is the same code that was inlined twice;
+    /// * genuinely different functions with the same mangled name are a real collision and
+    ///   become a clear error naming both definitions instead of a panic.
+    fn dedupe_fns(&self, fns: Vec<FnDef>) -> R<Vec<FnDef>> {
+        fn strip_spans(s: &str) -> String {
+            let b = s.as_bytes();
+            let mut out = String::with_capacity(s.len());
+            let mut i = 0;
+            while i < b.len() {
+                if s[i..].starts_with("Span {") {
+                    let mut depth = 0i32;
+                    let mut in_str = false;
+                    while i < b.len() {
+                        let c = b[i];
+                        if in_str {
+                            if c == b'\\' { i += 1; } else if c == b'"' { in_str = false; }
+                        } else if c == b'"' {
+                            in_str = true;
+                        } else if c == b'{' {
+                            depth += 1;
+                        } else if c == b'}' {
+                            depth -= 1;
+                            if depth == 0 { i += 1; break; }
+                        }
+                        i += 1;
+                    }
+                    out.push_str("Span");
+                    continue;
+                }
+                let ch = s[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            out
+        }
+        let mut seen: HashMap<String, (usize, String)> = HashMap::new();
+        let mut out: Vec<FnDef> = Vec::with_capacity(fns.len());
+        for f in fns {
+            let sig = strip_spans(&format!("{:?}|{:?}|{:?}|{}|{}", f.params, f.return_type, f.body, f.is_async, f.is_unsafe));
+            if let Some((idx, first_sig)) = seen.get(&f.name) {
+                if *first_sig == sig {
+                    continue; // same function inlined twice
+                }
+                return Err(CodegenError::Llvm(format!(
+                    "function `{}` is defined twice with different bodies: {} and {} (two modules mangle to the same name — rename one of them)",
+                    f.name, out[*idx].span, f.span
+                )));
+            }
+            seen.insert(f.name.clone(), (out.len(), sig));
+            out.push(f);
+        }
+        Ok(out)
     }
 
     fn build_fn_type<'ctx>(&self, ctx: &'ctx Context, f: &FnDef)
