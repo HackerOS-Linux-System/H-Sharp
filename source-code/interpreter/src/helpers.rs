@@ -176,6 +176,7 @@ pub fn resolve_builtin_dunder(name: &str) -> Option<&'static str> {
         "sort_ints"    => "sort_ints",
         "sort_strings" => "sort_strings",
         "sort_by"      => "sort_by",
+        "sort_by_key"  => "sort_by_key",
         // ── path ─────────────────────────────────────────────────────
         "path_join"          => "path_join",
         "path_stem"          => "path_stem",
