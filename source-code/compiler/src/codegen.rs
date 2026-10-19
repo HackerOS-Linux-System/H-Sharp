@@ -1637,16 +1637,11 @@ impl LlvmCodegen {
         // tools, and out of scope here) still fails loudly and early
         // rather than silently producing a binary with a dangling link
         // against a runtime file that no longer exists.
-        if needs_db {
-            return Err(CodegenError::Link(format!(
-                "this program uses `db ->`, which the native AOT (LLVM) backend doesn't support yet.\n\n\
-`sqlite.c` — the C runtime that used to provide this — has been removed: H# no longer embeds std \
-libraries straight into the compiler/binary. `std -> db` now lives purely as real source under \
-/usr/lib/HackerOS/H#/std/db.h#, and is fully supported by the interpreter backend today.\n\n\
-Run this program with `hsharp preview` (or `hsharp run`) instead of `hsharp build` until the \
-AOT backend grows its own native bridge for this."
-            )));
-        }
+        // `db ->` used to be rejected right here ("AOT doesn't support db yet").
+        // It now has a real native bridge (core.c: hsh_sqlite_* / hsh_db_col_*,
+        // driven through the `sqlite3` CLI like regex:: is driven through grep/sed),
+        // so the early bail-out is gone. Needs `sqlite3` on PATH at *run* time.
+        let _ = needs_db;
         let _ = needs_regex; // no longer gated here — see the comment above
 
         // ── Runtime link flags (built early — used by SharedLib + Binary) ────
@@ -6205,6 +6200,107 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let a = str_arg!(0);
                            self.call_coerced(self.builtins.hsh_sqlite_close, &[a.into()], "");
                            Ok(self.ctx.i64_type().const_zero().into())
+                       }
+                       // ── db:: native bridge (runtime/core.c, "db:: (std -> db) on the
+                       // AOT backend"). Reached through `resolve_builtin_dunder_llvm`
+                       // from each `__builtin_db_*` call in std/db.h#. ──────────────
+                       // ── crypto:: / path:: / os:: / sort:: native bridge (runtime/core.c) ──
+                       "crypto_sha256" => call1!(self.builtins.hsh_crypto_sha256, "csha256"),
+                       "crypto_sha512" => call1!(self.builtins.hsh_crypto_sha512, "csha512"),
+                       "crypto_sha1"   => call1!(self.builtins.hsh_crypto_sha1, "csha1"),
+                       "crypto_md5"    => call1!(self.builtins.hsh_crypto_md5, "cmd5"),
+                       "crypto_blake3" => call1!(self.builtins.hsh_crypto_blake3, "cb3"),
+                       "crypto_argon2_hash"   => call1!(self.builtins.hsh_crypto_argon2_hash, "cargon"),
+                       "crypto_argon2_verify" => call2!(self.builtins.hsh_crypto_argon2_verify, "cargonv"),
+                       "crypto_hmac_sha256" => call2!(self.builtins.hsh_crypto_hmac_sha256, "chmac256"),
+                       "crypto_hmac_sha512" => call2!(self.builtins.hsh_crypto_hmac_sha512, "chmac512"),
+                       // `bytes` are HshArray* — pass through expr(.., None), not str_arg!
+                       "crypto_sha256_bytes" => {
+                           let b = if let Some(e) = args.first() { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_crypto_sha256_bytes, &[b.into()], "csha256b");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "crypto_bytes_eq" | "crypto_xor_bytes" => {
+                           let a = if let Some(e) = args.first() { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let b = if let Some(e) = args.get(1) { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let f = if name == "crypto_bytes_eq" { self.builtins.hsh_crypto_bytes_eq } else { self.builtins.hsh_crypto_xor_bytes };
+                           let r = self.call_coerced(f, &[a.into(), b.into()], "cbytes2");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "crypto_random_bytes" => {
+                           let n = if let Some(e) = args.first() { self.expr(e, Some(self.ctx.i64_type().into()))? } else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_crypto_random_bytes, &[n.into()], "crandb");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "crypto_pbkdf2" => {
+                           let pw = str_arg!(0);
+                           let salt = if let Some(e) = args.get(1) { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let it = if let Some(e) = args.get(2) { self.expr(e, Some(self.ctx.i64_type().into()))? } else { self.ctx.i64_type().const_zero().into() };
+                           let kl = if let Some(e) = args.get(3) { self.expr(e, Some(self.ctx.i64_type().into()))? } else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_crypto_pbkdf2, &[pw.into(), salt.into(), it.into(), kl.into()], "cpbkdf2");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "path_join"           => call2!(self.builtins.hsh_path_join, "pjoin"),
+                       "path_parent"         => call1!(self.builtins.hsh_path_parent, "pparent"),
+                       "path_filename"       => call1!(self.builtins.hsh_path_filename, "pfile"),
+                       "path_stem"           => call1!(self.builtins.hsh_path_stem, "pstem"),
+                       "path_extension"      => call1!(self.builtins.hsh_path_extension, "pext"),
+                       "path_is_absolute"    => call1!(self.builtins.hsh_path_is_absolute, "pabs"),
+                       "path_normalize"      => call1!(self.builtins.hsh_path_normalize, "pnorm"),
+                       "path_with_extension" => call2!(self.builtins.hsh_path_with_extension, "pwithext"),
+                       "os_home_dir" => { let r = self.call_coerced(self.builtins.hsh_os_home_dir, &[], "oshome"); Ok(self.unwrap_call(r)) }
+                       "os_temp_dir" => { let r = self.call_coerced(self.builtins.hsh_os_temp_dir, &[], "ostmp"); Ok(self.unwrap_call(r)) }
+                       "os_is_root"  => { let r = self.call_coerced(self.builtins.hsh_os_is_root, &[], "osroot"); Ok(self.unwrap_call(r)) }
+                       // sort_*: arg 0 is an HshArray*; arg 1 (sort_by/sort_by_key) is a
+                       // function pointer value (a named fn, or a `fn`-typed param).
+                       "sort_ints" => {
+                           let a = if let Some(e) = args.first() { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_sort_ints, &[a.into()], "sorti");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "sort_by" | "sort_by_key" => {
+                           let a = if let Some(e) = args.first() { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let f = if let Some(e) = args.get(1) { self.expr(e, None)? } else { self.ctx.i64_type().const_zero().into() };
+                           let h = if name == "sort_by" { self.builtins.hsh_sort_by } else { self.builtins.hsh_sort_by_key };
+                           let r = self.call_coerced(h, &[a.into(), f.into()], "sortby");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "sqlite_ping"     => call1!(self.builtins.hsh_sqlite_ping, "dbping"),
+                       "sqlite_begin"    => call1!(self.builtins.hsh_sqlite_begin, "dbbegin"),
+                       "sqlite_commit"   => call1!(self.builtins.hsh_sqlite_commit, "dbcommit"),
+                       "sqlite_rollback" => call1!(self.builtins.hsh_sqlite_rollback, "dbrollback"),
+                       // (conn, sql, params: [any]) — the 3rd arg is an HshArray*,
+                       // NOT a string, so it bypasses str_arg!'s i8ptr hint.
+                       "sqlite_exec_params" => {
+                           let a = str_arg!(0); let b = str_arg!(1);
+                           let arr = if let Some(e) = args.get(2) { self.expr(e, None)? }
+                                     else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_sqlite_exec_params, &[a.into(), b.into(), arr.into()], "dbexecp");
+                           Ok(self.unwrap_call(r))
+                       }
+                       "sqlite_query_params" => {
+                           let a = str_arg!(0); let b = str_arg!(1);
+                           let arr = if let Some(e) = args.get(2) { self.expr(e, None)? }
+                                     else { self.ctx.i64_type().const_zero().into() };
+                           let r = self.call_coerced(self.builtins.hsh_sqlite_query_params, &[a.into(), b.into(), arr.into()], "dbqueryp");
+                           Ok(self.unwrap_call(r))
+                       }
+                       // col_*(row, col): row is a `[string]` (HshArray*, held in an
+                       // `any`/i64 slot), col is a column name or decimal index string.
+                       "sqlite_col_str" | "sqlite_col_int" | "sqlite_col_float" |
+                       "sqlite_col_bool" | "sqlite_col_is_null" => {
+                           let row = if let Some(e) = args.first() { self.expr(e, None)? }
+                                     else { self.ctx.i64_type().const_zero().into() };
+                           let col = str_arg!(1);
+                           let f = match name {
+                               "sqlite_col_str"  => self.builtins.hsh_db_col_str,
+                               "sqlite_col_int"  => self.builtins.hsh_db_col_int,
+                               "sqlite_col_float"=> self.builtins.hsh_db_col_float,
+                               "sqlite_col_bool" => self.builtins.hsh_db_col_bool,
+                               _                 => self.builtins.hsh_db_col_is_null,
+                           };
+                           let r = self.call_coerced(f, &[row.into(), col.into()], "dbcol");
+                           Ok(self.unwrap_call(r))
                        }
                        // db_query_bind(db, sql, b1[, b2[, b3]]) — parameterized
                        // queries, SQL-injection-safe by construction (§12). Resolved
