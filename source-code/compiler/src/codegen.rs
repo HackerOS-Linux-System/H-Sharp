@@ -270,7 +270,13 @@ impl LlvmCodegen {
                         EnumVariantFields::Tuple(tys) => tys.len(),
                         EnumVariantFields::Struct(_) => 0,
                     };
+                    // Bare name (legacy lookups / fallback) AND `Enum::Variant`: two enums may
+                    // reuse a variant name with different shapes (nidus `Style::Json` is a unit
+                    // variant, hpm `HpmError::Json(string)` has a field) - a bare-name-only map
+                    // let one silently overwrite the other and produced bogus errors like
+                    // "`Json` has 1 field(s) and must be constructed as `Json(...)`".
                     enum_arity.insert(v.name.clone(), arity);
+                    enum_arity.insert(format!("{}::{}", ed.name, v.name), arity);
                 }
             }
         }
@@ -3164,6 +3170,22 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
         p
     }
 
+    /// Arity of the enum variant named by a path like `Style::Json` / `error::HpmError::Json`.
+    /// Resolution order: exact `Enum::Variant`; then a module-mangled enum name
+    /// (`<prefix>_Enum::Variant`, see modules.rs `mangle_module_items`); finally the bare variant
+    /// name (single-segment paths, or when the qualifier isn't a known enum).
+    fn variant_arity(&self, segments: &[String]) -> Option<usize> {
+        let variant = segments.last()?;
+        if segments.len() >= 2 {
+            let ty = &segments[segments.len() - 2];
+            let exact = format!("{}::{}", ty, variant);
+            if let Some(&a) = self.enums.get(&exact) { return Some(a); }
+            let suffix = format!("_{}::{}", ty, variant);
+            if let Some((_, &a)) = self.enums.iter().find(|(k, _)| k.ends_with(&suffix)) { return Some(a); }
+        }
+        self.enums.get(variant).copied()
+    }
+
     /// Build a boxed enum value: `HshArray* [tag_string, field0, field1, ...]`.
     /// Used by both variant *construction* sites (bare `EnumName::Variant`
     /// and `EnumName::Variant(args...)` in `expr()`) — see the long doc
@@ -4761,7 +4783,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            // too, since that's a reasonable spelling.
                            if let Expr::Path(segments, _) = callee.as_ref() {
                                if let Some(variant) = segments.last() {
-                                   if let Some(&arity) = self.enums.get(variant) {
+                                   if let Some(arity) = self.variant_arity(segments) {
                                        if args.len() != arity {
                                            return Err(CodegenError::Llvm(format!(
                                                "{}: `{}` takes {} field(s), got {}",
@@ -5774,7 +5796,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        // trying to touch (e.g. unresolved/qualified consts).
                        Expr::Path(segments, span) => {
                            if let Some(variant) = segments.last() {
-                               if let Some(&arity) = self.enums.get(variant) {
+                               if let Some(arity) = self.variant_arity(segments) {
                                    if arity != 0 {
                                        return Err(CodegenError::Llvm(format!(
                                            "{}: `{}` has {} field(s) and must be constructed as `{}(...)`, not used bare",
