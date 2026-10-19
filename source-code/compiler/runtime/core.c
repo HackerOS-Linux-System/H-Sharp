@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>  /* strcasecmp (db:: col_bool) */
 #include <ctype.h>
 #include <unistd.h>
 #include <pwd.h>
@@ -1183,6 +1184,1386 @@ static char* hsh_drain_fd(int fd) {
     return buf;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * db:: (std -> db) on the AOT / LLVM backend.
+ *
+ * Until now `__builtin_db_*` was "interpreter only": codegen.rs already had
+ * `sqlite_open/exec/query/close` arms and builtins.rs already declared the
+ * `hsh_sqlite_*` symbols, but no C definition existed for them (sqlite.c was
+ * removed) and `emit_binary_with_machine` bailed out early on any program
+ * that touched `db ->`.  This section is the missing native bridge.
+ *
+ * Same philosophy as regex:: and `hsh_sqlite_query_bind*` above: no new C
+ * library dependency, the real `sqlite3` CLI is driven through fork+execvp
+ * (no shell => no shell injection).  SQL is fed through a temp file on the
+ * child's stdin (no ARG_MAX limit, no pipe deadlock on large statements).
+ *
+ * Contract (mirrors the interpreter where it has one):
+ *   open(path|uri)   -> handle string "sqlite://<path>"
+ *   exec(h, sql)     -> rows changed (int), -1 on error (message on stderr)
+ *   query(h, sql)    -> [[string]]  one inner array per row, columns split on TAB
+ *   begin(h)         -> tx handle "sqlite-tx://<n>"
+ *       exec(tx, sql) only BUFFERS the statement; commit(tx) runs the whole
+ *       buffer as ONE `BEGIN; ... COMMIT;` script (atomic); rollback(tx) drops it.
+ *       query(tx, sql) runs buffer + query inside BEGIN..ROLLBACK (read-your-writes).
+ *   exec_params / query_params: every `?` outside a quoted literal is replaced
+ *       by a properly escaped literal (strings quoted, ints bare).
+ *   col_*(row, col)  -> `col` is a column NAME (resolved against the header of
+ *       the most recent query) or a decimal INDEX ("0", "1", ...).
+ *       NULL comes back from the sqlite3 CLI as an empty string, so
+ *       col_is_null is true for NULL and for "" alike.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#define HSH_DB_PREFIX    "sqlite://"
+#define HSH_DB_TX_PREFIX "sqlite-tx://"
+#define HSH_DB_MAX_TX    64
+
+typedef struct { int used; char* path; char* buf; size_t len, cap; } HshDbTx;
+static HshDbTx g_hsh_db_tx[HSH_DB_MAX_TX];
+static char**  g_hsh_db_cols  = NULL;   /* header of the last query */
+static int     g_hsh_db_ncols = 0;
+
+static char* hsh_db_dup(const char* s, size_t n) {
+    char* o = (char*)hsh_alloc((uint64_t)n + 1);
+    if (!o) return (char*)"";
+    memcpy(o, s, n); o[n] = '\0';
+    return o;
+}
+
+static int hsh_db_is_tx(const char* h) {
+    return h && strncmp(h, HSH_DB_TX_PREFIX, strlen(HSH_DB_TX_PREFIX)) == 0;
+}
+
+static HshDbTx* hsh_db_tx_get(const char* h) {
+    if (!hsh_db_is_tx(h)) return NULL;
+    long i = strtol(h + strlen(HSH_DB_TX_PREFIX), NULL, 10);
+    if (i < 0 || i >= HSH_DB_MAX_TX || !g_hsh_db_tx[i].used) return NULL;
+    return &g_hsh_db_tx[i];
+}
+
+static const char* hsh_db_path_of(const char* h) {
+    if (!h) return "";
+    HshDbTx* t = hsh_db_tx_get(h);
+    if (t) return t->path;
+    if (strncmp(h, HSH_DB_PREFIX, strlen(HSH_DB_PREFIX)) == 0) return h + strlen(HSH_DB_PREFIX);
+    return h;
+}
+
+static void hsh_db_tx_append(HshDbTx* t, const char* sql) {
+    size_t n = strlen(sql);
+    size_t add = n + 3; /* sql + "\n;\n" */
+    if (t->len + add + 1 > t->cap) {
+        size_t nc = (t->cap + add + 1) * 2;
+        char* nb = (char*)realloc(t->buf, nc);
+        if (!nb) return;
+        t->buf = nb; t->cap = nc;
+    }
+    memcpy(t->buf + t->len, sql, n); t->len += n;
+    t->buf[t->len++] = '\n';
+    t->buf[t->len++] = ';';
+    t->buf[t->len++] = '\n';
+    t->buf[t->len] = '\0';
+}
+
+/* Runs `sqlite3` on `path`, SQL on stdin (temp file). Returns exit status
+ * (0 = ok, -1 = could not start). *out receives stdout (malloc'd), *err stderr. */
+static int hsh_db_run(const char* path, const char* sql, int header, char** out, char** err) {
+    *out = NULL; *err = NULL;
+    const char* tmpd = getenv("TMPDIR");
+    if (!tmpd || !*tmpd) tmpd = "/tmp";
+    char in_t[4096], err_t[4096];
+    snprintf(in_t,  sizeof(in_t),  "%s/hshdbinXXXXXX",  tmpd);
+    snprintf(err_t, sizeof(err_t), "%s/hshdberrXXXXXX", tmpd);
+    int in_fd = mkstemp(in_t);
+    if (in_fd < 0) return -1;
+    int err_fd = mkstemp(err_t);
+    if (err_fd < 0) { close(in_fd); unlink(in_t); return -1; }
+    size_t sl = strlen(sql), done = 0;
+    while (done < sl) {
+        ssize_t w = write(in_fd, sql + done, sl - done);
+        if (w <= 0) break;
+        done += (size_t)w;
+    }
+    lseek(in_fd, 0, SEEK_SET);
+    int pipefd[2];
+    if (done != sl || pipe(pipefd) != 0) {
+        close(in_fd); close(err_fd); unlink(in_t); unlink(err_t); return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]); close(in_fd); close(err_fd);
+        unlink(in_t); unlink(err_t); return -1;
+    }
+    if (pid == 0) {
+        dup2(in_fd, STDIN_FILENO);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(err_fd, STDERR_FILENO);
+        close(pipefd[0]); close(pipefd[1]); close(in_fd); close(err_fd);
+        char* argv[12]; int k = 0;
+        argv[k++] = (char*)"sqlite3";
+        argv[k++] = (char*)"-batch";
+        argv[k++] = (char*)"-bail";
+        if (header) argv[k++] = (char*)"-header";
+        argv[k++] = (char*)"-separator";
+        argv[k++] = (char*)"\t";
+        argv[k++] = (char*)"-cmd";
+        argv[k++] = (char*)".timeout 5000";
+        argv[k++] = (char*)path;
+        argv[k] = NULL;
+        execvp("sqlite3", argv);
+        _exit(127);
+    }
+    close(pipefd[1]); close(in_fd);
+    *out = hsh_drain_fd(pipefd[0]);
+    close(pipefd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    lseek(err_fd, 0, SEEK_SET);
+    *err = hsh_drain_fd(err_fd);
+    close(err_fd);
+    unlink(in_t); unlink(err_t);
+    if (WIFEXITED(status)) {
+        int c = WEXITSTATUS(status);
+        if (c == 127) {
+            free(*err);
+            *err = strdup("sqlite3 binary not found in PATH (install the `sqlite3` package)");
+        }
+        return c;
+    }
+    return -1;
+}
+
+static void hsh_db_report(int rc, const char* err) {
+    if (rc == 0) return;
+    fprintf(stderr, "db error: %s\n", (err && *err) ? err : "sqlite3 failed");
+}
+
+static char* hsh_db_cat3(const char* a, const char* b, const char* c) {
+    size_t la = strlen(a), lb = strlen(b), lc = strlen(c);
+    char* o = (char*)malloc(la + lb + lc + 1);
+    if (!o) return NULL;
+    memcpy(o, a, la); memcpy(o + la, b, lb); memcpy(o + la + lb, c, lc);
+    o[la + lb + lc] = '\0';
+    return o;
+}
+
+hsh_string hsh_sqlite_open(hsh_string uri) {
+    const char* p = uri ? uri : "./db.sqlite";
+    if (strncmp(p, HSH_DB_PREFIX, strlen(HSH_DB_PREFIX)) == 0) p += strlen(HSH_DB_PREFIX);
+    size_t n = strlen(HSH_DB_PREFIX) + strlen(p);
+    char* o = (char*)hsh_alloc((uint64_t)n + 1);
+    if (!o) return "";
+    snprintf(o, n + 1, "%s%s", HSH_DB_PREFIX, p);
+    return o;
+}
+
+int64_t hsh_sqlite_exec(hsh_string h, hsh_string sql) {
+    if (!h || !sql) return -1;
+    HshDbTx* t = hsh_db_tx_get(h);
+    if (t) { hsh_db_tx_append(t, sql); return 0; }
+    size_t n = strlen(sql);
+    /* "\n;" (not just ";") so a trailing `-- comment` can't swallow what follows */
+    (void)n;
+    char* full = hsh_db_cat3(sql, "\n;\n", "SELECT changes();\n");
+    if (!full) return -1;
+    char *out, *err;
+    int rc = hsh_db_run(hsh_db_path_of(h), full, 0, &out, &err);
+    free(full);
+    int64_t changed = -1;
+    if (rc == 0 && out) {
+        size_t ol = strlen(out);
+        while (ol > 0 && (out[ol - 1] == '\n' || out[ol - 1] == '\r')) out[--ol] = '\0';
+        const char* last = strrchr(out, '\n');
+        last = last ? last + 1 : out;
+        changed = (int64_t)strtoll(last, NULL, 10);
+    } else {
+        hsh_db_report(rc, err);
+    }
+    free(out); free(err);
+    return changed;
+}
+
+static void hsh_db_set_header(char* line) {
+    for (int i = 0; i < g_hsh_db_ncols; i++) free(g_hsh_db_cols[i]);
+    free(g_hsh_db_cols);
+    g_hsh_db_cols = NULL; g_hsh_db_ncols = 0;
+    int cnt = 1;
+    for (char* p = line; *p; p++) if (*p == '\t') cnt++;
+    g_hsh_db_cols = (char**)calloc((size_t)cnt, sizeof(char*));
+    if (!g_hsh_db_cols) return;
+    char* start = line;
+    for (char* p = line;; p++) {
+        if (*p == '\t' || *p == '\0') {
+            g_hsh_db_cols[g_hsh_db_ncols++] = strndup(start, (size_t)(p - start));
+            if (*p == '\0') break;
+            start = p + 1;
+        }
+    }
+}
+
+static HshArray* hsh_db_parse_rows(char* out) {
+    HshArray* rows = hsh_array_new();
+    if (!out) return rows;
+    int first = 1;
+    char* line = out;
+    while (line && *line) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        size_t ll = strlen(line);
+        if (ll && line[ll - 1] == '\r') line[ll - 1] = '\0';
+        if (first) { hsh_db_set_header(line); first = 0; }
+        else if (*line) {
+            HshArray* row = hsh_array_new();
+            char* s = line;
+            for (char* p = line;; p++) {
+                if (*p == '\t' || *p == '\0') {
+                    row = hsh_array_push(row, (int64_t)(uintptr_t)hsh_db_dup(s, (size_t)(p - s)));
+                    if (*p == '\0') break;
+                    s = p + 1;
+                }
+            }
+            rows = hsh_array_push(rows, (int64_t)(uintptr_t)row);
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    return rows;
+}
+
+HshArray* hsh_sqlite_query(hsh_string h, hsh_string sql) {
+    if (!h || !sql) return hsh_array_new();
+    HshDbTx* t = hsh_db_tx_get(h);
+    size_t n = strlen(sql);
+    (void)n;
+    const char* tail = "\n;\n";
+    char* full;
+    if (t) {
+        char* a = hsh_db_cat3("BEGIN;\n", t->buf ? t->buf : "", sql);
+        full = a ? hsh_db_cat3(a, tail, "ROLLBACK;\n") : NULL;
+        free(a);
+    } else {
+        full = hsh_db_cat3(sql, tail, "");
+    }
+    if (!full) return hsh_array_new();
+    char *out, *err;
+    int rc = hsh_db_run(hsh_db_path_of(h), full, 1, &out, &err);
+    free(full);
+    HshArray* rows;
+    if (rc != 0) { hsh_db_report(rc, err); rows = hsh_array_new(); }
+    else rows = hsh_db_parse_rows(out);
+    free(out); free(err);
+    return rows;
+}
+
+void hsh_sqlite_close(hsh_string h) {
+    HshDbTx* t = hsh_db_tx_get(h);
+    if (t) { free(t->path); free(t->buf); memset(t, 0, sizeof(*t)); }
+}
+
+int64_t hsh_sqlite_ping(hsh_string h) {
+    if (!h) return 0;
+    char *out, *err;
+    int rc = hsh_db_run(hsh_db_path_of(h), "SELECT 1;\n", 0, &out, &err);
+    int ok = (rc == 0 && out && out[0] == '1');
+    free(out); free(err);
+    return ok;
+}
+
+int64_t hsh_sqlite_begin(hsh_string h) {
+    /* returns a handle string, cast to i64 for `any` */
+    if (!h || hsh_db_is_tx(h)) return 0;
+    for (int i = 0; i < HSH_DB_MAX_TX; i++) {
+        if (!g_hsh_db_tx[i].used) {
+            g_hsh_db_tx[i].used = 1;
+            g_hsh_db_tx[i].path = strdup(hsh_db_path_of(h));
+            g_hsh_db_tx[i].buf = NULL; g_hsh_db_tx[i].len = g_hsh_db_tx[i].cap = 0;
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%s%d", HSH_DB_TX_PREFIX, i);
+            return (int64_t)(uintptr_t)hsh_db_dup(tmp, strlen(tmp));
+        }
+    }
+    fprintf(stderr, "db error: too many open transactions\n");
+    return 0;
+}
+
+int64_t hsh_sqlite_commit(hsh_string h) {
+    HshDbTx* t = hsh_db_tx_get(h);
+    if (!t) return 0;
+    int ok = 1;
+    if (t->buf && t->len) {
+        char* full = hsh_db_cat3("BEGIN;\n", t->buf, "COMMIT;\n");
+        char *out, *err;
+        int rc = full ? hsh_db_run(t->path, full, 0, &out, &err) : -1;
+        if (full) { hsh_db_report(rc, rc == -1 ? NULL : err); free(out); free(err); }
+        free(full);
+        ok = (rc == 0);
+    }
+    free(t->path); free(t->buf); memset(t, 0, sizeof(*t));
+    return ok;
+}
+
+int64_t hsh_sqlite_rollback(hsh_string h) {
+    HshDbTx* t = hsh_db_tx_get(h);
+    if (!t) return 0;
+    free(t->path); free(t->buf); memset(t, 0, sizeof(*t));
+    return 1;
+}
+
+/* ?-binding that (unlike the older hsh_sql_bind above) leaves `?` inside
+ * quoted literals alone. Ints (the <=0x10000 / >=0x7ffffffffffe magnitude
+ * convention hsh_val_to_str already uses) are emitted bare, anything else
+ * is treated as a char* and emitted as an escaped literal. */
+static char* hsh_db_bind_array(const char* sql, HshArray* params) {
+    int64_t np = params ? params->len : 0;
+    size_t cap = strlen(sql) + 1;
+    char** lit = (char**)calloc((size_t)(np > 0 ? np : 1), sizeof(char*));
+    if (!lit) return strdup(sql);
+    for (int64_t i = 0; i < np; i++) {
+        int64_t v = params->data[i];
+        if ((uint64_t)v <= 0x10000ULL || (uint64_t)v >= 0x7ffffffffffeULL) {
+            char tmp[32]; snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+            lit[i] = strdup(tmp);
+        } else {
+            lit[i] = hsh_sql_escape((const char*)(uintptr_t)v);
+        }
+        cap += lit[i] ? strlen(lit[i]) : 0;
+    }
+    char* o = (char*)malloc(cap + 1);
+    if (!o) { for (int64_t i = 0; i < np; i++) free(lit[i]); free(lit); return strdup(sql); }
+    size_t w = 0; int64_t bi = 0; char q = 0;
+    for (const char* p = sql; *p; p++) {
+        if (q) { o[w++] = *p; if (*p == q) q = 0; }
+        else if (*p == '\'' || *p == '"') { q = *p; o[w++] = *p; }
+        else if (*p == '?' && bi < np) { size_t l = strlen(lit[bi]); memcpy(o + w, lit[bi], l); w += l; bi++; }
+        else o[w++] = *p;
+    }
+    o[w] = '\0';
+    for (int64_t i = 0; i < np; i++) free(lit[i]);
+    free(lit);
+    return o;
+}
+
+int64_t hsh_sqlite_exec_params(hsh_string h, hsh_string sql, HshArray* params) {
+    if (!h || !sql) return -1;
+    char* bound = hsh_db_bind_array(sql, params);
+    int64_t r = hsh_sqlite_exec(h, bound);
+    free(bound);
+    return r;
+}
+
+HshArray* hsh_sqlite_query_params(hsh_string h, hsh_string sql, HshArray* params) {
+    if (!h || !sql) return hsh_array_new();
+    char* bound = hsh_db_bind_array(sql, params);
+    HshArray* r = hsh_sqlite_query(h, bound);
+    free(bound);
+    return r;
+}
+
+static const char* hsh_db_cell(HshArray* row, hsh_string col) {
+    if (!row || !col) return "";
+    int64_t idx = -1;
+    int digits = (*col != '\0');
+    for (const char* p = col; *p; p++) if (*p < '0' || *p > '9') { digits = 0; break; }
+    if (digits) idx = (int64_t)strtoll(col, NULL, 10);
+    else for (int i = 0; i < g_hsh_db_ncols; i++)
+        if (g_hsh_db_cols[i] && strcmp(g_hsh_db_cols[i], col) == 0) { idx = i; break; }
+    if (idx < 0 || idx >= row->len) return "";
+    const char* v = (const char*)(uintptr_t)row->data[idx];
+    return v ? v : "";
+}
+
+hsh_string hsh_db_col_str(HshArray* row, hsh_string col)  { return hsh_db_cell(row, col); }
+int64_t    hsh_db_col_int(HshArray* row, hsh_string col)  { return (int64_t)strtoll(hsh_db_cell(row, col), NULL, 10); }
+double     hsh_db_col_float(HshArray* row, hsh_string col){ return strtod(hsh_db_cell(row, col), NULL); }
+int64_t    hsh_db_col_bool(HshArray* row, hsh_string col) {
+    const char* v = hsh_db_cell(row, col);
+    return (strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "t") == 0);
+}
+int64_t    hsh_db_col_is_null(HshArray* row, hsh_string col) { return hsh_db_cell(row, col)[0] == '\0'; }
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * crypto:: / path:: / os:: / sort:: native implementations for the AOT backend.
+ *
+ * These `std -> crypto/path/os/sort` builtins used to be "interpreter only":
+ * every program importing those std modules failed to compile with
+ * "`__builtin_crypto_sha256` is not supported by the h# (LLVM) backend".
+ * Pure C, no new library dependencies. Digests/KDFs were verified bit-for-bit
+ * against Python hashlib / blake3 / argon2-cffi (SHA-1/256/512, MD5, HMAC,
+ * PBKDF2-HMAC-SHA256, BLAKE3 incl. multi-chunk trees, Argon2id incl. multi-lane).
+ * `bytes` in this runtime is an HshArray* of byte values (see hsh_fs_read_bytes).
+ * ══════════════════════════════════════════════════════════════════════════ */
+static const uint32_t hsh_sha256_k[64] = {
+    0x428a2f98u,
+    0x71374491u,
+    0xb5c0fbcfu,
+    0xe9b5dba5u,
+    0x3956c25bu,
+    0x59f111f1u,
+    0x923f82a4u,
+    0xab1c5ed5u,
+    0xd807aa98u,
+    0x12835b01u,
+    0x243185beu,
+    0x550c7dc3u,
+    0x72be5d74u,
+    0x80deb1feu,
+    0x9bdc06a7u,
+    0xc19bf174u,
+    0xe49b69c1u,
+    0xefbe4786u,
+    0x0fc19dc6u,
+    0x240ca1ccu,
+    0x2de92c6fu,
+    0x4a7484aau,
+    0x5cb0a9dcu,
+    0x76f988dau,
+    0x983e5152u,
+    0xa831c66du,
+    0xb00327c8u,
+    0xbf597fc7u,
+    0xc6e00bf3u,
+    0xd5a79147u,
+    0x06ca6351u,
+    0x14292967u,
+    0x27b70a85u,
+    0x2e1b2138u,
+    0x4d2c6dfcu,
+    0x53380d13u,
+    0x650a7354u,
+    0x766a0abbu,
+    0x81c2c92eu,
+    0x92722c85u,
+    0xa2bfe8a1u,
+    0xa81a664bu,
+    0xc24b8b70u,
+    0xc76c51a3u,
+    0xd192e819u,
+    0xd6990624u,
+    0xf40e3585u,
+    0x106aa070u,
+    0x19a4c116u,
+    0x1e376c08u,
+    0x2748774cu,
+    0x34b0bcb5u,
+    0x391c0cb3u,
+    0x4ed8aa4au,
+    0x5b9cca4fu,
+    0x682e6ff3u,
+    0x748f82eeu,
+    0x78a5636fu,
+    0x84c87814u,
+    0x8cc70208u,
+    0x90befffau,
+    0xa4506cebu,
+    0xbef9a3f7u,
+    0xc67178f2u,
+};
+static const uint32_t hsh_sha256_h0[8] = {
+    0x6a09e667u,
+    0xbb67ae85u,
+    0x3c6ef372u,
+    0xa54ff53au,
+    0x510e527fu,
+    0x9b05688cu,
+    0x1f83d9abu,
+    0x5be0cd19u,
+};
+static const uint64_t hsh_sha512_k[80] = {
+    0x428a2f98d728ae22ULL,
+    0x7137449123ef65cdULL,
+    0xb5c0fbcfec4d3b2fULL,
+    0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL,
+    0x59f111f1b605d019ULL,
+    0x923f82a4af194f9bULL,
+    0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL,
+    0x12835b0145706fbeULL,
+    0x243185be4ee4b28cULL,
+    0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL,
+    0x80deb1fe3b1696b1ULL,
+    0x9bdc06a725c71235ULL,
+    0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL,
+    0xefbe4786384f25e3ULL,
+    0x0fc19dc68b8cd5b5ULL,
+    0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL,
+    0x4a7484aa6ea6e483ULL,
+    0x5cb0a9dcbd41fbd4ULL,
+    0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL,
+    0xa831c66d2db43210ULL,
+    0xb00327c898fb213fULL,
+    0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL,
+    0xd5a79147930aa725ULL,
+    0x06ca6351e003826fULL,
+    0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL,
+    0x2e1b21385c26c926ULL,
+    0x4d2c6dfc5ac42aedULL,
+    0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL,
+    0x766a0abb3c77b2a8ULL,
+    0x81c2c92e47edaee6ULL,
+    0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL,
+    0xa81a664bbc423001ULL,
+    0xc24b8b70d0f89791ULL,
+    0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL,
+    0xd69906245565a910ULL,
+    0xf40e35855771202aULL,
+    0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL,
+    0x1e376c085141ab53ULL,
+    0x2748774cdf8eeb99ULL,
+    0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL,
+    0x4ed8aa4ae3418acbULL,
+    0x5b9cca4f7763e373ULL,
+    0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL,
+    0x78a5636f43172f60ULL,
+    0x84c87814a1f0ab72ULL,
+    0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL,
+    0xa4506cebde82bde9ULL,
+    0xbef9a3f7b2c67915ULL,
+    0xc67178f2e372532bULL,
+    0xca273eceea26619cULL,
+    0xd186b8c721c0c207ULL,
+    0xeada7dd6cde0eb1eULL,
+    0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL,
+    0x0a637dc5a2c898a6ULL,
+    0x113f9804bef90daeULL,
+    0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL,
+    0x32caab7b40c72493ULL,
+    0x3c9ebe0a15c9bebcULL,
+    0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL,
+    0x597f299cfc657e2aULL,
+    0x5fcb6fab3ad6faecULL,
+    0x6c44198c4a475817ULL,
+};
+static const uint64_t hsh_sha512_h0[8] = {
+    0x6a09e667f3bcc908ULL,
+    0xbb67ae8584caa73bULL,
+    0x3c6ef372fe94f82bULL,
+    0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL,
+    0x9b05688c2b3e6c1fULL,
+    0x1f83d9abfb41bd6bULL,
+    0x5be0cd19137e2179ULL,
+};
+static const uint32_t hsh_md5_t[64] = {
+    0xd76aa478u,
+    0xe8c7b756u,
+    0x242070dbu,
+    0xc1bdceeeu,
+    0xf57c0fafu,
+    0x4787c62au,
+    0xa8304613u,
+    0xfd469501u,
+    0x698098d8u,
+    0x8b44f7afu,
+    0xffff5bb1u,
+    0x895cd7beu,
+    0x6b901122u,
+    0xfd987193u,
+    0xa679438eu,
+    0x49b40821u,
+    0xf61e2562u,
+    0xc040b340u,
+    0x265e5a51u,
+    0xe9b6c7aau,
+    0xd62f105du,
+    0x02441453u,
+    0xd8a1e681u,
+    0xe7d3fbc8u,
+    0x21e1cde6u,
+    0xc33707d6u,
+    0xf4d50d87u,
+    0x455a14edu,
+    0xa9e3e905u,
+    0xfcefa3f8u,
+    0x676f02d9u,
+    0x8d2a4c8au,
+    0xfffa3942u,
+    0x8771f681u,
+    0x6d9d6122u,
+    0xfde5380cu,
+    0xa4beea44u,
+    0x4bdecfa9u,
+    0xf6bb4b60u,
+    0xbebfbc70u,
+    0x289b7ec6u,
+    0xeaa127fau,
+    0xd4ef3085u,
+    0x04881d05u,
+    0xd9d4d039u,
+    0xe6db99e5u,
+    0x1fa27cf8u,
+    0xc4ac5665u,
+    0xf4292244u,
+    0x432aff97u,
+    0xab9423a7u,
+    0xfc93a039u,
+    0x655b59c3u,
+    0x8f0ccc92u,
+    0xffeff47du,
+    0x85845dd1u,
+    0x6fa87e4fu,
+    0xfe2ce6e0u,
+    0xa3014314u,
+    0x4e0811a1u,
+    0xf7537e82u,
+    0xbd3af235u,
+    0x2ad7d2bbu,
+    0xeb86d391u,
+};
+
+/* ── SHA-256 / SHA-512 / SHA-1 / MD5 ─────────────────────────────────────── */
+#define HSH_ROR32(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define HSH_ROR64(x,n) (((x) >> (n)) | ((x) << (64 - (n))))
+#define HSH_ROL32(x,n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t n; } HshSha256;
+static void hsh_sha256_block(HshSha256* c, const uint8_t* p) {
+    uint32_t w[64], a,b,cc,d,e,f,g,h;
+    for (int i = 0; i < 16; i++) w[i] = ((uint32_t)p[4*i]<<24)|((uint32_t)p[4*i+1]<<16)|((uint32_t)p[4*i+2]<<8)|p[4*i+3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = HSH_ROR32(w[i-15],7) ^ HSH_ROR32(w[i-15],18) ^ (w[i-15]>>3);
+        uint32_t s1 = HSH_ROR32(w[i-2],17) ^ HSH_ROR32(w[i-2],19) ^ (w[i-2]>>10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = HSH_ROR32(e,6) ^ HSH_ROR32(e,11) ^ HSH_ROR32(e,25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + hsh_sha256_k[i] + w[i];
+        uint32_t S0 = HSH_ROR32(a,2) ^ HSH_ROR32(a,13) ^ HSH_ROR32(a,22);
+        uint32_t mj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint32_t t2 = S0 + mj;
+        h=g; g=f; f=e; e=d+t1; d=cc; cc=b; b=a; a=t1+t2;
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void hsh_sha256_init(HshSha256* c){ memcpy(c->h, hsh_sha256_h0, 32); c->len=0; c->n=0; }
+static void hsh_sha256_update(HshSha256* c, const uint8_t* d, size_t l) {
+    c->len += l;
+    while (l) { size_t t = 64 - c->n; if (t > l) t = l; memcpy(c->buf + c->n, d, t); c->n += t; d += t; l -= t;
+        if (c->n == 64) { hsh_sha256_block(c, c->buf); c->n = 0; } }
+}
+static void hsh_sha256_final(HshSha256* c, uint8_t out[32]) {
+    uint64_t bits = c->len * 8; uint8_t pad = 0x80; hsh_sha256_update(c, &pad, 1);
+    uint8_t z = 0; while (c->n != 56) hsh_sha256_update(c, &z, 1);
+    uint8_t lb[8]; for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bits >> (56 - 8*i));
+    hsh_sha256_update(c, lb, 8);
+    for (int i = 0; i < 8; i++) { out[4*i]=(uint8_t)(c->h[i]>>24); out[4*i+1]=(uint8_t)(c->h[i]>>16); out[4*i+2]=(uint8_t)(c->h[i]>>8); out[4*i+3]=(uint8_t)c->h[i]; }
+}
+
+typedef struct { uint64_t h[8]; uint64_t len; uint8_t buf[128]; size_t n; } HshSha512;
+static void hsh_sha512_block(HshSha512* c, const uint8_t* p) {
+    uint64_t w[80], a,b,cc,d,e,f,g,h;
+    for (int i = 0; i < 16; i++) { w[i] = 0; for (int j = 0; j < 8; j++) w[i] = (w[i] << 8) | p[8*i+j]; }
+    for (int i = 16; i < 80; i++) {
+        uint64_t s0 = HSH_ROR64(w[i-15],1) ^ HSH_ROR64(w[i-15],8) ^ (w[i-15]>>7);
+        uint64_t s1 = HSH_ROR64(w[i-2],19) ^ HSH_ROR64(w[i-2],61) ^ (w[i-2]>>6);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+    for (int i = 0; i < 80; i++) {
+        uint64_t S1 = HSH_ROR64(e,14) ^ HSH_ROR64(e,18) ^ HSH_ROR64(e,41);
+        uint64_t ch = (e & f) ^ (~e & g);
+        uint64_t t1 = h + S1 + ch + hsh_sha512_k[i] + w[i];
+        uint64_t S0 = HSH_ROR64(a,28) ^ HSH_ROR64(a,34) ^ HSH_ROR64(a,39);
+        uint64_t mj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint64_t t2 = S0 + mj;
+        h=g; g=f; f=e; e=d+t1; d=cc; cc=b; b=a; a=t1+t2;
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void hsh_sha512_init(HshSha512* c){ memcpy(c->h, hsh_sha512_h0, 64); c->len=0; c->n=0; }
+static void hsh_sha512_update(HshSha512* c, const uint8_t* d, size_t l) {
+    c->len += l;
+    while (l) { size_t t = 128 - c->n; if (t > l) t = l; memcpy(c->buf + c->n, d, t); c->n += t; d += t; l -= t;
+        if (c->n == 128) { hsh_sha512_block(c, c->buf); c->n = 0; } }
+}
+static void hsh_sha512_final(HshSha512* c, uint8_t out[64]) {
+    uint64_t bits = c->len * 8; uint8_t pad = 0x80; hsh_sha512_update(c, &pad, 1);
+    uint8_t z = 0; while (c->n != 112) hsh_sha512_update(c, &z, 1);
+    uint8_t lb[16] = {0}; for (int i = 0; i < 8; i++) lb[8+i] = (uint8_t)(bits >> (56 - 8*i));
+    hsh_sha512_update(c, lb, 16);
+    for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) out[8*i+j] = (uint8_t)(c->h[i] >> (56 - 8*j));
+}
+
+typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t n; } HshSha1;
+static void hsh_sha1_block(HshSha1* c, const uint8_t* p) {
+    uint32_t w[80], a,b,cc,d,e;
+    for (int i = 0; i < 16; i++) w[i] = ((uint32_t)p[4*i]<<24)|((uint32_t)p[4*i+1]<<16)|((uint32_t)p[4*i+2]<<8)|p[4*i+3];
+    for (int i = 16; i < 80; i++) w[i] = HSH_ROL32(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1);
+    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)      { f = (b & cc) | (~b & d); k = 0x5A827999u; }
+        else if (i < 40) { f = b ^ cc ^ d;          k = 0x6ED9EBA1u; }
+        else if (i < 60) { f = (b & cc) | (b & d) | (cc & d); k = 0x8F1BBCDCu; }
+        else             { f = b ^ cc ^ d;          k = 0xCA62C1D6u; }
+        uint32_t t = HSH_ROL32(a,5) + f + e + k + w[i];
+        e=d; d=cc; cc=HSH_ROL32(b,30); b=a; a=t;
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;
+}
+static void hsh_sha1_init(HshSha1* c){ c->h[0]=0x67452301u;c->h[1]=0xEFCDAB89u;c->h[2]=0x98BADCFEu;c->h[3]=0x10325476u;c->h[4]=0xC3D2E1F0u; c->len=0; c->n=0; }
+static void hsh_sha1_update(HshSha1* c, const uint8_t* d, size_t l) {
+    c->len += l;
+    while (l) { size_t t = 64 - c->n; if (t > l) t = l; memcpy(c->buf + c->n, d, t); c->n += t; d += t; l -= t;
+        if (c->n == 64) { hsh_sha1_block(c, c->buf); c->n = 0; } }
+}
+static void hsh_sha1_final(HshSha1* c, uint8_t out[20]) {
+    uint64_t bits = c->len * 8; uint8_t pad = 0x80; hsh_sha1_update(c, &pad, 1);
+    uint8_t z = 0; while (c->n != 56) hsh_sha1_update(c, &z, 1);
+    uint8_t lb[8]; for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bits >> (56 - 8*i));
+    hsh_sha1_update(c, lb, 8);
+    for (int i = 0; i < 5; i++) { out[4*i]=(uint8_t)(c->h[i]>>24); out[4*i+1]=(uint8_t)(c->h[i]>>16); out[4*i+2]=(uint8_t)(c->h[i]>>8); out[4*i+3]=(uint8_t)c->h[i]; }
+}
+
+typedef struct { uint32_t h[4]; uint64_t len; uint8_t buf[64]; size_t n; } HshMd5;
+static void hsh_md5_block(HshMd5* c, const uint8_t* p) {
+    static const int s[64] = {7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22, 5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+                              4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23, 6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+    uint32_t m[16], a=c->h[0], b=c->h[1], cc=c->h[2], d=c->h[3];
+    for (int i = 0; i < 16; i++) m[i] = (uint32_t)p[4*i] | ((uint32_t)p[4*i+1]<<8) | ((uint32_t)p[4*i+2]<<16) | ((uint32_t)p[4*i+3]<<24);
+    for (int i = 0; i < 64; i++) {
+        uint32_t f; int g;
+        if (i < 16)      { f = (b & cc) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & cc); g = (5*i + 1) % 16; }
+        else if (i < 48) { f = b ^ cc ^ d;          g = (3*i + 5) % 16; }
+        else             { f = cc ^ (b | ~d);       g = (7*i) % 16; }
+        f = f + a + hsh_md5_t[i] + m[g];
+        a = d; d = cc; cc = b; b = b + HSH_ROL32(f, s[i]);
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;
+}
+static void hsh_md5_init(HshMd5* c){ c->h[0]=0x67452301u;c->h[1]=0xefcdab89u;c->h[2]=0x98badcfeu;c->h[3]=0x10325476u; c->len=0; c->n=0; }
+static void hsh_md5_update(HshMd5* c, const uint8_t* d, size_t l) {
+    c->len += l;
+    while (l) { size_t t = 64 - c->n; if (t > l) t = l; memcpy(c->buf + c->n, d, t); c->n += t; d += t; l -= t;
+        if (c->n == 64) { hsh_md5_block(c, c->buf); c->n = 0; } }
+}
+static void hsh_md5_final(HshMd5* c, uint8_t out[16]) {
+    uint64_t bits = c->len * 8; uint8_t pad = 0x80; hsh_md5_update(c, &pad, 1);
+    uint8_t z = 0; while (c->n != 56) hsh_md5_update(c, &z, 1);
+    uint8_t lb[8]; for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bits >> (8*i));
+    hsh_md5_update(c, lb, 8);
+    for (int i = 0; i < 4; i++) { out[4*i]=(uint8_t)c->h[i]; out[4*i+1]=(uint8_t)(c->h[i]>>8); out[4*i+2]=(uint8_t)(c->h[i]>>16); out[4*i+3]=(uint8_t)(c->h[i]>>24); }
+}
+
+/* one-shot helpers -> raw digest; algo: 0=sha256 1=sha512 2=sha1 3=md5 */
+static size_t hsh_digest_len(int algo) { static const size_t l[4] = {32, 64, 20, 16}; return l[algo]; }
+static size_t hsh_digest_block(int algo) { return algo == 1 ? 128 : 64; }
+static void hsh_digest2(int algo, const uint8_t* a, size_t al, const uint8_t* b, size_t bl, uint8_t* out) {
+    switch (algo) {
+        case 0: { HshSha256 c; hsh_sha256_init(&c); hsh_sha256_update(&c,a,al); if (bl) hsh_sha256_update(&c,b,bl); hsh_sha256_final(&c,out); break; }
+        case 1: { HshSha512 c; hsh_sha512_init(&c); hsh_sha512_update(&c,a,al); if (bl) hsh_sha512_update(&c,b,bl); hsh_sha512_final(&c,out); break; }
+        case 2: { HshSha1   c; hsh_sha1_init(&c);   hsh_sha1_update(&c,a,al);   if (bl) hsh_sha1_update(&c,b,bl);   hsh_sha1_final(&c,out);   break; }
+        default:{ HshMd5    c; hsh_md5_init(&c);    hsh_md5_update(&c,a,al);    if (bl) hsh_md5_update(&c,b,bl);    hsh_md5_final(&c,out);    break; }
+    }
+}
+static void hsh_hmac(int algo, const uint8_t* key, size_t kl, const uint8_t* msg, size_t ml, uint8_t* out) {
+    size_t bs = hsh_digest_block(algo), dl = hsh_digest_len(algo);
+    uint8_t k[128] = {0}, ipad[128], opad[128], inner[64];
+    if (kl > bs) hsh_digest2(algo, key, kl, NULL, 0, k); else memcpy(k, key, kl);
+    for (size_t i = 0; i < bs; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    /* inner = H(ipad || msg) */
+    uint8_t* tmp = (uint8_t*)malloc(bs + ml);
+    if (!tmp) { memset(out, 0, dl); return; }
+    memcpy(tmp, ipad, bs); memcpy(tmp + bs, msg, ml);
+    hsh_digest2(algo, tmp, bs + ml, NULL, 0, inner);
+    free(tmp);
+    hsh_digest2(algo, opad, bs, inner, dl, out);
+}
+
+static hsh_string hsh_hex_of(const uint8_t* d, size_t n) {
+    static const char* hx = "0123456789abcdef";
+    char* o = (char*)hsh_alloc((uint64_t)n * 2 + 1);
+    if (!o) return "";
+    for (size_t i = 0; i < n; i++) { o[2*i] = hx[d[i] >> 4]; o[2*i+1] = hx[d[i] & 15]; }
+    o[2*n] = '\0';
+    return o;
+}
+/* bytes in this runtime == HshArray* of byte values 0-255 (see hsh_fs_read_bytes) */
+static uint8_t* hsh_bytes_flatten(HshArray* a, size_t* n) {
+    *n = a ? (size_t)a->len : 0;
+    uint8_t* b = (uint8_t*)malloc(*n ? *n : 1);
+    if (!b) { *n = 0; return NULL; }
+    for (size_t i = 0; i < *n; i++) b[i] = (uint8_t)a->data[i];
+    return b;
+}
+static HshArray* hsh_bytes_wrap(const uint8_t* d, size_t n) {
+    HshArray* a = hsh_array_new();
+    for (size_t i = 0; i < n; i++) a = hsh_array_push(a, (int64_t)d[i]);
+    return a;
+}
+
+hsh_string hsh_crypto_sha256(hsh_string s)  { uint8_t o[32]; hsh_digest2(0,(const uint8_t*)(s?s:""),s?strlen(s):0,NULL,0,o); return hsh_hex_of(o,32); }
+hsh_string hsh_crypto_sha512(hsh_string s)  { uint8_t o[64]; hsh_digest2(1,(const uint8_t*)(s?s:""),s?strlen(s):0,NULL,0,o); return hsh_hex_of(o,64); }
+hsh_string hsh_crypto_sha1(hsh_string s)    { uint8_t o[20]; hsh_digest2(2,(const uint8_t*)(s?s:""),s?strlen(s):0,NULL,0,o); return hsh_hex_of(o,20); }
+hsh_string hsh_crypto_md5(hsh_string s)     { uint8_t o[16]; hsh_digest2(3,(const uint8_t*)(s?s:""),s?strlen(s):0,NULL,0,o); return hsh_hex_of(o,16); }
+hsh_string hsh_crypto_sha256_bytes(HshArray* b) {
+    size_t n; uint8_t* d = hsh_bytes_flatten(b, &n);
+    uint8_t o[32]; hsh_digest2(0, d ? d : (const uint8_t*)"", n, NULL, 0, o); free(d);
+    return hsh_hex_of(o, 32);
+}
+hsh_string hsh_crypto_hmac_sha256(hsh_string k, hsh_string m) {
+    uint8_t o[32]; hsh_hmac(0,(const uint8_t*)(k?k:""),k?strlen(k):0,(const uint8_t*)(m?m:""),m?strlen(m):0,o); return hsh_hex_of(o,32);
+}
+hsh_string hsh_crypto_hmac_sha512(hsh_string k, hsh_string m) {
+    uint8_t o[64]; hsh_hmac(1,(const uint8_t*)(k?k:""),k?strlen(k):0,(const uint8_t*)(m?m:""),m?strlen(m):0,o); return hsh_hex_of(o,64);
+}
+
+/* PBKDF2-HMAC-SHA256: (password: string, salt: bytes, iterations, key_len) -> bytes */
+HshArray* hsh_crypto_pbkdf2(hsh_string pw, HshArray* salt, int64_t iters, int64_t klen) {
+    if (klen <= 0 || iters <= 0) return hsh_array_new();
+    size_t sl; uint8_t* s = hsh_bytes_flatten(salt, &sl);
+    size_t pl = pw ? strlen(pw) : 0;
+    uint8_t* dk = (uint8_t*)malloc((size_t)klen + 32);
+    uint8_t* sb = (uint8_t*)malloc(sl + 4);
+    if (!dk || !sb) { free(dk); free(sb); free(s); return hsh_array_new(); }
+    size_t blocks = ((size_t)klen + 31) / 32;
+    for (size_t b = 1; b <= blocks; b++) {
+        uint8_t u[32], t[32];
+        memcpy(sb, s, sl);
+        sb[sl] = (uint8_t)(b >> 24); sb[sl+1] = (uint8_t)(b >> 16); sb[sl+2] = (uint8_t)(b >> 8); sb[sl+3] = (uint8_t)b;
+        hsh_hmac(0, (const uint8_t*)(pw?pw:""), pl, sb, sl + 4, u);
+        memcpy(t, u, 32);
+        for (int64_t i = 1; i < iters; i++) {
+            hsh_hmac(0, (const uint8_t*)(pw?pw:""), pl, u, 32, u);
+            for (int j = 0; j < 32; j++) t[j] ^= u[j];
+        }
+        memcpy(dk + (b - 1) * 32, t, 32);
+    }
+    HshArray* r = hsh_bytes_wrap(dk, (size_t)klen);
+    free(dk); free(sb); free(s);
+    return r;
+}
+
+static void hsh_urandom(uint8_t* buf, size_t n) {
+    FILE* f = fopen("/dev/urandom", "rb");
+    size_t got = f ? fread(buf, 1, n, f) : 0;
+    if (f) fclose(f);
+    if (got != n) { fprintf(stderr, "crypto: cannot read /dev/urandom\n"); exit(1); }
+}
+HshArray* hsh_crypto_random_bytes(int64_t n) {
+    if (n <= 0) return hsh_array_new();
+    uint8_t* b = (uint8_t*)malloc((size_t)n);
+    if (!b) return hsh_array_new();
+    hsh_urandom(b, (size_t)n);
+    HshArray* r = hsh_bytes_wrap(b, (size_t)n);
+    free(b);
+    return r;
+}
+/* constant-time (does not short-circuit on the first mismatch) */
+int64_t hsh_crypto_bytes_eq(HshArray* a, HshArray* b) {
+    int64_t la = a ? a->len : 0, lb = b ? b->len : 0;
+    uint8_t diff = (la != lb);
+    int64_t m = la > lb ? la : lb;
+    for (int64_t i = 0; i < m; i++) {
+        uint8_t x = i < la ? (uint8_t)a->data[i] : 0, y = i < lb ? (uint8_t)b->data[i] : 0;
+        diff |= x ^ y;
+    }
+    return diff == 0;
+}
+HshArray* hsh_crypto_xor_bytes(HshArray* a, HshArray* b) {
+    int64_t la = a ? a->len : 0, lb = b ? b->len : 0;
+    if (la != lb || la == 0) return hsh_array_new();
+    HshArray* r = hsh_array_new();
+    for (int64_t i = 0; i < la; i++) r = hsh_array_push(r, (int64_t)(((uint8_t)a->data[i]) ^ ((uint8_t)b->data[i])));
+    return r;
+}
+
+/* ── BLAKE3 (default hash mode, 32-byte output) ──────────────────────────── */
+static const uint8_t hsh_b3_perm[16] = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
+#define HSH_B3_CHUNK_START 1
+#define HSH_B3_CHUNK_END   2
+#define HSH_B3_PARENT      4
+#define HSH_B3_ROOT        8
+static void hsh_b3_g(uint32_t* s, int a, int b, int c, int d, uint32_t mx, uint32_t my) {
+    s[a] = s[a] + s[b] + mx; s[d] = HSH_ROR32(s[d] ^ s[a], 16);
+    s[c] = s[c] + s[d];      s[b] = HSH_ROR32(s[b] ^ s[c], 12);
+    s[a] = s[a] + s[b] + my; s[d] = HSH_ROR32(s[d] ^ s[a], 8);
+    s[c] = s[c] + s[d];      s[b] = HSH_ROR32(s[b] ^ s[c], 7);
+}
+static void hsh_b3_round(uint32_t* s, const uint32_t* m) {
+    hsh_b3_g(s,0,4,8,12,m[0],m[1]);  hsh_b3_g(s,1,5,9,13,m[2],m[3]);
+    hsh_b3_g(s,2,6,10,14,m[4],m[5]); hsh_b3_g(s,3,7,11,15,m[6],m[7]);
+    hsh_b3_g(s,0,5,10,15,m[8],m[9]); hsh_b3_g(s,1,6,11,12,m[10],m[11]);
+    hsh_b3_g(s,2,7,8,13,m[12],m[13]);hsh_b3_g(s,3,4,9,14,m[14],m[15]);
+}
+static void hsh_b3_compress(const uint32_t cv[8], const uint32_t blk[16], uint64_t ctr, uint32_t blen, uint32_t flags, uint32_t out[16]) {
+    uint32_t s[16] = { cv[0],cv[1],cv[2],cv[3],cv[4],cv[5],cv[6],cv[7],
+                       hsh_sha256_h0[0],hsh_sha256_h0[1],hsh_sha256_h0[2],hsh_sha256_h0[3],
+                       (uint32_t)ctr, (uint32_t)(ctr >> 32), blen, flags };
+    uint32_t m[16], t[16];
+    memcpy(m, blk, 64);
+    for (int r = 0; r < 7; r++) {
+        hsh_b3_round(s, m);
+        if (r < 6) { for (int i = 0; i < 16; i++) t[i] = m[hsh_b3_perm[i]]; memcpy(m, t, 64); }
+    }
+    for (int i = 0; i < 8; i++) { s[i] ^= s[i+8]; s[i+8] ^= cv[i]; }
+    memcpy(out, s, 64);
+}
+static void hsh_b3_words(const uint8_t* b, size_t n, uint32_t w[16]) {
+    uint8_t p[64] = {0}; memcpy(p, b, n);
+    for (int i = 0; i < 16; i++) w[i] = (uint32_t)p[4*i] | ((uint32_t)p[4*i+1]<<8) | ((uint32_t)p[4*i+2]<<16) | ((uint32_t)p[4*i+3]<<24);
+}
+typedef struct { uint32_t cv[8]; uint32_t blk[16]; uint64_t ctr; uint32_t blen; uint32_t flags; } HshB3Out;
+static void hsh_b3_out_cv(const HshB3Out* o, uint32_t cv[8]) {
+    uint32_t t[16]; hsh_b3_compress(o->cv, o->blk, o->ctr, o->blen, o->flags, t); memcpy(cv, t, 32);
+}
+typedef struct { uint32_t cv[8]; uint64_t ctr; uint8_t buf[64]; size_t n; uint8_t nblocks; } HshB3Chunk;
+static void hsh_b3_chunk_init(HshB3Chunk* c, uint64_t ctr) { memcpy(c->cv, hsh_sha256_h0, 32); c->ctr = ctr; c->n = 0; c->nblocks = 0; }
+static size_t hsh_b3_chunk_len(const HshB3Chunk* c) { return 64 * (size_t)c->nblocks + c->n; }
+static void hsh_b3_chunk_update(HshB3Chunk* c, const uint8_t* d, size_t l) {
+    while (l) {
+        if (c->n == 64) {
+            uint32_t w[16], t[16]; hsh_b3_words(c->buf, 64, w);
+            hsh_b3_compress(c->cv, w, c->ctr, 64, c->nblocks == 0 ? HSH_B3_CHUNK_START : 0, t);
+            memcpy(c->cv, t, 32); c->nblocks++; c->n = 0;
+        }
+        size_t t = 64 - c->n; if (t > l) t = l;
+        memcpy(c->buf + c->n, d, t); c->n += t; d += t; l -= t;
+    }
+}
+static HshB3Out hsh_b3_chunk_output(const HshB3Chunk* c) {
+    HshB3Out o; memcpy(o.cv, c->cv, 32); hsh_b3_words(c->buf, c->n, o.blk);
+    o.ctr = c->ctr; o.blen = (uint32_t)c->n;
+    o.flags = (c->nblocks == 0 ? HSH_B3_CHUNK_START : 0) | HSH_B3_CHUNK_END;
+    return o;
+}
+static HshB3Out hsh_b3_parent_out(const uint32_t l[8], const uint32_t r[8]) {
+    HshB3Out o; memcpy(o.cv, hsh_sha256_h0, 32);
+    memcpy(o.blk, l, 32); memcpy(o.blk + 8, r, 32);
+    o.ctr = 0; o.blen = 64; o.flags = HSH_B3_PARENT; return o;
+}
+static void hsh_b3_hash(const uint8_t* d, size_t l, uint8_t out[32]) {
+    uint32_t stack[54][8]; int sp = 0;
+    HshB3Chunk ch; hsh_b3_chunk_init(&ch, 0);
+    while (l) {
+        if (hsh_b3_chunk_len(&ch) == 1024) {
+            HshB3Out o = hsh_b3_chunk_output(&ch);
+            uint32_t cv[8]; hsh_b3_out_cv(&o, cv);
+            uint64_t total = ch.ctr + 1;
+            while ((total & 1) == 0) {
+                HshB3Out p = hsh_b3_parent_out(stack[--sp], cv);
+                hsh_b3_out_cv(&p, cv); total >>= 1;
+            }
+            memcpy(stack[sp++], cv, 32);
+            hsh_b3_chunk_init(&ch, ch.ctr + 1);
+        }
+        size_t t = 1024 - hsh_b3_chunk_len(&ch); if (t > l) t = l;
+        hsh_b3_chunk_update(&ch, d, t); d += t; l -= t;
+    }
+    HshB3Out o = hsh_b3_chunk_output(&ch);
+    while (sp > 0) {
+        uint32_t cv[8]; hsh_b3_out_cv(&o, cv);
+        o = hsh_b3_parent_out(stack[--sp], cv);
+    }
+    uint32_t w[16]; hsh_b3_compress(o.cv, o.blk, 0, o.blen, o.flags | HSH_B3_ROOT, w);
+    for (int i = 0; i < 8; i++) { out[4*i]=(uint8_t)w[i]; out[4*i+1]=(uint8_t)(w[i]>>8); out[4*i+2]=(uint8_t)(w[i]>>16); out[4*i+3]=(uint8_t)(w[i]>>24); }
+}
+hsh_string hsh_crypto_blake3(hsh_string s) {
+    uint8_t o[32]; hsh_b3_hash((const uint8_t*)(s ? s : ""), s ? strlen(s) : 0, o); return hsh_hex_of(o, 32);
+}
+
+/* ── BLAKE2b (variable output, unkeyed) — needed by Argon2 ────────────────── */
+static const uint8_t hsh_b2_sigma[12][16] = {
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},{14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
+    {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4},{7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
+    {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13},{2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
+    {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11},{13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
+    {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5},{10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},{14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3} };
+typedef struct { uint64_t h[8]; uint64_t t; uint8_t buf[128]; size_t n; size_t outlen; } HshB2;
+#define HSH_B2G(a,b,c,d,x,y) do { v[a]=v[a]+v[b]+(x); v[d]=HSH_ROR64(v[d]^v[a],32); v[c]=v[c]+v[d]; v[b]=HSH_ROR64(v[b]^v[c],24); \
+    v[a]=v[a]+v[b]+(y); v[d]=HSH_ROR64(v[d]^v[a],16); v[c]=v[c]+v[d]; v[b]=HSH_ROR64(v[b]^v[c],63); } while (0)
+static void hsh_b2_compress(HshB2* c, const uint8_t* blk, int last) {
+    uint64_t m[16], v[16];
+    for (int i = 0; i < 16; i++) { m[i] = 0; for (int j = 7; j >= 0; j--) m[i] = (m[i] << 8) | blk[8*i+j]; }
+    for (int i = 0; i < 8; i++) { v[i] = c->h[i]; v[i+8] = hsh_sha512_h0[i]; }
+    v[12] ^= c->t; /* high half of the 128-bit counter is always 0 here */
+    if (last) v[14] = ~v[14];
+    for (int r = 0; r < 12; r++) {
+        const uint8_t* s = hsh_b2_sigma[r];
+        HSH_B2G(0,4,8,12,m[s[0]],m[s[1]]);  HSH_B2G(1,5,9,13,m[s[2]],m[s[3]]);
+        HSH_B2G(2,6,10,14,m[s[4]],m[s[5]]); HSH_B2G(3,7,11,15,m[s[6]],m[s[7]]);
+        HSH_B2G(0,5,10,15,m[s[8]],m[s[9]]); HSH_B2G(1,6,11,12,m[s[10]],m[s[11]]);
+        HSH_B2G(2,7,8,13,m[s[12]],m[s[13]]);HSH_B2G(3,4,9,14,m[s[14]],m[s[15]]);
+    }
+    for (int i = 0; i < 8; i++) c->h[i] ^= v[i] ^ v[i+8];
+}
+static void hsh_b2_init(HshB2* c, size_t outlen) {
+    memcpy(c->h, hsh_sha512_h0, 64);
+    c->h[0] ^= 0x01010000ULL ^ (uint64_t)outlen;
+    c->t = 0; c->n = 0; c->outlen = outlen;
+}
+static void hsh_b2_update(HshB2* c, const uint8_t* d, size_t l) {
+    while (l) {
+        if (c->n == 128) { c->t += 128; hsh_b2_compress(c, c->buf, 0); c->n = 0; }
+        size_t t = 128 - c->n; if (t > l) t = l;
+        memcpy(c->buf + c->n, d, t); c->n += t; d += t; l -= t;
+    }
+}
+static void hsh_b2_final(HshB2* c, uint8_t* out) {
+    c->t += c->n; memset(c->buf + c->n, 0, 128 - c->n);
+    hsh_b2_compress(c, c->buf, 1);
+    for (size_t i = 0; i < c->outlen; i++) out[i] = (uint8_t)(c->h[i / 8] >> (8 * (i % 8)));
+}
+static void hsh_b2(const uint8_t* a, size_t al, const uint8_t* b, size_t bl, uint8_t* out, size_t outlen) {
+    HshB2 c; hsh_b2_init(&c, outlen); hsh_b2_update(&c, a, al); if (bl) hsh_b2_update(&c, b, bl); hsh_b2_final(&c, out);
+}
+
+/* ── Argon2id (RFC 9106), PHC string format ───────────────────────────────── */
+#define HSH_A2_BLK 128 /* 1024-byte block = 128 u64 */
+static void hsh_a2_hprime(uint8_t* out, size_t T, const uint8_t* in, size_t inl) {
+    uint8_t lt[4] = { (uint8_t)T, (uint8_t)(T >> 8), (uint8_t)(T >> 16), (uint8_t)(T >> 24) };
+    if (T <= 64) {
+        HshB2 c; hsh_b2_init(&c, T); hsh_b2_update(&c, lt, 4); hsh_b2_update(&c, in, inl); hsh_b2_final(&c, out); return;
+    }
+    uint8_t v[64];
+    HshB2 c; hsh_b2_init(&c, 64); hsh_b2_update(&c, lt, 4); hsh_b2_update(&c, in, inl); hsh_b2_final(&c, v);
+    memcpy(out, v, 32);
+    size_t pos = 32, rem = T - 32;
+    while (rem > 64) {
+        uint8_t nv[64]; hsh_b2(v, 64, NULL, 0, nv, 64);
+        memcpy(v, nv, 64); memcpy(out + pos, v, 32); pos += 32; rem -= 32;
+    }
+    hsh_b2(v, 64, NULL, 0, out + pos, rem);
+}
+static uint64_t hsh_a2_mka(uint64_t x, uint64_t y) { return x + y + 2ULL * (uint64_t)(uint32_t)x * (uint64_t)(uint32_t)y; }
+#define HSH_A2G(a,b,c,d) do { a = hsh_a2_mka(a,b); d = HSH_ROR64(d^a,32); c = hsh_a2_mka(c,d); b = HSH_ROR64(b^c,24); \
+    a = hsh_a2_mka(a,b); d = HSH_ROR64(d^a,16); c = hsh_a2_mka(c,d); b = HSH_ROR64(b^c,63); } while (0)
+static void hsh_a2_round(uint64_t* v0,uint64_t* v1,uint64_t* v2,uint64_t* v3,uint64_t* v4,uint64_t* v5,uint64_t* v6,uint64_t* v7,
+                         uint64_t* v8,uint64_t* v9,uint64_t* v10,uint64_t* v11,uint64_t* v12,uint64_t* v13,uint64_t* v14,uint64_t* v15) {
+    HSH_A2G(*v0,*v4,*v8,*v12); HSH_A2G(*v1,*v5,*v9,*v13); HSH_A2G(*v2,*v6,*v10,*v14); HSH_A2G(*v3,*v7,*v11,*v15);
+    HSH_A2G(*v0,*v5,*v10,*v15); HSH_A2G(*v1,*v6,*v11,*v12); HSH_A2G(*v2,*v7,*v8,*v13); HSH_A2G(*v3,*v4,*v9,*v14);
+}
+static void hsh_a2_fill(uint64_t* next, const uint64_t* prev, const uint64_t* ref, int with_xor) {
+    uint64_t R[HSH_A2_BLK], T[HSH_A2_BLK];
+    for (int i = 0; i < HSH_A2_BLK; i++) R[i] = ref[i] ^ prev[i];
+    memcpy(T, R, sizeof(R));
+    if (with_xor) for (int i = 0; i < HSH_A2_BLK; i++) T[i] ^= next[i];
+    for (int i = 0; i < 8; i++) { uint64_t* b = R + 16*i;
+        hsh_a2_round(&b[0],&b[1],&b[2],&b[3],&b[4],&b[5],&b[6],&b[7],&b[8],&b[9],&b[10],&b[11],&b[12],&b[13],&b[14],&b[15]); }
+    for (int i = 0; i < 8; i++)
+        hsh_a2_round(&R[2*i],&R[2*i+1],&R[2*i+16],&R[2*i+17],&R[2*i+32],&R[2*i+33],&R[2*i+48],&R[2*i+49],
+                     &R[2*i+64],&R[2*i+65],&R[2*i+80],&R[2*i+81],&R[2*i+96],&R[2*i+97],&R[2*i+112],&R[2*i+113]);
+    for (int i = 0; i < HSH_A2_BLK; i++) next[i] = T[i] ^ R[i];
+}
+static void hsh_a2_next_addr(uint64_t* addr, uint64_t* in) {
+    uint64_t zero[HSH_A2_BLK] = {0};
+    in[6]++;
+    hsh_a2_fill(addr, zero, in, 0);
+    hsh_a2_fill(addr, zero, addr, 0);
+}
+/* returns 0 ok */
+static int hsh_argon2id_raw(const uint8_t* pw, size_t pwl, const uint8_t* salt, size_t sl,
+                            uint32_t t_cost, uint32_t m_cost, uint32_t lanes, uint8_t* out, size_t outlen) {
+    if (lanes < 1 || t_cost < 1 || m_cost < 8 * lanes) return -1;
+    uint32_t mblocks = (m_cost / (4 * lanes)) * (4 * lanes);
+    uint32_t lane_len = mblocks / lanes, seg_len = lane_len / 4;
+    uint64_t* mem = (uint64_t*)malloc((size_t)mblocks * 1024);
+    if (!mem) return -1;
+    /* H0 */
+    uint8_t h0in_hdr[24]; uint32_t hv[6] = { lanes, (uint32_t)outlen, m_cost, t_cost, 0x13, 2 };
+    for (int i = 0; i < 6; i++) for (int j = 0; j < 4; j++) h0in_hdr[4*i+j] = (uint8_t)(hv[i] >> (8*j));
+    HshB2 hc; hsh_b2_init(&hc, 64); hsh_b2_update(&hc, h0in_hdr, 24);
+    uint8_t l4[4];
+    #define HSH_A2_LE(v) do { l4[0]=(uint8_t)(v); l4[1]=(uint8_t)((v)>>8); l4[2]=(uint8_t)((v)>>16); l4[3]=(uint8_t)((v)>>24); hsh_b2_update(&hc, l4, 4); } while (0)
+    HSH_A2_LE((uint32_t)pwl); hsh_b2_update(&hc, pw, pwl);
+    HSH_A2_LE((uint32_t)sl);  hsh_b2_update(&hc, salt, sl);
+    HSH_A2_LE(0u); HSH_A2_LE(0u); /* no secret, no associated data */
+    uint8_t h0[72]; hsh_b2_final(&hc, h0);
+    for (uint32_t l = 0; l < lanes; l++) for (uint32_t i = 0; i < 2; i++) {
+        h0[64] = (uint8_t)i; h0[65] = h0[66] = h0[67] = 0;
+        h0[68] = (uint8_t)l; h0[69] = (uint8_t)(l >> 8); h0[70] = (uint8_t)(l >> 16); h0[71] = (uint8_t)(l >> 24);
+        uint8_t blk[1024]; hsh_a2_hprime(blk, 1024, h0, 72);
+        uint64_t* dst = mem + ((size_t)l * lane_len + i) * HSH_A2_BLK;
+        for (int w = 0; w < HSH_A2_BLK; w++) { dst[w] = 0; for (int j = 7; j >= 0; j--) dst[w] = (dst[w] << 8) | blk[8*w+j]; }
+    }
+    for (uint32_t pass = 0; pass < t_cost; pass++) for (uint32_t slice = 0; slice < 4; slice++) for (uint32_t lane = 0; lane < lanes; lane++) {
+        int indep = (pass == 0 && slice < 2);
+        uint64_t in[HSH_A2_BLK] = {0}, addr[HSH_A2_BLK] = {0};
+        in[0] = pass; in[1] = lane; in[2] = slice; in[3] = mblocks; in[4] = t_cost; in[5] = 2;
+        uint32_t start = 0;
+        if (pass == 0 && slice == 0) { start = 2; if (indep) hsh_a2_next_addr(addr, in); }
+        size_t cur = (size_t)lane * lane_len + (size_t)slice * seg_len + start;
+        size_t prv = (cur % lane_len == 0) ? cur + lane_len - 1 : cur - 1;
+        for (uint32_t i = start; i < seg_len; i++, cur++, prv++) {
+            if (cur % lane_len == 1) prv = cur - 1;
+            uint64_t rnd;
+            if (indep) { if (i % 128 == 0) hsh_a2_next_addr(addr, in); rnd = addr[i % 128]; }
+            else rnd = mem[prv * HSH_A2_BLK];
+            uint32_t rlane = (uint32_t)((rnd >> 32) % lanes);
+            if (pass == 0 && slice == 0) rlane = lane;
+            int same = (rlane == lane);
+            int64_t area;
+            if (pass == 0) {
+                if (slice == 0) area = (int64_t)i - 1;
+                else if (same)  area = (int64_t)slice * seg_len + i - 1;
+                else            area = (int64_t)slice * seg_len + (i == 0 ? -1 : 0);
+            } else {
+                if (same) area = (int64_t)lane_len - seg_len + i - 1;
+                else      area = (int64_t)lane_len - seg_len + (i == 0 ? -1 : 0);
+            }
+            uint64_t rel = rnd & 0xFFFFFFFFULL;
+            rel = (rel * rel) >> 32;
+            rel = (uint64_t)area - 1 - (((uint64_t)area * rel) >> 32);
+            uint64_t startpos = 0;
+            if (pass != 0) startpos = (slice == 3) ? 0 : (uint64_t)(slice + 1) * seg_len;
+            size_t refidx = (size_t)((startpos + rel) % lane_len);
+            hsh_a2_fill(mem + cur * HSH_A2_BLK, mem + prv * HSH_A2_BLK, mem + ((size_t)rlane * lane_len + refidx) * HSH_A2_BLK, pass != 0);
+        }
+    }
+    uint64_t fin[HSH_A2_BLK];
+    memcpy(fin, mem + ((size_t)0 * lane_len + lane_len - 1) * HSH_A2_BLK, 1024);
+    for (uint32_t l = 1; l < lanes; l++) {
+        const uint64_t* b = mem + ((size_t)l * lane_len + lane_len - 1) * HSH_A2_BLK;
+        for (int w = 0; w < HSH_A2_BLK; w++) fin[w] ^= b[w];
+    }
+    uint8_t fb[1024];
+    for (int w = 0; w < HSH_A2_BLK; w++) for (int j = 0; j < 8; j++) fb[8*w+j] = (uint8_t)(fin[w] >> (8*j));
+    hsh_a2_hprime(out, outlen, fb, 1024);
+    memset(mem, 0, (size_t)mblocks * 1024);
+    free(mem);
+    return 0;
+}
+
+static const char hsh_cr_b64_tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static size_t hsh_cr_b64_enc_nopad(const uint8_t* d, size_t n, char* o) {
+    size_t w = 0, i = 0;
+    for (; i + 2 < n; i += 3) {
+        uint32_t v = ((uint32_t)d[i] << 16) | ((uint32_t)d[i+1] << 8) | d[i+2];
+        o[w++] = hsh_cr_b64_tab[v >> 18]; o[w++] = hsh_cr_b64_tab[(v >> 12) & 63]; o[w++] = hsh_cr_b64_tab[(v >> 6) & 63]; o[w++] = hsh_cr_b64_tab[v & 63];
+    }
+    if (n - i == 1) { uint32_t v = (uint32_t)d[i] << 16; o[w++] = hsh_cr_b64_tab[v >> 18]; o[w++] = hsh_cr_b64_tab[(v >> 12) & 63]; }
+    else if (n - i == 2) { uint32_t v = ((uint32_t)d[i] << 16) | ((uint32_t)d[i+1] << 8);
+        o[w++] = hsh_cr_b64_tab[v >> 18]; o[w++] = hsh_cr_b64_tab[(v >> 12) & 63]; o[w++] = hsh_cr_b64_tab[(v >> 6) & 63]; }
+    o[w] = '\0'; return w;
+}
+static int hsh_cr_b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+static int hsh_cr_b64_dec_nopad(const char* s, size_t sl, uint8_t* o, size_t* ol) {
+    uint32_t acc = 0; int bits = 0; size_t w = 0;
+    for (size_t i = 0; i < sl; i++) {
+        int v = hsh_cr_b64_val(s[i]); if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; o[w++] = (uint8_t)(acc >> bits); }
+    }
+    *ol = w; return 0;
+}
+/* Defaults of the `argon2` crate (m=19456 KiB, t=2, p=1, 32-byte tag, 16-byte salt). */
+hsh_string hsh_crypto_argon2_hash(hsh_string pw) {
+    uint8_t salt[16], tag[32];
+    hsh_urandom(salt, 16);
+    const uint32_t m = 19456, t = 2, p = 1;
+    if (hsh_argon2id_raw((const uint8_t*)(pw ? pw : ""), pw ? strlen(pw) : 0, salt, 16, t, m, p, tag, 32) != 0) return "";
+    char sb[32], hb[64]; hsh_cr_b64_enc_nopad(salt, 16, sb); hsh_cr_b64_enc_nopad(tag, 32, hb);
+    char* o = (char*)hsh_alloc(160);
+    if (!o) return "";
+    snprintf(o, 160, "$argon2id$v=19$m=%u,t=%u,p=%u$%s$%s", m, t, p, sb, hb);
+    return o;
+}
+int64_t hsh_crypto_argon2_verify(hsh_string pw, hsh_string hash) {
+    if (!hash) return 0;
+    unsigned m, t, p; int v = 19; char salt_b[128], hash_b[256];
+    int n = sscanf(hash, "$argon2id$v=%d$m=%u,t=%u,p=%u$%127[^$]$%255s", &v, &m, &t, &p, salt_b, hash_b);
+    if (n != 6 || v != 19 || m > (1u << 22) || p == 0 || p > 64) return 0;
+    uint8_t salt[96], want[128], got[128]; size_t sl, wl;
+    if (hsh_cr_b64_dec_nopad(salt_b, strlen(salt_b), salt, &sl) != 0 || sl > sizeof(salt)) return 0;
+    if (hsh_cr_b64_dec_nopad(hash_b, strlen(hash_b), want, &wl) != 0 || wl < 4 || wl > sizeof(got)) return 0;
+    if (hsh_argon2id_raw((const uint8_t*)(pw ? pw : ""), pw ? strlen(pw) : 0, salt, sl, t, m, p, got, wl) != 0) return 0;
+    uint8_t diff = 0; for (size_t i = 0; i < wl; i++) diff |= got[i] ^ want[i];
+    return diff == 0;
+}
+
+/* ── path:: (lexical, never touches the filesystem — mirrors Rust's
+ *    std::path::Path as used by the interpreter) ───────────────────────── */
+static char* hsh_p_dup(const char* s, size_t n) { return hsh_db_dup(s, n); }
+/* length of `s` without trailing '/' (a path of only slashes keeps 0) */
+static size_t hsh_p_trim_slash(const char* s, size_t n) { while (n > 0 && s[n-1] == '/') n--; return n; }
+/* drops trailing "/." components too (Rust treats `a/.` as `a`) */
+static size_t hsh_p_trim_tail(const char* s, size_t n) {
+    for (;;) {
+        n = hsh_p_trim_slash(s, n);
+        if (n >= 2 && s[n-1] == '.' && s[n-2] == '/') { n -= 2; continue; }
+        if (n == 1 && s[0] == '.') return 0;
+        return n;
+    }
+}
+hsh_string hsh_path_join(hsh_string a, hsh_string b) {
+    if (!a) a = "";
+    if (!b) b = "";
+    if (b[0] == '/' || a[0] == '\0') return hsh_p_dup(b, strlen(b));
+    size_t al = strlen(a), bl = strlen(b);
+    int slash = (a[al-1] != '/');
+    char* o = (char*)hsh_alloc((uint64_t)(al + bl + 2));
+    if (!o) return "";
+    memcpy(o, a, al); if (slash) o[al++] = '/';
+    memcpy(o + al, b, bl + 1);
+    return o;
+}
+static void hsh_p_filename(const char* p, const char** name, size_t* nl) {
+    size_t n = hsh_p_trim_tail(p, strlen(p));
+    size_t s = n; while (s > 0 && p[s-1] != '/') s--;
+    *name = p + s; *nl = n - s;
+    if (*nl == 2 && (*name)[0] == '.' && (*name)[1] == '.') *nl = 0;
+}
+hsh_string hsh_path_filename(hsh_string p) {
+    if (!p) return "";
+    const char* nm; size_t nl; hsh_p_filename(p, &nm, &nl); return hsh_p_dup(nm, nl);
+}
+/* index of the extension dot inside name, or -1 (a leading dot is part of the stem) */
+static long hsh_p_dot(const char* nm, size_t nl) {
+    for (long i = (long)nl - 1; i > 0; i--) if (nm[i] == '.') return i;
+    return -1;
+}
+hsh_string hsh_path_stem(hsh_string p) {
+    if (!p) return "";
+    const char* nm; size_t nl; hsh_p_filename(p, &nm, &nl);
+    long d = hsh_p_dot(nm, nl); return hsh_p_dup(nm, d < 0 ? nl : (size_t)d);
+}
+hsh_string hsh_path_extension(hsh_string p) {
+    if (!p) return "";
+    const char* nm; size_t nl; hsh_p_filename(p, &nm, &nl);
+    long d = hsh_p_dot(nm, nl); return d < 0 ? "" : hsh_p_dup(nm + d + 1, nl - (size_t)d - 1);
+}
+hsh_string hsh_path_parent(hsh_string p) {
+    if (!p || !*p) return "";
+    size_t n = hsh_p_trim_tail(p, strlen(p));
+    if (n == 0) return "";                       /* "/" , "." or "" -> no parent */
+    size_t s = n; while (s > 0 && p[s-1] != '/') s--;
+    if (s == 0) return "";                       /* single relative component */
+    size_t e = hsh_p_trim_slash(p, s);
+    if (e == 0) return "/";                      /* "/a" -> "/" */
+    return hsh_p_dup(p, e);
+}
+int64_t hsh_path_is_absolute(hsh_string p) { return p && p[0] == '/'; }
+hsh_string hsh_path_normalize(hsh_string p) {
+    if (!p) return "";
+    size_t n = strlen(p);
+    char** seg = (char**)calloc(n + 2, sizeof(char*)); size_t ns = 0; int root = (n > 0 && p[0] == '/');
+    int have_root = root;
+    size_t i = 0;
+    while (i < n) {
+        while (i < n && p[i] == '/') i++;
+        size_t st = i; while (i < n && p[i] != '/') i++;
+        size_t l = i - st; if (l == 0) continue;
+        if (l == 1 && p[st] == '.') continue;
+        if (l == 2 && p[st] == '.' && p[st+1] == '.') { if (ns > 0) free(seg[--ns]); else have_root = 0; continue; }
+        seg[ns++] = strndup(p + st, l);
+    }
+    size_t cap = n + 2; char* o = (char*)hsh_alloc((uint64_t)cap); size_t w = 0;
+    if (!o) { for (size_t k = 0; k < ns; k++) free(seg[k]); free(seg); return ""; }
+    if (have_root) o[w++] = '/';
+    for (size_t k = 0; k < ns; k++) { if (k) o[w++] = '/'; size_t l = strlen(seg[k]); memcpy(o + w, seg[k], l); w += l; free(seg[k]); }
+    o[w] = '\0'; free(seg);
+    return o;
+}
+hsh_string hsh_path_with_extension(hsh_string p, hsh_string ext) {
+    if (!p) return "";
+    if (!ext) ext = "";
+    const char* nm; size_t nl; hsh_p_filename(p, &nm, &nl);
+    if (nl == 0) return hsh_p_dup(p, strlen(p));
+    long d = hsh_p_dot(nm, nl); size_t stem = d < 0 ? nl : (size_t)d;
+    size_t pre = (size_t)(nm - p), el = strlen(ext);
+    char* o = (char*)hsh_alloc((uint64_t)(pre + stem + el + 2)); size_t w = 0;
+    if (!o) return "";
+    memcpy(o, p, pre); w = pre; memcpy(o + w, nm, stem); w += stem;
+    if (el) { o[w++] = '.'; memcpy(o + w, ext, el); w += el; }
+    o[w] = '\0'; return o;
+}
+
+/* ── os:: additions ────────────────────────────────────────────────────── */
+hsh_string hsh_os_home_dir(void) { const char* h = getenv("HOME");
+    return h ? hsh_p_dup(h, strlen(h)) : ""; }
+hsh_string hsh_os_temp_dir(void) { const char* t = getenv("TMPDIR");
+    if (!t || !*t) t = "/tmp";
+    return hsh_p_dup(t, strlen(t)); }
+int64_t    hsh_os_is_root(void)  { return getuid() == 0; }
+
+/* ── sort:: — in place AND returns the same array, so both call styles work:
+ *    `sort::sort_ints(a)`  (statement, as the std doc says "in-place") and
+ *    `a = sort::sort_ints(a)`. ─────────────────────────────────────────── */
+static int hsh_cmp_i64(const void* a, const void* b) { int64_t x = *(const int64_t*)a, y = *(const int64_t*)b; return (x > y) - (x < y); }
+HshArray* hsh_sort_ints(HshArray* a) {
+    if (!a) return hsh_array_new();
+    if (a->len > 1) qsort(a->data, (size_t)a->len, sizeof(int64_t), hsh_cmp_i64);
+    return a;
+}
+typedef int64_t (*HshCmpFn)(int64_t, int64_t);
+static void hsh_msort(int64_t* d, int64_t* tmp, int64_t n, HshCmpFn f) {
+    if (n < 2) return;
+    int64_t m = n / 2;
+    hsh_msort(d, tmp, m, f); hsh_msort(d + m, tmp, n - m, f);
+    int64_t i = 0, j = m, k = 0;
+    while (i < m && j < n) tmp[k++] = (f(d[i], d[j]) > 0) ? d[j++] : d[i++];   /* stable */
+    while (i < m) tmp[k++] = d[i++];
+    while (j < n) tmp[k++] = d[j++];
+    memcpy(d, tmp, (size_t)n * sizeof(int64_t));
+}
+/* sort_by(arr, cmp): cmp(a, b) > 0 means a goes after b. Stable. `cmp` is a plain
+ * (named) function pointer; closure literals are not supported on this backend. */
+HshArray* hsh_sort_by(HshArray* a, HshCmpFn f) {
+    if (!a) return hsh_array_new();
+    if (!f || a->len < 2) return a;
+    int64_t* tmp = (int64_t*)malloc((size_t)a->len * sizeof(int64_t));
+    if (!tmp) return a;
+    hsh_msort(a->data, tmp, a->len, f);
+    free(tmp);
+    return a;
+}
+/* sort_by_key(arr, key_fn): keys are compared as strings when both look like
+ * pointers and as signed ints otherwise (same magnitude test hsh_val_to_str uses —
+ * an `any` slot carries no runtime tag on this backend). Stable. */
+static int hsh_looks_ptr(int64_t v) { return (uint64_t)v > 0x10000ULL && (uint64_t)v < 0x7ffffffffffeULL; }
+HshArray* hsh_sort_by_key(HshArray* a, int64_t (*key)(int64_t)) {
+    if (!a) return hsh_array_new();
+    if (!key || a->len < 2) return a;
+    int64_t n = a->len;
+    int64_t* keys = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* idx  = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* out  = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!keys || !idx || !out) { free(keys); free(idx); free(out); return a; }
+    for (int64_t i = 0; i < n; i++) { keys[i] = key(a->data[i]); idx[i] = i; }
+    /* stable insertion sort on idx (arrays handled here are small: lists of packages/files) */
+    for (int64_t i = 1; i < n; i++) {
+        int64_t cur = idx[i], j = i;
+        while (j > 0) {
+            int64_t k1 = keys[idx[j-1]], k2 = keys[cur];
+            int gt = (hsh_looks_ptr(k1) && hsh_looks_ptr(k2)) ? (strcmp((const char*)(uintptr_t)k1, (const char*)(uintptr_t)k2) > 0) : (k1 > k2);
+            if (!gt) break;
+            idx[j] = idx[j-1]; j--;
+        }
+        idx[j] = cur;
+    }
+    for (int64_t i = 0; i < n; i++) out[i] = a->data[idx[i]];
+    memcpy(a->data, out, (size_t)n * sizeof(int64_t));
+    free(keys); free(idx); free(out);
+    return a;
+}
+
 /* proc::run_cmd(cmd, timeout_secs) / proc::run_cmd_live(cmd, timeout_secs)
  * — run `cmd` through /bin/sh, capturing stdout and stderr *separately*
  * (unlike hsh_shell above, which only gives combined stdout and
@@ -2189,12 +3570,13 @@ static int hsh_strcmp_for_qsort(const void* a, const void* b) {
 }
 
 HshArray *hsh_sort_strings(HshArray *a) {
+    /* Sorts IN PLACE and returns the same array: std/sort.h# documents
+     * "sort a string array in-place", and callers (hpm) call it as a bare
+     * statement. It used to return a sorted *copy*, which made
+     * `sort::sort_strings(xs)` a silent no-op on this backend. */
     if (!a) return hsh_array_new();
-    HshArray *r = hsh_arr_alloc(a->len);
-    r->len = a->len;
-    for (int64_t i = 0; i < a->len; i++) r->data[i] = a->data[i];
-    if (r->len > 1) qsort(r->data, (size_t)r->len, sizeof(int64_t), hsh_strcmp_for_qsort);
-    return r;
+    if (a->len > 1) qsort(a->data, (size_t)a->len, sizeof(int64_t), hsh_strcmp_for_qsort);
+    return a;
 }
 
 /* strings::split_whitespace(s) / the direct
