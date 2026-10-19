@@ -1,5 +1,5 @@
-pub fn sort_ints(arr: [int]) is
-    __builtin_sort_ints(arr)
+pub fn sort_ints(arr: [int]) -> [int] is
+    return __builtin_sort_ints(arr)
 end
 
 ;; Sort an int array in-place (descending).
@@ -17,25 +17,21 @@ pub fn sort_ints_desc(mut arr: [int]) is
 end
 
 ;; Sort a string array in-place (ascending).
-pub fn sort_strings(arr: [string]) is
-    __builtin_sort_strings(arr)
+pub fn sort_strings(arr: [string]) -> [string] is
+    return __builtin_sort_strings(arr)
 end
 
 ;; Sort an array in-place using a comparator fn.
 ;; comparator(a, b) should return negative if a < b, 0 if equal, positive if a > b.
-pub fn sort_by(arr: [any], cmp: fn(any, any) -> int) is
-    __builtin_sort_by(arr, cmp)
+pub fn sort_by(arr: [any], cmp: fn(any, any) -> int) -> [any] is
+    return __builtin_sort_by(arr, cmp)
 end
 
-;; Sort by a key extractor function (stable).
-pub fn sort_by_key(arr: [any], key_fn: fn(any) -> any) is
-    sort_by(arr, |a: any, b: any| -> int is
-        let ka = key_fn(a)
-        let kb = key_fn(b)
-        if ka < kb is return -1 end
-        if ka > kb is return  1 end
-        return 0
-    end)
+;; Sort by a key extractor function (stable), in place; the array is also returned.
+;; (Implemented natively — no closure literal, so it also compiles on the LLVM backend.
+;; Pass a named function as `key_fn`.)
+pub fn sort_by_key(arr: [any], key_fn: fn(any) -> any) -> [any] is
+    return __builtin_sort_by_key(arr, key_fn)
 end
 
 ;; Binary search in a sorted int array. Returns index or -1 if not found.
