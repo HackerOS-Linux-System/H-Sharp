@@ -1970,6 +1970,32 @@ impl Interpreter {
                 }
                 return Ok(Value::Array(arr));
             }
+            // sort_by_key(arr, key_fn) — stable; keys compare as strings when both
+            // are strings, otherwise as ints (same rule as the native hsh_sort_by_key).
+            "sort_by_key" => {
+                let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
+                let f = args.get(1).cloned();
+                let (params, body, fenv) = match &f {
+                    Some(Value::Fn { params, body, env, .. }) => (params.clone(), body.clone(), env.clone()),
+                    _ => return Ok(Value::Array(arr)),
+                };
+                let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(arr.len());
+                for x in arr {
+                    let k = self.invoke_fn_value(&params, &body, fenv.clone(), vec![x.clone()])?;
+                    keyed.push((k, x));
+                }
+                for i in 1..keyed.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        let gt = match (&keyed[j - 1].0, &keyed[j].0) {
+                            (Value::Str(a), Value::Str(b)) => a > b,
+                            (a, b) => a.to_int() > b.to_int(),
+                        };
+                        if gt { keyed.swap(j - 1, j); j -= 1; } else { break; }
+                    }
+                }
+                return Ok(Value::Array(HArr::from(keyed.into_iter().map(|(_, x)| x).collect::<Vec<_>>())));
+            }
             "iter_map" => {
                 let arr = match args.first() { Some(Value::Array(a)) => a.clone(), _ => HArr::from(Vec::new()) };
                 let f = args.get(1).cloned();
