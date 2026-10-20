@@ -409,6 +409,7 @@ double hsh_tan(double x)   { return tan(x);   }
 double hsh_sqrt(double x)  { return sqrt(x);  }
 double hsh_pow(double x, double y) { return pow(x, y); }
 double hsh_floor(double x) { return floor(x); }
+double hsh_round(double x) { return round(x); } /* half away from zero, like Rust f64::round */
 double hsh_ceil(double x)  { return ceil(x);  }
 double hsh_abs_f(double x) { return fabs(x);  }
 int64_t hsh_abs_i(int64_t x) { return x < 0 ? -x : x; }
