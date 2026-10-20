@@ -6185,6 +6185,8 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            Ok(self.unwrap_call(r))
                        }
                        "conv_str_to_int" | "str_to_int" => call1!(self.builtins.hsh_str_to_int, "s2i"),
+                       // Bare `parse_int(s) -> int?`: whole-string strict parse, 0 (= nil) on failure.
+                       "parse_int" => call1!(self.builtins.hsh_parse_int_opt, "pint"),
                        "env_get" => call1!(self.builtins.hsh_env_get, "envget"),
                        "env_read_line" | "read_line" => {
                            let r = self.call_coerced(self.builtins.hsh_env_read_line, &[], "readline");
