@@ -2774,6 +2774,30 @@ int64_t hsh_str_to_int(hsh_string s) {
     return (int64_t)strtoll(s, NULL, 10);
 }
 
+/* Bare `parse_int(s)`: the Option-shaped sibling of hsh_str_to_int. The interpreter
+ * returns `nil` unless the WHOLE string is a base-10 i64 (optional +/- sign, no
+ * whitespace — exactly Rust's `str::parse::<i64>`). An `int?` is a plain i64 on this
+ * backend and `nil` is 0, so a failed parse yields 0 — which means a successfully
+ * parsed "0" is indistinguishable from nil here (callers use `parse_int_or`-style
+ * defaults / 1-based menu indices, where that is harmless). */
+int64_t hsh_parse_int_opt(hsh_string s) {
+    if (!s || !*s) return 0;
+    const char* p = s;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    if (!*p) return 0;
+    unsigned long long acc = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        unsigned d = (unsigned)(*p - '0');
+        if (acc > (0x7fffffffffffffffULL - d) / 10ULL + (neg ? 1ULL : 0ULL)) return 0; /* overflow */
+        acc = acc * 10ULL + d;
+    }
+    if (!neg && acc > 0x7fffffffffffffffULL) return 0;
+    if (neg && acc > 0x8000000000000000ULL) return 0;
+    return neg ? (int64_t)(0ULL - acc) : (int64_t)acc;
+}
+
 /* conv::int_to_hex(n) — lowercase hex, no "0x" prefix (matches the
  * interpreter's formatting). Added this session. */
 hsh_string hsh_conv_int_to_hex(int64_t n) {
