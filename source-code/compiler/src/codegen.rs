@@ -204,11 +204,47 @@ impl LlvmCodegen {
                             } else {
                                 module.add_function(&fn_decl.name, sig, Some(inkwell::module::Linkage::External))
                             };
+                            // Several libraries may declare the SAME C symbol with a
+                            // different parameter COUNT (libseccomp: `syscall(nr, a1..a6)`,
+                            // landlock/hpm: `syscall(nr, a1..a4)`). An LLVM module has one
+                            // declaration per symbol, and the first one used to win — every
+                            // call written against another arity then failed module
+                            // verification ("Incorrect number of arguments passed to called
+                            // function!"). Keep the shared declaration, and give each
+                            // other arity a tiny internal forwarder with ITS signature that
+                            // calls the real symbol through a plain pointer (an indirect call
+                            // is not type-checked against the declaration). Variadic-style C
+                            // functions such as `syscall` tolerate this under the C ABI.
+                            // `call_user_fn` picks the variant by argument count (key
+                            // `name#<arity>`).
+                            let arity = fn_decl.params.len();
+                            let key = format!("{}#{}", fn_decl.name, arity);
+                            if !func_vals.contains_key(&key) {
+                                if fv.count_params() as usize == arity {
+                                    func_vals.insert(key, fv);
+                                } else {
+                                    let wname = format!("{}__arity{}", fn_decl.name, arity);
+                                    let w = module.add_function(&wname, sig, Some(inkwell::module::Linkage::Internal));
+                                    let entry = ctx.append_basic_block(w, "entry");
+                                    builder.position_at_end(entry);
+                                    let target = fv.as_global_value().as_pointer_value();
+                                    let fwd_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+                                        w.get_param_iter().map(|a| a.into()).collect();
+                                    let call = builder.build_indirect_call(sig, target, &fwd_args, "fwd").unwrap();
+                                    if sig.get_return_type().is_some() {
+                                        let rv = unwrap_call(ctx, call);
+                                        builder.build_return(Some(&rv)).unwrap();
+                                    } else {
+                                        builder.build_return(None).unwrap();
+                                    }
+                                    func_vals.insert(key, w);
+                                }
+                            }
                             // Register so `call_fn`'s fallback
                             // (`self.func_vals.get(name)`) resolves calls
                             // to this extern symbol exactly like a
                             // user-defined H# function.
-                            func_vals.insert(fn_decl.name.clone(), fv);
+                            func_vals.entry(fn_decl.name.clone()).or_insert(fv);
                         }
                     }
                     ExternLang::Python => {
@@ -7652,6 +7688,12 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                }
 
                fn call_user_fn(&mut self, fv: FunctionValue<'ctx>, args: &[Expr], _name: &str) -> R<BasicValueEnum<'ctx>> {
+                   // An extern C symbol declared with several different arities (see the
+                   // extern pass in `compile`): use the variant matching this call.
+                   let fv = match self.func_vals.get(format!("{}#{}", _name, args.len()).as_str()) {
+                       Some(&v) => v,
+                       None => fv,
+                   };
                    let sig = fv.get_type();
                    let mut avs = Vec::new();
                    for (i, a) in args.iter().enumerate() {
