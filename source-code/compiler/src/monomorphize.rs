@@ -304,6 +304,25 @@ fn collect_in_expr(
     expected_ret_ty: Option<&HType>,
 ) {
     if let Expr::Call(callee, args, span) = expr {
+        // Module-qualified call (`error::is_err(x)`): after module flattening the callee is
+        // still an `Expr::Path` whose last segment is the (flat) generic fn name. Only plain
+        // `Expr::Ident` callees were ever specialised, so every qualified call to a generic fn
+        // was left pointing at a generic that is never emitted -> "undefined fn: is_err".
+        if let Expr::Path(segs, _) = callee.as_ref() {
+            if segs.len() >= 2 {
+                if let Some(name) = qualified_generic_key(segs, generic_fns) {
+                    if let Some(generic_fn) = generic_fns.get(&name) {
+                        match infer_type_args(generic_fn, args, checker, local_types, expected_ret_ty) {
+                            Some(type_args) => {
+                                check_bounds(generic_fn, &type_args, impls_table, span, stats);
+                                worklist.push_back((name.clone(), type_args));
+                            }
+                            None => stats.unresolved.push((name.clone(), span.clone())),
+                        }
+                    }
+                }
+            }
+        }
         if let Expr::Ident(name, _) = callee.as_ref() {
             if let Some(generic_fn) = generic_fns.get(name) {
                 match infer_type_args(generic_fn, args, checker, local_types, expected_ret_ty) {
@@ -392,6 +411,22 @@ fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChe
         }
     }
     Some(out)
+}
+
+/// Name under which a module-qualified call (`error::is_err`) is registered in `generic_fns`:
+/// the module-mangled `error_is_err` when modules.rs prefixed the fn, else the bare last
+/// segment (flat namespace). Same two candidates, in the same order, as codegen's own
+/// `module::function` resolution.
+fn qualified_generic_key(segs: &[String], generic_fns: &HashMap<String, FnDef>) -> Option<String> {
+    let joined = segs.join("_");
+    if generic_fns.contains_key(&joined) {
+        return Some(joined);
+    }
+    let last = segs.last()?;
+    if generic_fns.contains_key(last.as_str()) {
+        return Some(last.clone());
+    }
+    None
 }
 
 /// Does `ty` mention the type parameter `name` anywhere inside it?
@@ -642,6 +677,21 @@ fn rewrite_block_calls(stmts: &mut [Stmt], generic_fns: &HashMap<String, FnDef>,
 
 fn rewrite_expr_calls(expr: &mut Expr, generic_fns: &HashMap<String, FnDef>, checker: &mut TypeChecker, stats: &mut MonoStats, local_types: &mut HashMap<String, HType>, expected_ret_ty: Option<&HType>) {
     if let Expr::Call(callee, args, _) = expr {
+        // Mirror of the qualified-call handling in `collect_in_expr`: rewrite
+        // `module::generic_fn(..)` into a plain call of the specialised instance.
+        let path_target: Option<(String, Span)> = match callee.as_ref() {
+            Expr::Path(segs, sp) if segs.len() >= 2 => qualified_generic_key(segs, generic_fns).map(|n| (n, sp.clone())),
+            _ => None,
+        };
+        if let Some((gname, sp)) = path_target {
+            if let Some(generic_fn) = generic_fns.get(gname.as_str()) {
+                if let Some(type_args) = infer_type_args(generic_fn, args, checker, local_types, expected_ret_ty) {
+                    let mangled = format!("{}__{}", gname, mangle_suffix(&type_args));
+                    **callee = Expr::Ident(mangled, sp);
+                    stats.call_sites_rewritten += 1;
+                }
+            }
+        }
         if let Expr::Ident(name, ident_span) = callee.as_mut() {
             if let Some(generic_fn) = generic_fns.get(name.as_str()) {
                 if let Some(type_args) = infer_type_args(generic_fn, args, checker, local_types, expected_ret_ty) {
