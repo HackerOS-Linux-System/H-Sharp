@@ -377,9 +377,33 @@ fn infer_type_args(generic_fn: &FnDef, call_args: &[Expr], checker: &mut TypeChe
 
     let mut out = Vec::with_capacity(generic_fn.type_params.len());
     for tp in &generic_fn.type_params {
-        out.push(resolved.get(&tp.name).cloned()?);
+        match resolved.get(&tp.name) {
+            Some(t) => out.push(t.clone()),
+            // The argument matched the parameter's *shape* but carried no usable
+            // type information for `T` — typically a generic user enum/struct such as
+            // `fn is_err<T>(r: HpmResult<T>)` called with an `HpmResult<bool>` value
+            // (`HType` keeps no type arguments for those). Failing here left the call
+            // pointing at a generic that was never instantiated ("undefined fn: is_err").
+            // `T` only appears behind a boxed generic type, so every instantiation has
+            // the same machine representation: specialise on `any`. A `T` that appears
+            // ONLY in the return type (`fn make<T>() -> T`) is still reported as unresolved.
+            None if generic_fn.params.iter().any(|p| type_mentions(&p.ty, &tp.name)) => out.push(HType::Any),
+            None => return None,
+        }
     }
     Some(out)
+}
+
+/// Does `ty` mention the type parameter `name` anywhere inside it?
+fn type_mentions(ty: &TypeExpr, name: &str) -> bool {
+    match ty {
+        TypeExpr::Named(n) => n == name,
+        TypeExpr::Generic(_, args) => args.iter().any(|a| type_mentions(a, name)),
+        TypeExpr::Tuple(ts) => ts.iter().any(|a| type_mentions(a, name)),
+        TypeExpr::Fn(ps, r) => ps.iter().any(|a| type_mentions(a, name)) || type_mentions(r, name),
+        TypeExpr::Array(i) | TypeExpr::Slice(i, _) | TypeExpr::Optional(i) | TypeExpr::Ref(i) | TypeExpr::RefMut(i) => type_mentions(i, name),
+        _ => false,
+    }
 }
 
 /// Walk `param_ty` (which may reference a type parameter, e.g.
