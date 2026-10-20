@@ -5670,6 +5670,33 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                    let call = self.call_coerced(self.builtins.hsh_array_join, &[obj.into(), sep.into()], "ajoin");
                                    Ok(self.unwrap_call(call))
                                }
+                               // f64 receiver methods (`(x * 10.0).round() / 10.0`, hpm's
+                               // `human_size`/`clean`): the same C functions that back the bare
+                               // `floor(x)`/`ceil(x)`/`sqrt(x)`/`abs(x)` calls, plus `hsh_round`
+                               // (C `round`: half away from zero == Rust's `f64::round`).
+                               "round" | "floor" | "ceil" | "sqrt" => {
+                                   let f64t = self.ctx.f64_type();
+                                   let x = self.coerce_basic_value(obj, f64t.into());
+                                   let f = match method.as_str() {
+                                       "round" => self.builtins.hsh_round,
+                                       "floor" => self.builtins.hsh_floor,
+                                       "ceil"  => self.builtins.hsh_ceil,
+                                       _       => self.builtins.hsh_sqrt,
+                                   };
+                                   let call = self.call_coerced(f, &[x.into()], "mthf");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               "abs" => match obj {
+                                   BasicValueEnum::IntValue(_) => {
+                                       let call = self.call_coerced(self.builtins.hsh_abs_i, &[obj.into()], "mthabsi");
+                                       Ok(self.unwrap_call(call))
+                                   }
+                                   _ => {
+                                       let x = self.coerce_basic_value(obj, self.ctx.f64_type().into());
+                                       let call = self.call_coerced(self.builtins.hsh_abs_f, &[x.into()], "mthabsf");
+                                       Ok(self.unwrap_call(call))
+                                   }
+                               },
                                // `.trim_end()` — right-trim only (unlike
                                // the already-handled `.trim()`, which
                                // trims both sides). Already had a real,
