@@ -345,6 +345,14 @@ impl LlvmCodegen {
             let sig = self.build_fn_type(ctx, f);
             let fv  = module.add_function(&f.name, sig, None);
             mark_nounwind(fv); // H# has no unwinding (panic = abort/exit) — see llvm_optimize.rs
+            // Debug aid: `HSHARP_NOINLINE=1` keeps every H# function as its own frame. A release
+            // build otherwise inlines the whole program into `main`, so a crash reports only
+            // `main ()` and `gdb ... -ex bt` can't say which H# function faulted. Combine with
+            // `HSHARP_KEEP_SYMBOLS=1`.
+            if std::env::var("HSHARP_NOINLINE").map(|v| v == "1").unwrap_or(false) {
+                let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("noinline");
+                fv.add_attribute(inkwell::attributes::AttributeLoc::Function, ctx.create_enum_attribute(kind, 0));
+            }
             func_vals.insert(f.name.clone(), fv);
 
             // ── async fn: also declare the hidden "real body" function ──
