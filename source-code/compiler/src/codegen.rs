@@ -6336,6 +6336,8 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        "regex_find"    => call2!(self.builtins.hsh_regex_find, "rxfind"),
                        "regex_replace" => call3!(self.builtins.hsh_regex_replace, "rxrepl"),
                        "regex_find_all" => call2!(self.builtins.hsh_regex_find_all, "rxfindall"),
+                       "regex_captures"     => call2!(self.builtins.hsh_regex_captures, "rxcap"),
+                       "regex_captures_all" => call2!(self.builtins.hsh_regex_captures_all, "rxcapall"),
                        // `std/regex.h#`'s `split(s, pattern)` calls
                        // `__builtin_regex_split(s, pattern)` — text
                        // *first* (unlike match/find/replace, which take
