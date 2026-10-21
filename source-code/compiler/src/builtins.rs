@@ -369,6 +369,8 @@ pub struct LlvmBuiltins<'ctx> {
     // these pre-existing declarations for real, in addition to the two
     // genuinely new ones below.
     pub hsh_regex_find_all:   FunctionValue<'ctx>,
+    pub hsh_regex_captures:   FunctionValue<'ctx>,
+    pub hsh_regex_captures_all: FunctionValue<'ctx>,
     pub hsh_regex_split:      FunctionValue<'ctx>,
     pub hsh_file_delete:   FunctionValue<'ctx>,
     pub hsh_dir_create:    FunctionValue<'ctx>,
@@ -708,6 +710,8 @@ impl<'ctx> LlvmBuiltins<'ctx> {
             hsh_sys_machine:          np("hsh_sys_machine"),
             hsh_sys_kernel_version:   np("hsh_sys_kernel_version"),
             hsh_regex_find_all: ppp("hsh_regex_find_all"),
+            hsh_regex_captures: ppp("hsh_regex_captures"),
+            hsh_regex_captures_all: ppp("hsh_regex_captures_all"),
             hsh_regex_split:    ppp("hsh_regex_split"),
             hsh_file_delete:   pi("hsh_file_delete"),
             hsh_dir_create:    pi("hsh_dir_create"),
