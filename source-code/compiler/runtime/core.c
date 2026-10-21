@@ -3873,6 +3873,61 @@ HshArray *hsh_regex_find_all(hsh_string pattern, hsh_string text) {
     return result;
 }
 
+/* regex::captures(text, pattern) / regex::captures_all(text, pattern)
+ *
+ * Real capture groups — the grep/sed-based functions above cannot return them, so
+ * `captures`/`captures_all` used to be stubs returning [] / [whole match] and
+ * everything that parses structured text with groups (hpm's repo.json and GitHub
+ * release JSON parsing) silently saw "0 matches".
+ *
+ * Backed by libc's POSIX `regcomp`/`regexec` (REG_EXTENDED): no extra library, no
+ * subprocess. glibc's ERE understands the GNU escapes `\s \S \w \W \b`, bracket
+ * classes and alternation; it does NOT understand PCRE-only syntax (lazy `*?`,
+ * lookaround, `\d` is accepted by glibc but `(?i)`-style flags are not). A pattern
+ * that fails to compile yields an empty result rather than crashing.
+ *
+ * Each match is an array [whole, group1, group2, ...] of strings (a group that did not
+ * participate is ""). captures -> the first match (or [] when none); captures_all ->
+ * an array of such arrays (all non-overlapping matches, left to right). */
+#include <regex.h>
+static HshArray *hsh_re_match_row(const char *base, const regmatch_t *m, size_t ngroups) {
+    HshArray *row = hsh_array_new();
+    for (size_t g = 0; g < ngroups; g++) {
+        const char *s = "";
+        size_t len = 0;
+        if (m[g].rm_so >= 0) { s = base + m[g].rm_so; len = (size_t)(m[g].rm_eo - m[g].rm_so); }
+        row = hsh_array_push(row, (int64_t)(uintptr_t)hsh_db_dup(s, len));
+    }
+    return row;
+}
+static HshArray *hsh_re_captures_impl(hsh_string pattern, hsh_string text, int all) {
+    HshArray *result = hsh_array_new();
+    if (!pattern || !text) return result;
+    regex_t re;
+    if (regcomp(&re, pattern, REG_EXTENDED) != 0) return result;
+    size_t ng = re.re_nsub + 1;
+    regmatch_t *m = (regmatch_t *)calloc(ng, sizeof(regmatch_t));
+    if (!m) { regfree(&re); return result; }
+    const char *p = text;
+    int first = 1;
+    while (*p || first) {
+        if (regexec(&re, p, ng, m, (p == text) ? 0 : REG_NOTBOL) != 0) break;
+        HshArray *row = hsh_re_match_row(p, m, ng);
+        if (!all) { result = row; break; }
+        result = hsh_array_push(result, (int64_t)(uintptr_t)row);
+        first = 0;
+        regoff_t adv = m[0].rm_eo > m[0].rm_so ? m[0].rm_eo : m[0].rm_eo + 1; /* never loop on an empty match */
+        if (adv <= 0) adv = 1;
+        p += adv;
+        if ((size_t)(p - text) > strlen(text)) break;
+    }
+    free(m);
+    regfree(&re);
+    return result;
+}
+HshArray *hsh_regex_captures(hsh_string pattern, hsh_string text)     { return hsh_re_captures_impl(pattern, text, 0); }
+HshArray *hsh_regex_captures_all(hsh_string pattern, hsh_string text) { return hsh_re_captures_impl(pattern, text, 1); }
+
 /* regex::replace(text, pattern, repl) / regex::replace_all(...) -> string.
  * `sed -E 's{d}pattern{d}repl{d}g'` — the `g` flag already replaces
  * every match, which is why `replace` and `replace_all` are the same
