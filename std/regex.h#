@@ -34,18 +34,19 @@ pub fn split(s: string, pattern: string) -> [string] is
     return __builtin_regex_split(s, pattern)
 end
 
-;; ── NOT IMPLEMENTED — real gaps, not silently faked ─────────────────
-;; The grep/sed backend has no way to extract capture groups or hold a
-;; compiled pattern handle. Calling these currently returns an empty/
-;; best-effort result rather than raising, so existing call sites don't
-;; crash — but the *data* is not real capture-group data.
+;; ── Capture groups ───────────────────────────────────────────────────
+;; Native (LLVM) backend: real capture groups via libc POSIX ERE. Syntax is
+;; POSIX extended + GNU escapes (\s \S \w \W \b); PCRE-only syntax (lazy
+;; quantifiers `*?`, lookaround, inline flags) is NOT available here.
+
+;; First match: [whole, group1, group2, ...]; [] when there is no match.
 pub fn captures(s: string, pattern: string) -> [string] is
-    if is_match(s, pattern) is return [find(s, pattern)] end
-    return []
+    return __builtin_regex_captures(pattern, s)
 end
 
+;; Every non-overlapping match, each as [whole, group1, group2, ...].
 pub fn captures_all(s: string, pattern: string) -> [[string]] is
-    return []
+    return __builtin_regex_captures_all(pattern, s)
 end
 
 pub fn compile(pattern: string) -> string is
