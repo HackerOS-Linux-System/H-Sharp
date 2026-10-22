@@ -1,0 +1,87 @@
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+use "std -> os" from "os"
+use "std -> path" from "path"
+use "std -> process" from "process"
+use "std -> strings" from "strings"
+use "std -> conv" from "conv"
+use "std -> io" from "io"
+
+pub fn shell_quote(s: string) -> string is
+    return "'" + strings::replace_all(s, "'", "'\\''") + "'"
+end
+
+pub fn find_hsharp() -> string is
+    let e: string = env::get_or("HSHARP", "")
+    if e != "" is return e end
+    let w: string = process::which("h#")
+    if w != "" is return w end
+    return process::which("hsharp")
+end
+
+;; `<h#> preview [--jit] -q <skrypt> <argumenty...>` (bez przekierowan) - czysta funkcja, testowalna.
+pub fn build_command(hsharp: string, script: string, args: [string], no_jit: bool) -> string is
+    let mut parts: [string] = [shell_quote(hsharp), "preview"]
+    if !no_jit is parts.push("--jit") end
+    parts.push("-q")
+    parts.push(shell_quote(script))
+    let mut i: int = 0
+    while i < args.len() is
+        parts.push(shell_quote(args[i]))
+        i += 1
+    end
+    return strings::join(parts, " ")
+end
+
+;; Linia na stderr procesu fast. `process::shell` przechwytuje stdout I stderr dziecka, wiec piszemy
+;; wprost do deskryptora 2 procesu fast (`/proc/<pid>/fd/2`).
+pub fn err_line(msg: string) is
+    process::shell("printf '%s\\n' " + shell_quote(msg) + " >/proc/" + to_string(os::pid()) + "/fd/2")
+end
+
+fn last_index_of(s: string, sub: string) -> int is
+    let mut i: int = s.len() - sub.len()
+    while i >= 0 is
+        if strings::slice(s, i, i + sub.len()) == sub is return i end
+        i -= 1
+    end
+    return -1
+end
+
+fn parse_rc(s: string) -> int is
+    let t: string = strings::trim(s)
+    if t == "" is return 1 end
+    return conv::str_to_int(t)
+end
+
+;; Uruchamia skrypt, zwraca kod wyjscia programu.
+pub fn run(hsharp: string, script: string, args: [string], no_jit: bool) -> int is
+    let base: string = build_command(hsharp, script, args, no_jit)
+    let pid: string = to_string(os::pid())
+    let rcfile: string = path::join(os::temp_dir(), "fast-" + pid + ".rc")
+    let proc_fd: string = "/proc/" + pid + "/fd/"
+    let cmd: string = base + " </proc/" + pid + "/fd/0 >" + proc_fd + "1 2>" + proc_fd + "2; echo $? > " + shell_quote(rcfile)
+    process::shell(cmd)
+    if fs::exists(rcfile) is
+        let rc: int = parse_rc(fs::read(rcfile))
+        fs::remove(rcfile)
+        return rc
+    end
+    ;; awaryjnie (np. stdout to gniazdo i /proc/<pid>/fd/1 nie da sie otworzyc): tryb buforowany
+    let out: string = process::shell(base + "; echo __FAST_RC=$?")
+    let k: int = last_index_of(out, "__FAST_RC=")
+    if k < 0 is
+        err_line("fast: cannot determine the exit code of the script")
+        return 1
+    end
+    io::write_no_nl(strings::slice(out, 0, k))
+    return parse_rc(strings::slice(out, k + 10, out.len()))
+end
+
+;; (dostepny, powod) - pyta `h# preview --jit-status`; brak odpowiedzi = niedostepny.
+pub fn jit_status(hsharp: string) -> (bool, string) is
+    let out: string = strings::trim(process::shell(shell_quote(hsharp) + " preview --jit-status"))
+    if out == "available" is return (true, "") end
+    if out.starts_with("unavailable: ") is return (false, strings::slice(out, 13, out.len())) end
+    return (false, "`h# preview --jit-status` gave no answer (old `h#`?)")
+end
