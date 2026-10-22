@@ -1,0 +1,52 @@
+use "std -> strings" from "strings"
+
+pub fn basename(p: string) -> string is
+    let parts: [string] = strings::split(p, "/")
+    if parts.len() == 0 is return p end
+    return parts[parts.len() - 1]
+end
+
+;; tokeny po `#!` (bez pustych)
+pub fn tokens(line: string) -> [string] is
+    if !line.starts_with("#!") is return [] end
+    let raw: [string] = strings::split_whitespace(strings::slice(line, 2, line.len()))
+    return raw
+end
+
+;; indeks tokenu `fast` w linii (`#!/bin/fast`, `#!/usr/bin/env fast`, `#!/usr/bin/env -S fast --no-jit`) lub -1
+pub fn fast_index(line: string) -> int is
+    let t: [string] = tokens(line)
+    if t.len() == 0 is return -1 end
+    if basename(t[0]) == "fast" is return 0 end
+    if basename(t[0]) == "env" is
+        let mut i: int = 1
+        while i < t.len() is
+            if t[i].starts_with("-") is
+                i += 1
+            elsif basename(t[i]) == "fast" is
+                return i
+            else is
+                return -1
+            end
+        end
+    end
+    return -1
+end
+
+pub fn is_fast_shebang(line: string) -> bool is
+    return fast_index(line) >= 0
+end
+
+;; flagi po `fast` w shebang
+pub fn flags(line: string) -> [string] is
+    let k: int = fast_index(line)
+    let mut out: [string] = []
+    if k < 0 is return out end
+    let t: [string] = tokens(line)
+    let mut i: int = k + 1
+    while i < t.len() is
+        out.push(t[i])
+        i += 1
+    end
+    return out
+end
