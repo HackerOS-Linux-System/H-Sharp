@@ -4855,6 +4855,16 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            let rv = self.expr(r, hint)?;
                            // String concat for pointer + pointer
                            if matches!(op, BinOp::Add) {
+                               // `array + array` is concatenation (new array), not a string
+                               // concat of two HshArray* — that crashed hpm's hk parser
+                               // (`section_path + key_path`). Needs a statically known array
+                               // operand (annotated let/param/field, `[..]` literal).
+                               let is_arr = |e: &Expr, me: &Self| me.infer_elem_type_expr(e).is_some() || matches!(e, Expr::ArrayLit(..));
+                               if is_arr(l.as_ref(), self) || is_arr(r.as_ref(), self) {
+                                   let r2 = self.call_coerced(
+                                       self.builtins.hsh_array_concat, &[lv.into(), rv.into()], "acat2");
+                                   return Ok(self.unwrap_call(r2));
+                               }
                                if let (BasicValueEnum::PointerValue(_), BasicValueEnum::PointerValue(_)) = (&lv, &rv) {
                                    let r2 = self.call_coerced(
                                        self.builtins.hsh_strcat, &[lv.into(), rv.into()], "cat");
@@ -5221,8 +5231,17 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                } else {
                                    b
                                };
+                               // `arr[a..b]` on an ARRAY (statically known element type) is a
+                               // sub-array, not a string slice — see core.c `hsh_array_slice`.
+                               let slice_fn = if self.infer_elem_type_expr(arr_e).is_some()
+                                   || matches!(arr_e.as_ref(), Expr::ArrayLit(..))
+                               {
+                                   self.builtins.hsh_array_slice
+                               } else {
+                                   self.builtins.hsh_string_slice
+                               };
                                let call = self.call_coerced(
-                                   self.builtins.hsh_string_slice,
+                                   slice_fn,
                                    &[s.into(), a.into(), b.into()], "sslc");
                                return Ok(self.unwrap_call(call));
                            }
