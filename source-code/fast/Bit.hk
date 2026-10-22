@@ -1,1 +1,12 @@
+[package]
+-> name        => fast
+-> version     => 0.1.0
+-> description => Launcher skryptow H# (shebang `#!/bin/fast`): doinstalowuje brakujace biblioteki `bit` i uruchamia `h# preview --jit`
+-> author      => HackerOS Team
+-> license     => MPL-2.0
 
+[build]
+-> lang   => h#
+-> entry  => src/main.h#
+-> output => build/fast
+-> emit   => bin
