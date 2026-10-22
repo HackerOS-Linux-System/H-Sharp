@@ -1,0 +1,66 @@
+use "std -> strings" from "strings"
+use "std -> process" from "process"
+use "workspace -> typecheck" from "lib -> *"
+
+pub struct Dep is
+    pub name:        string
+    pub version:     string
+    pub has_version: bool
+    pub is_dynamic:  bool
+end
+
+pub struct Missing is
+    pub dep: Dep
+    pub why: string
+end
+
+fn dep_listed(deps: [Dep], name: string) -> bool is
+    let mut i: int = 0
+    while i < deps.len() is
+        if deps[i].name == name is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Wszystkie `use "bit -> nazwa"` ze skryptu (bez duplikatow, w kolejnosci wystapienia).
+pub fn collect(imports: [(typecheck_ImportKind, string, bool, typecheck_Span)]) -> [Dep] is
+    let mut out: [Dep] = []
+    let mut i: int = 0
+    while i < imports.len() is
+        match imports[i].0 is
+            typecheck_ImportKind::IkBitRepo(name, version, hv, _, _, dy) => is
+                if !dep_listed(out, name) is
+                    out.push(Dep { name: name, version: version, has_version: hv, is_dynamic: dy })
+                end
+            end
+            _ => is end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Zaleznosci, ktorych resolver nie potrafi rozwiazac (brak biblioteki / zla wersja) + powod.
+pub fn missing(deps: [Dep], start_dir: string) -> [Missing] is
+    let mut out: [Missing] = []
+    let mut i: int = 0
+    while i < deps.len() is
+        let d: Dep = deps[i]
+        let r: typecheck_BU = typecheck_br_resolve_use(d.name, d.version, d.has_version, d.is_dynamic, start_dir)
+        if !r.ok is
+            out.push(Missing { dep: d, why: r.err })
+        end
+        i += 1
+    end
+    return out
+end
+
+;; `bit install <nazwa>` (bit sam dociaga tranzytywne zaleznosci). Zwraca stdout bita.
+pub fn install(name: string) -> string is
+    return process::run_args("bit", ["install", name])
+end
+
+pub fn bit_available() -> bool is
+    return process::which("bit") != ""
+end
