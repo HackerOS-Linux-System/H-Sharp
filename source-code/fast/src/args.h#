@@ -1,0 +1,112 @@
+use "std -> strings" from "strings"
+
+pub struct Opts is
+    pub script:      string
+    pub script_args: [string]
+    pub no_install:  bool
+    pub no_jit:      bool
+    pub require_jit: bool
+    pub dry_run:     bool
+    pub verbose:     bool
+    pub help:        bool
+    pub version:     bool
+    pub err:         string
+end
+
+pub fn opts_empty() -> Opts is
+    return Opts { script: "", script_args: [], no_install: false, no_jit: false, dry_run: false,
+                  verbose: false, help: false, version: false, err: "", require_jit: false }
+end
+
+fn opts_flag(o: Opts, which: string) -> Opts is
+    return Opts {
+        script: o.script, script_args: o.script_args,
+        no_install: o.no_install || which == "no-install",
+        no_jit:     o.no_jit     || which == "no-jit",
+        require_jit: o.require_jit || which == "require-jit",
+        dry_run:    o.dry_run    || which == "dry-run",
+        verbose:    o.verbose    || which == "verbose",
+        help:       o.help       || which == "help",
+        version:    o.version    || which == "version",
+        err: o.err
+    }
+end
+
+fn opts_script(o: Opts, script: string, rest: [string]) -> Opts is
+    return Opts { script: script, script_args: rest, no_install: o.no_install, no_jit: o.no_jit,
+                  dry_run: o.dry_run, verbose: o.verbose, help: o.help, version: o.version, err: o.err, require_jit: o.require_jit }
+end
+
+fn opts_err(o: Opts, msg: string) -> Opts is
+    return Opts { script: o.script, script_args: o.script_args, no_install: o.no_install, no_jit: o.no_jit,
+                  dry_run: o.dry_run, verbose: o.verbose, help: o.help, version: o.version, err: msg, require_jit: o.require_jit }
+end
+
+;; (opcje, czy_rozpoznano)
+pub fn apply_flag(o: Opts, flag: string) -> (Opts, bool) is
+    if flag == "--no-install" is return (opts_flag(o, "no-install"), true) end
+    if flag == "--no-jit"     is return (opts_flag(o, "no-jit"), true) end
+    if flag == "--require-jit" is return (opts_flag(o, "require-jit"), true) end
+    if flag == "--dry-run"    is return (opts_flag(o, "dry-run"), true) end
+    if flag == "-v" || flag == "--verbose" is return (opts_flag(o, "verbose"), true) end
+    if flag == "-h" || flag == "--help"    is return (opts_flag(o, "help"), true) end
+    if flag == "-V" || flag == "--version" is return (opts_flag(o, "version"), true) end
+    return (o, false)
+end
+
+;; argv[0] = nazwa programu (`fast`), dalej opcje, skrypt, argumenty skryptu.
+pub fn parse_args(argv: [string]) -> Opts is
+    let mut o: Opts = opts_empty()
+    let mut i: int = 1
+    while i < argv.len() && argv[i].starts_with("-") && argv[i] != "-" is
+        let r: (Opts, bool) = apply_flag(o, argv[i])
+        if !r.1 is
+            return opts_err(o, "unknown option `" + argv[i] + "` (see `fast --help`)")
+        end
+        o = r.0
+        i += 1
+    end
+    if i >= argv.len() is
+        if o.help || o.version is return o end
+        return opts_err(o, "missing script: fast [options] <script.h#> [args...]")
+    end
+    let mut rest: [string] = []
+    let mut j: int = i + 1
+    while j < argv.len() is
+        rest.push(argv[j])
+        j += 1
+    end
+    return opts_script(o, argv[i], rest)
+end
+
+;; Dokleja flagi z linii shebang (`#!/bin/fast --no-jit`). Nieznana flaga = blad.
+pub fn apply_shebang_flags(o: Opts, flags: [string]) -> Opts is
+    let mut cur: Opts = o
+    let mut i: int = 0
+    while i < flags.len() is
+        let r: (Opts, bool) = apply_flag(cur, flags[i])
+        if !r.1 is
+            return opts_err(cur, "unknown option `" + flags[i] + "` in the shebang line")
+        end
+        cur = r.0
+        i += 1
+    end
+    return cur
+end
+
+pub fn usage() -> string is
+    return "fast - launcher of H# scripts\n\n" +
+         "usage:  fast [options] <script.h#> [args...]\n" +
+         "        put `#!/bin/fast` in the first line of a .h# file and run it directly (chmod +x)\n\n" +
+         "fast finds the `use \"bit -> lib\"` libraries the script needs, installs the missing ones\n" +
+         "with `bit install`, then runs the script with `h# preview --jit`.\n\n" +
+         "options:\n" +
+         "  --no-install   do not install anything; fail when a library is missing\n" +
+         "  --no-jit       run with the plain interpreter (`h# preview`) instead of `--jit`\n" +
+         "  --require-jit  fail when the JIT engine is unavailable (default: warn and use the interpreter)\n" +
+         "  --dry-run      print what would be installed and run, change nothing\n" +
+         "  -v, --verbose  print every step\n" +
+         "  -h, --help     this text\n" +
+         "  -V, --version  version\n\n" +
+         "environment:  HSHARP = path of the `h#` binary (default: `h#` from PATH)\n"
+end
