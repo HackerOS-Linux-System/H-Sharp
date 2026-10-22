@@ -3551,6 +3551,20 @@ HshArray *hsh_array_concat(HshArray *a, HshArray *b) {
     return r;
 }
 
+/* arr[start..end] on an ARRAY (end exclusive; indices clamped to [0, len]).
+ * Range-indexing an array used to be compiled as hsh_string_slice — a string slice of
+ * an HshArray* — which returned a garbage pointer (e.g. hpm's hk parser crashed in
+ * hsh_array_len on `path[1..array_len(path)]`). A new array is returned; elements
+ * are shared (boxed slots are copied by value, like hsh_array_concat). */
+HshArray *hsh_array_slice(HshArray *a, int64_t start, int64_t end) {
+    HshArray *r = hsh_array_new();
+    if (!a) return r;
+    if (start < 0) start = 0;
+    if (end > a->len) end = a->len;
+    for (int64_t i = start; i < end; i++) r = hsh_array_push(r, a->data[i]);
+    return r;
+}
+
 HshArray *hsh_array_contains(HshArray *a, int64_t val) {
     if (!a) return (HshArray*)0;
     for (int64_t i = 0; i < a->len; i++) {
