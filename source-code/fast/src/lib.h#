@@ -1,0 +1,122 @@
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+use "std -> path" from "path"
+use "std -> strings" from "strings"
+use "workspace -> typecheck" from "lib -> *"
+
+mod args
+mod shebang
+mod deps
+mod launch
+
+;; fast - launcher skryptow H#. Czesc biblioteczna (testowalna); `main.h#` jest cienkim wejsciem.
+;; Po glob-imporcie (`use "workspace -> fast" from "lib -> *"`) funkcje dostaja prefiks `fast_`.
+pub const FAST_VERSION: string = "0.1.0"
+
+pub fn argv() -> [string] is
+    return env::args()
+end
+
+fn fail(msg: string) -> int is
+    launch::err_line("fast: error: " + msg)
+    return 2
+end
+
+;; Zwraca kod wyjscia procesu (kod skryptu, gdy sie uruchomil).
+pub fn run(argv_in: [string]) -> int is
+    let mut o: args::Opts = args::parse_args(argv_in)
+    if o.err != "" is return fail(o.err) end
+    if o.help is
+        println(args::usage())
+        return 0
+    end
+    if o.version is
+        println("fast " + FAST_VERSION)
+        return 0
+    end
+    if !fs::exists(o.script) is return fail("cannot read `" + o.script + "`: no such file") end
+
+    let source: string = fs::read(o.script)
+    let first: string = typecheck_shebang_line(source)
+    if first != "" && shebang::is_fast_shebang(first) is
+        o = args::apply_shebang_flags(o, shebang::flags(first))
+        if o.err != "" is return fail(o.err) end
+    end
+
+    ;; parse w trybie skryptowym: shebang dozwolony, bledy skladni przerywaja przed instalacja czegokolwiek
+    let pr = typecheck_parse_script(source, o.script)
+    if pr.errors.len() > 0 is
+        println(pr.render_errors())
+        return 1
+    end
+
+    let start: string = path::parent(o.script)
+    let ds: [deps::Dep] = deps::collect(pr.module.imports)
+    let miss: [deps::Missing] = deps::missing(ds, start)
+    if miss.len() > 0 is
+        let rc: int = install_missing(o, miss, start)
+        if rc != 0 is return rc end
+    end
+
+    let hs: string = launch::find_hsharp()
+    if hs == "" is return fail("`h#` not found in PATH (set HSHARP=/path/to/h#)") end
+    ;; JIT: `--jit` tylko gdy silnik jest dostepny; inaczej glosne ostrzezenie i interpreter (albo blad z --require-jit)
+    let mut no_jit: bool = o.no_jit
+    if !no_jit && !o.dry_run is
+        let js: (bool, string) = launch::jit_status(hs)
+        if !js.0 is
+            if o.require_jit is return fail("--require-jit: JIT unavailable: " + js.1) end
+            launch::err_line("fast: warning: JIT unavailable (" + js.1 + ") - using the interpreter")
+            no_jit = true
+        end
+    end
+    if o.dry_run is
+        println("would run: " + launch::build_command(hs, o.script, o.script_args, no_jit))
+        return 0
+    end
+    if o.verbose is
+        launch::err_line("fast: running " + launch::build_command(hs, o.script, o.script_args, no_jit))
+    end
+    return launch::run(hs, o.script, o.script_args, no_jit)
+end
+
+fn install_missing(o: args::Opts, miss: [deps::Missing], start: string) -> int is
+    if o.no_install is
+        return fail("missing library `" + miss[0].dep.name + "`: " + miss[0].why + " (--no-install)")
+    end
+    if o.dry_run is
+        let mut i: int = 0
+        while i < miss.len() is
+            println("would install: bit install " + miss[i].dep.name)
+            i += 1
+        end
+        return 0
+    end
+    if !deps::bit_available() is
+        return fail("missing library `" + miss[0].dep.name + "` and `bit` is not in PATH - install bit first")
+    end
+    let mut i: int = 0
+    while i < miss.len() is
+        let d: deps::Dep = miss[i].dep
+        launch::err_line("fast: installing `" + d.name + "` ...")
+        let out: string = deps::install(d.name)
+        if o.verbose is launch::err_line(out) end
+        i += 1
+    end
+    ;; po instalacji sprawdz ponownie TYM SAMYM resolverem co preview
+    let still: [deps::Missing] = deps::missing(deps_of(miss), start)
+    if still.len() > 0 is
+        return fail("could not install `" + still[0].dep.name + "`: " + still[0].why)
+    end
+    return 0
+end
+
+fn deps_of(miss: [deps::Missing]) -> [deps::Dep] is
+    let mut out: [deps::Dep] = []
+    let mut i: int = 0
+    while i < miss.len() is
+        out.push(miss[i].dep)
+        i += 1
+    end
+    return out
+end
