@@ -1,1 +1,9 @@
+use "workspace -> fast" from "lib -> *"
 
+;; Cienkie wejscie binarki `fast` (uzywane jako `#!/bin/fast`): cala logika w lib.h#.
+fn main() is
+    let rc: int = fast_run(fast_argv())
+    if rc != 0 is
+        exit(rc)
+    end
+end
