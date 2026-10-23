@@ -13,6 +13,7 @@ pub mod target;
 pub mod typechecker;
 pub mod optimize_ast;
 pub mod builtins_registry;
+pub mod builtins_llvm_ext;
 pub mod features;
 pub mod reachability;
 pub mod monomorphize;
