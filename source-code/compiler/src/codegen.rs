@@ -2938,6 +2938,13 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                     "index_of", "rindex_of", "string_to_int", "to_int",
                     "float_to_int", "hash", "random_int", "count",
                 ];
+                // table-driven builtins (builtins_llvm_ext): `__builtin_date_add_days(..)` etc. return `int`
+                if let Some(n) = &fn_name {
+                    let d = n.strip_prefix("__builtin_").unwrap_or(n.as_str());
+                    if let Some(e) = crate::builtins_llvm_ext::find_dunder(d) {
+                        if e.ret == crate::builtins_llvm_ext::Kind::Int { return true; }
+                    }
+                }
                 fn_name.map(|n| INT_BUILTINS.contains(&n.as_str())).unwrap_or(false)
             }
             _ => false,
@@ -5587,6 +5594,15 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                        self.builtins.hsh_trim, &[obj.into()], "mtr");
                                    Ok(self.unwrap_call(call))
                                }
+                               // `s.trim_start()` / `s.trim_end()` — Rust semantics (strip one side only).
+                               "trim_start" | "trim_end" => {
+                                   let sym = if method == "trim_start" { "hsh_trim_start" } else { "hsh_trim_end" };
+                                   let ptr = self.ctx.ptr_type(AddressSpace::default());
+                                   let f = self.module.get_function(sym)
+                                       .unwrap_or_else(|| self.module.add_function(sym, ptr.fn_type(&[ptr.into()], false), None));
+                                   let call = self.call_coerced(f, &[obj.into()], "mtrs");
+                                   Ok(self.unwrap_call(call))
+                               }
                                // EXPANSION: hashmap/hashset method-call
                                // syntax (`.insert(k, v)`, `.contains_key(k)`,
                                // `.remove(k)`, `.keys()`) — what `hsh`'s
@@ -5718,6 +5734,14 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                "split" => {
                                    let sep = self.expr(&method_args[0], None)?;
                                    let call = self.call_coerced(self.builtins.hsh_string_split, &[obj.into(), sep.into()], "sspl");
+                                   Ok(self.unwrap_call(call))
+                               }
+                               // `s.chars()` -> [string] of Unicode scalars (UTF-8 aware, like Rust's `str::chars`).
+                               "chars" => {
+                                   let ptr = self.ctx.ptr_type(AddressSpace::default());
+                                   let f = self.module.get_function("hsh_string_chars")
+                                       .unwrap_or_else(|| self.module.add_function("hsh_string_chars", ptr.fn_type(&[ptr.into()], false), None));
+                                   let call = self.call_coerced(f, &[obj.into()], "schars");
                                    Ok(self.unwrap_call(call))
                                }
                                // `.join(sep)` — an array-of-strings method
@@ -6062,6 +6086,51 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                // real user function named e.g. `env_get` still correctly
                // shadows any *direct* call to `env_get` in user code,
                // since that always enters through `call_fn`/`true` first.
+               /// Generic lowering for the table in `builtins_llvm_ext.rs`: evaluates the
+               /// arguments by `Kind`, declares the C symbol on demand and calls it.
+               fn call_ext_builtin(&mut self, ext: &'static crate::builtins_llvm_ext::Ext, args: &[Expr]) -> R<BasicValueEnum<'ctx>> {
+                   use crate::builtins_llvm_ext::Kind;
+                   let ptr = self.ctx.ptr_type(AddressSpace::default());
+                   let i64t = self.ctx.i64_type();
+                   let f64t = self.ctx.f64_type();
+                   let mut ptys: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+                   for k in ext.params {
+                       ptys.push(match k { Kind::Str | Kind::Arr => ptr.into(), Kind::Int | Kind::Bool => i64t.into(), Kind::F64 => f64t.into() });
+                   }
+                   let fn_ty = match ext.ret {
+                       Kind::Str | Kind::Arr => ptr.fn_type(&ptys, false),
+                       Kind::Int | Kind::Bool => i64t.fn_type(&ptys, false),
+                       Kind::F64 => f64t.fn_type(&ptys, false),
+                   };
+                   let f = self.module.get_function(ext.sym).unwrap_or_else(|| self.module.add_function(ext.sym, fn_ty, None));
+                   let mut vals: Vec<BasicValueEnum<'ctx>> = Vec::new();
+                   for (i, k) in ext.params.iter().enumerate() {
+                       let v: BasicValueEnum<'ctx> = match args.get(i) {
+                           Some(a) => match k {
+                               Kind::Str => self.expr(a, Some(ptr.into()))?,
+                               Kind::Arr => self.expr(a, None)?,
+                               Kind::Int | Kind::Bool => { let v = self.expr(a, Some(i64t.into()))?; self.coerce_basic_value(v, i64t.into()) }
+                               Kind::F64 => { let v = self.expr(a, Some(f64t.into()))?; self.coerce_basic_value(v, f64t.into()) }
+                           },
+                           None => match k {
+                               Kind::Str | Kind::Arr => ptr.const_null().into(),
+                               Kind::Int | Kind::Bool => i64t.const_zero().into(),
+                               Kind::F64 => f64t.const_zero().into(),
+                           },
+                       };
+                       vals.push(v);
+                   }
+                   let r = self.call_coerced(f, &vals, ext.name);
+                   let rv = self.unwrap_call(r);
+                   if ext.ret == Kind::Bool {
+                       // C returns 0/1 as int64; narrow to i1 so `if f(..)` and `to_string(f(..))` see a real bool
+                       let iv = self.value_to_i64_bits(rv);
+                       let b = self.builder.build_int_compare(inkwell::IntPredicate::NE, iv, i64t.const_zero(), "extb").unwrap();
+                       return Ok(b.into());
+                   }
+                   Ok(rv)
+               }
+
                fn call_fn_impl(&mut self, name: &str, args: &[Expr], _hint: Option<BasicTypeEnum<'ctx>>, call_span: &Span, check_user_shadow: bool) -> R<BasicValueEnum<'ctx>> {
                    // A user-defined H# function always shadows a built-in of the
                    // same name — otherwise `fn len(...)`/`fn print(...)`/etc. in
@@ -6124,6 +6193,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                    macro_rules! call3 {
                        ($f:expr, $name:expr) => {{ let a = str_arg!(0); let b = str_arg!(1); let c = str_arg!(2); let r = self.call_coerced($f, &[a.into(), b.into(), c.into()], $name); Ok(self.unwrap_call(r)) }}
                    }
+                   if let Some(ext) = crate::builtins_llvm_ext::find(name) {
+                       return self.call_ext_builtin(ext, args);
+                   }
                    match name {
                        "write" | "writeln" | "println" => {
                            let a = str_arg!(0);
@@ -6163,6 +6235,25 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                                    let iv = self.value_to_i64_bits(a);
                                    let r = self.call_coerced(self.builtins.hsh_int_to_string, &[iv.into()], "ts_int");
                                    return Ok(self.unwrap_call(r));
+                               }
+                           }
+                           // `float` values: format as a float (previously the raw f64 bits were printed as an int)
+                           if let BasicValueEnum::FloatValue(fv) = a {
+                               let f64t = self.ctx.f64_type();
+                               let ptr = self.ctx.ptr_type(AddressSpace::default());
+                               let f = self.module.get_function("hsh_float_to_string")
+                                   .unwrap_or_else(|| self.module.add_function("hsh_float_to_string", ptr.fn_type(&[f64t.into()], false), None));
+                               let fv = if fv.get_type() == f64t { fv } else { self.builder.build_float_ext(fv, f64t, "tsfx").unwrap() };
+                               let r = self.call_coerced(f, &[fv.into()], "ts_f");
+                               return Ok(self.unwrap_call(r));
+                           }
+                           // `bool` (i1) values: "true"/"false" (previously sign-extended to -1/0)
+                           if let BasicValueEnum::IntValue(bv) = a {
+                               if bv.get_type().get_bit_width() == 1 {
+                                   let t = self.builder.build_global_string_ptr("true", "ts_true").unwrap().as_pointer_value();
+                                   let fl = self.builder.build_global_string_ptr("false", "ts_false").unwrap().as_pointer_value();
+                                   let sel = self.builder.build_select(bv, t, fl, "ts_bool").unwrap();
+                                   return Ok(sel);
                                }
                            }
                            let iv = self.value_to_i64_bits(a);
@@ -7416,6 +7507,10 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                            Ok(self.unwrap_call(call))
                        }
                        "bytes_to_string" => {
+                           // 1-arg form: lossy UTF-8 (builtins_llvm_ext table); 2-arg form (bytes, n) is the legacy one
+                           if args.len() < 2 {
+                               if let Some(e) = crate::builtins_llvm_ext::find("ext_bytes_to_string") { return self.call_ext_builtin(e, args); }
+                           }
                            let b = self.expr(&args[0], None)?;
                            let n = self.expr(&args[1], None)?;
                            let call = self.call_coerced(self.builtins.hsh_bytes_to_string, &[b.into(), n.into()], "bts");
@@ -7628,7 +7723,9 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                fn find_user_method(&self, recv: &Expr, method: &str) -> Option<String> {
                    let sn = self.infer_struct_name(recv)?;
                    let bare = sn.rsplit("::").next().unwrap_or(&sn).to_string();
-                   [sn.clone(), bare].into_iter()
+                   // `mod`-expanded types are mangled `<mod>_<Type>`, so `context::Context` -> `context_Context`.
+                   let mangled = sn.replace("::", "_");
+                   [sn.clone(), bare, mangled].into_iter()
                        .map(|t| format!("{}_{}", t, method))
                        .find(|m| self.func_vals.contains_key(m.as_str()) && self.is_self_method(m))
                }
