@@ -38,6 +38,11 @@ pub struct ModuleResolver {
     /// (mangled) name — which corrupts codegen (duplicate/stale
     /// `FunctionValue` bindings) badly enough to crash the compiler itself.
     inlined_files: HashSet<PathBuf>,
+    /// std imports already inlined, keyed by (file, alias). A std module is mangled under the alias
+    /// of the `use` that inlined it (`alias_fn`), so a second `use` of the same module under a
+    /// *different* alias (e.g. `from "strings"` here and `from "nstr"` inside a dependency) must be
+    /// inlined again under that alias, or `nstr::split_whitespace` would not exist.
+    inlined_std: HashSet<(PathBuf, String)>,
     /// `Bit.hk` root of the entry file's project (see
     /// `bit_resolve::edition_for_file`): files owned by it use the
     /// process-wide default edition (so `--edition` wins for your own code);
@@ -79,7 +84,7 @@ impl ModuleResolver {
             .map(|d| if d.as_os_str().is_empty() { Path::new(".") } else { d })
             .and_then(|d| std::fs::canonicalize(d).ok())
             .and_then(|d| bit_resolve::manifest_dir_of(&d));
-        Self { search_paths, cache: HashMap::new(), inlined_files: HashSet::new(), entry_project_root }
+        Self { search_paths, cache: HashMap::new(), inlined_files: HashSet::new(), inlined_std: HashSet::new(), entry_project_root }
     }
 
     /// Parse one imported file under *its own* edition: its `using`, else the
@@ -146,7 +151,7 @@ please install h# utils for HackerOS use:\n\
         // and its functions must still only end up in the compiled
         // program a single time.
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !self.inlined_files.insert(canonical) {
+        if !self.inlined_std.insert((canonical, alias.to_string())) {
             return Ok(Vec::new());
         }
 
