@@ -345,7 +345,15 @@ fix one of:\n\
             .map_err(|e| format!(".hlib '{}' failed its internal integrity check: {}", name, e))?;
 
         // ── Path 1: splice the ast artifact directly ────────────────────
-        if let Some(ast_artifact) = archive.manifest.artifacts_of_kind(hsharp_hlib::ArtifactKind::Ast).next() {
+        // HLIB_FORMAT §5: an `ast` artifact is a same-language fast path and is never read across languages.
+        // A HackerScript / Hacker Lang archive stores .hcs source / hl nodes there, which is not H# `Item` JSON.
+        let same_language = archive.manifest.language == hsharp_hlib::Language::Hsharp;
+        let ast_candidate = if same_language {
+            archive.manifest.artifacts_of_kind(hsharp_hlib::ArtifactKind::Ast).next()
+        } else {
+            None
+        };
+        if let Some(ast_artifact) = ast_candidate {
             let ast_bytes = archive.entry_bytes(&ast_artifact.path).ok_or_else(|| {
                 format!(".hlib '{}': ast artifact listed in manifest but missing from the archive", name)
             })?;
@@ -359,10 +367,20 @@ fix one of:\n\
 
         // ── Path 2: synthesize `extern` from the header ─────────────────
         let host_triple = crate::target::TargetTriple::host().llvm_triple;
+        let foreign_note = if same_language {
+            String::new()
+        } else {
+            format!(
+                " It was built by {lang}: its `ast` is {lang} source, which H# does not read; across languages only a \
+                 native `.so` listed in `manifest.exports` (non-generic functions with plain C types) can be called.",
+                lang = archive.manifest.language.as_str()
+            )
+        };
         let so_artifact = archive.manifest.shared_object_for(&host_triple).ok_or_else(|| {
             format!(
-                ".hlib '{name}' has neither an `ast` artifact nor a `.so` built for this host \
-                 ({host_triple}) — nothing here can be linked. Available native targets: {targets}",
+                ".hlib '{name}' has neither a usable `ast` artifact nor a `.so` built for this host \
+                 ({host_triple}) — nothing here can be linked. Available native targets: {targets}.{foreign_note}",
+                foreign_note = foreign_note,
                 name = name,
                 host_triple = host_triple,
                 targets = archive
