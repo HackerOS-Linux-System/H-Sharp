@@ -70,10 +70,28 @@ char* hsh_int_to_string(int64_t n) {
     return buf ? buf : (char*)"";
 }
 
+/* Shortest representation that round-trips (what Rust's `{}` prints for f64 and what the interpreter
+ * shows): 2.5 -> "2.5", 3.0 -> "3", 0.1+0.2 -> "0.30000000000000004". Fixed notation for
+ * 1e-5 <= |x| < 1e16, `%g` style outside that range; NaN/inf as Rust spells them. */
 char* hsh_float_to_string(double n) {
     char* buf = (char*)malloc(64);
-    if (buf) snprintf(buf, 64, "%g", n);
-    return buf ? buf : (char*)"";
+    if (!buf) return (char*)"";
+    if (n != n) { snprintf(buf, 64, "NaN"); return buf; }
+    if (n > 1.7976931348623157e308) { snprintf(buf, 64, "inf"); return buf; }
+    if (n < -1.7976931348623157e308) { snprintf(buf, 64, "-inf"); return buf; }
+    double a = n < 0 ? -n : n;
+    if (a == 0 || (a >= 1e-5 && a < 1e16)) {
+        for (int d = 0; d <= 20; d++) {
+            snprintf(buf, 64, "%.*f", d, n);
+            if (strtod(buf, NULL) == n) break;
+        }
+    } else {
+        for (int p = 1; p <= 17; p++) {
+            snprintf(buf, 64, "%.*g", p, n);
+            if (strtod(buf, NULL) == n) break;
+        }
+    }
+    return buf;
 }
 
 int64_t hsh_strlen(hsh_string s) { return s ? (int64_t)strlen(s) : 0; }
@@ -4179,15 +4197,23 @@ int64_t hsh_scan_port_net(const char *host, int64_t port, int64_t timeout_ms) {
 }
 #endif
 
-/* ── hsh_string_chars — return HshArray* of single-char strings ──────────────*/
+/* ── hsh_string_chars — return HshArray* of single-char strings ──────────────
+ * UTF-8 aware (one item per Unicode scalar, like the interpreter's / Rust's
+ * `str::chars`); stray or truncated bytes become single-byte items. For pure
+ * ASCII input the result is identical to the former byte-wise version. */
 HshArray *hsh_string_chars(const char *s) {
     HshArray *a = hsh_array_new();
     if (!s) return a;
-    size_t n = strlen(s);
-    for (size_t i = 0; i < n; i++) {
-        char *ch = (char*)malloc(2);
-        ch[0] = s[i]; ch[1] = '\0';
+    size_t n = strlen(s), i = 0;
+    while (i < n) {
+        unsigned char b = (unsigned char)s[i];
+        size_t len = b < 0x80 ? 1 : (b >= 0xF0 ? 4 : (b >= 0xE0 ? 3 : (b >= 0xC0 ? 2 : 1)));
+        if (i + len > n) len = n - i;
+        for (size_t k = 1; k < len; k++) if (((unsigned char)s[i + k] & 0xC0) != 0x80) { len = k; break; }
+        char *ch = (char*)malloc(len + 1);
+        memcpy(ch, s + i, len); ch[len] = '\0';
         a = hsh_array_push(a, (int64_t)(uintptr_t)ch);
+        i += len;
     }
     return a;
 }
@@ -4874,4 +4900,265 @@ void hsh_map_clear(HshMap* m) {
     }
     memset(m->entries, 0, (size_t)m->cap * sizeof(HshMapEntry));
     m->count = 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * LLVM-backend parity for builtins that used to be interpreter-only
+ * (hex / bytes / base64-bytes / date / env / term / uuid / math).
+ * Each function mirrors the semantics of the interpreter arm of the same
+ * name in interpreter/src/call.rs. Wired through builtins_llvm_ext.rs
+ * (table), builtins_registry.rs (Backend::Llvm) and codegen.rs
+ * (`call_ext_builtin`). `bytes` here is an HshArray* of 0-255 values.
+ * Known C-string limit: functions returning `hsh_string` cannot carry NUL.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* Rust `String::from_utf8_lossy` (maximal-subpart replacement). `out` must have
+ * room for 3*n+1 bytes; returns the written length (NUL-terminated). */
+static size_t hsh_utf8_lossy_into(const uint8_t* s, size_t n, char* out) {
+    size_t i = 0, o = 0;
+    while (i < n) {
+        uint8_t b = s[i];
+        if (b < 0x80) { out[o++] = (char)b; i++; continue; }
+        size_t need = 0; uint8_t lo = 0x80, hi = 0xBF;
+        if (b >= 0xC2 && b <= 0xDF) need = 1;
+        else if (b == 0xE0) { need = 2; lo = 0xA0; }
+        else if ((b >= 0xE1 && b <= 0xEC) || b == 0xEE || b == 0xEF) need = 2;
+        else if (b == 0xED) { need = 2; hi = 0x9F; }
+        else if (b == 0xF0) { need = 3; lo = 0x90; }
+        else if (b >= 0xF1 && b <= 0xF3) need = 3;
+        else if (b == 0xF4) { need = 3; hi = 0x8F; }
+        else { out[o++] = (char)0xEF; out[o++] = (char)0xBF; out[o++] = (char)0xBD; i++; continue; }
+        size_t j = 1; int ok = 1;
+        for (; j <= need; j++) {
+            if (i + j >= n) { ok = 0; break; }
+            uint8_t c = s[i + j];
+            uint8_t l = (j == 1) ? lo : 0x80, h = (j == 1) ? hi : 0xBF;
+            if (c < l || c > h) { ok = 0; break; }
+        }
+        if (!ok) { out[o++] = (char)0xEF; out[o++] = (char)0xBF; out[o++] = (char)0xBD; i += j; continue; }
+        for (size_t k = 0; k <= need; k++) out[o++] = (char)s[i + k];
+        i += need + 1;
+    }
+    out[o] = '\0';
+    return o;
+}
+static hsh_string hsh_utf8_lossy_str(const uint8_t* s, size_t n) {
+    char* o = (char*)hsh_alloc(n * 3 + 1);
+    if (!o) return "";
+    hsh_utf8_lossy_into(s, n, o);
+    return o;
+}
+static int hsh_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+/* "ab12ff" -> bytes; pairs that are not two hex digits are skipped (as the interpreter's filter_map). */
+static uint8_t* hsh_hex_pairs(hsh_string h, size_t* n) {
+    size_t len = h ? strlen(h) : 0;
+    uint8_t* b = (uint8_t*)malloc(len / 2 + 1);
+    size_t k = 0;
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        int hi = hsh_hexval(h[i]), lo = hsh_hexval(h[i + 1]);
+        if (hi >= 0 && lo >= 0) b[k++] = (uint8_t)(hi * 16 + lo);
+    }
+    *n = k;
+    return b;
+}
+
+/* ── hex ─────────────────────────────────────────────────────────────────── */
+hsh_string hsh_hex_encode(hsh_string s) {
+    return hsh_hex_of((const uint8_t*)(s ? s : ""), s ? strlen(s) : 0);
+}
+hsh_string hsh_hex_encode_bytes(HshArray* b) {
+    size_t n; uint8_t* d = hsh_bytes_flatten(b, &n);
+    hsh_string r = hsh_hex_of(d ? d : (const uint8_t*)"", n);
+    free(d);
+    return r;
+}
+hsh_string hsh_hex_decode(hsh_string h) {
+    size_t n; uint8_t* d = hsh_hex_pairs(h, &n);
+    hsh_string r = hsh_utf8_lossy_str(d, n);
+    free(d);
+    return r;
+}
+hsh_string hsh_hex_xor(hsh_string a, hsh_string b) {
+    size_t na, nb; uint8_t* x = hsh_hex_pairs(a, &na); uint8_t* y = hsh_hex_pairs(b, &nb);
+    size_t n = nb ? na : 0;   /* zip(a, b.cycle()): empty b => empty result */
+    uint8_t* o = (uint8_t*)malloc(n ? n : 1);
+    for (size_t i = 0; i < n; i++) o[i] = x[i] ^ y[i % nb];
+    hsh_string r = hsh_hex_of(o, n);
+    free(x); free(y); free(o);
+    return r;
+}
+
+/* ── bytes ([int] 0-255 <-> bytes; both are HshArray* of int64) ─────────── */
+HshArray* hsh_bytes_from_ints(HshArray* a) {
+    HshArray* r = hsh_array_new();
+    int64_t n = a ? a->len : 0;
+    for (int64_t i = 0; i < n; i++) r = hsh_array_push(r, a->data[i] & 0xff);
+    return r;
+}
+HshArray* hsh_bytes_to_ints(HshArray* b) {
+    HshArray* r = hsh_array_new();
+    int64_t n = b ? b->len : 0;
+    for (int64_t i = 0; i < n; i++) r = hsh_array_push(r, b->data[i] & 0xff);
+    return r;
+}
+HshArray* hsh_bytes_concat(HshArray* a, HshArray* b) {
+    HshArray* r = hsh_array_new();
+    int64_t na = a ? a->len : 0, nb = b ? b->len : 0;
+    for (int64_t i = 0; i < na; i++) r = hsh_array_push(r, a->data[i] & 0xff);
+    for (int64_t i = 0; i < nb; i++) r = hsh_array_push(r, b->data[i] & 0xff);
+    return r;
+}
+int64_t hsh_bytes_len(HshArray* b) { return b ? b->len : 0; }
+hsh_string hsh_bytes_to_str_lossy(HshArray* b) {
+    size_t n; uint8_t* d = hsh_bytes_flatten(b, &n);
+    hsh_string r = hsh_utf8_lossy_str(d ? d : (const uint8_t*)"", n);
+    free(d);
+    return r;
+}
+/* RFC 4648 standard alphabet, '=' and whitespace ignored; invalid input => empty bytes
+ * (the interpreter returns nil there, which has no `bytes` representation). */
+HshArray* hsh_base64_decode_bytes(hsh_string s) {
+    HshArray* r = hsh_array_new();
+    size_t len = s ? strlen(s) : 0;
+    uint8_t* clean = (uint8_t*)malloc(len + 1);
+    size_t cn = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '=' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') continue;
+        clean[cn++] = c;
+    }
+    for (size_t p = 0; p < cn; p += 4) {
+        size_t m = cn - p < 4 ? cn - p : 4;
+        uint32_t n = 0;
+        for (size_t i = 0; i < m; i++) {
+            unsigned char c = clean[p + i]; int v;
+            if (c >= 'A' && c <= 'Z') v = c - 'A';
+            else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+            else if (c >= '0' && c <= '9') v = c - '0' + 52;
+            else if (c == '+') v = 62;
+            else if (c == '/') v = 63;
+            else { free(clean); return hsh_array_new(); }
+            n |= (uint32_t)v << (18 - 6 * i);
+        }
+        r = hsh_array_push(r, (n >> 16) & 0xff);
+        if (m > 2) r = hsh_array_push(r, (n >> 8) & 0xff);
+        if (m > 3) r = hsh_array_push(r, n & 0xff);
+    }
+    free(clean);
+    return r;
+}
+
+/* ── date (UTC, Hinnant civil_from_days — same as the interpreter) ──────── */
+static void hsh_civil_from_unix(int64_t ts, int64_t* y, int64_t* m, int64_t* d, int64_t* days) {
+    int64_t dd = ts / 86400; if (ts % 86400 < 0) dd -= 1;       /* div_euclid */
+    int64_t z = dd + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t yy = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t dday = doy - (153 * mp + 2) / 5 + 1;
+    int64_t mm = mp < 10 ? mp + 3 : mp - 9;
+    *y = mm <= 2 ? yy + 1 : yy; *m = mm; *d = dday; *days = dd;
+}
+int64_t hsh_date_year(int64_t ts)  { int64_t y, m, d, w; hsh_civil_from_unix(ts, &y, &m, &d, &w); return y; }
+int64_t hsh_date_month(int64_t ts) { int64_t y, m, d, w; hsh_civil_from_unix(ts, &y, &m, &d, &w); return m; }
+int64_t hsh_date_day(int64_t ts)   { int64_t y, m, d, w; hsh_civil_from_unix(ts, &y, &m, &d, &w); return d; }
+hsh_string hsh_date_weekday(int64_t ts) {
+    static const char* const names[7] = {"Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"};
+    int64_t y, m, d, w; hsh_civil_from_unix(ts, &y, &m, &d, &w);
+    int64_t i = w % 7; if (i < 0) i += 7;
+    return names[i];
+}
+int64_t hsh_date_add_days(int64_t ts, int64_t days)   { return ts + days * 86400; }
+int64_t hsh_date_add_hours(int64_t ts, int64_t hours) { return ts + hours * 3600; }
+int64_t hsh_date_diff_days(int64_t a, int64_t b)      { return (a - b) / 86400; }
+
+/* ── env ─────────────────────────────────────────────────────────────────── */
+extern char** environ;
+hsh_string hsh_env_home(void) {
+    const char* h = getenv("HOME");
+    return h ? h : "";
+}
+int64_t hsh_env_remove(hsh_string k) {
+    if (k && k[0]) unsetenv(k);
+    return 1;
+}
+/* ["KEY=value", ...] — array of strings */
+HshArray* hsh_env_vars(void) {
+    HshArray* r = hsh_array_new();
+    for (char** e = environ; e && *e; e++) {
+        size_t n = strlen(*e);
+        char* c = (char*)hsh_alloc(n + 1);
+        if (!c) continue;
+        memcpy(c, *e, n + 1);
+        r = hsh_array_push(r, (int64_t)(intptr_t)c);
+    }
+    return r;
+}
+
+/* ── term ────────────────────────────────────────────────────────────────── */
+#include <sys/ioctl.h>
+static int hsh_term_size(int64_t* rows, int64_t* cols) {
+    struct winsize ws;
+    int fd = open("/dev/tty", O_RDONLY);
+    int ok = 0;
+    if (fd >= 0) {
+        if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) { *rows = ws.ws_row; *cols = ws.ws_col; ok = 1; }
+        close(fd);
+    }
+    if (!ok) { *rows = 24; *cols = 80; }   /* same 80x24 fallback as the interpreter */
+    return ok;
+}
+int64_t hsh_term_width(void)  { int64_t r, c; hsh_term_size(&r, &c); return c; }
+int64_t hsh_term_height(void) { int64_t r, c; hsh_term_size(&r, &c); return r; }
+int64_t hsh_term_is_tty(void) { return isatty(1) ? 1 : 0; }
+
+/* ── uuid ────────────────────────────────────────────────────────────────── */
+int64_t hsh_uuid_is_valid(hsh_string s) {
+    if (!s || strlen(s) != 36) return 0;
+    for (int i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (s[i] != '-') return 0; }
+        else if (hsh_hexval(s[i]) < 0) return 0;
+    }
+    return 1;
+}
+
+/* ── math (libm; Rust f64 methods map 1:1) ──────────────────────────────── */
+double hsh_math_asin(double x)  { return asin(x); }
+double hsh_math_acos(double x)  { return acos(x); }
+double hsh_math_atan(double x)  { return atan(x); }
+double hsh_math_atan2(double y, double x) { return atan2(y, x); }
+double hsh_math_round(double x) { return round(x); }   /* half away from zero == Rust f64::round */
+double hsh_math_trunc(double x) { return trunc(x); }
+double hsh_math_log(double x)   { return log(x); }
+double hsh_math_log2(double x)  { return log2(x); }
+double hsh_math_log10(double x) { return log10(x); }
+double hsh_math_exp(double x)   { return exp(x); }
+
+/* `s.trim_start()` / `s.trim_end()` — strip leading / trailing ASCII whitespace (Rust `str::trim_start/_end`). */
+static int hsh_is_ws_ch(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+hsh_string hsh_trim_start(hsh_string s) {
+    if (!s) return "";
+    while (*s && hsh_is_ws_ch(*s)) s++;
+    size_t n = strlen(s);
+    char* out = (char*)hsh_alloc(n + 1);
+    if (!out) return s;
+    memcpy(out, s, n + 1);
+    return out;
+}
+hsh_string hsh_trim_end(hsh_string s) {
+    if (!s) return "";
+    size_t n = strlen(s);
+    while (n > 0 && hsh_is_ws_ch(s[n - 1])) n--;
+    char* out = (char*)hsh_alloc(n + 1);
+    if (!out) return s;
+    memcpy(out, s, n); out[n] = '\0';
+    return out;
 }
