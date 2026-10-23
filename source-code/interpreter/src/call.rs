@@ -1521,7 +1521,7 @@ impl Interpreter {
             "env_remove" => {
                 let k = args.first().map(|v| v.to_string()).unwrap_or_default();
                 unsafe { std::env::remove_var(&k); }
-                return Ok(Value::Nil);
+                return Ok(Value::Bool(true)); // declared `bool` in builtins_registry (was Nil)
             }
             // Returns `["KEY=value", ...]` — kept as a flat array of
             // `"KEY=value"` strings rather than a map, since H#'s
