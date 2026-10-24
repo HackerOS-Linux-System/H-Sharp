@@ -742,6 +742,13 @@ as \"{member}\", or as a path ending in \"/{member}\", e.g. \"source-code/{membe
         for a in &ancestors {
             if !dirs.iter().any(|d| *d == a.as_path()) { dirs.push(a.as_path()); }
         }
+        // LAST fallback: source directories of the `[dependencies]` of the project owning the
+        // declaring file (e.g. `obsidian`'s `src/` for `mod context`). Searched after everything
+        // local, so a project's own module always wins over a same-named dependency module.
+        let dep_dirs: Vec<PathBuf> = bit_resolve::dependency_source_dirs(from_dir);
+        for d in &dep_dirs {
+            if !dirs.iter().any(|x| *x == d.as_path()) { dirs.push(d.as_path()); }
+        }
         for dir in dirs {
             for candidate in &candidates {
                 let path = dir.join(candidate);
