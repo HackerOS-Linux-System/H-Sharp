@@ -1585,3 +1585,52 @@ mod edition_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod hlib_explicit_import_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hsharp_modules_hlib_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    fn expand(root: &Path, main_src: &str) -> Result<Vec<Item>, String> {
+        let entry = root.join("main.h#");
+        std::fs::write(&entry, main_src).unwrap();
+        let parsed = hsharp_parser::parse(main_src, entry.to_str().unwrap());
+        assert!(!parsed.has_errors(), "{}", parsed.render_errors());
+        let mut r = ModuleResolver::new(&entry);
+        r.expand_program(&parsed.module, root)
+    }
+
+    /// `use "hlib -> mylib" from "mylib"` against a real same-language
+    /// `.hlib`: the library's functions are spliced in with no `extern`.
+    #[test]
+    fn hlib_import_needs_no_extern() {
+        let root = tmp("noextern");
+        let lib_src = "pub fn add(a: int, b: int) -> int is\n    return a + b\nend\n";
+        let parsed = hsharp_parser::parse(lib_src, "mylib.h#");
+        assert!(!parsed.has_errors(), "{}", parsed.render_errors());
+        let mut b = hsharp_hlib::HlibBuilder::new("mylib", "1.0.0", hsharp_hlib::Language::Hsharp);
+        b.add_ast(&serde_json::to_vec(&parsed.module.items).unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("hlibs")).unwrap();
+        b.finish(&root.join("hlibs/mylib.hlib"), None).unwrap();
+
+        let items = expand(&root, "use \"hlib -> mylib\" from \"mylib\"\nfn main() is\nend\n").expect("expand");
+        let names: Vec<String> = items.iter().filter_map(|i| match i { Item::FnDef(f) => Some(f.name.clone()), _ => None }).collect();
+        assert!(names.iter().any(|n| n.contains("add")), "{names:?}");
+        assert!(!items.iter().any(|i| matches!(i, Item::Extern(_))), "no extern block should be needed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_hlib_lists_search_paths() {
+        let root = tmp("missing");
+        let err = expand(&root, "use \"hlib -> ghost_lib_xyz\" from \"g\"\nfn main() is\nend\n").unwrap_err();
+        assert!(err.contains("ghost_lib_xyz"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
