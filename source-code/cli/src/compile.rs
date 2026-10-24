@@ -30,8 +30,21 @@ pub fn run(
     .and_then(|s| s.to_str())
     .unwrap_or("output");
 
-    std::fs::create_dir_all("build").ok();
-    let out_path = output.unwrap_or_else(|| format!("build/{}", stem));
+    // `build/` is only the DEFAULT output location. When `-o` is given (always the case
+    // under `bit`, which puts artifacts in cache/build/...), create just the parent
+    // directory of that path and never an extra `build/` next to the sources.
+    let out_path = match output {
+        Some(o) => o,
+        None => {
+            std::fs::create_dir_all("build").ok();
+            format!("build/{}", stem)
+        }
+    };
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
 
     // ── Target ──────────────────────────────────────────────────────────────
     let triple = if let Some(t) = target {
