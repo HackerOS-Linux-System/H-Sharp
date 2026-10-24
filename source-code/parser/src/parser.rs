@@ -334,7 +334,7 @@ impl Parser {
             let s = s.clone(); self.advance(); s
         } else {
             return Err(self.error("expected use path string after `use`",
-                                  vec![r#"write: use "std -> io" from "io""#.to_string()]));
+                                  vec![r#"the source is always explicit — write: use "bit -> mold" or use "hlib -> mold" (e.g. `use mold` alone is not valid)"#.to_string()]));
         };
 
         let alias = if matches!(self.current().kind, TokenKind::From) {
@@ -381,7 +381,7 @@ impl Parser {
             ParseErrorKind::Custom("invalid use path".into()),
                                        span.clone(),
                                        format!("cannot parse use path `{}`", path_tok),
-                                           vec![r#"valid forms: "std -> module", "bit -> lib/1.0", "github -> owner/repo""#.to_string()],
+                                           vec![r#"valid forms: "std -> module", "bit -> lib/1.0", "hlib -> lib/1.0", "github -> owner/repo""#.to_string()],
         ))?;
         Ok((kind, alias, span))
     }
