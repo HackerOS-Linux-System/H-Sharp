@@ -361,3 +361,37 @@ mod comment_tests {
         assert!(r.render_errors().contains(":4:"), "{}", r.render_errors());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// The import source is always explicit: `use mold` is an error.
+#[cfg(test)]
+mod explicit_source_tests {
+    use super::*;
+    use ast::ImportKind;
+
+    #[test]
+    fn bare_use_is_an_error() {
+        let result = parse("use mold\nfn main() is end\n", "test.h#");
+        assert!(result.has_errors(), "`use mold` must not parse");
+        assert!(result.render_errors().contains("hlib -> mold"), "{}", result.render_errors());
+    }
+
+    #[test]
+    fn string_without_source_is_an_error() {
+        assert!(parse("use \"mold\"\nfn main() is end\n", "test.h#").has_errors());
+    }
+
+    #[test]
+    fn explicit_forms_parse() {
+        for (src, want_hlib) in [
+            ("use \"hlib -> mold\" from \"mold\"\nfn main() is end\n", true),
+            ("use \"bit -> mold\" from \"mold\"\nfn main() is end\n", false),
+        ] {
+            let r = parse(src, "test.h#");
+            assert!(!r.has_errors(), "{}", r.render_errors());
+            let k = &r.module.imports[0].0;
+            assert_eq!(matches!(k, ImportKind::Hlib { .. }), want_hlib);
+            assert_eq!(matches!(k, ImportKind::BitRepo { .. }), !want_hlib);
+        }
+    }
+}
