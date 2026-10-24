@@ -34,11 +34,15 @@ fn cmd_build(
     release: bool,
 ) {
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("mylib").to_string();
+    // `build/` is only the default; with `-o` (always the case under `bit`) nothing
+    // is created outside the directory of the requested output file.
     let out_hlib = output.unwrap_or_else(|| format!("build/{}.hlib", stem));
-    if let Some(parent) = Path::new(&out_hlib).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::create_dir_all("build").ok();
+    let out_parent = Path::new(&out_hlib)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&out_parent).ok();
 
     let triple = match target {
         Some(t) => TargetTriple::from_str(&t).unwrap_or_else(|| die(format!("unknown target `{t}`. Run `h# targets` to list them."))),
@@ -72,8 +76,8 @@ fn cmd_build(
 
     crate::edition_cmd::end_build(false);
 
-    // ── Compile to a shared object at build/<stem>.hlib.tmp<suffix> ─────
-    let tmp_stem = format!("build/.hlib-{}", stem);
+    // ── Compile to a shared object next to the output: <out dir>/.hlib-<stem> ──
+    let tmp_stem = out_parent.join(format!(".hlib-{}", stem)).to_string_lossy().into_owned();
     let opts = CompileOptions {
         target: triple.clone(),
         optimize: release,
