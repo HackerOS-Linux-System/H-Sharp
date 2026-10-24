@@ -6386,7 +6386,7 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        }
                        "json_set_str" => call3!(self.builtins.hsh_json_set_str, "jsonset"),
                        "json_get_str" => call2!(self.builtins.hsh_json_get, "jsongetstr"),
-                       "is_dir" => call1!(self.builtins.hsh_is_dir, "isdir"),
+                       "is_dir" | "fs_is_dir" => call1!(self.builtins.hsh_is_dir, "isdir"),
                        // `hsh_is_file`/`hsh_append_file` — see their
                        // `LlvmBuiltins` field doc comment; real C
                        // implementations that simply had no dispatch arm
