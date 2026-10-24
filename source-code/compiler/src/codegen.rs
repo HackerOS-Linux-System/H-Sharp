@@ -1938,7 +1938,11 @@ impl LlvmCodegen {
             OutputKind::SharedLib => {
                 let so_suffix = self.opts.output_kind.file_suffix(&self.opts.target);
                 let out = format!("{}{}", self.opts.output, so_suffix);
-                let extern_args = self.link_flags.borrow().to_cc_args();
+                let extern_args = {
+                    let mut lf = self.link_flags.borrow().clone();
+                    for note in lf.resolve_missing_static_libs() { eprintln!("  note: {}", note); }
+                    lf.to_cc_args()
+                };
                 let mut cmd = std::process::Command::new(&cc_bin);
                 cmd.args(&cc_extra);
                 cmd.arg("-shared").arg("-fPIC");
@@ -1984,7 +1988,14 @@ impl LlvmCodegen {
         let suffix = self.opts.target.exe_suffix();
         let out    = format!("{}{}", self.opts.output, suffix);
 
-        let extern_args = self.link_flags.borrow().to_cc_args_ex(self.opts.static_link);
+        let extern_args = {
+            let mut lf = self.link_flags.borrow().clone();
+            // A fully static link (`-static`) cannot use shared libs, so the fallback is skipped.
+            if !self.opts.static_link {
+                for note in lf.resolve_missing_static_libs() { eprintln!("  note: {}", note); }
+            }
+            lf.to_cc_args_ex(self.opts.static_link)
+        };
         let user_ldflags = Self::user_ldflags();
 
         let mut cmd = std::process::Command::new(&cc_bin);
