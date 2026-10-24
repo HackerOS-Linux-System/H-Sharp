@@ -468,6 +468,57 @@ fn path_dependency_dirs(project_root: &Path, name: &str) -> Vec<PathBuf> {
     out
 }
 
+/// Source directories of the libraries named in `[dependencies]` of the project (and its workspace
+/// root) that owns `start_dir`, in search order. Used as the LAST fallback when a `mod X` cannot be
+/// found next to the declaring file: a dependency such as `obsidian` is a bag of `mod`-includable
+/// files (`context.h#`, `pass_manager.h#`, ...), and `h# lib build` / `h# compile` run from the
+/// member directory (as `bit build` does) have no other way to see them. Without this, the `mod`
+/// only produced a non-fatal `warn: module 'context' not found` and the build died later with an
+/// opaque `codegen: undefined fn: create`.
+///
+/// For every dependency name the candidates are: `bit_lib_candidates` (path deps, `cache/`, installed
+/// libs), plus `<project or workspace root>/libs/<name>` (a library vendored in the repository).
+/// Each existing candidate contributes the directory of its entry file (normally `src/`) and `src/`.
+pub fn dependency_source_dirs(start_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if p.is_dir() && !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    let roots = project_roots(start_dir);
+    let mut names: Vec<String> = Vec::new();
+    for root in &roots {
+        for e in load_hk(root) {
+            if e.section != "dependencies" {
+                continue;
+            }
+            let first = e.key.split('.').next().unwrap_or("").to_string();
+            if valid_lib_name(&first) && !names.contains(&first) {
+                names.push(first);
+            }
+        }
+    }
+    for name in &names {
+        let mut dirs = bit_lib_candidates(name, start_dir);
+        for root in &roots {
+            dirs.push(root.join("libs").join(name));
+        }
+        for dir in dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(entry) = lib_dir_entry(&dir, name) {
+                if let Some(parent) = entry.parent() {
+                    push(parent.to_path_buf(), &mut out);
+                }
+            }
+            push(dir.join("src"), &mut out);
+        }
+    }
+    out
+}
+
 /// Newest (by modification time) version directory of `<libs>/<name>/`,
 /// ignoring `current` and hidden entries.
 fn newest_version_dir(base: &Path) -> Option<PathBuf> {
