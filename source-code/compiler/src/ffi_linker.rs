@@ -251,6 +251,56 @@ impl LinkFlags {
         args
     }
 
+    /// Make `extern static [c, "X"]` usable on systems that only ship a SHARED `libX`.
+    ///
+    /// `static_libs` are emitted as `-Wl,-Bstatic -lX`, which needs `libX.a`. Distribution LLVM
+    /// packages (Debian/Ubuntu `llvm-21-dev`, Fedora, Arch, Homebrew) provide only the monolithic
+    /// `libLLVM-21.so`, and keep it in `/usr/lib/llvm-21/lib`, which is not on `ld`'s default
+    /// search path, so `h# lib build` of anything using `obsidian` died with
+    /// `cannot find -lLLVM-21 ... have you installed the static version`.
+    ///
+    /// For every static lib with no `lib<name>.a` in the search dirs but with a `lib<name>.so`
+    /// (`.dylib` on macOS) this moves it to `dynamic_libs` and adds `-L<dir>` and an rpath, so the
+    /// result also runs without `LD_LIBRARY_PATH`. A lib found nowhere is left untouched (the
+    /// linker then reports the usual error). Returns the notes printed to stderr.
+    pub fn resolve_missing_static_libs(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        let mut keep: Vec<String> = Vec::new();
+        let libs = std::mem::take(&mut self.static_libs);
+        for lib in libs {
+            let dirs = static_lib_search_dirs(&lib);
+            let has_static = dirs.iter().any(|d| d.join(format!("lib{}.a", lib)).is_file());
+            if has_static {
+                keep.push(lib);
+                continue;
+            }
+            let so_names: Vec<String> = if cfg!(target_os = "macos") {
+                vec![format!("lib{}.dylib", lib)]
+            } else {
+                vec![format!("lib{}.so", lib)]
+            };
+            let found = dirs.iter().find(|d| so_names.iter().any(|n| d.join(n).exists()));
+            match found {
+                Some(dir) => {
+                    let d = dir.to_string_lossy().into_owned();
+                    notes.push(format!(
+                        "extern static `{}`: no lib{}.a found, linking the shared library from {} instead",
+                        lib, lib, d
+                    ));
+                    self.pkg_config_args.insert(0, format!("-L{}", d));
+                    if !cfg!(target_os = "macos") {
+                        self.rpath_hints.push(format!("-Wl,-rpath,{}", d));
+                    }
+                    self.dynamic_libs.push(lib);
+                }
+                None => keep.push(lib),
+            }
+        }
+        self.static_libs = keep;
+        self.dedup();
+        notes
+    }
+
     pub fn is_empty(&self) -> bool {
         self.static_libs.is_empty()
             && self.dynamic_libs.is_empty()
@@ -303,6 +353,50 @@ pub fn describe_flags(flags: &LinkFlags) -> String {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Directories searched by [`LinkFlags::resolve_missing_static_libs`]: `LIBRARY_PATH`, `-L` entries
+/// of `LDFLAGS`, the usual system lib dirs and, for `LLVM-<N>`, the LLVM install dirs
+/// (`llvm-config --libdir`, `/usr/lib/llvm-<N>/lib`, `/usr/lib64/llvm<N>/lib`, Homebrew).
+fn static_lib_search_dirs(lib: &str) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut add = |p: PathBuf, dirs: &mut Vec<PathBuf>| {
+        if p.is_dir() && !dirs.contains(&p) { dirs.push(p); }
+    };
+    if let Ok(v) = std::env::var("LIBRARY_PATH") {
+        for d in v.split(':').filter(|d| !d.is_empty()) { add(PathBuf::from(d), &mut dirs); }
+    }
+    if let Ok(v) = std::env::var("LDFLAGS") {
+        for t in v.split_whitespace() {
+            if let Some(d) = t.strip_prefix("-L") { add(PathBuf::from(d), &mut dirs); }
+        }
+    }
+    if let Some(ver) = lib.strip_prefix("LLVM-").filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())) {
+        for cfg in [format!("llvm-config-{}", ver), format!("llvm-config{}", ver), "llvm-config".to_string()] {
+            if let Ok(o) = std::process::Command::new(&cfg).arg("--libdir").output() {
+                if o.status.success() {
+                    let d = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !d.is_empty() { add(PathBuf::from(d), &mut dirs); }
+                }
+            }
+        }
+        for d in [
+            format!("/usr/lib/llvm-{}/lib", ver),
+            format!("/usr/lib64/llvm{}/lib", ver),
+            format!("/usr/lib/llvm{}/lib", ver),
+            format!("/usr/local/lib/llvm-{}", ver),
+            format!("/usr/local/opt/llvm@{}/lib", ver),
+            format!("/opt/homebrew/opt/llvm@{}/lib", ver),
+        ] { add(PathBuf::from(d), &mut dirs); }
+    }
+    for d in [
+        "/usr/lib", "/usr/lib64", "/usr/local/lib", "/lib", "/lib64",
+        "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu",
+        "/lib/x86_64-linux-gnu", "/lib/aarch64-linux-gnu", "/opt/homebrew/lib",
+    ] { add(PathBuf::from(d), &mut dirs); }
+    dirs
+}
+
+
 fn dedup_vec(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
@@ -320,6 +414,35 @@ mod tests {
             dynamic_libs:            dynamic_libs.iter().map(|s| s.to_string()).collect(),
             rust_whole_archive_libs: rust_wa.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missing_static_lib_without_shared_is_left_alone() {
+        let mut f = make_flags(&["definitely_not_a_real_lib_xyz"], &[], &[]);
+        let notes = f.resolve_missing_static_libs();
+        assert!(notes.is_empty());
+        assert_eq!(f.static_libs, vec!["definitely_not_a_real_lib_xyz".to_string()]);
+    }
+
+    #[test]
+    fn missing_static_lib_falls_back_to_shared() {
+        let dir = std::env::temp_dir().join(format!("hs_ffi_fb_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libhsfaketest.so"), b"").unwrap();
+        let old = std::env::var("LIBRARY_PATH").ok();
+        std::env::set_var("LIBRARY_PATH", &dir);
+        let mut f = make_flags(&["hsfaketest"], &[], &[]);
+        let notes = f.resolve_missing_static_libs();
+        match old { Some(v) => std::env::set_var("LIBRARY_PATH", v), None => std::env::remove_var("LIBRARY_PATH") }
+        std::fs::remove_dir_all(&dir).ok();
+        if cfg!(target_os = "linux") {
+            assert_eq!(notes.len(), 1);
+            assert!(f.static_libs.is_empty());
+            let args = f.to_cc_args();
+            assert!(args.contains(&"-lhsfaketest".to_string()));
+            assert!(args.iter().any(|a| a.starts_with("-L")));
+            assert!(!args.contains(&"-Wl,-Bstatic".to_string()));
         }
     }
 
