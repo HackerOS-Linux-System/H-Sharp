@@ -6208,6 +6208,19 @@ impl<'ctx, 'a> FnCx<'ctx, 'a> {
                        return self.call_ext_builtin(ext, args);
                    }
                    match name {
+                       // Bare `env_home()` — only the `__builtin_env_home` spelling was routed
+                       // (via the ext table) before, so `env_home()` ended in "undefined fn".
+                       "env_home" => {
+                           let e = crate::builtins_llvm_ext::find("ext_env_home").expect("ext_env_home is registered in builtins_llvm_ext::EXT");
+                           self.call_ext_builtin(e, args)
+                       }
+                       // Bare `str_join(arr, sep)` == `arr.join(sep)`.
+                       "str_join" => {
+                           let arr = self.expr(&args[0], None)?;
+                           let sep = self.expr(&args[1], None)?;
+                           let call = self.call_coerced(self.builtins.hsh_array_join, &[arr.into(), sep.into()], "ajoin");
+                           Ok(self.unwrap_call(call))
+                       }
                        "write" | "writeln" | "println" => {
                            let a = str_arg!(0);
                            self.call_coerced(self.builtins.hsh_println, &[a.into()], "");
