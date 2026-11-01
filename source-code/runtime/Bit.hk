@@ -1,0 +1,20 @@
+[package]
+-> name        => hsharp-runtime
+-> version     => 1.0.0
+-> description => H# runtime written in H# (slow rewrite of compiler/runtime: core.c + hsharp_rt.hpp) — NOT wired in yet
+-> license     => MPL-2.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[lib]
+-> output => hlib
+
+[dependencies]
