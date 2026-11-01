@@ -1,0 +1,111 @@
+mod builtins_table
+mod builtin_syms_table
+
+;; the only backend: "Cpp" (`Backend::Cpp`, name "h# (C++ transpiler)")
+pub fn backend_name(b: string) -> string is
+    return "h# (C++ transpiler)"
+end
+
+fn split_bar(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 124 is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(c)
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+;; index of the BuiltinSpec that has `name` among its aliases, -1 when none
+pub fn find(name: string) -> int is
+    let names: [string] = builtins_table::bt_names()
+    let mut i: int = 0
+    while i < names.len() is
+        for n in split_bar(names[i]) is
+            if n == name is return i end
+        end
+        i += 1
+    end
+    return -1
+end
+
+;; backends of spec `idx`, e.g. ["Cpp"]
+pub fn spec_backends(idx: int) -> [string] is
+    let b: string = builtins_table::bt_backends()[idx]
+    if b == "" is return [] end
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < b.len() is
+        if byte_at(b, i) == 44 is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(b, i))
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+pub fn spec_doc(idx: int) -> string is return builtins_table::bt_doc()[idx] end
+pub fn spec_c_symbol(idx: int) -> string is return builtins_table::bt_csym()[idx] end
+
+;; true for every name that is not a builtin at all
+pub fn supported_on(name: string, backend: string) -> bool is
+    let idx: int = find(name)
+    if idx < 0 is return true end
+    for b in spec_backends(idx) is
+        if b == backend is return true end
+    end
+    return false
+end
+
+fn index_of(xs: [string], s: string) -> int is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; builtin_syms::find_ext_dunder -> index in the EXT table or -1
+pub fn find_ext_dunder(dunder: string) -> int is
+    return index_of(builtin_syms_table::ext_dunder(), dunder)
+end
+
+pub fn find_ext(name: string) -> int is
+    return index_of(builtin_syms_table::ext_internal(), name)
+end
+
+;; builtin_syms::legacy_symbol, "" when none
+pub fn legacy_symbol(name: string) -> string is
+    let at: int = index_of(builtin_syms_table::legacy_names(), name)
+    if at >= 0 is return builtin_syms_table::legacy_syms()[at] end
+    let e: int = find_ext(name)
+    if e >= 0 is return builtin_syms_table::ext_csym()[e] end
+    let want: string = "hsh_" + name
+    if index_of(builtin_syms_table::rt_symbols(), want) >= 0 is return want end
+    return ""
+end
+
+;; builtins_registry::resolve_builtin_dunder_llvm, "" when `name` has no AOT implementation
+pub fn resolve_builtin_dunder_llvm(name: string) -> string is
+    if name.len() < 10 || name[0..10] != "__builtin_" is return "" end
+    let stripped: string = name[10..name.len()]
+    let e: int = find_ext_dunder(stripped)
+    if e >= 0 is return builtin_syms_table::ext_internal()[e] end
+    let at: int = index_of(builtins_table::dunder_from(), stripped)
+    if at >= 0 is return builtins_table::dunder_to()[at] end
+    return ""
+end
