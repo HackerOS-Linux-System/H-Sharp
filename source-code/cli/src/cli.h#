@@ -1,0 +1,1695 @@
+use "std -> option" from "option"
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "std -> env" from "env"
+use "std -> os" from "os"
+use "std -> time" from "time"
+
+mod fmt
+use "workspace -> hlib" from "lib -> *"
+use "workspace -> lsp" from "lib -> *"
+mod cli_templates
+mod cli_help
+mod cli_help2
+mod cli_style
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+extern static [c] is
+    fn system(cmd: string) -> int
+    fn isatty(fd: int) -> int
+    fn fdopen(fd: int, mode: string) -> int
+    fn fputs(s: string, f: int) -> int
+    fn fflush(f: int) -> int
+end
+
+;; stderr (H# has no stderr builtin; the string goes straight through libc)
+fn eprint(s: string) is
+    fflush(0)                              ;; keep stdout/stderr in program order
+    let f: int = fdopen(2, "w")
+    fputs(s, f)
+    fflush(f)
+end
+
+fn version() -> string is return "0.9.0" end
+
+;; ── terminal colours (the `colors` library through cli_style.h#; only on a terminal, never with NO_COLOR) ──
+fn color_on() -> bool is
+    let forced: string = env::get("HSHARP_COLOR")      ;; set by the parent `h#` for its `--phase` children
+    if forced == "1" is return true end
+    if forced == "0" is return false end
+    if env::get("NO_COLOR") != "" is return false end
+    if env::get("CLICOLOR_FORCE") != "" || env::get("FORCE_COLOR") != "" is return true end
+    if env::get("TERM") == "dumb" is return false end
+    return isatty(1) != 0 || isatty(2) != 0
+end
+
+;; decides colour once per process; the parser's nidus error frames read HSHARP_COLOR too
+fn color_init() is
+    if color_on() is
+        cli_style::enable()
+        env::set("HSHARP_COLOR", "1")
+    else
+        cli_style::disable()
+        env::set("HSHARP_COLOR", "0")
+    end
+end
+
+fn bold(s: string) -> string is return cli_style::bold(s) end
+fn dim(s: string) -> string is return cli_style::dim(s) end
+fn green(s: string) -> string is return cli_style::green(s) end
+fn green_b(s: string) -> string is return cli_style::green_b(s) end
+fn cyan(s: string) -> string is return cli_style::cyan(s) end
+fn cyan_b(s: string) -> string is return cli_style::cyan_b(s) end
+fn yellow(s: string) -> string is return cli_style::yellow(s) end
+fn yellow_b(s: string) -> string is return cli_style::yellow_b(s) end
+fn red_b(s: string) -> string is return cli_style::red_b(s) end
+fn red(s: string) -> string is return cli_style::red(s) end
+
+fn cli_join(parts: [string], sep: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < parts.len() is
+        if i > 0 is sb.push(sep) end
+        sb.push(parts[i])
+        i += 1
+    end
+    return sb.build()
+end
+
+;; `h# __lsp-job ...` (hidden): one LSP request answered by a short-lived worker, see source-code/lsp/src/langserver.h#
+pub fn lsp_job(args: [string]) -> int is
+    return langserver::job(args)
+end
+
+fn die(msg: string) is
+    eprint(red_b("Error:") + " " + msg + "\n")
+    exit(1)
+end
+
+;; ── small helpers ─────────────────────────────────────────────────────────────
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+fn trim_s(s: string) -> string is
+    let mut a: int = 0
+    let mut e: int = s.len()
+    while a < e && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 13) is a += 1 end
+    while e > a && (byte_at(s, e - 1) == 32 || byte_at(s, e - 1) == 9 || byte_at(s, e - 1) == 13) is e -= 1 end
+    return s[a..e]
+end
+
+fn index_of(s: string, needle: string) -> int is
+    let n: int = needle.len()
+    let mut i: int = 0
+    while i + n <= s.len() is
+        if s[i..i + n] == needle is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn lower(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        out += str_from_byte(if c >= 65 && c <= 90 is c + 32 else c end)
+        i += 1
+    end
+    return out
+end
+
+fn sh_quote(s: string) -> string is
+    let mut out: string = "'"
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 39 is out += "'\\''" else out += str_from_byte(c) end
+        i += 1
+    end
+    return out + "'"
+end
+
+fn dir_of(path: string) -> string is
+    let mut i: int = path.len() - 1
+    while i >= 0 is
+        if byte_at(path, i) == 47 is return path[0..i] end
+        i -= 1
+    end
+    return ""
+end
+
+fn file_stem(path: string) -> string is
+    let mut a: int = path.len()
+    while a > 0 && byte_at(path, a - 1) != 47 is a -= 1 end
+    let name: string = path[a..path.len()]
+    let mut e: int = name.len() - 1
+    while e > 0 is
+        if byte_at(name, e) == 46 is return name[0..e] end
+        e -= 1
+    end
+    return name
+end
+
+fn out_line(s: string) is
+    write(s)
+end
+
+;; ── stage0 delegation ─────────────────────────────────────────────────────────
+fn stage0() -> string is
+    let e: string = env::get("HSHARP_STAGE0")
+    if e != "" is return e end
+    let me: string = env::args()[0]
+    let d: string = dir_of(me)
+    ;; bin/hsharp (this binary) delegates to bin/stage0/hsharp (the Rust transpiler); never to itself
+    if d != "" && fs::exists(d + "/stage0/hsharp") is return d + "/stage0/hsharp" end
+    return "hsharp-stage0"
+end
+
+;; run the stage0 CLI with `args` (stdio inherited) and exit with its status
+fn delegate(args: [string], edition_flag: string) is
+    let mut parts: [string] = [sh_quote(stage0())]
+    if edition_flag != "" is
+        parts.push("--edition")
+        parts.push(sh_quote(edition_flag))
+    end
+    for a in args is parts.push(sh_quote(a)) end
+    let status: int = system(cli_join(parts, " "))
+    exit((status / 256) % 256)
+end
+
+;; ── editions (edition_cmd.rs) ─────────────────────────────────────────────────
+fn latest_edition() -> string is return "2026" end
+fn edition_summary() -> string is
+    return "baseline syntax: `is … end` blocks, `use \"std -> x\"`, `@: mode`, hlib/bit/workspace imports"
+end
+
+;; Err(message) reproduces `Edition::parse`'s message + hints
+fn edition_error(raw: string) -> string is
+    let t: string = trim_s(raw)
+    let mut digits: bool = t.len() == 4
+    let mut i: int = 0
+    while i < t.len() is
+        if byte_at(t, i) < 48 || byte_at(t, i) > 57 is digits = false end
+        i += 1
+    end
+    let supported: string = "supported editions: " + latest_edition()
+    if !digits is
+        return "invalid edition `" + raw + "` in `using` declaration (expected a four-digit year, e.g. \"" + latest_edition() + "\")\n  hint: write it as `using \"" + latest_edition() + "\"`; " + supported
+    end
+    if t == latest_edition() is return "" end
+    if to_int(t) > to_int(latest_edition()) is
+        return "edition \"" + t + "\" is newer than this H# toolchain (v" + version() + ") understands\n  hint: upgrade H# (`hsharp --version` shows v" + version() + "), or change the file to `using \"" + latest_edition() + "\"`; this file was written for edition " + t + "; " + supported
+    end
+    return "edition \"" + t + "\" is no longer supported by this H# toolchain (v" + version() + ")\n  hint: migrate the file to `using \"" + latest_edition() + "\"`; " + supported
+end
+
+;; nearest directory (walking up from `start`) holding a Bit.hk / bit.hk; "" if none
+fn abspath(p: string) -> string is
+    let full: string = if starts_with(p, "/") is p else fs::cwd() + "/" + p end
+    let mut parts: [string] = []
+    for seg in string_split(full, "/") is
+        if seg == "" || seg == "." is continue end
+        if seg == ".." is
+            if parts.len() > 0 is
+                let mut kept: [string] = []
+                let mut i: int = 0
+                while i < parts.len() - 1 is
+                    kept.push(parts[i])
+                    i += 1
+                end
+                parts = kept
+            end
+            continue
+        end
+        parts.push(seg)
+    end
+    return "/" + cli_join(parts, "/")
+end
+
+fn manifest_dir(start: string) -> string is
+    let mut d: string = start
+    if d == "" is d = "." end
+    if fs::is_file(d) is d = dir_of(d) end
+    if d == "" is d = "." end
+    let mut depth: int = 0
+    while depth < 12 is
+        if fs::exists(d + "/Bit.hk") || fs::exists(d + "/bit.hk") is return d end
+        if d == "/" || d == "" is return "" end
+        let p: string = if d == "." is ".." else d + "/.." end
+        if !fs::is_dir(p) is return "" end
+        d = p
+        depth += 1
+    end
+    return ""
+end
+
+fn hk_unquote(v: string) -> string is
+    let s: string = trim_s(v)
+    if s.len() >= 2 && (byte_at(s, 0) == 34 || byte_at(s, 0) == 39) && byte_at(s, s.len() - 1) == byte_at(s, 0) is return s[1..s.len() - 1] end
+    return s
+end
+
+;; value of `-> key => value` in [section] (top-level keys only), "" if absent
+fn hk_get(content: string, want_section: string, want_key: string) -> string is
+    let mut section: string = ""
+    for raw in string_split(content, "\n") is
+        let line: string = trim_s(raw)
+        if line == "" || starts_with(line, "!") || starts_with(line, ";;") is continue end
+        if starts_with(line, "[") && ends_with(line, "]") is
+            section = lower(trim_s(line[1..line.len() - 1]))
+            continue
+        end
+        let mut dashes: int = 0
+        while dashes < line.len() && byte_at(line, dashes) == 45 is dashes += 1 end
+        if dashes != 1 || dashes >= line.len() || byte_at(line, dashes) != 62 is continue end
+        let rest: string = trim_s(line[dashes + 1..line.len()])
+        let eq: int = index_of(rest, "=>")
+        if eq < 0 is continue end
+        if section == want_section && trim_s(rest[0..eq]) == want_key is
+            return hk_unquote(rest[eq + 2..rest.len()])
+        end
+    end
+    return ""
+end
+
+fn lang_is_hsharp(content: string) -> bool is
+    let mut raw: string = hk_get(content, "package", "lang")
+    if raw == "" is raw = hk_get(content, "project", "lang") end
+    if raw == "" is raw = hk_get(content, "build", "lang") end
+    if raw == "" is return false end
+    for part in string_split(raw, ",") is
+        let mut t: string = ""
+        let l: string = lower(part)
+        let mut i: int = 0
+        while i < l.len() is
+            let c: int = byte_at(l, i)
+            if c != 32 && c != 45 && c != 95 && c != 34 && c != 39 && c != 91 && c != 93 is t += str_from_byte(c) end
+            i += 1
+        end
+        if t == "h#" || t == "hsharp" || t == "hsh" || t == "hs#" is return true end
+    end
+    return false
+end
+
+;; result: edition + where it came from; error message in `err` (exit code 2 in `init`)
+pub struct EditionInfo is
+    pub edition: string
+    pub source: string
+    pub err: string
+end
+
+fn describe_source(s: string) -> string is
+    if s == "flag" is return "--edition flag" end
+    if s == "env" is return "HSHARP_EDITION" end
+    if s == "bit" is return "Bit.hk [edition]" end
+    return "newest known edition"
+end
+
+fn resolve_edition(flag: string, envv: string, anchor: string) -> EditionInfo is
+    if flag != "" is
+        let m: string = edition_error(flag)
+        if m != "" is return EditionInfo { edition: "", source: "", err: "--edition " + flag + ": " + m } end
+        return EditionInfo { edition: trim_s(flag), source: "flag", err: "" }
+    end
+    let ev: string = trim_s(envv)
+    if ev != "" is
+        let m: string = edition_error(ev)
+        if m != "" is return EditionInfo { edition: "", source: "", err: "HSHARP_EDITION=" + ev + ": " + m } end
+        return EditionInfo { edition: ev, source: "env", err: "" }
+    end
+    let d: string = manifest_dir(anchor)
+    if d != "" is
+        let ad: string = abspath(d)
+        let mf: string = if fs::exists(ad + "/Bit.hk") is ad + "/Bit.hk" else ad + "/bit.hk" end
+        let content: string = fs::read(mf)
+        if lang_is_hsharp(content) is
+            let raw: string = hk_get(content, "edition", "edition")
+            if raw != "" is
+                let m: string = edition_error(raw)
+                if m != "" is
+                    return EditionInfo { edition: "", source: "", err: mf + ": [edition] -> edition => " + raw + ": " + m }
+                end
+                return EditionInfo { edition: trim_s(raw), source: "bit", err: "" }
+            end
+        end
+    end
+    return EditionInfo { edition: latest_edition(), source: "latest", err: "" }
+end
+
+fn cmd_editions(info: EditionInfo) is
+    out_line(bold("Supported H# editions:"))
+    let mark: string = if latest_edition() == info.edition is "*" else " " end
+    out_line("  " + mark + " " + cyan_b(latest_edition()) + "  " + green("stable") + " (latest)  " + dim(edition_summary()))
+    out_line("")
+    out_line("  " + bold("default for files without `using`:") + " " + cyan(info.edition) + "  " + dim("(from " + describe_source(info.source) + ")"))
+    out_line(dim("  pick one per file:      using \"2026\""))
+    out_line(dim("  pick one per run:       h# compile main.h# --edition 2026   (or HSHARP_EDITION=2026)"))
+    out_line(dim("  pick one per project:   Bit.hk  [edition] -> edition => 2026   (needs lang => h#)"))
+end
+
+;; ── docs ──────────────────────────────────────────────────────────────────────
+fn cmd_docs() is
+    let url: string = "https://hackeros-linux-system.github.io/HackerOS-Website/h-sharp/docs.html"
+    let q: string = sh_quote(url)
+    let mut status: int = 1
+    if env::get("TERMUX_VERSION") != "" is
+        status = system("termux-open-url " + q + " >/dev/null 2>&1")
+    else
+        status = system("xdg-open " + q + " >/dev/null 2>&1")
+    end
+    if status == 0 is
+        out_line(green_b("Opened docs:") + " " + dim(url))
+    else
+        out_line(yellow("Couldn't open a browser automatically. Docs are here:"))
+        out_line("  " + cyan(url))
+    end
+end
+
+;; ── fmt (fmt.rs `run`) ────────────────────────────────────────────────────────
+fn collect_sources() -> [string] is
+    let mut out: [string] = []
+    for p in fs::walk(".") is
+        if (ends_with(p, ".h#") || ends_with(p, ".hsp") || ends_with(p, ".h-sharp")) && !starts_with(p, "./build") is out.push(p) end
+    end
+    return out
+end
+
+fn cmd_fmt(files: [string], check: bool) -> int is
+    let mut targets: [string] = files
+    if targets.len() == 0 is targets = collect_sources() end
+    if targets.len() == 0 is
+        die("no .h# files found")
+    end
+    let mut changed: int = 0
+    let mut unchanged: int = 0
+    for path in targets is
+        if !fs::exists(path) is die("cannot read `" + path + "`: No such file or directory (os error 2)") end
+        let src: string = fs::read(path)
+        let formatted: string = fmt::format_source(src)
+        if formatted == src is
+            unchanged += 1
+            continue
+        end
+        if check is
+            out_line(yellow_b("would reformat:") + " " + path)
+            changed += 1
+            continue
+        end
+        fs::write(path, formatted)
+        out_line(green_b("reformatted:") + " " + path)
+        changed += 1
+    end
+    let verb: string = if check is "would reformat" else "reformatted" end
+    out_line("\n" + verb + " " + to_string(changed) + " file(s), " + to_string(unchanged) + " already formatted")
+    if check && changed > 0 is return 1 end
+    return 0
+end
+
+;; ── new (new.rs) ──────────────────────────────────────────────────────────────
+fn json_str(s: string) -> string is
+    return hlib::jstr_pub(s)
+end
+
+fn cmd_new(name: string, template: string) is
+    out_line(cyan_b("Creating:") + " H# project `" + name + "`")
+    if fs::exists(name) is die("directory `" + name + "` already exists") end
+    hlib::make_dirs(name + "/src")
+    hlib::make_dirs(name + "/build")
+    hlib::make_dirs(name + "/tests")
+    ;; serde_json::json! keeps keys sorted
+    fs::write(name + "/h#.json", "\{\n  \"dependencies\": \{},\n  \"name\": " + json_str(name) + ",\n  \"template\": " + json_str(template) + ",\n  \"version\": \"0.1.0\"\n}")
+    fs::write(name + "/.gitignore", "build/\n*.c\n.cache/\ncache/\n.bit/\n")
+
+    let is_lib: bool = template == "lib"
+    let mut bit: string = "[package]\n-> name        => " + name + "\n-> version     => 0.1.0\n-> lang        => h#\n\n"
+    bit += "! default edition for files without `using \"<year>\"` (only read for lang => h#)\n[edition]\n-> edition => 2026\n\n"
+    bit += "[layout]\n-> src => src\n"
+    if is_lib is bit += "-> hsharp-lib-entry => src/main.h#\n" end
+    bit += "\n[build]\n-> link => static\n"
+    if is_lib is bit += "\n[lib]\n-> output => hlib\n" end
+    bit += "\n! what a bare `bit` / `bit build` does\n[default-build]\n-> profile => release\n-> emit    => " + (if is_lib is "hlib" else "bin" end) + "\n\n"
+    bit += "! libraries: `bit add <name>` installs one and records it here;\n! use it in code with:  use \"bit -> <name>\"\n[dependencies]\n"
+    fs::write(name + "/Bit.hk", bit)
+
+    let mut main_src: string = cli_templates::template_app()
+    let mut readme: string = cli_templates::readme_app()
+    let mut test_src: string = cli_templates::test_app()
+    if template == "cybersec" || template == "security" is
+        main_src = cli_templates::template_cybersec()
+        readme = cli_templates::readme_cybersec()
+        test_src = cli_templates::test_cybersec()
+    elsif template == "net" || template == "network" is
+        main_src = cli_templates::template_network()
+        readme = cli_templates::readme_network()
+        test_src = cli_templates::test_network()
+    elsif template == "lib" is
+        main_src = cli_templates::template_lib()
+        readme = cli_templates::readme_lib()
+        test_src = cli_templates::test_lib()
+    elsif template == "web" is
+        main_src = cli_templates::template_web()
+        readme = cli_templates::readme_web()
+        test_src = cli_templates::test_web()
+    elsif template == "tui" is
+        main_src = cli_templates::template_tui()
+        readme = cli_templates::readme_tui()
+        test_src = cli_templates::test_tui()
+    elsif template == "wasm" is
+        main_src = cli_templates::template_wasm()
+        readme = cli_templates::readme_wasm()
+        test_src = cli_templates::test_wasm()
+    end
+    ;; every generated source states its edition right after the template's first line
+    let nl: int = index_of(main_src, "\n")
+    main_src = main_src[0..nl] + "\nusing \"2026\"\n\n" + main_src[nl + 1..main_src.len()]
+    fs::write(name + "/src/main.h#", main_src)
+    fs::write(name + "/README.md", readme)
+    fs::write(name + "/tests/main_test.h#", test_src)
+
+    out_line("\n  " + green_b("Created:") + " " + name + "/")
+    out_line("  " + green("Created:") + " " + name + "/src/main.h#")
+    out_line("  " + green("Created:") + " " + name + "/tests/main_test.h#")
+    out_line("  " + green("Created:") + " " + name + "/README.md")
+    out_line("  " + green("Created:") + " " + name + "/h#.json")
+    out_line("  " + green("Created:") + " " + name + "/Bit.hk")
+    out_line("\n  " + bold("Get started:"))
+    out_line("    cd " + name)
+    out_line("    h# run src/main.h#        # compile + run")
+    out_line("    h# compile src/main.h#    # compile to native binary")
+    out_line("    bit                       # build with bit (reads Bit.hk)")
+    out_line("    bit check                 # syntax + type check")
+    out_line("    bit add <lib>             # add a library, then: use \"bit -> <lib>\"")
+end
+
+;; ── lib inspect | verify | keygen | bind (hlib_cmd.rs) ───────────────────────────
+fn open_archive(file: string) -> hlib::HlibArchive is
+    match hlib::archive_open(file) is
+        option::Result::Ok(a) => is return a end
+        option::Result::Err(e) => is die(e) end
+    end
+    return hlib::HlibArchive { manifest: hlib::empty_manifest(), entries: [] }
+end
+
+fn kind_debug(k: string) -> string is
+    if k == "shared_object" is return "SharedObject" end
+    if k == "bytecode" is return "Bytecode" end
+    if k == "ast" is return "Ast" end
+    if k == "header" is return "Header" end
+    return "Extra"
+end
+
+fn pad_right(s: string, w: int) -> string is
+    let mut out: string = s
+    while out.len() < w is out += " " end
+    return out
+end
+
+fn cmd_inspect(file: string) is
+    let a: hlib::HlibArchive = open_archive(file)
+    let m: hlib::Manifest = a.manifest
+    out_line(bold("hlib:") + " " + m.name + " v" + m.version + " (" + m.language + ")")
+    out_line("  spec version:     " + to_string(m.spec_version))
+    out_line("  abi version:      " + to_string(m.abi_version))
+    out_line("  built by:         " + m.language + " " + m.language_version)
+    if m.language == "hsharp" is out_line("  edition:          " + m.edition) end
+    out_line("  created at:       " + m.created_at)
+    if m.description != "" is out_line("  description:      " + m.description) end
+    out_line("  signed:           " + (if m.signed is "yes" else "no" end))
+    if m.signed is out_line("    public key:     " + m.sig_public_key) end
+    out_line("  artifacts (" + to_string(m.artifacts.len()) + "):")
+    for x in m.artifacts is
+        out_line("    " + pad_right(kind_debug(x.kind), 10) + " " + pad_right(x.path, 45) + " " + to_string(x.size) + " bytes  sha256:" + x.sha256[0..16])
+    end
+    out_line("  exports (" + to_string(m.exports.len()) + "):")
+    for e in m.exports is
+        out_line("    " + e.signature + (if e.generic is "  [generic — AST only]" else "" end))
+    end
+end
+
+fn cmd_verify(file: string, pubkey: string) is
+    let a: hlib::HlibArchive = open_archive(file)
+    match hlib::verify_checksums(a) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is die("checksum verification failed: " + e) end
+    end
+    out_line(green_b("✓") + " checksums OK (" + to_string(a.manifest.artifacts.len()) + " entries)")
+    if pubkey != "" is
+        match hlib::verify_signature(a, pubkey) is
+            option::Result::Ok(_) => is end
+            option::Result::Err(e) => is die("signature verification failed: " + e) end
+        end
+        out_line(green_b("✓") + " signature OK (public key " + (if pubkey.len() > 16 is pubkey[0..16] else pubkey end) + "…)")
+    else
+        out_line(yellow_b("!") + " no --pubkey given — skipped signature verification (archive signed: " + (if a.manifest.signed is "true" else "false" end) + ")")
+    end
+end
+
+fn cmd_keygen(out: string) is
+    let kp: hlib::KeyPair = hlib::generate_keypair()
+    fs::write(out, kp.signing_hex)
+    chmod(out, 384)                       ;; 0o600
+    out_line(green_b("✓") + " secret signing key written to " + out + " (keep it private!)")
+    out_line("  public key (share this / commit it to your trust store):")
+    out_line("  " + bold(kp.verifying_hex))
+end
+
+fn cmd_bind(file: string, into: string) is
+    let a: hlib::HlibArchive = open_archive(file)
+    match hlib::verify_checksums(a) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is die("checksum verification failed: " + e) end
+    end
+    hlib::make_dirs(into)
+    match hlib::extract_to_dir(a, into) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is die(e) end
+    end
+    let m: hlib::Manifest = a.manifest
+    let mut stub: string = "// Auto-generated by `h# lib bind` from " + file + "\n"
+    stub += "// " + m.name + " v" + m.version + " (" + m.language + ") — do not edit by hand, re-run `h# lib bind` instead.\n\n"
+    let mut so_path: string = ""
+    for x in m.artifacts is
+        if so_path == "" && x.kind == "shared_object" is so_path = x.path end
+    end
+    if so_path != "" is
+        stub += "extern dynamic [rust, \"" + into + "/" + so_path + "\"] is\n"
+        for e in m.exports is
+            if !e.generic && e.kind == "function" is stub += "    " + e.signature + "\n" end
+        end
+        stub += "end\n"
+    end
+    let mut generic_names: [string] = []
+    for e in m.exports is
+        if e.generic is generic_names.push(e.name) end
+    end
+    if generic_names.len() > 0 is
+        stub += "\n// The following exports carry unresolved type parameters and are only\n// available via the AST artifact — see " + into + "/ast/" + m.name + ".ast.json.\n"
+        stub += "// H# does not yet auto-splice these into your module; for now, copy the\n// relevant source from the AST (or from the producer's own source) directly:\n// " + cli_join(generic_names, ", ") + "\n"
+    end
+    let stub_path: string = into + "/" + m.name + "_hlib_bind.h#"
+    fs::write(stub_path, stub)
+    out_line(green_b("✓") + " extracted " + to_string(m.artifacts.len()) + " artifact(s) to " + into)
+    out_line("  generated binding: " + bold(stub_path))
+    out_line("  use it with:       mod " + m.name + "_hlib_bind;")
+end
+
+;; ── dispatcher (main.rs) ──────────────────────────────────────────────────────
+fn usage() -> string is
+    return cli_style::help(cli_help::help_main())
+end
+
+fn lib_usage() -> string is
+    return cli_style::help(cli_help::help_lib())
+end
+
+;; clap's short error for an unknown subcommand (`path` = "h#" or "h# lib")
+fn unknown_subcommand(name: string, path: string, opts: string) -> string is
+    return "error: unrecognized subcommand '" + name + "'\n\nUsage: " + path + " " + opts + "<COMMAND>\n\nFor more information, try '--help'.\n"
+end
+
+;; value of `--long X` / `--long=X` / `-s X` at args[i]; returns "" when args[i] is not that option
+fn opt_value(args: [string], i: int, long_name: string, short_name: string) -> string is
+    let a: string = args[i]
+    if a == long_name || (short_name != "" && a == short_name) is
+        if i + 1 < args.len() is return args[i + 1] end
+        die("a value is required for '" + a + "' but none was supplied")
+    end
+    if starts_with(a, long_name + "=") is return a[long_name.len() + 1..a.len()] end
+    return ""
+end
+
+fn is_opt(a: string, long_name: string, short_name: string) -> bool is
+    return a == long_name || (short_name != "" && a == short_name) || starts_with(a, long_name + "=")
+end
+
+fn banner(info: EditionInfo) is
+    out_line(cyan_b("  H# v" + version() + "  LLVM backend  (default edition " + info.edition + ")"))
+    out_line("")
+end
+
+;; ── lib build (hlib_cmd.rs::cmd_build) — native ──────────────────────────────
+fn cmd_lib_build(rest: [string], year: int) -> int is
+    let mut file: string = ""
+    let mut output: string = ""
+    let mut lib_version: string = "0.1.0"
+    let mut target_s: string = ""
+    let mut sign: string = ""
+    let mut release: bool = false
+    let mut i: int = 0
+    while i < rest.len() is
+        let a: string = rest[i]
+        if is_opt(a, "--output", "-o") is
+            output = opt_value(rest, i, "--output", "-o")
+            if a == "--output" || a == "-o" is i += 1 end
+        elsif is_opt(a, "--lib-version", "") is
+            lib_version = opt_value(rest, i, "--lib-version", "")
+            if a == "--lib-version" is i += 1 end
+        elsif is_opt(a, "--target", "-t") is
+            target_s = opt_value(rest, i, "--target", "-t")
+            if a == "--target" || a == "-t" is i += 1 end
+        elsif is_opt(a, "--sign", "") is
+            sign = opt_value(rest, i, "--sign", "")
+            if a == "--sign" is i += 1 end
+        elsif a == "--release" is release = true
+        elsif starts_with(a, "-") is return unexpected(a, "Usage: h# lib build [OPTIONS] <FILE>")
+        else file = a end
+        i += 1
+    end
+    if file == "" is
+        eprint("error: the following required arguments were not provided:\n  <FILE>\n\nUsage: h# lib build [OPTIONS] <FILE>\n\nFor more information, try '--help'.\n")
+        return 2
+    end
+    let stem: string = file_stem(file)
+    let mut out_hlib: string = output
+    if out_hlib == "" is out_hlib = "build/" + stem + ".hlib" end
+    let mut out_parent: string = parent_dir(out_hlib)
+    if out_parent == "" is out_parent = "." end
+    mkdir_p(out_parent)
+    let mut triple: target::TargetTriple = target::host()
+    if target_s != "" is
+        let tl: target::TargetLookup = target::from_str(target_s)
+        if !tl.found is return die_ret("unknown target `" + target_s + "`. Run `h# targets` to list them.") end
+        triple = tl.target
+    end
+    if !fs::exists(file) is return die_ret("cannot read `" + file + "`: No such file or directory (os error 2)") end
+    let source: string = fs::read(file)
+    let rec: edition::EditionRecorder = edition::new_recorder()
+    let st: edition::EditionState = edition::new_state()
+    edition::start_recording(rec)
+    let r: parser::ParseResult = parser::parse_with_default(source, file, year, rec, st)
+    if parser::has_errors(r) is
+        eprint(parser::render_errors(r) + "\n")
+        return die_ret("parsing failed.")
+    end
+    let res: modules::Resolver = modules::new_resolver(file, [], rec, st)
+    let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(file))
+    if !e.ok is return die_ret(e.err) end
+    let recs: [edition::EditionRecord] = edition::take_records(rec)
+    let mut lib_edition: string = to_string(year)
+    if recs.len() > 0 is lib_edition = to_string(recs[0].year) end
+    if lib_edition == "0" is lib_edition = latest_edition() end
+    let note: string = edition::describe_mix(recs)
+    if note != "" is eprint(yellow(trim_s(note)) + "\n") end
+    let module: ast::Node = ast::nd("Module", r.module.text, [r.module.kids[0], r.module.kids[1], r.module.kids[2], ast::nd("Items", "", e.items)])
+
+    let tmp_stem: string = out_parent + "/.hlib-" + stem
+    let opts: options::CompileOptions = options::CompileOptions { target: triple, optimize: release, static_link: true, debug_info: false,
+        output: tmp_stem, output_kind: "SharedLib", default_mem_mode: "", strict_memory: false, save_cpp: false, test_mode: false, verbose: false }
+    out_line("  " + green_b("Compiling:") + " " + file + " (target: " + triple.llvm_triple + ")")
+    let cr: pipeline::CompileResult = pipeline::compile(module, source, file, opts)
+    if !cr.ok is
+        if cr.diag is return die_ret("compilation failed (type errors above).") end
+        return die_ret(cr.err)
+    end
+    let so_path: string = tmp_stem + options::file_suffix("SharedLib", triple)
+    let mut so_bytes: hlib::Buf = hlib::buf_new(0)
+    match hlib::read_file(so_path) is
+        option::Result::Ok(b) => is so_bytes = b end
+        option::Result::Err(er) => is return die_ret("compiled .so vanished at `" + so_path + "`: " + er) end
+    end
+
+    let summary: hlib_export::ExportSummary = hlib_export::summarize_exports(e.items)
+    let header_json: string = hlib::exports_json(summary.symbols)
+    let ast_json: string = hlib_export::ast_encode(summary.pub_items)
+    let mut generic_count: int = 0
+    for sy in summary.symbols is
+        if sy.generic is generic_count += 1 end
+    end
+    out_line("  " + green_b("Exports:") + " " + to_string(summary.symbols.len()) + " export(s) (" + to_string(generic_count) + " generic — carried via AST only)")
+
+    let b: hlib::HlibBuilder = hlib::builder_new(stem, lib_version, "hsharp")
+    b.language_version = version()
+    b.edition = lib_edition
+    match hlib::add_shared_object(b, triple.llvm_triple, so_bytes) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(er) => is return die_ret(er) end
+    end
+    match hlib::add_header(b, hlib::buf_from_str(header_json)) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(er) => is return die_ret(er) end
+    end
+    if summary.pub_items.len() > 0 is
+        match hlib::add_ast(b, hlib::buf_from_str(ast_json)) is
+            option::Result::Ok(_) => is end
+            option::Result::Err(er) => is return die_ret(er) end
+        end
+    end
+    b.exports = summary.symbols
+    let mut key_hex: string = ""
+    if sign != "" is
+        if !fs::exists(sign) is return die_ret("cannot read signing key `" + sign + "`: No such file or directory (os error 2)") end
+        key_hex = trim_s(fs::read(sign))
+    end
+    let mut mf: hlib::Manifest = hlib::empty_manifest()
+    match hlib::builder_finish(b, out_hlib, key_hex) is
+        option::Result::Ok(m) => is mf = m end
+        option::Result::Err(er) => is return die_ret(er) end
+    end
+    fs::remove(so_path)
+    let mut sg: string = ", unsigned"
+    if mf.signed is sg = ", signed" end
+    out_line(green_b("✓") + " " + file + " → " + bold(out_hlib) + " (" + to_string(mf.artifacts.len()) + " artifact(s)" + sg + ")")
+    return 0
+end
+
+fn die_ret(msg: string) -> int is
+    if print_located(msg, "CODEGEN ERROR") is return 1 end
+    eprint(red_b("Error:") + " " + msg + "\n")
+    return 1
+end
+
+fn run_lib(args: [string], edition_flag: string, info: EditionInfo) -> int is
+    if args.len() == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" is
+        out_line(lib_usage())
+        return if args.len() == 0 is 2 else 0 end
+    end
+    let sub: string = args[0]
+    let mut rest: [string] = []
+    let mut i: int = 1
+    while i < args.len() is
+        rest.push(args[i])
+        i += 1
+    end
+    if sub == "build" is
+        let mut y: int = 0
+        if info.edition != "" is y = str_to_int_cli(info.edition) end
+        return cmd_lib_build(rest, y)
+    end
+    if sub == "inspect" is
+        banner(info)
+        if rest.len() != 1 is die("usage: h# lib inspect <file.hlib>") end
+        cmd_inspect(rest[0])
+        return 0
+    end
+    if sub == "verify" is
+        banner(info)
+        let mut file: string = ""
+        let mut pubkey: string = ""
+        let mut j: int = 0
+        while j < rest.len() is
+            if is_opt(rest[j], "--pubkey", "") is
+                pubkey = opt_value(rest, j, "--pubkey", "")
+                if rest[j] == "--pubkey" is j += 1 end
+            else
+                file = rest[j]
+            end
+            j += 1
+        end
+        if file == "" is die("usage: h# lib verify <file.hlib> [--pubkey HEX]") end
+        cmd_verify(file, pubkey)
+        return 0
+    end
+    if sub == "keygen" is
+        banner(info)
+        let mut out: string = "hlib_signing.key"
+        let mut j: int = 0
+        while j < rest.len() is
+            if is_opt(rest[j], "--out", "-o") is
+                out = opt_value(rest, j, "--out", "-o")
+                if rest[j] == "--out" || rest[j] == "-o" is j += 1 end
+            end
+            j += 1
+        end
+        cmd_keygen(out)
+        return 0
+    end
+    if sub == "bind" is
+        banner(info)
+        let mut file: string = ""
+        let mut into: string = "hlibs"
+        let mut j: int = 0
+        while j < rest.len() is
+            if is_opt(rest[j], "--into", "-i") is
+                into = opt_value(rest, j, "--into", "-i")
+                if rest[j] == "--into" || rest[j] == "-i" is j += 1 end
+            else
+                file = rest[j]
+            end
+            j += 1
+        end
+        if file == "" is die("usage: h# lib bind <file.hlib> [--into DIR]") end
+        cmd_bind(file, into)
+        return 0
+    end
+    eprint(unknown_subcommand(sub, "h# lib", "[OPTIONS] "))
+    return 2
+end
+
+
+;; ── check · targets · ffi-header (native: check.rs, ffi_header.rs, the `targets` arm of main.rs) ──
+fn usage_error(msg: string, usage_line: string) -> int is
+    eprint("error: " + msg + "\n\n" + usage_line + "\n\nFor more information, try '--help'.\n")
+    return 2
+end
+
+fn unexpected(a: string, usage_line: string) -> int is
+    if starts_with(a, "-") && usage_line != "Usage: h# targets [OPTIONS]" is
+        eprint("error: unexpected argument '" + a + "' found\n\n  tip: to pass '" + a + "' as a value, use '-- " + a + "'\n\n" + usage_line + "\n\nFor more information, try '--help'.\n")
+    else
+        eprint("error: unexpected argument '" + a + "' found\n\n" + usage_line + "\n\nFor more information, try '--help'.\n")
+    end
+    return 2
+end
+
+fn has_help(rest: [string]) -> bool is
+    for r in rest is
+        if r == "-h" || r == "--help" is return true end
+    end
+    return false
+end
+
+fn cmd_targets(rest: [string], info: EditionInfo) -> int is
+    if has_help(rest) is
+        print(cli_style::help(cli_help2::help_targets()))
+        return 0
+    end
+    if rest.len() > 0 is return unexpected(rest[0], "Usage: h# targets [OPTIONS]") end
+    banner(info)
+    out_line(bold("Available cross-compilation targets:") + "\n")
+    let names: [string] = target::all_named()
+    let mut i: int = 0
+    while i + 1 < names.len() is
+        let mut pad: string = names[i]
+        while pad.len() < 25 is pad = pad + " " end
+        out_line("  " + cyan(pad) + "  " + names[i + 1])
+        i += 2
+    end
+    out_line("\n" + dim("Usage: h# compile --target linux-aarch64 src/main.h#"))
+    return 0
+end
+
+fn cmd_ffi_header_native(rest: [string], info: EditionInfo) -> int is
+    let usage_line: string = "Usage: h# ffi-header [OPTIONS] <FILE>"
+    if has_help(rest) is
+        print(cli_style::help(cli_help2::help_ffi_header()))
+        return 0
+    end
+    let mut file: string = ""
+    let mut lang: string = "c"
+    let mut i: int = 0
+    while i < rest.len() is
+        let a: string = rest[i]
+        if is_opt(a, "--lang", "-l") is
+            if a == "--lang" || a == "-l" is
+                if i + 1 >= rest.len() is
+                    eprint("error: a value is required for '--lang <LANG>' but none was supplied\n\nFor more information, try '--help'.\n")
+                    return 2
+                end
+                lang = rest[i + 1]
+                i += 1
+            else
+                lang = opt_value(rest, i, "--lang", "-l")
+            end
+        elsif starts_with(a, "-") && a != "-" is
+            return unexpected(a, usage_line)
+        elsif file == "" is
+            file = a
+        else
+            return unexpected(a, usage_line)
+        end
+        i += 1
+    end
+    if file == "" is
+        eprint("error: the following required arguments were not provided:\n  <FILE>\n\nUsage: h# ffi-header <FILE>\n\nFor more information, try '--help'.\n")
+        return 2
+    end
+    banner(info)
+    if !fs::exists(file) is
+        eprint(red_b("Error:") + " " + file + ": No such file or directory (os error 2)\n")
+        return 1
+    end
+    let src: string = fs::read(file)
+    let r: parser::ParseResult = parser::parse(src, file)
+    if parser::has_errors(r) is
+        eprint(parser::render_errors(r))
+        return 1
+    end
+    let structs: ffi::StructTable = ffi::new_struct_table()
+    let mut blocks: [ast::Node] = []
+    for it in r.module.kids[3].kids is
+        if it.tag == "Struct" is ffi::add_struct(structs, it.text, it.kids[1]) end
+        if it.tag == "Extern" is blocks.push(it) end
+    end
+    if blocks.len() == 0 is
+        out_line(yellow_b("Note:") + " no `extern` blocks found in " + file)
+        return 0
+    end
+    let l: string = lower(lang)
+    let is_rust: bool = l == "rust" || l == "rs"
+    let mut wrote: bool = false
+    for b in blocks is
+        if b.kids[0].text == "Python" is continue end
+        wrote = true
+        if is_rust is
+            out_line(ffi::rust_extern_block_with_structs(b.kids[3].kids, structs))
+        else
+            out_line(ffi::c_header_block_with_structs(b.kids[3].kids, structs))
+        end
+        out_line("")
+    end
+    if !wrote is out_line(yellow_b("Note:") + " every `extern` block in " + file + " is `[python]` — no C/Rust header to generate") end
+    return 0
+end
+
+fn ext_of(p: string) -> string is
+    let mut i: int = p.len() - 1
+    while i >= 0 is
+        let c: int = byte_at(p, i)
+        if c == 46 is return p[i + 1..p.len()] end
+        if c == 47 is return "" end
+        i -= 1
+    end
+    return ""
+end
+
+fn depth_of(p: string) -> int is
+    let mut d: int = 0
+    let mut i: int = 0
+    while i < p.len() is
+        if byte_at(p, i) == 47 is d += 1 end
+        i += 1
+    end
+    return d
+end
+
+fn find_sources() -> [string] is
+    let mut out: [string] = []
+    for p in fs::walk(".") is
+        let e: string = ext_of(p)
+        let full: string = if starts_with(p, "./") is p else "./" + p end
+        if (e == "h#" || e == "hsp" || e == "h-sharp") && !starts_with(full, "./build") && depth_of(full) <= 5 is out.push(full) end
+    end
+    return out
+end
+
+;; one file; returns the number of errors it contributed. `single` selects the single-file output style.
+fn check_one(path: string, single: bool, year: int) -> int is
+    if !fs::exists(path) is
+        eprint(red_b("Error:") + " " + path + ": No such file or directory (os error 2)\n")
+        return 1
+    end
+    let src: string = fs::read(path)
+    let rec: edition::EditionRecorder = edition::new_recorder()
+    let st: edition::EditionState = edition::new_state()
+    let r: parser::ParseResult = parser::parse_with_default(src, path, year, rec, st)
+    if parser::has_errors(r) is
+        eprint(parser::render_errors(r))
+        return r.errors.len()
+    end
+    let res: modules::Resolver = modules::new_resolver(path, [], rec, st)
+    let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(path))
+    if !e.ok is
+        eprint(red_b("Error:") + " " + path + ": " + e.err + "\n")
+        return 1
+    end
+    let m: ast::Node = ast::nd("Module", r.module.text, [r.module.kids[0], r.module.kids[1], r.module.kids[2], ast::nd("Items", "", e.items)])
+    let tc: checker::TypeChecker = checker::new_checker(path)
+    let mut diags: [diagnostics::Diag] = checker::check_module(tc, m)
+    for fd in features::check_module_features(m, "Cpp") is
+        let d: diagnostics::Diag = diagnostics::Diag { sev: "E", sp: fd.sp, file: path, msg: fd.message, hints: fd.hints }
+        diags.push(d)
+    end
+    let n: int = diagnostics::count_errors(diags)
+    if n == 0 is
+        if single is out_line("  " + green("✓") + " " + path) else out_line("  " + green_b("✓") + " " + dim(path)) end
+    else
+        diagnostics::print_diagnostics(diags, src, path)
+        if single is out_line("  " + red("✗") + " " + path + "  (" + to_string(n) + " error(s))") end
+    end
+    return n
+end
+
+fn cmd_check(rest: [string], info: EditionInfo) -> int is
+    if has_help(rest) is
+        print(cli_style::help(cli_help2::help_check()))
+        return 0
+    end
+    let mut files: [string] = []
+    for a in rest is
+        if starts_with(a, "-") && a != "-" is return unexpected(a, "Usage: h# check [OPTIONS] [FILES]...") end
+        files.push(a)
+    end
+    let single: bool = files.len() <= 1
+    if files.len() == 0 is
+        files = find_sources()
+        if files.len() == 0 is
+            eprint(red_b("Error:") + " no .h# files found\n")
+            return 1
+        end
+    end
+    let mut year: int = 0
+    if info.edition != "" is year = str_to_int_cli(info.edition) end
+    out_line(cyan_b("Checking:") + " " + to_string(files.len()) + " file(s)\n")
+    let mut total: int = 0
+    for f in files is total += check_one(f, single, year) end
+    out_line("")
+    if total == 0 is
+        if single is out_line(green_b("✓") + " No errors found.") else out_line(green_b("✓ No errors found.")) end
+        return 0
+    end
+    if single is
+        out_line(red_b("✗") + " Found " + to_string(total) + " error(s).")
+    else
+        eprint(red_b("✗") + " Found " + red(to_string(total) + " error(s)") + ".\n")
+    end
+    return 1
+end
+
+fn str_to_int_cli(s: string) -> int is
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        v = v * 10 + (byte_at(s, i) - 48)
+        i += 1
+    end
+    return v
+end
+
+;; `argv` = the program arguments after the executable name
+;; ── compile / run / test (compile.rs, run_cmd.rs) — native, no stage0 ─────────
+pub struct CompileArgs is
+    pub file: string
+    pub output: string
+    pub target: string
+    pub release: bool
+    pub no_opt: bool
+    pub debug: bool
+    pub dynamic: bool
+    pub emit_cpp: bool
+    pub emit_kind: string
+    pub verbose: bool
+    pub mem_mode: string
+    pub strict_memory: bool
+    pub test_mode: bool
+    pub save_cpp: bool
+    pub phase: string        ;; internal: "check" | "gen" (with --handoff)
+    pub handoff: string      ;; internal: frontend-only mode, writes program.cpp + meta into this directory
+end
+
+fn new_compile_args(file: string) -> CompileArgs is
+    return CompileArgs { file: file, output: "", target: "", release: false, no_opt: false, debug: false, dynamic: false,
+        emit_cpp: false, emit_kind: "", verbose: false, mem_mode: "", strict_memory: false, test_mode: false, save_cpp: false, phase: "", handoff: "" }
+end
+
+fn quiet_on() -> bool is return env::get("HSHARP_QUIET") != "" end
+
+fn mkdir_p(dir: string) is
+    if dir != "" && dir != "." is system("mkdir -p " + sh_quote(dir)) end
+end
+
+fn parent_dir(p: string) -> string is
+    let mut i: int = p.len() - 1
+    while i >= 0 is
+        if byte_at(p, i) == 47 is
+            if i == 0 is return "/" end
+            return p[0..i]
+        end
+        i -= 1
+    end
+    return ""
+end
+
+;; Rust `{:.2?}` of a Duration
+fn fmt_elapsed(ms: int) -> string is
+    if ms >= 1000 is
+        let c: int = (ms % 1000) / 10
+        let mut cs: string = to_string(c)
+        if c < 10 is cs = "0" + cs end
+        return to_string(ms / 1000) + "." + cs + "s"
+    end
+    return to_string(ms) + ".00ms"
+end
+
+fn edition_summary_of(recs: [edition::EditionRecord]) -> string is
+    let mut years: [int] = []
+    for r in recs is
+        let mut seen: bool = false
+        for y in years is
+            if y == r.year is seen = true end
+        end
+        if !seen is years.push(r.year) end
+    end
+    let mut i: int = 1
+    while i < years.len() is
+        let cur: int = years[i]
+        let mut j: int = i - 1
+        while j >= 0 && years[j] > cur is
+            years[j + 1] = years[j]
+            j -= 1
+        end
+        years[j + 1] = cur
+        i += 1
+    end
+    if years.len() == 0 is return "" end
+    if years.len() == 1 is return to_string(years[0]) end
+    let mut ps: [string] = []
+    for y in years is ps.push(to_string(y)) end
+    return cli_join(ps, " + ") + " (mixed)"
+end
+
+;; returns the process exit code (0 = built)
+fn compile_file(a: CompileArgs, year: int) -> int is
+    let t0: int = time::now_ms()
+    let src_path: string = a.file
+    let stem: string = file_stem(src_path)
+    let mut out_path: string = a.output
+    if out_path == "" is
+        mkdir_p("build")
+        out_path = "build/" + stem
+    end
+    mkdir_p(parent_dir(out_path))
+
+    let mut triple: target::TargetTriple = target::host()
+    if a.target != "" is
+        let tl: target::TargetLookup = target::from_str(a.target)
+        if !tl.found is
+            eprint(red_b("Error:") + " unknown target `" + a.target + "`. Run `h# targets` to list them.\n")
+            return 1
+        end
+        triple = tl.target
+    end
+
+    let mut kind: string = "Binary"
+    if a.emit_cpp is
+        kind = "Cpp"
+    elsif a.emit_kind != "" is
+        let kl: options::KindLookup = options::kind_from_str(a.emit_kind)
+        if !kl.found is
+            eprint(red_b("Error:") + " unknown --emit kind `" + a.emit_kind + "`. Valid: bin, obj, so, lib, cpp\n")
+            return 1
+        end
+        kind = kl.kind
+    end
+
+    if a.strict_memory is env::set("HSHARP_STRICT_MEMORY", "1") end
+    let optimize: bool = a.release && !a.no_opt
+
+    let mut mm: string = ""
+    if a.mem_mode != "" is
+        if a.mem_mode == "default" is mm = "Default"
+        elsif a.mem_mode == "safety" is mm = "Safety"
+        elsif a.mem_mode == "arc" is mm = "Arc"
+        elsif a.mem_mode == "arena" is mm = "Arena"
+        elsif a.mem_mode == "pointers" is mm = "Pointers"
+        else
+            eprint(red_b("Error:") + " unknown --mem-mode `" + a.mem_mode + "`. Valid: default, safety, arc, arena, pointers\n")
+            return 1
+        end
+    end
+
+    let opts: options::CompileOptions = options::CompileOptions { target: triple, optimize: optimize, static_link: !a.dynamic,
+        debug_info: a.debug, output: out_path, output_kind: kind, default_mem_mode: mm,
+        strict_memory: a.strict_memory || env::get("HSHARP_STRICT_MEMORY") == "1", save_cpp: a.save_cpp,
+        test_mode: a.test_mode, verbose: a.verbose }
+
+    if a.verbose && a.handoff == "" is
+        let mut mode: string = "g++ -O0 (debug)"
+        if optimize is mode = "g++ -O2 + gc-sections + strip" end
+        out_line("  " + green_b("Compiling:") + " " + src_path + " → " + out_path + target::exe_suffix(triple) + "  [" + mode + "]")
+        out_line("")
+    end
+
+    if a.handoff == "" is
+        return orchestrate(a, opts, year, t0, out_path, kind, triple, optimize)
+    end
+    return frontend_phase(a, opts, year, src_path)
+end
+
+;; ── two-process build: the frontend (parse … cppgen) runs in a child that exits and gives its memory back;
+;;    this process then only drives g++ ─────────────────────────────────────────────────────────────────
+fn args_of(a: CompileArgs) -> [string] is
+    let mut v: [string] = ["compile", a.file]
+    if a.output != "" is
+        v.push("-o")
+        v.push(a.output)
+    end
+    if a.target != "" is
+        v.push("--target")
+        v.push(a.target)
+    end
+    if a.release is v.push("--release") end
+    if a.no_opt is v.push("--no-opt") end
+    if a.debug is v.push("--debug") end
+    if a.dynamic is v.push("--dynamic") end
+    if a.emit_cpp is v.push("--emit-cpp") end
+    if a.emit_kind != "" is
+        v.push("--emit")
+        v.push(a.emit_kind)
+    end
+    if a.verbose is v.push("--verbose") end
+    if a.mem_mode != "" is
+        v.push("--mem-mode")
+        v.push(a.mem_mode)
+    end
+    if a.strict_memory is v.push("--strict-memory") end
+    if a.save_cpp is v.push("--save-cpp") end
+    if a.test_mode is v.push("--test-mode") end
+    return v
+end
+
+fn meta_get(meta: [string], key: string) -> [string] is
+    for line in meta is
+        let parts: [string] = line.split("\t")
+        if parts.len() > 0 && parts[0] == key is
+            let mut out: [string] = []
+            let mut i: int = 1
+            while i < parts.len() is
+                if parts[i] != "" is out.push(parts[i]) end
+                i += 1
+            end
+            return out
+        end
+    end
+    return []
+end
+
+;; "codegen: path:12:5: message" (or without the prefix) -> [path, line, col, message]; [] when it has no location
+fn split_loc(err: string) -> [string] is
+    let mut e: string = err
+    if starts_with(e, "codegen: ") is e = e[9..e.len()] end
+    let mut i: int = 0
+    while i < e.len() is
+        if byte_at(e, i) == 58 is
+            let mut j: int = i + 1
+            while j < e.len() && byte_at(e, j) >= 48 && byte_at(e, j) <= 57 is j += 1 end
+            if j > i + 1 && j < e.len() && byte_at(e, j) == 58 is
+                let mut k: int = j + 1
+                while k < e.len() && byte_at(e, k) >= 48 && byte_at(e, k) <= 57 is k += 1 end
+                if k > j + 1 && k + 1 < e.len() && byte_at(e, k) == 58 is
+                    return [e[0..i], e[i + 1..j], e[j + 1..k], trim_s(e[k + 1..e.len()])]
+                end
+            end
+        end
+        i += 1
+    end
+    let none: [string] = []
+    return none
+end
+
+;; prints a located error like a syntax error (snippet + caret); false when it cannot be located
+fn print_located(err: string, title: string) -> bool is
+    let parts: [string] = split_loc(err)
+    if parts.len() != 4 is return false end
+    if !fs::is_file(parts[0]) || !ends_with(parts[0], ".h#") is return false end   ;; never frame g++ errors in generated C++
+    let line: int = to_int(parts[1])
+    let col: int = to_int(parts[2])
+    let pe: error::ParseError = error::new_error("Custom", parts[0], line, col, 0, line, col + 1, 0, parts[3], [])
+    eprint(error::render_titled(pe, fs::read(parts[0]), title) + "\n")
+    return true
+end
+
+fn frontend_phase(a: CompileArgs, opts: options::CompileOptions, year: int, src_path: string) -> int is
+    if !fs::exists(src_path) is
+        eprint(red_b("Error:") + " cannot read `" + src_path + "`: No such file or directory (os error 2)\n")
+        return 1
+    end
+    let source: string = fs::read(src_path)
+
+    let rec: edition::EditionRecorder = edition::new_recorder()
+    let st: edition::EditionState = edition::new_state()
+    edition::start_recording(rec)
+    let r: parser::ParseResult = parser::parse_with_default(source, src_path, year, rec, st)
+    if parser::has_errors(r) is
+        eprint(parser::render_errors(r) + "\n")
+        eprint(red_b("✗") + " parsing failed.\n")
+        return 1
+    end
+    let res: modules::Resolver = modules::new_resolver(src_path, [], rec, st)
+    let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(src_path))
+    if !e.ok is
+        eprint(red_b("Error:") + " " + e.err + "\n")
+        return 1
+    end
+    let module: ast::Node = ast::nd("Module", r.module.text, [r.module.kids[0], r.module.kids[1], r.module.kids[2], ast::nd("Items", "", e.items)])
+
+    let recs: [edition::EditionRecord] = edition::take_records(rec)
+    if a.verbose && a.phase == "check" is
+        for er in recs is
+            let mut tag: string = ""
+            if !er.declared is tag = "  (default)" end
+            out_line("  " + dim("edition") + " " + cyan(to_string(er.year)) + "  " + dim(er.file + tag))
+        end
+    end
+    let note: string = edition::describe_mix(recs)
+    if note != "" is eprint(yellow(trim_s(note)) + "\n") end
+    let ed_summary: string = edition_summary_of(recs)
+
+    if a.phase == "check" is
+        let cr: pipeline::FrontOut = pipeline::check_phase(module, source, src_path, opts)
+        if cr.ok is return 0 end
+        if cr.diag is return 4 end
+        fs::write(a.handoff + "/err", cr.err)
+        return 3
+    end
+    let fr: pipeline::FrontOut = pipeline::gen_phase(module, opts)
+    if !fr.ok is
+        if fr.diag is return 4 end
+        if print_located(fr.err, "CODEGEN ERROR") is return 4 end
+        fs::write(a.handoff + "/err", fr.err)
+        return 3
+    end
+    fs::write(a.handoff + "/program.cpp", fr.cpp)
+    let link: ffi_linker::LinkFlags = fr.link
+    let mut meta: [string] = []
+    let mut hm: string = "0"
+    if fr.has_main is hm = "1" end
+    meta.push("has_main\t" + hm)
+    meta.push("static_libs\t" + cli_join(link.static_libs, "\t"))
+    meta.push("dynamic_libs\t" + cli_join(link.dynamic_libs, "\t"))
+    meta.push("rust_whole_archive_libs\t" + cli_join(link.rust_whole_archive_libs, "\t"))
+    meta.push("pkg_config_args\t" + cli_join(link.pkg_config_args, "\t"))
+    meta.push("rpath_hints\t" + cli_join(link.rpath_hints, "\t"))
+    meta.push("python_notes\t" + cli_join(link.python_notes, "\t"))
+    meta.push("diagnostics\t" + cli_join(link.diagnostics, "\t"))
+    meta.push("ed_summary\t" + ed_summary)
+    meta.push("link_desc\t" + ffi_linker::describe_flags(ffi_linker::collect_link_flags(r.module)))
+    fs::write(a.handoff + "/meta", cli_join(meta, "\n"))
+    return 0
+end
+
+fn orchestrate(a: CompileArgs, opts: options::CompileOptions, year: int, t0: int, out_path: string, kind: string, triple: target::TargetTriple, optimize: bool) -> int is
+    let dir: string = env::temp_dir() + "/hsharp_fe_" + to_string(os::pid())
+    system("rm -rf " + sh_quote(dir))
+    mkdir_p(dir)
+    let mut parts: [string] = ["HSHARP_EDITION=" + sh_quote(to_string(year)), "/proc/" + to_string(os::pid()) + "/exe"]
+    if year == 0 is parts = ["/proc/" + to_string(os::pid()) + "/exe"] end
+    for x in args_of(a) is parts.push(sh_quote(x)) end
+    parts.push("--handoff")
+    parts.push(sh_quote(dir))
+    let base: string = cli_join(parts, " ")
+    let t_chk: int = time::now_ms()
+    let mut code: int = (system(base + " --phase check") / 256) % 256
+    if a.verbose is out_line("  " + dim("front-end check:") + " " + fmt_elapsed(time::now_ms() - t_chk)) end
+    let t_gen: int = time::now_ms()
+    if code == 0 is code = (system(base + " --phase gen") / 256) % 256 end
+    if a.verbose is out_line("  " + dim("C++ generation:") + " " + fmt_elapsed(time::now_ms() - t_gen) + "  (g++ runs next; its errors are printed in full)") end
+    if code != 0 is
+        if code == 3 is
+            let gerr: string = fs::read(dir + "/err")
+            if !print_located(gerr, "CODEGEN ERROR") is eprint(red_b("✗ Error:") + " " + gerr + "\n") end
+        elsif code == 4 is
+            eprint(red_b("✗") + " Compilation failed (type errors above).\n")
+        end
+        system("rm -rf " + sh_quote(dir))
+        return 1
+    end
+    let meta: [string] = fs::read_lines(dir + "/meta")
+    let link: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    link.static_libs = meta_get(meta, "static_libs")
+    link.dynamic_libs = meta_get(meta, "dynamic_libs")
+    link.rust_whole_archive_libs = meta_get(meta, "rust_whole_archive_libs")
+    link.pkg_config_args = meta_get(meta, "pkg_config_args")
+    link.rpath_hints = meta_get(meta, "rpath_hints")
+    link.python_notes = meta_get(meta, "python_notes")
+    link.diagnostics = meta_get(meta, "diagnostics")
+    let hm: [string] = meta_get(meta, "has_main")
+    let has_main: bool = hm.len() > 0 && hm[0] == "1"
+    let eds: [string] = meta_get(meta, "ed_summary")
+    let ld: [string] = meta_get(meta, "link_desc")
+    let mut ed_summary: string = ""
+    if eds.len() > 0 is ed_summary = eds[0] end
+    let mut link_desc: string = ""
+    if ld.len() > 0 is link_desc = ld[0] end
+    let cpp: string = fs::read(dir + "/program.cpp")
+    system("rm -rf " + sh_quote(dir))
+    let inp: cpp_build::BuildInput = cpp_build::BuildInput { cpp: cpp, link: link, has_main: has_main || opts.test_mode,
+        strict_memory: opts.strict_memory, verbose: opts.verbose }
+    let be: string = cpp_build::build(inp, opts)
+    if be != "" is
+        eprint(red_b("✗ Error:") + " " + be + "\n")
+        return 1
+    end
+    return report(opts, t0, out_path, kind, triple, optimize, ed_summary, link_desc)
+end
+
+fn report(opts: options::CompileOptions, t0: int, out_path: string, kind: string, triple: target::TargetTriple, optimize: bool, ed_summary: string, link_desc: string) -> int is
+
+    if quiet_on() is return 0 end
+    let mut artifact_suffix: string = ""
+    let mut label: string = "Binary:"
+    if kind == "Binary" is
+        artifact_suffix = target::exe_suffix(triple)
+    elsif kind == "Object" is
+        artifact_suffix = ".o"
+        label = "Object:"
+    elsif kind == "SharedLib" is
+        artifact_suffix = options::file_suffix(kind, triple)
+        label = "SharedLib:"
+    elsif kind == "StaticLib" is
+        artifact_suffix = ".a"
+        label = "StaticLib:"
+    else
+        artifact_suffix = ".cpp"
+        label = "C++ source:"
+    end
+    let bin: string = out_path + artifact_suffix
+    let elapsed: int = time::now_ms() - t0
+    let mut bar: string = ""
+    let mut k: int = 0
+    while k < 54 is
+        bar = bar + "─"
+        k += 1
+    end
+    out_line("")
+    out_line(dim(bar))
+    out_line("  " + bold(pad_right(label, 10)) + " " + cyan(bin))
+    out_line("  " + bold(pad_right("Target:", 10)) + " " + triple.llvm_triple)
+    out_line("  " + bold(pad_right("Backend:", 10)) + " " + green("C++ (g++)"))
+    if optimize is
+        out_line("  " + bold(pad_right("Mode:", 10)) + " " + yellow("release (-O2)"))
+    else
+        out_line("  " + bold(pad_right("Mode:", 10)) + " " + dim("debug (-O0)"))
+    end
+    if link_desc != "" is out_line("  " + bold(pad_right("Linked:", 10)) + " " + yellow(link_desc)) end
+    out_line("  " + bold(pad_right("Time:", 10)) + " " + fmt_elapsed(elapsed))
+    if ed_summary != "" is out_line("  " + bold(pad_right("Edition:", 10)) + " " + cyan(ed_summary)) end
+    out_line("  " + bold(pad_right("Toolchain:", 10)) + " h# " + version())
+    out_line(dim(bar))
+    out_line("\n  " + green_b("✓") + " Build complete!")
+    return 0
+end
+
+;; compile to a temp binary, run it, forward its exit code
+fn build_and_run(file: string, prog_args: [string], test_mode: bool, quiet: bool, year: int) -> int is
+    if quiet is env::set("HSHARP_QUIET", "1") end
+    let dir: string = env::temp_dir() + "/hsharp_run_" + to_string(os::pid())
+    mkdir_p(dir)
+    let out: string = dir + "/" + file_stem(file)
+    let ca: CompileArgs = new_compile_args(file)
+    ca.output = out
+    ca.dynamic = true
+    ca.test_mode = test_mode
+    let rc: int = compile_file(ca, year)
+    if rc != 0 is
+        system("rm -rf " + sh_quote(dir))
+        return rc
+    end
+    let exe: string = out + target::exe_suffix(target::host())
+    let mut parts: [string] = [sh_quote(exe)]
+    for x in prog_args is parts.push(sh_quote(x)) end
+    let status: int = system(cli_join(parts, " "))
+    system("rm -rf " + sh_quote(dir))
+    return (status / 256) % 256
+end
+
+fn cmd_compile_native(cmd: string, rest: [string], info: EditionInfo) -> int is
+    let mut year: int = 0
+    if info.edition != "" is year = str_to_int_cli(info.edition) end
+    if cmd == "run" is
+        let mut quiet: bool = false
+        let mut file: string = ""
+        let mut prog: [string] = []
+        let mut i: int = 0
+        while i < rest.len() is
+            let a: string = rest[i]
+            if prog.len() > 0 is
+                prog.push(a)
+            elsif a == "-q" || a == "--quiet" is quiet = true
+            elsif file != "" is
+                prog.push(a)
+            elsif a == "--" is
+                i += 1
+                if i < rest.len() && file == "" is file = rest[i] end
+            elsif starts_with(a, "-") && a != "-" is return unexpected(a, "Usage: h# run [OPTIONS] <FILE> [ARGS]...")
+            else file = a end
+            i += 1
+        end
+        if file == "" is
+            eprint("error: the following required arguments were not provided:\n  <FILE>\n\nUsage: h# run [OPTIONS] <FILE> [ARGS]...\n\nFor more information, try '--help'.\n")
+            return 2
+        end
+        return build_and_run(file, prog, false, quiet, year)
+    end
+    if cmd == "test" is
+        if rest.len() != 1 || starts_with(rest[0], "-") is
+            eprint("error: the following required arguments were not provided:\n  <FILE>\n\nUsage: h# test <FILE>\n\nFor more information, try '--help'.\n")
+            return 2
+        end
+        return build_and_run(rest[0], [], true, false, year)
+    end
+    let mut ca: CompileArgs = new_compile_args("")
+    let mut i: int = 0
+    while i < rest.len() is
+        let a: string = rest[i]
+        if is_opt(a, "--output", "-o") is
+            ca.output = opt_value(rest, i, "--output", "-o")
+            if a == "--output" || a == "-o" is i += 1 end
+        elsif is_opt(a, "--target", "-t") is
+            ca.target = opt_value(rest, i, "--target", "-t")
+            if a == "--target" || a == "-t" is i += 1 end
+        elsif is_opt(a, "--emit", "") is
+            ca.emit_kind = opt_value(rest, i, "--emit", "")
+            if a == "--emit" is i += 1 end
+        elsif is_opt(a, "--mem-mode", "") is
+            ca.mem_mode = opt_value(rest, i, "--mem-mode", "")
+            if a == "--mem-mode" is i += 1 end
+        elsif is_opt(a, "--phase", "") is
+            ca.phase = opt_value(rest, i, "--phase", "")
+            if a == "--phase" is i += 1 end
+        elsif is_opt(a, "--handoff", "") is
+            ca.handoff = opt_value(rest, i, "--handoff", "")
+            if a == "--handoff" is i += 1 end
+        elsif a == "--release" is ca.release = true
+        elsif a == "--no-opt" is ca.no_opt = true
+        elsif a == "--debug" is ca.debug = true
+        elsif a == "--dynamic" is ca.dynamic = true
+        elsif a == "--emit-cpp" || a == "--emit-ir" is ca.emit_cpp = true
+        elsif a == "--save-cpp" is ca.save_cpp = true
+        elsif a == "--test-mode" is ca.test_mode = true
+        elsif a == "--strict-memory" is ca.strict_memory = true
+        elsif a == "-v" || a == "--verbose" is ca.verbose = true
+        elsif starts_with(a, "-") && a != "-" is return unexpected(a, "Usage: h# compile [OPTIONS] <FILE>")
+        else ca.file = a end
+        i += 1
+    end
+    if ca.file == "" is
+        eprint("error: the following required arguments were not provided:\n  <FILE>\n\nUsage: h# compile [OPTIONS] <FILE>\n\nFor more information, try '--help'.\n")
+        return 2
+    end
+    return compile_file(ca, year)
+end
+
+pub fn run(argv: [string]) -> int is
+    color_init()
+    ;; the global --edition flag may appear anywhere (e.g. `h# lib build x.h# --edition 2026`); for `run` only before the file,
+    ;; because everything after it belongs to the program
+    let mut edition_flag: string = ""
+    let mut args: [string] = []
+    let mut i: int = 0
+    while i < argv.len() is
+        let a: string = argv[i]
+        if a == "--" is
+            while i < argv.len() is
+                args.push(argv[i])
+                i += 1
+            end
+            break
+        end
+        if is_opt(a, "--edition", "") && (args.len() < 2 || (args.len() >= 1 && args[0] != "run")) is
+            edition_flag = opt_value(argv, i, "--edition", "")
+            if a == "--edition" is i += 1 end
+        else
+            args.push(a)
+        end
+        i += 1
+    end
+    if args.len() == 0 is
+        eprint(usage() + "\n")
+        return 2
+    end
+    let cmd: string = args[0]
+    if cmd == "-h" || cmd == "--help" || cmd == "help" is
+        out_line(usage())
+        return 0
+    end
+    if cmd == "-V" || cmd == "--version" is
+        out_line("h# " + version())
+        return 0
+    end
+    let mut rest: [string] = []
+    let mut k: int = 1
+    while k < args.len() is
+        rest.push(args[k])
+        k += 1
+    end
+
+    ;; the default edition is resolved once, up front (flag > HSHARP_EDITION > Bit.hk > newest)
+    let mut anchor: string = "."
+    if (cmd == "compile" || cmd == "run" || cmd == "test" || cmd == "ffi-header" || cmd == "check" || cmd == "fmt") && rest.len() > 0 && !starts_with(rest[0], "-") is
+        anchor = rest[0]
+    end
+    if cmd == "lib" && rest.len() > 1 && rest[0] == "build" && !starts_with(rest[1], "-") is anchor = rest[1] end
+    let info: EditionInfo = resolve_edition(edition_flag, env::get("HSHARP_EDITION"), anchor)
+    if info.err != "" is
+        eprint(red_b("Error:") + " " + info.err + "\n")
+        return 2
+    end
+
+    if cmd == "check" is return cmd_check(rest, info) end
+    if cmd == "targets" is return cmd_targets(rest, info) end
+    if cmd == "ffi-header" is return cmd_ffi_header_native(rest, info) end
+    if cmd == "compile" || cmd == "run" || cmd == "test" is
+        return cmd_compile_native(cmd, rest, info)
+    end
+    let known: [string] = ["new", "fmt", "lsp", "docs", "editions", "lib"]
+    let mut is_known: bool = false
+    for kcmd in known is
+        if kcmd == cmd is is_known = true end
+    end
+    if !is_known is
+        eprint(unknown_subcommand(cmd, "h#", "[OPTIONS] "))
+        return 2
+    end
+    if cmd == "new" is
+        let mut name: string = ""
+        let mut template: string = "app"
+        let mut j: int = 0
+        while j < rest.len() is
+            if is_opt(rest[j], "--template", "-t") is
+                template = opt_value(rest, j, "--template", "-t")
+                if rest[j] == "--template" || rest[j] == "-t" is j += 1 end
+            else
+                name = rest[j]
+            end
+            j += 1
+        end
+        if name == "" is
+            eprint("error: the following required arguments were not provided:\n  <NAME>\n\nUsage: h# new <NAME>\n\nFor more information, try '--help'.\n")
+            return 2
+        end
+        banner(info)
+        cmd_new(name, template)
+        return 0
+    end
+    if cmd == "fmt" is
+        let mut files: [string] = []
+        let mut check: bool = false
+        for r in rest is
+            if r == "--check" is check = true else files.push(r) end
+        end
+        banner(info)
+        return cmd_fmt(files, check)
+    end
+    if cmd == "lsp" is return langserver::run() end
+    if cmd == "docs" is
+        banner(info)
+        cmd_docs()
+        return 0
+    end
+    if cmd == "editions" is
+        banner(info)
+        cmd_editions(info)
+        return 0
+    end
+    if cmd == "lib" is return run_lib(rest, edition_flag, info) end
+    eprint(unknown_subcommand(cmd, "h#", "[OPTIONS] "))
+    return 2
+end
