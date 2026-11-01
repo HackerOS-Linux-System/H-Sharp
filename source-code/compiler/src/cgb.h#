@@ -1,0 +1,1180 @@
+use "std -> map" from "map"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+mod cg
+mod drops
+
+fn none() -> ast::Node is return ast::nn() end
+
+fn empty_sig() -> cg::FnSig is
+    return cg::FnSig { params: [], ret: ast::nn(), generics: [], is_async: false, is_method: false, method_name: "", self_ty: "", owner: "" }
+end
+
+;; ── functions ─────────────────────────────────────────────────────────────────
+pub fn gen_fn(g: cg::Gen, f: ast::Node, gens: [string]) -> string is
+    g.tparams = gens
+    g.scopes = []
+    g.var_tys = []
+    let dset: map::Set<string> = map::Set::new()
+    g.declared = dset
+    g.arc_tracked = []
+    g.drop_names = []
+    g.cur_ret = f.kids[3]
+    g.cur_mode = f.kids[6].text
+    if g.cur_mode == "Safety" is g.drop_names = drops::candidates(f) end
+    g.cur_fn = f.text
+    let file: string = cg::replace_all(f.fl, "\\", "/")
+    g.cur_fn_is_std = cg::has_sub(file, "/std/") || cg::has_suffix(file, "std")
+    cg::push_scope(g)
+    let params_n: [ast::Node] = f.kids[2].kids
+    for p in params_n is
+        let c: string = cg::declare(g, p.text, p.kids[1])
+    end
+    let ret: string = cg::ret_ty(g, f.kids[3])
+    let mut body: string = "    using hs_ret_t = {ret};\n"
+    if g.cur_mode == "Arena" is body = body + "    hs::ArenaScope _fn_arena(0, 1048576);\n" end
+    g.depth = 0
+    let stmts_n: [ast::Node] = f.kids[4].kids
+    let tail_value: bool = ret != "void" && !cg::always_returns(stmts_n) && cg::yields_value(stmts_n)
+    if tail_value is
+        let mut init: [ast::Node] = []
+        let mut i: int = 0
+        while i + 1 < stmts_n.len() is
+            init.push(stmts_n[i])
+            i += 1
+        end
+        body = body + stmts(g, init)
+        let last: ast::Node = stmts_n[stmts_n.len() - 1]
+        body = body + ret_stmt(g, last.kids[0])
+    else
+        body = body + stmts(g, stmts_n)
+    end
+    if ret != "void" is body = body + "    return hs::try_ret<hs_ret_t>();\n" end
+    cg::pop_scope(g)
+    let mut ps: [string] = []
+    for p in params_n is ps.push(cg::ty(g, p.kids[1]) + " " + cg::kw(p.text)) end
+    let hdr: string = cg::template_hdr(gens)
+    let is_async: bool = cg::has_sub("," + f.kids[5].text + ",", ",async,")
+    if is_async is
+        let imp: string = cg::fname(f.text) + "__impl"
+        let mut args: [string] = []
+        for p in params_n is args.push(cg::kw(p.text)) end
+        let pj: string = cg::jc(ps)
+        return "{hdr}static {ret} {imp}({pj}) {{\n{body}}}\n{hdr}hs::Task<{ret}> {cg::fname(f.text)}({pj}) {{\n    return hs::spawn<{ret}>([=]() mutable -> {ret} {{ return {imp}({cg::jc(args)}); }});\n}}\n"
+    end
+    return "{hdr}{ret} {cg::fname(f.text)}({cg::jc(ps)}) {{\n{body}}}\n"
+end
+
+;; ── statements ────────────────────────────────────────────────────────────────
+pub fn stmts(g: cg::Gen, body: [ast::Node]) -> string is
+    let mut sb = strbuf::new()
+    for s in body is
+        if s.tag == "Stmts" is
+            sb.push(stmts(g, s.kids))
+        else
+            sb.push(stmt(g, s))
+        end
+    end
+    return sb.build()
+end
+
+fn block(g: cg::Gen, body: [ast::Node]) -> string is
+    cg::push_scope(g)
+    g.depth += 1
+    let r: string = stmts(g, body)
+    g.depth -= 1
+    cg::pop_scope(g)
+    return "{{\n" + r + "}"
+end
+
+fn cond(g: cg::Gen, e: ast::Node) -> string is
+    let c: string = expr(g, e)
+    return "(bool)(" + c + ")"
+end
+
+fn is_item_stmt(t: string) -> bool is
+    return t == "Import" || t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "Impl" || t == "TypeAlias" || t == "ConstDef" || t == "Extern" || t == "ModDecl"
+end
+
+fn stmt(g: cg::Gen, s: ast::Node) -> string is
+    let t: string = s.tag
+    if t == "Let" is return let_stmt(g, s) end
+    if t == "Return" is return ret_stmt(g, s.kids[0]) end
+    if t == "Break" is
+        if cg::is_none(s.kids[0]) is return "    break;\n" end
+        return "    {{ (void)(" + expr(g, s.kids[0]) + "); break; }}\n"
+    end
+    if t == "Continue" is return "    continue;\n" end
+    if is_item_stmt(t) is return "" end
+    if t == "ExprStmt" is return expr_stmt(g, s.kids[0]) end
+    return ""
+end
+
+fn let_stmt(g: cg::Gen, s: ast::Node) -> string is
+    let name: string = s.text
+    let t: ast::Node = s.kids[1]
+    let value: ast::Node = s.kids[2]
+    let mut decl_ty: string = "int64_t"
+    let mut rhs: string = ""
+    let mut has_rhs: bool = false
+    if !cg::is_none(t) && !cg::is_none(value) is
+        decl_ty = cg::ty(g, t)
+        rhs = expr_h(g, value, t)
+        has_rhs = true
+    elsif !cg::is_none(t) is
+        decl_ty = cg::ty(g, t)
+    elsif !cg::is_none(value) is
+        let is_empty_arr: bool = value.tag == "ArrayLit" && value.kids.len() == 0
+        let is_nil: bool = value.tag == "Nil"
+        if is_empty_arr is
+            decl_ty = "hs::Arr<int64_t>"
+            rhs = "hs::Arr<int64_t>(hsh_array_new())"
+        elsif is_nil is
+            decl_ty = "hs::Any"
+            rhs = expr(g, value)
+        else
+            decl_ty = "auto"
+            rhs = expr(g, value)
+        end
+        has_rhs = true
+    end
+    let c: string = cg::declare(g, name, t)
+    let mut out: string = ""
+    if has_rhs is
+        out = "    {decl_ty} {c} = {rhs};\n"
+    else
+        out = "    {decl_ty} {c}{{}};\n"
+    end
+    if g.cur_mode == "Arc" && g.depth == 0 is
+        if value.tag == "Call" is
+            if value.kids[0].tag == "Ident" && value.kids[0].text == "arc_alloc" is
+                out = out + "    hs::ArcGuard _g_{c}((void*)(intptr_t)hs::pack({c}));\n"
+                g.arc_tracked.push(name)
+            end
+        elsif value.tag == "Ident" is
+            if cg::in_list(g.arc_tracked, value.text) is
+                out = out + "    hs_b_arc_retain({c});\n    hs::ArcGuard _g_{c}((void*)(intptr_t)hs::pack({c}));\n"
+                g.arc_tracked.push(name)
+            end
+        end
+    end
+    if g.cur_mode == "Safety" && g.depth == 0 && has_rhs && cg::in_list(g.drop_names, name) is
+        out = out + "    hs::DropArr _d_{c}({c});\n"
+    end
+    return out
+end
+
+;; `e` is the returned expression node, or a `None` node for a bare `return`
+fn ret_stmt(g: cg::Gen, e: ast::Node) -> string is
+    let ret_void: bool = cg::is_none(g.cur_ret) || g.cur_ret.tag == "Void"
+    if cg::is_none(e) is
+        if ret_void is return "    return;\n" end
+        return "    return hs::try_ret<hs_ret_t>();\n"
+    end
+    if ret_void is
+        return "    {{ (void)(" + expr(g, e) + "); return; }}\n"
+    end
+    let rt: ast::Node = g.cur_ret
+    let mut v: string = expr_h(g, e, rt)
+    if g.cur_mode == "Arena" is v = "hs::arena_escape(" + v + ")" end
+    if e.tag == "Ident" is
+        if cg::in_list(g.arc_tracked, e.text) is
+            let c: string = cg::lookup(g, e.text)
+            if c != "" is return "    {{ _g_{c}.disarm(); return {v}; }}\n" end
+        end
+    end
+    return "    return " + v + ";\n"
+end
+
+fn expr_stmt(g: cg::Gen, e: ast::Node) -> string is
+    let t: string = e.tag
+    if t == "If" is
+        let c0: string = cond(g, e.kids[0])
+        let b0: string = block(g, e.kids[1].kids)
+        let mut o: string = "    if (" + c0 + ") " + b0
+        for el in e.kids[2].kids is
+            let c1: string = cond(g, el.kids[0])
+            let b1: string = block(g, el.kids[1].kids)
+            o = o + " else if (" + c1 + ") " + b1
+        end
+        if !cg::is_none(e.kids[3]) is o = o + " else " + block(g, e.kids[3].kids) end
+        return o + "\n"
+    end
+    if t == "While" is
+        let c: string = cond(g, e.kids[0])
+        let b: string = block(g, e.kids[1].kids)
+        return "    while (" + c + ") " + b + "\n"
+    end
+    if t == "For" is return for_stmt(g, e) end
+    if t == "Match" is return match_stmt(g, e) end
+    if t == "Assign" is return "    " + assign(g, e.kids[0], e.kids[1], e) + ";\n" end
+    if t == "CompoundAssign" is return "    " + compound(g, e.kids[0], e.text, e.kids[1], e) + ";\n" end
+    if t == "ReturnE" is return ret_stmt(g, e.kids[0]) end
+    if t == "Do" is return "    " + block(g, e.kids[0].kids) + "\n" end
+    if t == "Unsafe" is
+        let pre: string = arena_prefix(g, e.text)
+        cg::push_scope(g)
+        g.depth += 1
+        let b: string = stmts(g, e.kids[0].kids)
+        g.depth -= 1
+        cg::pop_scope(g)
+        return "    {{\n" + pre + b + "    }}\n"
+    end
+    return "    (void)(" + expr(g, e) + ");\n"
+end
+
+fn arena_prefix(g: cg::Gen, mode: string) -> string is
+    if !cg::has_prefix(mode, "arena:") is return "" end
+    let parts: [string] = cg::split_on(mode, 58)
+    let kind: string = parts[1]
+    let mut k: int = 0
+    if kind == "Fixed" is k = 1
+    elsif kind == "Pool" is k = 2
+    elsif kind == "Page" is k = 3
+    elsif kind == "Ring" is k = 4 end
+    let mut size: string = "1048576"
+    if parts.len() > 2 && parts[2] != "" is size = parts[2] end
+    return "    hs::ArenaScope _ar{g.uniq}({k}, {size});\n"
+end
+
+fn for_stmt(g: cg::Gen, e: ast::Node) -> string is
+    let pat_n: ast::Node = e.kids[0]
+    let iter: ast::Node = e.kids[1]
+    let body: [ast::Node] = e.kids[2].kids
+    let lc: string = cg::loc(e)
+    let it: string = cg::tmp(g, "it")
+    let k: string = cg::tmp(g, "k")
+    cg::push_scope(g)
+    g.depth += 1
+    let mut head: string = ""
+    let mut elem: string = ""
+    if iter.tag == "Range" is
+        let a: string = expr(g, iter.kids[0])
+        let b: string = expr(g, iter.kids[1])
+        let hi: string = cg::tmp(g, "hi")
+        let mut op: string = "<"
+        if iter.text == "true" is op = "<=" end
+        head = "    {{ int64_t {hi} = (int64_t)({b}); for (int64_t {k} = (int64_t)({a}); {k} {op} {hi}; ++{k}) {{\n"
+        elem = k
+    else
+        let ie: string = expr(g, iter)
+        head = "    {{ auto {it} = {ie}; for (int64_t {k} = 0; {k} < hs::len({it}); ++{k}) {{\n"
+        elem = "hs::idx({it}, {k}, {lc})"
+    end
+    let pr: PatRes = pat(g, pat_n, elem)
+    let mut bind_txt: string = ""
+    let mut i: int = 0
+    while i < pr.names.len() is
+        let cn: string = cg::declare(g, pr.names[i], none())
+        bind_txt = bind_txt + "        auto {cn} = {pr.exprs[i]};\n"
+        i += 1
+    end
+    let b: string = stmts(g, body)
+    g.depth -= 1
+    cg::pop_scope(g)
+    return head + bind_txt + b + "    }} }}\n"
+end
+
+;; ── match ─────────────────────────────────────────────────────────────────────
+fn match_stmt(g: cg::Gen, e: ast::Node) -> string is
+    let m: string = cg::tmp(g, "m")
+    let end_l: string = cg::tmp(g, "mend")
+    let subj: string = expr(g, e.kids[0])
+    let mut o: string = "    {{ auto&& {m} = ({subj});\n"
+    for arm in e.kids[1].kids is
+        cg::push_scope(g)
+        g.depth += 1
+        let pr: PatRes = pat(g, arm.kids[0], m)
+        let mut bt: string = ""
+        let mut i: int = 0
+        while i < pr.names.len() is
+            let cn: string = cg::declare(g, pr.names[i], none())
+            bt = bt + " auto {cn} = {pr.exprs[i]};"
+            i += 1
+        end
+        let has_guard: bool = !cg::is_none(arm.kids[1])
+        let mut guard: string = ""
+        if has_guard is guard = cond(g, arm.kids[1]) end
+        let body: string = stmts(g, arm.kids[2].kids)
+        g.depth -= 1
+        cg::pop_scope(g)
+        let c: string = pr.cond
+        if has_guard is
+            o = o + "    if ({c}) {{{bt} if ({guard}) {{\n{body}        goto {end_l}; }} }}\n"
+        else
+            o = o + "    if ({c}) {{{bt}\n{body}        goto {end_l}; }}\n"
+        end
+    end
+    o = o + "    {end_l}:; }}\n"
+    return o
+end
+
+fn match_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
+    let m: string = cg::tmp(g, "m")
+    let subj: string = expr(g, e.kids[0])
+    let mut conds: [string] = []
+    let mut bodies: [string] = []
+    for arm in e.kids[1].kids is
+        cg::push_scope(g)
+        let pr: PatRes = pat(g, arm.kids[0], m)
+        let mut bt: string = ""
+        let mut i: int = 0
+        while i < pr.names.len() is
+            let cn: string = cg::declare(g, pr.names[i], none())
+            bt = bt + " auto {cn} = {pr.exprs[i]};"
+            i += 1
+        end
+        let mut cnd: string = ""
+        if !cg::is_none(arm.kids[1]) is
+            let gd: string = cond(g, arm.kids[1])
+            cnd = "(({pr.cond}) && ({{{bt} {gd}; }}))"
+        else
+            cnd = "({pr.cond})"
+        end
+        let body: string = block_value(g, arm.kids[2].kids, bt, hint)
+        cg::pop_scope(g)
+        conds.push(cnd)
+        bodies.push(body)
+    end
+    let mut chain: string = "hs::NoMatch{{}}"
+    let mut j: int = conds.len() - 1
+    while j >= 0 is
+        chain = "({conds[j]} ? {bodies[j]} : {chain})"
+        j -= 1
+    end
+    return "({{ auto&& {m} = ({subj}); {chain}; }})"
+end
+
+;; `({ prefix; stmts...; <value of last expression> })`
+fn block_value(g: cg::Gen, body: [ast::Node], prefix: string, hint: ast::Node) -> string is
+    let saved: int = g.depth
+    g.depth = 1
+    cg::push_scope(g)
+    let mut o: string = "({{" + prefix + "\n"
+    if body.len() > 0 is
+        let mut init: [ast::Node] = []
+        let mut i: int = 0
+        while i + 1 < body.len() is
+            init.push(body[i])
+            i += 1
+        end
+        o = o + stmts(g, init)
+        let last: ast::Node = body[body.len() - 1]
+        if last.tag == "ExprStmt" && !cg::is_stmt_expr(last.kids[0]) is
+            let v: string = expr_h(g, last.kids[0], hint)
+            o = o + "    " + v + ";\n"
+        else
+            o = o + stmt(g, last)
+            let diverges: bool = last.tag == "Return" || last.tag == "Break" || last.tag == "Continue" || (last.tag == "ExprStmt" && last.kids[0].tag == "ReturnE")
+            if diverges is o = o + "    hs::NoMatch{{}};\n" end
+        end
+    end
+    cg::pop_scope(g)
+    g.depth = saved
+    return o + "}})"
+end
+
+;; ── patterns ──────────────────────────────────────────────────────────────────
+pub struct PatRes is
+    pub cond: string
+    pub names: [string]
+    pub exprs: [string]
+end
+
+fn pat_ok(c: string) -> PatRes is
+    return PatRes { cond: c, names: [], exprs: [] }
+end
+
+fn add_binds(into: PatRes, from: PatRes) is
+    for n in from.names is into.names.push(n) end
+    for x in from.exprs is into.exprs.push(x) end
+end
+
+fn pat(g: cg::Gen, p: ast::Node, subj: string) -> PatRes is
+    let t: string = p.tag
+    if t == "PWild" is return pat_ok("true") end
+    if t == "PIdent" is
+        let n: string = p.text
+        if n == "nil" is return pat_ok("hs::eq({subj}, hs::nil)") end
+        if cg::is_upper_first(n) is
+            let v: cg::VarRef = cg::is_unit_enum_variant(g, n)
+            if v.ok is return pat_ok("(({subj})->tag == {v.idx})") end
+        end
+        return PatRes { cond: "true", names: [n], exprs: [subj] }
+    end
+    if t == "PLit" is
+        let lit: string = literal(g, p.kids[0])
+        return pat_ok("hs::eq({subj}, {lit})")
+    end
+    if t == "PTuple" is
+        let res: PatRes = pat_ok("true")
+        let mut cs: [string] = []
+        let mut i: int = 0
+        while i < p.kids.len() is
+            let sub: PatRes = pat(g, p.kids[i], "std::get<{i}>({subj})")
+            if sub.cond != "true" is cs.push(sub.cond) end
+            add_binds(res, sub)
+            i += 1
+        end
+        if cs.len() > 0 is res.cond = cg::ja(cs) end
+        return res
+    end
+    if t == "PEnum" is
+        let qual: string = p.kids[0].text
+        let v: cg::VarRef = cg::find_variant(g, qual, qual != "", p.text)
+        if !v.ok is
+            cg::fail_at(g, p, "unknown enum variant `{p.text}`")
+            return pat_ok("true")
+        end
+        let res: PatRes = pat_ok("(({subj})->tag == {v.idx})")
+        let mut cs: [string] = ["(({subj})->tag == {v.idx})"]
+        let mut j: int = 1
+        while j < p.kids.len() is
+            let sub: PatRes = pat(g, p.kids[j], "({subj})->f{v.idx}_{j - 1}")
+            if sub.cond != "true" is cs.push(sub.cond) end
+            add_binds(res, sub)
+            j += 1
+        end
+        res.cond = cg::ja(cs)
+        return res
+    end
+    if t == "POr" is
+        let mut cs: [string] = []
+        for sp in p.kids is
+            let sub: PatRes = pat(g, sp, subj)
+            cs.push("(" + sub.cond + ")")
+        end
+        return pat_ok("(" + cg::join_with(cs, " || ") + ")")
+    end
+    return pat_ok("true")
+end
+
+;; ── assignment ────────────────────────────────────────────────────────────────
+fn assign(g: cg::Gen, l: ast::Node, r: ast::Node, at: ast::Node) -> string is
+    if l.tag == "IndexAccess" is
+        let lc: string = cg::loc(l)
+        let a: string = expr(g, l.kids[0])
+        let i: string = expr(g, l.kids[1])
+        let v: string = expr(g, r)
+        return "hs::aset({a}, {i}, {v}, {lc})"
+    end
+    if l.tag == "Ident" is
+        let hint: ast::Node = cg::lookup_ty(g, l.text)
+        let c: string = cg::lookup(g, l.text)
+        if c == "" is
+            cg::fail_at(g, at, "undefined variable `{l.text}`")
+            return ""
+        end
+        return c + " = " + expr_h(g, r, hint)
+    end
+    let a: string = expr(g, l)
+    let b: string = expr(g, r)
+    return a + " = " + b
+end
+
+fn compound(g: cg::Gen, l: ast::Node, op: string, r: ast::Node, at: ast::Node) -> string is
+    let lc: string = cg::loc(at)
+    let rv: string = expr(g, r)
+    if l.tag == "IndexAccess" is
+        let t1: string = cg::tmp(g, "a")
+        let t2: string = cg::tmp(g, "i")
+        let iloc: string = cg::loc(l)
+        let ae: string = expr(g, l.kids[0])
+        let ie: string = expr(g, l.kids[1])
+        let cur: string = "hs::idx({t1}, {t2}, {iloc})"
+        let nv: string = binop_text(op, cur, rv, lc)
+        return "({{ auto& {t1} = {ae}; int64_t {t2} = {ie}; hs::aset({t1}, {t2}, {nv}, {iloc}); }})"
+    end
+    let t: string = cg::tmp(g, "l")
+    let le: string = expr(g, l)
+    let nv: string = binop_text(op, t, rv, lc)
+    return "({{ auto& {t} = {le}; {t} = {nv}; }})"
+end
+
+fn binop_text(op: string, a: string, b: string, lc: string) -> string is
+    if op == "Add" is return "({a} + {b})" end
+    if op == "Sub" is return "({a} - {b})" end
+    if op == "Mul" is return "({a} * {b})" end
+    if op == "Div" is return "hs::div({a}, {b}, {lc})" end
+    if op == "Mod" is return "hs::mod({a}, {b}, {lc})" end
+    if op == "Eq" is return "hs::eq({a}, {b})" end
+    if op == "NotEq" is return "hs::ne({a}, {b})" end
+    if op == "Lt" is return "hs::lt({a}, {b})" end
+    if op == "Gt" is return "hs::gt({a}, {b})" end
+    if op == "LtEq" is return "hs::le({a}, {b})" end
+    if op == "GtEq" is return "hs::ge({a}, {b})" end
+    if op == "And" is return "((bool)({a}) && (bool)({b}))" end
+    if op == "Or" is return "((bool)({a}) || (bool)({b}))" end
+    if op == "BitAnd" is return "({a} & {b})" end
+    if op == "BitOr" is return "({a} | {b})" end
+    if op == "BitXor" is return "({a} ^ {b})" end
+    if op == "Shl" is return "({a} << {b})" end
+    return "({a} >> {b})"
+end
+
+;; ── expressions ───────────────────────────────────────────────────────────────
+pub fn expr(g: cg::Gen, e: ast::Node) -> string is
+    return expr_h(g, e, none())
+end
+
+fn literal(g: cg::Gen, l: ast::Node) -> string is
+    let t: string = l.tag
+    if t == "Int" is
+        let n: string = l.text
+        if n == "-9223372036854775808" is return "INT64_MIN" end
+        if cg::has_prefix(n, "-") is return "(INT64_C({n}))" end
+        return "INT64_C({n})"
+    end
+    if t == "Float" is
+        let s: string = l.text
+        if cg::has_sub(s, "inf") is
+            if cg::has_prefix(s, "-") is return "(-HUGE_VAL)" end
+            return "HUGE_VAL"
+        end
+        if cg::has_sub(s, "NaN") is return "NAN" end
+        return s
+    end
+    if t == "Bool" is return l.text end
+    if t == "Str" is return "hs::Str(" + cg::cpp_str_lit(l.text) + ")" end
+    if t == "Nil" is return "hs::nil" end
+    if t == "Interp" is
+        let mut o: string = "(hs::Str()"
+        for p in l.kids is
+            if p.tag == "Text" is
+                o = o + " + hs::Str(" + cg::cpp_str_lit(p.text) + ")"
+            else
+                o = o + " + hs::tostr(" + expr(g, p) + ")"
+            end
+        end
+        return o + ")"
+    end
+    return ""
+end
+
+pub fn expr_h(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
+    let t: string = e.tag
+    if t == "Int" || t == "Float" || t == "Bool" || t == "Str" || t == "Nil" || t == "Interp" is return literal(g, e) end
+    if t == "Ident" is return ident(g, e) end
+    if t == "Self" is return "self" end
+    if t == "BinOp" is
+        let lc: string = cg::loc(e)
+        let mut a: string = ""
+        let mut b: string = ""
+        if e.text == "And" || e.text == "Or" is
+            a = expr(g, e.kids[0])
+            b = expr(g, e.kids[1])
+        else
+            a = expr_h(g, e.kids[0], hint)
+            b = expr_h(g, e.kids[1], hint)
+        end
+        return binop_text(e.text, a, b, lc)
+    end
+    if t == "UnOp" is
+        let v: string = expr(g, e.kids[0])
+        if e.text == "Neg" is return "(-(" + v + "))" end
+        if e.text == "Not" is return "(!(bool)(" + v + "))" end
+        if e.text == "BitNot" is return "(~(" + v + "))" end
+        return "(" + v + ")"
+    end
+    if t == "Assign" is return "({{ " + assign(g, e.kids[0], e.kids[1], e) + "; INT64_C(0); }})" end
+    if t == "CompoundAssign" is return "({{ " + compound(g, e.kids[0], e.text, e.kids[1], e) + "; INT64_C(0); }})" end
+    if t == "FieldAccess" is
+        let f: string = e.text
+        let obj: string = expr(g, e.kids[0])
+        if cg::is_digits(f) is return "hs::tget<{f}>({obj})" end
+        if f == "len" || f == "length" is return "hs::field_len({obj}, {cg::loc(e)})" end
+        if e.kids[0].tag == "Self" is return "self->" + cg::kw(f) end
+        return "hs::p({obj}, {cg::loc(e)})->{cg::kw(f)}"
+    end
+    if t == "IndexAccess" is
+        let lc: string = cg::loc(e)
+        let ae: string = expr(g, e.kids[0])
+        let i: ast::Node = e.kids[1]
+        if i.tag == "Range" is
+            let lo: string = expr(g, i.kids[0])
+            let hi: string = expr(g, i.kids[1])
+            return "hs::idx({ae}, hs::Range{{{lo}, {hi}, {i.text}}}, {lc})"
+        end
+        let ix: string = expr(g, i)
+        return "hs::idx({ae}, {ix}, {lc})"
+    end
+    if t == "MethodCall" is return method_call(g, e) end
+    if t == "Call" is return call(g, e, hint) end
+    if t == "If" is
+        let mut chain: string = "hs::NoMatch{{}}"
+        if !cg::is_none(e.kids[3]) is chain = block_value(g, e.kids[3].kids, "", hint) end
+        let mut cs: [string] = [cond(g, e.kids[0])]
+        let mut bs: [string] = [block_value(g, e.kids[1].kids, "", hint)]
+        for el in e.kids[2].kids is
+            cs.push(cond(g, el.kids[0]))
+            bs.push(block_value(g, el.kids[1].kids, "", hint))
+        end
+        let mut j: int = cs.len() - 1
+        while j >= 0 is
+            chain = "({cs[j]} ? {bs[j]} : {chain})"
+            j -= 1
+        end
+        return chain
+    end
+    if t == "Match" is return match_value(g, e, hint) end
+    if t == "While" || t == "For" is
+        let saved: int = g.depth
+        g.depth = 1
+        let s: string = expr_stmt(g, e)
+        g.depth = saved
+        return "({{\n{s}    INT64_C(0); }})"
+    end
+    if t == "Do" is return block_value(g, e.kids[0].kids, "", hint) end
+    if t == "Unsafe" is
+        let pre: string = arena_prefix(g, e.text)
+        return block_value(g, e.kids[0].kids, pre, hint)
+    end
+    if t == "StructLit" is return struct_lit(g, e, hint) end
+    if t == "ArrayLit" is
+        if e.kids.len() == 0 is
+            if hint.tag == "Array" is return cg::ty(g, hint) + "(hsh_array_new())" end
+            return "hs::EmptyArr{{}}"
+        end
+        let mut elem_hint: ast::Node = none()
+        if hint.tag == "Array" is elem_hint = hint.kids[0] end
+        let mut xs: [string] = []
+        for x in e.kids is xs.push(expr_h(g, x, elem_hint)) end
+        if !cg::is_none(elem_hint) is return "hs::arr_lit_t<" + cg::ty(g, elem_hint) + ">(" + cg::jc(xs) + ")" end
+        return "hs::arr_lit(\"\", " + cg::jc(xs) + ")"
+    end
+    if t == "TupleLit" is
+        let mut xs: [string] = []
+        let mut i: int = 0
+        while i < e.kids.len() is
+            let mut h: ast::Node = none()
+            if hint.tag == "Tuple" && i < hint.kids.len() is h = hint.kids[i] end
+            xs.push(expr_h(g, e.kids[i], h))
+            i += 1
+        end
+        return "hs::tup(" + cg::jc(xs) + ")"
+    end
+    if t == "Closure" is return closure(g, e) end
+    if t == "Cast" is
+        let tt: string = cg::ty(g, e.kids[1])
+        let cx: string = expr(g, e.kids[0])
+        return "hs::cv<{tt}>({cx})"
+    end
+    if t == "Range" is
+        let a: string = expr(g, e.kids[0])
+        let b: string = expr(g, e.kids[1])
+        return "hs::Range{{{a}, {b}, {e.text}}}"
+    end
+    if t == "ReturnE" is
+        let s: string = ret_stmt(g, e.kids[0])
+        return "({{\n{s}    hs::NoMatch{{}}; }})"
+    end
+    if t == "Try" is
+        let tv: string = cg::tmp(g, "t")
+        let x: string = expr(g, e.kids[0])
+        return "({{ auto {tv} = ({x}); if (hs::try_fail({tv})) return hs::try_ret_for<hs_ret_t>({tv}); hs::try_val({tv}); }})"
+    end
+    if t == "Await" is return "hs::await_(" + expr(g, e.kids[0]) + ")" end
+    if t == "Path" is return path_value(g, e, hint) end
+    return ""
+end
+
+fn ident(g: cg::Gen, e: ast::Node) -> string is
+    let n: string = e.text
+    let c: string = cg::lookup(g, n)
+    if c != "" is return c end
+    let v: cg::VarRef = cg::is_unit_enum_variant(g, n)
+    if v.ok is return variant_ctor(g, v.en, v.idx, [], none()) end
+    if g.fns.has(n) || g.externs.has(n) is return cg::fname(n) end
+    cg::fail_at(g, e, "undefined variable `{n}`")
+    return ""
+end
+
+fn path_segs(e: ast::Node) -> [string] is
+    let mut out: [string] = []
+    let s: string = e.text
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if i + 1 < s.len() && byte_at(s, i) == 58 && byte_at(s, i + 1) == 58 is
+            out.push(cur)
+            cur = ""
+            i += 2
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+            i += 1
+        end
+    end
+    out.push(cur)
+    return out
+end
+
+fn path_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
+    let segs: [string] = path_segs(e)
+    if segs.len() >= 2 is
+        let q: string = segs[segs.len() - 2]
+        let v: string = segs[segs.len() - 1]
+        if cg::resolve_enum(g, q) != "" is
+            let vr: cg::VarRef = cg::find_variant(g, q, true, v)
+            if vr.ok is return variant_ctor(g, vr.en, vr.idx, [], hint) end
+        end
+    end
+    let snake: string = cg::join_with(segs, "_")
+    let last: string = segs[segs.len() - 1]
+    for cand in [snake, last] is
+        if g.fns.has(cand) is
+            let sig: cg::FnSig = g.fns.get(cand).unwrap_or(empty_sig())
+            if sig.params.len() == 0 is return cg::fname(cand) + "()" end
+            return cg::fname(cand)
+        end
+        if g.externs.has(cand) is return cg::fname(cand) end
+    end
+    cg::fail_at(g, e, "undefined path `{cg::jcc(segs)}`")
+    return ""
+end
+
+fn variant_ctor(g: cg::Gen, en: string, vi: int, args: [string], hint: ast::Node) -> string is
+    let info: cg::EnumInfo = g.enums.get(en).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+    let vname: string = info.variants[vi].text
+    let tn: string = cg::tname(en)
+    let aj: string = cg::jc(args)
+    if info.params.len() == 0 is return "{tn}::mk_{vname}({aj})" end
+    if hint.tag == "Generic" && hint.text == en is
+        let mut ta: [string] = []
+        for x in hint.kids is ta.push(cg::ty(g, x)) end
+        return "{tn}<{cg::jc(ta)}>::mk_{vname}({aj})"
+    end
+    return "hs::enum_proxy<{tn}, {vi}>({aj})"
+end
+
+fn struct_lit(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
+    let name: string = e.text
+    let fields: [ast::Node] = e.kids
+    let sp2: cg::Split2 = cg::rsplit_once(name, "::")
+    if sp2.ok is
+        let vr: cg::VarRef = cg::find_variant(g, sp2.a, true, sp2.b)
+        if vr.ok is
+            let info: cg::EnumInfo = g.enums.get(vr.en).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+            let fk: ast::Node = info.variants[vr.idx].kids[0]
+            if fk.tag == "StructV" is
+                let sf: [ast::Node] = fk.kids[0].kids
+                let mut args: [string] = []
+                for x in sf is args.push("") end
+                for f in fields is
+                    let mut j: int = -1
+                    let mut k: int = 0
+                    while k < sf.len() is
+                        if sf[k].text == f.text is j = k end
+                        k += 1
+                    end
+                    if j < 0 is
+                        cg::fail_at(g, e, "no field `{f.text}` in variant `{sp2.b}`")
+                        return ""
+                    end
+                    args[j] = expr_h(g, f.kids[0], sf[j].kids[1])
+                end
+                return variant_ctor(g, vr.en, vr.idx, args, hint)
+            end
+        end
+    end
+    if !g.structs.has(name) is
+        cg::fail_at(g, e, "unknown struct `{name}`")
+        return ""
+    end
+    let si: cg::StructInfo = g.structs.get(name).unwrap_or(cg::StructInfo { params: [], fields: [] })
+    let params: [string] = si.params
+    let sfields: [ast::Node] = si.fields
+    let hint_is_self: bool = hint.tag == "Generic" && hint.text == name
+    let mut ty_txt: string = ""
+    if params.len() == 0 is
+        ty_txt = cg::tname(name)
+    elsif hint_is_self is
+        let mut ta: [string] = []
+        for x in hint.kids is ta.push(cg::ty(g, x)) end
+        ty_txt = "{cg::tname(name)}<{cg::jc(ta)}>"
+    else
+        let mut args: [string] = []
+        for p in params is
+            let mut found: bool = false
+            let mut fx: ast::Node = none()
+            for sf in sfields is
+                if !found && sf.kids[1].tag == "Named" && sf.kids[1].text == p is
+                    for f in fields is
+                        if !found && f.text == sf.text is
+                            found = true
+                            fx = f.kids[0]
+                        end
+                    end
+                end
+            end
+            if found is
+                let tx: string = expr(g, fx)
+                args.push("std::decay_t<decltype({tx})>")
+            else
+                args.push("hs::Any")
+            end
+        end
+        ty_txt = "{cg::tname(name)}<{cg::jc(args)}>"
+    end
+    let s: string = cg::tmp(g, "s")
+    let has_hint_args: bool = hint_is_self && hint.kids.len() == params.len()
+    let mut o: string = "({{ {ty_txt}* {s} = hs::mk<{ty_txt}>();"
+    for f in fields is
+        let mut fty: ast::Node = none()
+        for sf in sfields is
+            if cg::is_none(fty) && sf.text == f.text is fty = sf.kids[1] end
+        end
+        if !cg::is_none(fty) && has_hint_args is fty = cg::subst_params(fty, params, hint.kids) end
+        let mut ety: ast::Node = none()
+        if params.len() == 0 || has_hint_args is ety = fty end
+        let fv: string = expr_h(g, f.kids[0], ety)
+        o = o + " {s}->{cg::kw(f.text)} = {fv};"
+    end
+    return o + " {s}; }})"
+end
+
+;; ── closures ──────────────────────────────────────────────────────────────────
+fn root_name(e: ast::Node) -> string is
+    if e.tag == "Ident" is return e.text end
+    if e.tag == "FieldAccess" || e.tag == "IndexAccess" is return root_name(e.kids[0]) end
+    return ""
+end
+
+fn mut_expr(e: ast::Node, a: map::Set<string>, l: map::Set<string>) is
+    let t: string = e.tag
+    if t == "Assign" || t == "CompoundAssign" is
+        let lhs: ast::Node = e.kids[0]
+        if lhs.tag == "Ident" is a.add(lhs.text) end
+        if lhs.tag == "IndexAccess" is
+            let n: string = root_name(lhs.kids[0])
+            if n != "" is a.add(n) end
+        end
+        mut_expr(lhs, a, l)
+        mut_expr(e.kids[1], a, l)
+    elsif t == "MethodCall" is
+        let m: string = e.text
+        if m == "push" || m == "append" || m == "pop" || m == "remove" || m == "insert" || m == "clear" is
+            let n: string = root_name(e.kids[0])
+            if n != "" is a.add(n) end
+        end
+        mut_expr(e.kids[0], a, l)
+        for x in e.kids[1].kids is mut_expr(x, a, l) end
+    elsif t == "BinOp" || t == "IndexAccess" is
+        mut_expr(e.kids[0], a, l)
+        mut_expr(e.kids[1], a, l)
+    elsif t == "UnOp" || t == "Cast" || t == "Try" || t == "Await" || t == "FieldAccess" is
+        mut_expr(e.kids[0], a, l)
+    elsif t == "Call" is
+        mut_expr(e.kids[0], a, l)
+        for x in e.kids[1].kids is mut_expr(x, a, l) end
+    elsif t == "If" is
+        mut_expr(e.kids[0], a, l)
+        collect_mutations(e.kids[1].kids, a, l)
+        for el in e.kids[2].kids is
+            mut_expr(el.kids[0], a, l)
+            collect_mutations(el.kids[1].kids, a, l)
+        end
+        if !cg::is_none(e.kids[3]) is collect_mutations(e.kids[3].kids, a, l) end
+    elsif t == "Match" is
+        mut_expr(e.kids[0], a, l)
+        for arm in e.kids[1].kids is collect_mutations(arm.kids[2].kids, a, l) end
+    elsif t == "While" is
+        mut_expr(e.kids[0], a, l)
+        collect_mutations(e.kids[1].kids, a, l)
+    elsif t == "For" is
+        mut_expr(e.kids[1], a, l)
+        collect_mutations(e.kids[2].kids, a, l)
+    elsif t == "Do" || t == "Unsafe" is
+        collect_mutations(e.kids[0].kids, a, l)
+    elsif t == "Closure" is
+        for p in e.kids[0].kids is l.add(p.text) end
+        collect_mutations(e.kids[2].kids, a, l)
+    elsif t == "StructLit" is
+        for f in e.kids is mut_expr(f.kids[0], a, l) end
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for x in e.kids is mut_expr(x, a, l) end
+    elsif t == "ReturnE" is
+        if !cg::is_none(e.kids[0]) is mut_expr(e.kids[0], a, l) end
+    end
+end
+
+fn collect_mutations(body: [ast::Node], a: map::Set<string>, l: map::Set<string>) is
+    for s in body is
+        if s.tag == "Let" is
+            if !cg::is_none(s.kids[2]) is mut_expr(s.kids[2], a, l) end
+            l.add(s.text)
+        elsif s.tag == "Return" is
+            if !cg::is_none(s.kids[0]) is mut_expr(s.kids[0], a, l) end
+        elsif s.tag == "ExprStmt" is
+            mut_expr(s.kids[0], a, l)
+        elsif s.tag == "Stmts" is
+            collect_mutations(s.kids, a, l)
+        end
+    end
+end
+
+fn closure(g: cg::Gen, e: ast::Node) -> string is
+    let params: [ast::Node] = e.kids[0].kids
+    let ret: ast::Node = e.kids[1]
+    let body: [ast::Node] = e.kids[2].kids
+    let assigned: map::Set<string> = map::Set::new()
+    let local: map::Set<string> = map::Set::new()
+    for p in params is local.add(p.text) end
+    collect_mutations(body, assigned, local)
+    let mut by_ref: [string] = []
+    for n in assigned.items() is
+        if !local.has(n) is
+            let c: string = cg::lookup(g, n)
+            if c != "" is by_ref.push(c) end
+        end
+    end
+    let sorted: [string] = cg::sort_strs(by_ref)
+    let mut uniq: [string] = []
+    for c in sorted is
+        if uniq.len() == 0 || uniq[uniq.len() - 1] != c is uniq.push(c) end
+    end
+    let mut capture: string = "="
+    if uniq.len() > 0 is
+        let mut rs: [string] = []
+        for c in uniq is rs.push("&" + c) end
+        capture = "=, " + cg::jc(rs)
+    end
+    let saved_ret: ast::Node = g.cur_ret
+    let saved_mode: string = g.cur_mode
+    let saved_depth: int = g.depth
+    g.cur_ret = ret
+    cg::push_scope(g)
+    let mut ps: [string] = []
+    for p in params is
+        let c: string = cg::declare(g, p.text, p.kids[1])
+        let pt: ast::Node = p.kids[1]
+        let is_unknown: bool = pt.tag == "Named" && (pt.text == "any" || pt.text == "")
+        if is_unknown is
+            ps.push("auto " + c)
+        else
+            ps.push(cg::ty(g, pt) + " " + c)
+        end
+    end
+    let has_ret: bool = !cg::is_none(ret)
+    let mut rt: string = ""
+    if has_ret is rt = cg::ty(g, ret) end
+    g.depth = 1
+    let mut b: string = "    using hs_ret_t = "
+    if has_ret is b = b + rt else b = b + "int64_t" end
+    b = b + ";\n"
+    let mut done: bool = false
+    if body.len() > 0 is
+        let last: ast::Node = body[body.len() - 1]
+        let ret_nonvoid: bool = !has_ret || ret.tag != "Void"
+        if last.tag == "ExprStmt" && cg::is_value_expr(last.kids[0]) && ret_nonvoid is
+            let mut init: [ast::Node] = []
+            let mut i: int = 0
+            while i + 1 < body.len() is
+                init.push(body[i])
+                i += 1
+            end
+            b = b + stmts(g, init)
+            let v: string = expr_h(g, last.kids[0], ret)
+            b = b + "    return " + v + ";\n"
+            done = true
+        end
+    end
+    if !done is b = b + stmts(g, body) end
+    cg::pop_scope(g)
+    g.cur_ret = saved_ret
+    g.cur_mode = saved_mode
+    g.depth = saved_depth
+    let mut arrow: string = ""
+    if has_ret is arrow = " -> " + rt end
+    return "([{capture}]({cg::jc(ps)}) mutable{arrow} {{\n{b}}})"
+end
+
+;; ── calls ─────────────────────────────────────────────────────────────────────
+fn type_mentions(t: ast::Node, name: string) -> bool is
+    if (t.tag == "Named" || t.tag == "Generic") && t.text == name is return true end
+    for k in t.kids is
+        if type_mentions(k, name) is return true end
+    end
+    return false
+end
+
+fn mentions_generic(t: ast::Node, generics: [string]) -> bool is
+    for gname in generics is
+        if type_mentions(t, gname) is return true end
+    end
+    return false
+end
+
+;; `sig_params` = Param nodes of the callee (or []), `generics` its generic names
+fn args_with_hints(g: cg::Gen, args: [ast::Node], sig_params: [ast::Node], generics: [string]) -> string is
+    let mut xs: [string] = []
+    let mut i: int = 0
+    while i < args.len() is
+        let mut h: ast::Node = none()
+        if i < sig_params.len() is
+            h = sig_params[i].kids[1]
+            if mentions_generic(h, generics) is h = none() end
+        end
+        xs.push(expr_h(g, args[i], h))
+        i += 1
+    end
+    return cg::jc(xs)
+end
+
+fn call(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
+    let callee: ast::Node = e.kids[0]
+    let args: [ast::Node] = e.kids[1].kids
+    if callee.tag == "Ident" is
+        let n: string = callee.text
+        let c: string = cg::lookup(g, n)
+        if c != "" is
+            let a: string = args_with_hints(g, args, [], [])
+            return "{c}({a})"
+        end
+        let vr: cg::VarRef = cg::find_variant(g, "", false, n)
+        if vr.ok && cg::is_upper_first(n) is
+            let info: cg::EnumInfo = g.enums.get(vr.en).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+            if !cg::variant_is_unit(info.variants[vr.idx]) is return enum_call(g, vr.en, vr.idx, args, hint, e) end
+        end
+        return call_named_h(g, n, args, hint, e)
+    end
+    if callee.tag == "Path" is
+        let segs: [string] = path_segs(callee)
+        if segs.len() >= 2 is
+            let q: string = segs[segs.len() - 2]
+            let v: string = segs[segs.len() - 1]
+            if cg::resolve_enum(g, q) != "" is
+                let vr: cg::VarRef = cg::find_variant(g, q, true, v)
+                if vr.ok is return enum_call(g, vr.en, vr.idx, args, hint, e) end
+            end
+        end
+        let snake: string = cg::join_with(segs, "_")
+        if g.fns.has(snake) || g.externs.has(snake) || cg::builtin_known(g, snake) is return call_named_h(g, snake, args, hint, e) end
+        let last: string = segs[segs.len() - 1]
+        let saved_err: string = g.err
+        g.err = ""
+        let r: string = call_named_h(g, last, args, none(), e)
+        if g.err != "" is
+            g.err = saved_err
+            let at: string = "{e.fl}:{e.sl}:{e.sc}"
+            cg::fail_raw(g, "{at}: undefined fn: {snake} ({at})")
+        else
+            g.err = saved_err
+        end
+        return r
+    end
+    let c: string = expr(g, callee)
+    let a: string = args_with_hints(g, args, [], [])
+    return "({c})({a})"
+end
+
+fn enum_call(g: cg::Gen, en: string, vi: int, args: [ast::Node], hint: ast::Node, at: ast::Node) -> string is
+    let info: cg::EnumInfo = g.enums.get(en).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+    let v: ast::Node = info.variants[vi]
+    let mut fields: [ast::Node] = []
+    let fk: ast::Node = v.kids[0]
+    if fk.tag == "Tuple" is
+        for x in fk.kids is fields.push(x) end
+    elsif fk.tag == "StructV" is
+        for f in fk.kids[0].kids is fields.push(f.kids[1]) end
+    end
+    if fields.len() != args.len() is
+        cg::fail_at(g, at, "`{v.text}` takes {fields.len()} field(s), got {args.len()}")
+        return ""
+    end
+    let generic: bool = info.params.len() > 0
+    let mut xs: [string] = []
+    let mut i: int = 0
+    while i < args.len() is
+        if generic is
+            xs.push(expr_h(g, args[i], none()))
+        else
+            xs.push(expr_h(g, args[i], fields[i]))
+        end
+        i += 1
+    end
+    return variant_ctor(g, en, vi, xs, hint)
+end
+
+fn call_named_h(g: cg::Gen, n: string, args: [ast::Node], hint: ast::Node, at: ast::Node) -> string is
+    let std_self_call: bool = g.cur_fn_is_std && n == g.cur_fn && cg::builtin_known(g, n)
+    if g.fns.has(n) && !std_self_call is
+        let sig: cg::FnSig = g.fns.get(n).unwrap_or(empty_sig())
+        let a: string = args_with_hints(g, args, sig.params, sig.generics)
+        let mut targs: string = ""
+        if sig.owner != "" && hint.tag == "Generic" is
+            let mut nparams: int = 0
+            if g.structs.has(sig.owner) is nparams = g.structs.get(sig.owner).unwrap_or(cg::StructInfo { params: [], fields: [] }).params.len()
+            elsif g.enums.has(sig.owner) is nparams = g.enums.get(sig.owner).unwrap_or(cg::EnumInfo { params: [], variants: [] }).params.len() end
+            if hint.text == sig.owner && nparams > 0 && nparams == hint.kids.len() && !sig.is_method is
+                let mut ts: [string] = []
+                for x in hint.kids is ts.push(cg::ty(g, x)) end
+                targs = "<" + cg::jc(ts) + ">"
+            end
+        end
+        return "{cg::fname(n)}{targs}({a})"
+    end
+    if g.externs.has(n) is
+        let ex: ast::Node = g.externs.get(n).unwrap_or(none())
+        let a: string = args_with_hints(g, args, ex.kids[0].kids, [])
+        return "{cg::fname(n)}({a})"
+    end
+    if cg::builtin_known(g, n) is
+        let r: string = cg::resolve_builtin(n)
+        g.used_builtins.add(r)
+        let a: string = args_with_hints(g, args, [], [])
+        return "hs_b_{r}({a})"
+    end
+    cg::fail_at(g, at, "undefined fn: {n}")
+    return ""
+end
+
+fn trim_trailing_us(s: string) -> string is
+    let mut n: int = s.len()
+    while n > 0 && byte_at(s, n - 1) == 95 is n -= 1 end
+    return s[0..n]
+end
+
+fn add_fallback(g: cg::Gen, m: string, b: string) is
+    let mut i: int = 0
+    while i < g.mf_m.len() is
+        if g.mf_m[i] == m && g.mf_b[i] == b is return end
+        i += 1
+    end
+    g.mf_m.push(m)
+    g.mf_b.push(b)
+end
+
+fn method_call(g: cg::Gen, e: ast::Node) -> string is
+    let m: string = e.text
+    let r: string = expr(g, e.kids[0])
+    let a: string = args_with_hints(g, e.kids[1].kids, [], [])
+    let mut comma: string = ", "
+    if a == "" is comma = "" end
+    let mut user_has: bool = false
+    for k in g.fns.key_list() is
+        let s: cg::FnSig = g.fns.get(k).unwrap_or(empty_sig())
+        if s.is_method && s.method_name == m is user_has = true end
+    end
+    let mm: string = trim_trailing_us(cg::kw(m))
+    let b0: string = cg::method_as_builtin(m)
+    if b0 != "" is
+        let mut b: string = b0
+        if m == "join" && g.fns.has("iter_join") is b = "iter_join" end
+        if g.fns.has(b) is
+            if user_has is
+                add_fallback(g, m, b)
+                return "hs_m_{mm}({r}{comma}{a})"
+            end
+            return "{cg::fname(b)}({r}{comma}{a})"
+        end
+        if cg::builtin_known(g, b) is
+            g.used_builtins.add(b)
+            if user_has is
+                add_fallback(g, m, b)
+                return "hs_m_{mm}({r}{comma}{a})"
+            end
+            return "hs_b_{b}({r}{comma}{a})"
+        end
+    end
+    return "hs_m_{mm}({r}{comma}{a})"
+end
