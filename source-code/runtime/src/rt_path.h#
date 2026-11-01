@@ -1,0 +1,144 @@
+fn trim_slash(s: string, n: int) -> int is
+    let mut k: int = n
+    while k > 0 && byte_at(s, k - 1) == 47 is k -= 1 end
+    return k
+end
+
+;; hsh_p_trim_tail: drops trailing '/' and trailing "/." components
+fn trim_tail(s: string, n: int) -> int is
+    let mut k: int = n
+    while true is
+        k = trim_slash(s, k)
+        if k >= 2 && byte_at(s, k - 1) == 46 && byte_at(s, k - 2) == 47 is
+            k -= 2
+        elsif k == 1 && byte_at(s, 0) == 46 is
+            return 0
+        else
+            return k
+        end
+    end
+    return k
+end
+
+;; start offset of the file name (hsh_p_filename); its end is trim_tail(p, len)
+fn name_start(p: string, n: int) -> int is
+    let mut s: int = n
+    while s > 0 && byte_at(p, s - 1) != 47 is s -= 1 end
+    return s
+end
+
+;; hsh_p_dot: index of the last '.' in nm[0..nl) that is not at index 0, else -1
+fn dot_index(p: string, from: int, nl: int) -> int is
+    let mut i: int = nl - 1
+    while i > 0 is
+        if byte_at(p, from + i) == 46 is return i end
+        i -= 1
+    end
+    return -1
+end
+
+;; file name length after the ".." rule
+fn name_len(p: string, s: int, n: int) -> int is
+    let nl: int = n - s
+    if nl == 2 && byte_at(p, s) == 46 && byte_at(p, s + 1) == 46 is return 0 end
+    return nl
+end
+
+;; hsh_path_join
+pub fn join(a: string, b: string) -> string is
+    if b.len() > 0 && byte_at(b, 0) == 47 is return b end
+    if a.len() == 0 is return b end
+    if byte_at(a, a.len() - 1) != 47 is return a + "/" + b end
+    return a + b
+end
+
+;; hsh_path_filename
+pub fn filename(p: string) -> string is
+    let n: int = trim_tail(p, p.len())
+    let s: int = name_start(p, n)
+    return p[s..s + name_len(p, s, n)]
+end
+
+;; hsh_path_stem
+pub fn stem(p: string) -> string is
+    let n: int = trim_tail(p, p.len())
+    let s: int = name_start(p, n)
+    let nl: int = name_len(p, s, n)
+    let d: int = dot_index(p, s, nl)
+    if d < 0 is return p[s..s + nl] end
+    return p[s..s + d]
+end
+
+;; hsh_path_extension
+pub fn extension(p: string) -> string is
+    let n: int = trim_tail(p, p.len())
+    let s: int = name_start(p, n)
+    let nl: int = name_len(p, s, n)
+    let d: int = dot_index(p, s, nl)
+    if d < 0 is return "" end
+    return p[s + d + 1..s + nl]
+end
+
+;; hsh_path_parent
+pub fn parent(p: string) -> string is
+    if p.len() == 0 is return "" end
+    let n: int = trim_tail(p, p.len())
+    if n == 0 is return "" end
+    let mut s: int = n
+    while s > 0 && byte_at(p, s - 1) != 47 is s -= 1 end
+    if s == 0 is return "" end
+    let e: int = trim_slash(p, s)
+    if e == 0 is return "/" end
+    return p[0..e]
+end
+
+;; hsh_path_is_absolute
+pub fn is_absolute(p: string) -> bool is
+    return p.len() > 0 && byte_at(p, 0) == 47
+end
+
+;; hsh_path_normalize
+pub fn normalize(p: string) -> string is
+    let n: int = p.len()
+    let mut seg: [string] = []
+    let mut have_root: bool = n > 0 && byte_at(p, 0) == 47
+    let mut i: int = 0
+    while i < n is
+        while i < n && byte_at(p, i) == 47 is i += 1 end
+        let st: int = i
+        while i < n && byte_at(p, i) != 47 is i += 1 end
+        let l: int = i - st
+        if l == 0 is
+            ;; nothing (trailing slashes)
+        elsif l == 1 && byte_at(p, st) == 46 is
+            ;; "." component
+        elsif l == 2 && byte_at(p, st) == 46 && byte_at(p, st + 1) == 46 is
+            if seg.len() > 0 is seg.pop() else have_root = false end
+        else
+            seg.push(p[st..i])
+        end
+    end
+    let mut o: string = ""
+    if have_root is o += "/" end
+    let mut k: int = 0
+    while k < seg.len() is
+        if k > 0 is o += "/" end
+        o += seg[k]
+        k += 1
+    end
+    return o
+end
+
+;; hsh_path_with_extension: "" removes the extension, a file name of "" or ".." leaves the path alone
+pub fn with_extension(p: string, ext: string) -> string is
+    let n: int = trim_tail(p, p.len())
+    let s: int = name_start(p, n)
+    let nl: int = name_len(p, s, n)
+    if nl == 0 is return p end
+    let d: int = dot_index(p, s, nl)
+    let mut st: int = nl
+    if d >= 0 is st = d end
+    let mut o: string = p[0..s + st]
+    if ext.len() > 0 is o += "." + ext end
+    return o
+end
