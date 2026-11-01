@@ -1,0 +1,28 @@
+use "std -> fs" from "fs"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+fn show(n: ast::Node, d: int) is
+    let t: string = n.tag
+    if !n.sp && (t == "BinOp" || t == "IndexAccess" || t == "FieldAccess" || t == "Call" || t == "MethodCall") is print("NOSPAN {t} {n.text}\n") end
+    for k in n.kids is show(k, d + 1) end
+end
+fn main() is
+    let args: [string] = env_args()
+    let path: string = args[1]
+    let opts: options::CompileOptions = options::default_options(false)
+    let rec: edition::EditionRecorder = edition::new_recorder()
+    let st: edition::EditionState = edition::new_state()
+    let r: parser::ParseResult = parser::parse_with_default(fs::read(path), path, 0, rec, st)
+    let res: modules::Resolver = modules::new_resolver(path, [], rec, st)
+    let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(path))
+    print("expanded\n")
+    for it in e.items is show(it, 0) end
+    let m0: ast::Node = ast::nd("Module", "", [r.module.kids[0], r.module.kids[1], r.module.kids[2], ast::nd("Items", "", e.items)])
+    let m: ast::Node = pipeline::prepare(m0, opts)
+    print("prepared\n")
+    show(m, 0)
+    let o: ast::Node = pipeline::optimize_pass(m, opts)
+    print("optimized\n")
+    show(o, 0)
+end
