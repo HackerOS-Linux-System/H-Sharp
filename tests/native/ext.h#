@@ -1,0 +1,16 @@
+struct P is
+    x: int
+    y: int
+end
+extern [c] is
+    fn takes(p: &P) -> int
+    fn plain(a: int, s: string) -> f64
+end
+extern [rust] is
+    fn rs_fn(a: int) -> int
+end
+extern [python] "math" is
+    fn sqrt(a: int) -> int
+end
+fn main() is
+end
