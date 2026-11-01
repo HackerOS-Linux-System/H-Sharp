@@ -1,0 +1,501 @@
+use "std -> fs" from "fs"
+use "std -> os" from "os"
+use "std -> env" from "env"
+use "std -> strings" from "str"
+use "workspace -> typecheck" from "lib -> *"
+
+mod target
+mod options
+mod ffi_linker
+mod runtime_embed
+
+;; ── runtime sources ────────────────────────────────────────────────────────
+pub fn runtime_dir() -> string is
+    ;; 1. explicit override (runtime development, distro packaging)
+    let v: string = env::get("HSHARP_RUNTIME_DIR")
+    if v.len() > 0 is return v end
+    ;; 2. a source checkout next to the binary (bin/hsharp, bin/stageN/hsharp): the runtime being edited wins over the
+    ;;    one baked in, so changes to source-code/compiler/runtime take effect without regenerating runtime_embed.h#
+    let d: string = tc_helpers::exe_dir()
+    if d.len() > 0 is
+        for rel in ["../source-code/compiler/runtime", "../../source-code/compiler/runtime"] is
+            let cand: string = d + "/" + rel
+            if fs::is_file(cand + "/hsharp_rt.hpp") && fs::is_file(cand + "/core.c") is
+                let canon: string = trim(exec("readlink", "-f", cand, ""))
+                if canon.len() > 0 is return canon end
+                return cand
+            end
+        end
+    end
+    ;; 3. the runtime carried by this very binary — always matches the compiler, needs no installation, no directory
+    ;;    lookup (an /usr/lib/... copy of some other version is exactly what used to break `bit build`).
+    return embedded_runtime_dir()
+end
+
+fn write_atomic(path: string, content: string) is
+    if fs::is_file(path) && fs::read(path) == content is return end
+    let tmp: string = path + "." + to_string(os::pid()) + ".tmp"
+    fs::write(tmp, content)
+    fs::rename(tmp, path)
+end
+
+;; materialises the baked-in runtime once per runtime version: <cache>/rt-src-<id>/ (marker file written last)
+fn embedded_runtime_dir() -> string is
+    let dir: string = cache_root() + "/rt-src-" + runtime_embed::id()
+    if fs::is_file(dir + "/.complete") is return dir end
+    fs::mkdir(cache_root())
+    fs::mkdir(dir)
+    write_atomic(dir + "/hsharp_rt.hpp", runtime_embed::rt_hpp())
+    write_atomic(dir + "/hsh_rt_decls.h", runtime_embed::rt_decls())
+    write_atomic(dir + "/core.c", runtime_embed::core_c())
+    write_atomic(dir + "/async_rt.c", runtime_embed::async_c())
+    write_atomic(dir + "/.complete", runtime_embed::id())
+    return dir
+end
+
+;; "" when the runtime sources are usable, else a message naming where they were looked for.  Without this a missing
+;; runtime silently produced an empty hsharp_rt.hpp and g++ answered with a wall of "'hs' has not been declared".
+pub fn runtime_problem() -> string is
+    let dir: string = runtime_dir()
+    let mut missing: string = ""
+    for f in ["hsharp_rt.hpp", "hsh_rt_decls.h", "core.c", "async_rt.c"] is
+        if !fs::is_file(dir + "/" + f) is missing = missing + " " + f end
+    end
+    if missing != "" is
+        return "H# runtime not found: `" + dir + "` is missing" + missing + ".\nHSHARP_RUNTIME_DIR points to a directory with the runtime sources (source-code/compiler/runtime in the H# tree)"
+    end
+    if !contains(fs::read(dir + "/hsharp_rt.hpp"), "namespace hs") is
+        return "H# runtime in `" + dir + "` does not match this compiler (hsharp_rt.hpp defines no `namespace hs`) — update it from source-code/compiler/runtime"
+    end
+    return ""
+end
+
+fn rt_hpp() -> string is return fs::read(runtime_dir() + "/hsharp_rt.hpp") end
+fn rt_decls() -> string is return fs::read(runtime_dir() + "/hsh_rt_decls.h") end
+fn core_c() -> string is return fs::read(runtime_dir() + "/core.c") end
+fn async_c() -> string is return fs::read(runtime_dir() + "/async_rt.c") end
+
+;; ── environment helpers ────────────────────────────────────────────────────
+fn split_on(s: string, ch: int) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == ch is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+fn contains(s: string, pat: string) -> bool is
+    let n: int = s.len()
+    let m: int = pat.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == pat is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn binary_on_path(name: string) -> bool is
+    let p: string = env::get_or("PATH", "")
+    for d in split_on(p, 58) is
+        if d != "" && fs::is_file(d + "/" + name) is return true end
+    end
+    return false
+end
+
+fn is_termux() -> bool is
+    if env::get_or("TERMUX_VERSION", "\x01unset") != "\x01unset" is return true end
+    return contains(env::get_or("PREFIX", ""), "com.termux")
+end
+
+fn user_ldflags() -> [string] is
+    let mut out: [string] = []
+    for v in ["LDFLAGS", "HSHARP_LDFLAGS"] is
+        for w in str::split_whitespace(env::get_or(v, "")) is out.push(w) end
+    end
+    return out
+end
+
+;; "" when there is no GNU cross prefix for the target
+pub fn gnu_cross_prefix(t: target::TargetTriple) -> string is
+    if t.arch == "x86_64" && t.os == "windows" && t.abi == "gnu" is return "x86_64-w64-mingw32" end
+    if t.arch == "aarch64" && t.os == "windows" && t.abi == "gnu" is return "aarch64-w64-mingw32" end
+    if t.arch == "aarch64" && t.os == "linux" && t.abi == "gnu" is return "aarch64-linux-gnu" end
+    if t.arch == "aarch64" && t.os == "linux" && t.abi == "musl" is return "aarch64-linux-musl" end
+    if t.arch == "riscv64" && t.os == "linux" && t.abi == "gnu" is return "riscv64-linux-gnu" end
+    if t.arch == "riscv64" && t.os == "linux" && t.abi == "musl" is return "riscv64-linux-musl" end
+    if t.arch == "x86_64" && t.os == "linux" && t.abi == "musl" is return "x86_64-linux-musl" end
+    return ""
+end
+
+pub fn apt_hint(t: target::TargetTriple) -> string is
+    if t.os == "windows" is return "g++-mingw-w64" end
+    if t.arch == "aarch64" && t.os == "linux" is return "g++-aarch64-linux-gnu" end
+    if t.arch == "riscv64" && t.os == "linux" is return "g++-riscv64-linux-gnu" end
+    if t.arch == "x86_64" && t.os == "linux" is return "musl-tools" end
+    return "clang"
+end
+
+;; Display of TargetTriple in the cross-compile error: arch-os-abi names as Rust's Display prints them
+fn target_display(t: target::TargetTriple) -> string is
+    return t.llvm_triple
+end
+
+pub struct Toolchain is
+    pub ok: bool
+    pub err: string
+    pub cc: string
+    pub cxx: string
+    pub extra: [string]
+end
+
+fn tc_err(m: string) -> Toolchain is
+    return Toolchain { ok: false, err: m, cc: "", cxx: "", extra: [] }
+end
+
+fn same_target(a: target::TargetTriple, b: target::TargetTriple) -> bool is
+    return a.arch == b.arch && a.os == b.os && a.abi == b.abi && a.llvm_triple == b.llvm_triple
+end
+
+pub fn toolchain(t: target::TargetTriple) -> Toolchain is
+    if same_target(t, target::host()) is
+        let mut cc: string = env::get_or("CC", "")
+        if cc == "" is
+            if binary_on_path("gcc") is cc = "gcc" else cc = "cc" end
+        end
+        let mut cxx: string = env::get_or("CXX", "")
+        if cxx == "" is
+            if binary_on_path("g++") is cxx = "g++"
+            elsif binary_on_path("clang++") is cxx = "clang++"
+            else cxx = "c++" end
+        end
+        if !binary_on_path(cxx) && !fs::is_file(cxx) is
+            return tc_err("no C++ compiler found (`" + cxx + "`) — H# now transpiles to C++, install one: sudo apt install g++ (or clang++)")
+        end
+        return Toolchain { ok: true, err: "", cc: cc, cxx: cxx, extra: [] }
+    end
+    let p: string = gnu_cross_prefix(t)
+    if p != "" is
+        let c: string = p + "-gcc"
+        let x: string = p + "-g++"
+        if binary_on_path(c) && binary_on_path(x) is return Toolchain { ok: true, err: "", cc: c, cxx: x, extra: [] } end
+        if binary_on_path("clang") && binary_on_path("clang++") is
+            return Toolchain { ok: true, err: "", cc: "clang", cxx: "clang++", extra: ["--target=" + p] }
+        end
+    elsif binary_on_path("clang") && binary_on_path("clang++") is
+        return Toolchain { ok: true, err: "", cc: "clang", cxx: "clang++", extra: ["--target=" + t.llvm_triple] }
+    end
+    let mut shown: string = p
+    if shown == "" is shown = t.llvm_triple end
+    return tc_err("cross-compiling to `" + target_display(t) + "` needs a `" + shown + "`-style g++ cross-toolchain or clang/clang++ on PATH. On Debian/Ubuntu try: sudo apt install " + apt_hint(t))
+end
+
+;; ── running commands ───────────────────────────────────────────────────────
+fn quote_all(prog: string, args: [string]) -> string is
+    let mut s: string = shell_escape(prog)
+    for a in args is s = s + " " + shell_escape(a) end
+    return s
+end
+
+;; "" on success, else the "<what> failed:\n<stderr>" message
+pub fn run(prog: string, args: [string], what: string) -> string is
+    let code: int = run_cmd_exec(quote_all(prog, args), 3600)
+    if code == 0 is return "" end
+    let mut msg: string = run_cmd_last_stderr()
+    if msg.len() > 6000 is msg = msg[0..6000] + "\n… (truncated)" end
+    return what + " failed:\n" + msg
+end
+
+;; ── cache ──────────────────────────────────────────────────────────────────
+pub fn cache_root() -> string is
+    let d: string = env::get_or("HSHARP_CACHE_DIR", "")
+    if d != "" is return d end
+    return env::temp_dir() + "/.h#-cache"
+end
+
+fn hex16(h: int) -> string is
+    let digits: string = "0123456789abcdef"
+    let mut out: string = ""
+    let mut i: int = 15
+    while i >= 0 is
+        let nib: int = (h >> (i * 4)) & 15
+        out = out + digits[nib..nib + 1]
+        i -= 1
+    end
+    return out
+end
+
+;; FNV-1a 64 over the parts (separated), as an i64 bit pattern
+pub fn hash_str(parts: [string]) -> int is
+    let mut h: int = -3750763034362895579    ;; 0xcbf29ce484222325
+    for p in parts is
+        let mut i: int = 0
+        while i < p.len() is
+            h = (h ^ byte_at(p, i)) * 1099511628211
+            i += 1
+        end
+        h = (h ^ 255) * 1099511628211
+    end
+    return h
+end
+
+fn cache_dir(key: int) -> string is
+    return cache_root() + "/rt-" + hex16(key)
+end
+
+;; (write_atomic: see above — temp file + rename; two h# processes share one hash-named work dir)
+
+pub fn write_headers(dir: string) is
+    fs::mkdir(dir)
+    write_atomic(dir + "/hsharp_rt.hpp", rt_hpp())
+    write_atomic(dir + "/hsh_rt_decls.h", rt_decls())
+end
+
+;; "" when the headers in `dir` are complete, else why not (checked before g++ runs)
+fn headers_problem(dir: string) -> string is
+    if !contains(fs::read(dir + "/hsharp_rt.hpp"), "namespace hs") is
+        return "the runtime header `" + dir + "/hsharp_rt.hpp` is empty or truncated (another h# process writing it? a full /tmp?) — run the build again"
+    end
+    return ""
+end
+
+fn opt_flag(o: options::CompileOptions) -> string is
+    if o.optimize is return "-O2" end
+    return "-O0"
+end
+
+pub struct ObjResult is
+    pub err: string
+    pub objs: [string]
+end
+
+fn runtime_objects(cc: string, extra: [string], o: options::CompileOptions) -> ObjResult is
+    let core: string = core_c()
+    let asy: string = async_c()
+    let flags: string = cc + "|" + str::join(extra, ",") + "|" + to_string(o.optimize)
+    let dir: string = cache_dir(hash_str([core, asy, flags, o.target.llvm_triple]))
+    fs::mkdir(dir)
+    let mut objs: [string] = []
+    for name in ["core", "async_rt"] is
+        let ob: string = dir + "/" + name + ".o"
+        if !fs::is_file(ob) is
+            let c: string = dir + "/" + name + ".c"
+            if name == "core" is fs::write(c, core) else fs::write(c, asy) end
+            let tmp: string = dir + "/" + name + ".tmp"
+            let mut args: [string] = []
+            for e in extra is args.push(e) end
+            for f in [opt_flag(o), "-fPIC", "-fwrapv", "-ffunction-sections", "-fdata-sections", "-w", "-c", c, "-o", tmp] is args.push(f) end
+            let e: string = run(cc, args, "compiling runtime/" + name + ".c")
+            if e != "" is return ObjResult { err: e, objs: [] } end
+            fs::rename(tmp, ob)
+        end
+        objs.push(ob)
+    end
+    return ObjResult { err: "", objs: objs }
+end
+
+pub struct BuildInput is
+    pub cpp: string
+    pub link: ffi_linker::LinkFlags
+    pub has_main: bool
+    pub strict_memory: bool
+    pub verbose: bool
+end
+
+fn parent_of(path: string) -> string is
+    let mut i: int = path.len() - 1
+    while i >= 0 is
+        if byte_at(path, i) == 47 is
+            if i == 0 is return "/" end
+            return path[0..i]
+        end
+        i -= 1
+    end
+    return ""
+end
+
+fn file_name_of(path: string) -> string is
+    let mut i: int = path.len() - 1
+    while i >= 0 is
+        if byte_at(path, i) == 47 is return path[i + 1..path.len()] end
+        i -= 1
+    end
+    return path
+end
+
+fn file_stem_of(path: string) -> string is
+    let n: string = file_name_of(path)
+    let mut i: int = n.len() - 1
+    while i > 0 is
+        if byte_at(n, i) == 46 is return n[0..i] end
+        i -= 1
+    end
+    return n
+end
+
+fn hex8(h: int) -> string is
+    let s: string = hex16(h)
+    return s[8..16]
+end
+
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+;; returns "" on success, otherwise the error text (Toolchain error in the Rust version)
+pub fn build(inp: BuildInput, o: options::CompileOptions) -> string is
+    let rp: string = runtime_problem()
+    if rp != "" is return rp end
+    if o.output_kind == "Cpp" is
+        let out: string = o.output + ".cpp"
+        let mut dir: string = parent_of(out)
+        if dir == "" is dir = "." end
+        write_headers(dir)
+        fs::write(dir + "/hsharp_core.c", core_c())
+        fs::write(dir + "/hsharp_async_rt.c", async_c())
+        fs::write(out, inp.cpp)
+        return ""
+    end
+    let tc: Toolchain = toolchain(o.target)
+    if !tc.ok is return tc.err end
+    let mut stem: string = file_stem_of(o.output)
+    if stem == "" is stem = "program" end
+    let hpp: string = rt_hpp()
+    let work: string = cache_root() + "/" + stem + "-" + hex8(hash_str([inp.cpp, hpp, o.target.llvm_triple]))
+    write_headers(work)
+    let hp: string = headers_problem(work)
+    if hp != "" is
+        fs::remove(work + "/hsharp_rt.hpp")          ;; one self-heal attempt before giving up
+        write_headers(work)
+        let hp2: string = headers_problem(work)
+        if hp2 != "" is return hp2 end
+    end
+    let cpp_path: string = work + "/program.cpp"
+    fs::write(cpp_path, inp.cpp)
+    let ro: ObjResult = runtime_objects(tc.cc, tc.extra, o)
+    if ro.err != "" is return ro.err end
+    let main_o: string = work + "/program.o"
+    let mut cargs: [string] = []
+    for e in tc.extra is cargs.push(e) end
+    for f in ["-std=gnu++17", "-I" + work, opt_flag(o), "-fPIC", "-w", "-fwrapv", "-fno-strict-aliasing", "-ffunction-sections", "-fdata-sections", "-c"] is cargs.push(f) end
+    if o.debug_info is cargs.push("-g") end
+    if inp.strict_memory is cargs.push("-DHSH_STRICT_MEMORY") end
+    cargs.push(cpp_path)
+    cargs.push("-o")
+    cargs.push(main_o)
+    let ce: string = run(tc.cxx, cargs, "compiling generated C++")
+    if ce != "" is
+        if contains(ce, "'hs' has not been declared") is
+            return ce + "\nhint: g++ never saw the H# runtime header (`namespace hs` undeclared) — `" + work + "/hsharp_rt.hpp` is missing or broken; runtime dir: " + runtime_dir() + " (HSHARP_RUNTIME_DIR overrides it)"
+        end
+        return ce + "\nhint: this is a bug in the H# C++ backend or an unsupported construct; the generated source is in " + work
+    end
+    let on_linux: bool = !is_termux() && o.target.os == "linux"
+    let mut linux_libs: [string] = []
+    if on_linux is linux_libs = ["-lm", "-lpthread", "-ldl"]
+    elsif o.target.os == "macos" is linux_libs = ["-lm"] end
+    let lf: ffi_linker::LinkFlags = inp.link
+    if !o.static_link is ffi_linker::resolve_missing_static_libs(lf) end
+    let ext_args: [string] = ffi_linker::to_cc_args_ex(lf, o.static_link)
+    let mut result: string = ""
+    if o.output_kind == "Object" is
+        fs::copy(main_o, o.output + ".o")
+    elsif o.output_kind == "StaticLib" is
+        let out: string = o.output + ".a"
+        let mut ar: [string] = ["rcs", out, main_o]
+        for ob in ro.objs is ar.push(ob) end
+        result = run("ar", ar, "ar")
+    elsif o.output_kind == "SharedLib" is
+        let out: string = o.output + options::file_suffix(o.output_kind, o.target)
+        let mut l: [string] = []
+        for e in tc.extra is l.push(e) end
+        l.push("-shared")
+        l.push("-fPIC")
+        l.push(main_o)
+        for ob in ro.objs is l.push(ob) end
+        l.push("-o")
+        l.push(out)
+        for a in linux_libs is l.push(a) end
+        for a in ext_args is l.push(a) end
+        for a in user_ldflags() is l.push(a) end
+        result = run(tc.cxx, l, "linking shared library")
+    else
+        if !inp.has_main is
+            fs::copy(main_o, o.output + ".o")
+            return ""
+        end
+        let out: string = o.output + target_exe_suffix(o.target)
+        let mut l: [string] = []
+        for e in tc.extra is l.push(e) end
+        l.push(main_o)
+        for ob in ro.objs is l.push(ob) end
+        l.push("-o")
+        l.push(out)
+        if on_linux is l.push("-no-pie") end
+        for a in ext_args is l.push(a) end
+        for a in linux_libs is l.push(a) end
+        for a in user_ldflags() is l.push(a) end
+        if o.optimize is
+            l.push("-O2")
+            l.push("-Wl,--gc-sections")
+            if env::get_or("HSHARP_KEEP_SYMBOLS", "") != "1" && o.target.os == "linux" is l.push("-s") end
+        end
+        if o.static_link is l.push("-static") end
+        let first: string = run(tc.cxx, l, "linking")
+        if first != "" && o.static_link is
+            let mut l2: [string] = []
+            for e in tc.extra is l2.push(e) end
+            l2.push(main_o)
+            for ob in ro.objs is l2.push(ob) end
+            l2.push("-o")
+            l2.push(out)
+            if on_linux is l2.push("-no-pie") end
+            if o.target.os == "linux" is
+                for a in ext_args is
+                    if a != "-static" is l2.push(a) end
+                end
+            end
+            for a in linux_libs is l2.push(a) end
+            for a in user_ldflags() is l2.push(a) end
+            if o.optimize is l2.push("-O2") end
+            let e2: string = run(tc.cxx, l2, "linking")
+            if e2 != "" is
+                let mut hint: string = ""
+                if contains(e2, "sqlite3") is hint = "\nhint: sudo apt install libsqlite3-dev"
+                elsif contains(e2, "cannot find -l") is hint = "\nhint: check `extern [c/cpp/rust, \"...\"]` library names and LIBRARY_PATH" end
+                return e2 + hint
+            end
+        elsif first != "" is
+            return first
+        end
+    end
+    if result != "" is return result end
+    ;; drop stale translations of the same program
+    for n in fs::list_dir(cache_root()) is
+        let full: string = cache_root() + "/" + n
+        if starts_with(n, stem + "-") && full != work && !starts_with(n, "rt-") is fs::rmdir_all(full) end
+    end
+    if o.save_cpp is
+        let mut dest: string = parent_of(o.output)
+        if dest == "" is dest = "build" end
+        fs::mkdir(dest)
+        fs::write(dest + "/hsharp_core.c", core_c())
+        fs::write(dest + "/hsharp_async_rt.c", async_c())
+        write_headers(dest)
+        fs::copy(cpp_path, dest + "/" + stem + ".cpp")
+    end
+    return ""
+end
+
+fn target_exe_suffix(t: target::TargetTriple) -> string is
+    return target::exe_suffix(t)
+end
