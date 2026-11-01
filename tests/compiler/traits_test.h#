@@ -1,0 +1,49 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn items(src: string) -> [ast::Node] is
+    return parser::parse_source(src).kids[3].kids
+end
+
+fn registry() -> traits::TraitRegistry is
+    let r: traits::TraitRegistry = traits::new_registry()
+    let src: string = "trait Shape is\n    fn area(self, k: int) -> int\n    fn name(self) -> string\nend\nimpl Circle : Shape is\n    pub fn area(self, k: int) -> int is\n        return k\n    end\n    fn name(self) -> string is\n        return \"c\"\n    end\nend\nimpl Square is\n    fn side(self) -> int is\n        return 1\n    end\nend\nimpl Square : Shape is\n    fn area(self, k: int) -> int is\n        return k + k\n    end\nend\n"
+    for it in items(src) is
+        if it.tag == "Trait" is traits::register_trait(r, it) end
+        if it.tag == "Impl" is traits::register_impl(r, it) end
+    end
+    return r
+end
+
+#[test]
+fn test_registration_and_implements() is
+    let r: traits::TraitRegistry = registry()
+    assert_eq(r.traits.len(), 1)
+    assert_eq(r.traits[0].methods.len(), 2)
+    assert_eq(r.impls.len(), 2)
+    assert_eq(traits::implements(r, "Circle", "Shape"), true)
+    assert_eq(traits::implements(r, "Square", "Shape"), true)
+    assert_eq(traits::implements(r, "Circle", "Other"), false)
+end
+
+#[test]
+fn test_dispatch_mangles_names_and_keeps_pub() is
+    let r: traits::TraitRegistry = registry()
+    let f: ast::Node = traits::dispatch_fn(r, "Circle", "area")
+    assert_eq(f.text, "Circle__Shape__area")
+    assert_eq(f.kids[5].text, "pub")
+    let g: ast::Node = traits::dispatch_fn(r, "Circle", "name")
+    assert_eq(g.kids[5].text, "")
+    assert_eq(traits::dispatch_fn(r, "Square", "side").tag, "None")
+    assert_eq(traits::dispatch_fn(r, "Nope", "area").tag, "None")
+end
+
+#[test]
+fn test_all_methods_and_emit() is
+    let r: traits::TraitRegistry = registry()
+    assert_eq(traits::all_methods_for(r, "Circle").len(), 2)
+    assert_eq(traits::all_methods_for(r, "Square").len(), 1)
+    assert_eq(traits::emit_fns(r).len(), 3)
+end
