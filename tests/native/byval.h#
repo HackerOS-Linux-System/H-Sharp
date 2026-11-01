@@ -1,0 +1,16 @@
+struct P is
+    x: int
+end
+extern [c] is
+    fn bad(p: P) -> int
+end
+fn go() is
+    let f = |a: int| a + 1
+end
+async fn af() is
+end
+fn main() is
+    let v = af().await
+    unsafe arena is
+    end
+end
