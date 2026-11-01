@@ -1,0 +1,142 @@
+use "workspace -> parser" from "lib -> *"
+
+fn mk(tag: string, text: string, kids: [ast::Node]) -> ast::Node is
+    return ast::nd(tag, text, kids)
+end
+
+;; first item of a one-item source snippet
+;; Rust builds every shim by hand, so a string literal is a plain `Str`; the parser yields an `Interp` made only of
+;; `Text` parts for a literal that contains `{{` / `}}` escapes — fold those back into one `Str`.
+fn fold_text_interps(n: ast::Node) is
+    let mut k: int = 0
+    while k < n.kids.len() is
+        let c: ast::Node = n.kids[k]
+        if c.tag == "Interp" is
+            let mut only_text: bool = true
+            let mut txt: string = ""
+            for p in c.kids is
+                if p.tag != "Text" is only_text = false else txt = txt + p.text end
+            end
+            if only_text is n.kids[k] = ast::lf("Str", txt) end
+        end
+        fold_text_interps(n.kids[k])
+        k += 1
+    end
+end
+
+;; Rust builds shims with `Span::dummy()` (file `<unknown>`, position 0:0:0)
+fn dummy_spans(n: ast::Node) is
+    if n.sp is
+        n.sl = 0
+        n.sc = 0
+        n.so = 0
+        n.el = 0
+        n.ec = 0
+        n.eo = 0
+        n.fl = "<unknown>"
+    end
+    for k in n.kids is dummy_spans(k) end
+end
+
+fn item_from(src: string) -> ast::Node is
+    let m: ast::Node = parser::parse_source(src)
+    let it: ast::Node = m.kids[3].kids[0]
+    fold_text_interps(it)
+    dummy_spans(it)
+    return it
+end
+
+fn proc_result_struct() -> ast::Node is
+    return item_from("pub struct ProcResult is\n    pub stdout: string\n    pub stderr: string\n    pub exit_code: i64\nend\n")
+end
+
+fn run_cmd_fn(name: string) -> ast::Node is
+    return item_from("pub fn " + name + "(cmd: string, timeout_secs: i64) -> ProcResult is\n    let __code: i64 = run_cmd_exec(cmd, timeout_secs)\n    return ProcResult {{ stdout: run_cmd_last_stdout(), stderr: run_cmd_last_stderr(), exit_code: __code }}\nend\n")
+end
+
+fn str_split_fn() -> ast::Node is
+    return item_from("pub fn str_split(s: string, sep: string) -> [string] is\n    let __n: i64 = str_split_count(s, sep)\n    let mut __result: [string] = []\n    let mut __i: i64 = 0\n    while __i < __n is\n        __result.push(str_split_part(s, sep, __i))\n        __i = __i + 1\n    end\n    return __result\nend\n")
+end
+
+fn str_count_fn() -> ast::Node is
+    return item_from("pub fn str_count(s: string, sub: string) -> i64 is\n    return str_split_count(s, sub) - 1\nend\n")
+end
+
+fn iter_join_fn() -> ast::Node is
+    return item_from("pub fn iter_join(arr: [string], sep: string) -> string is\n    let __n: i64 = arr.len()\n    let mut __result: string = \"\"\n    let mut __i: i64 = 0\n    while __i < __n is\n        if __i > 0 is\n            __result = __result + sep\n        end\n        __result = __result + arr[__i]\n        __i = __i + 1\n    end\n    return __result\nend\n")
+end
+
+fn json_empty_object_fn() -> ast::Node is
+    ;; Rust builds this body by hand as the plain string literal "{}"; parsing source text would give an
+    ;; interpolated string, so the literal node is patched in after parsing.
+    let f: ast::Node = item_from("pub fn json_empty_object() -> string is\n    return 0\nend\n")
+    f.kids[4].kids[0].kids[0] = ast::lf("Str", "{{}}")
+    return f
+end
+
+fn json_parse_fn() -> ast::Node is
+    return item_from("pub fn json_parse(s: string) -> string is\n    return s\nend\n")
+end
+
+fn json_stringify_pretty_fn() -> ast::Node is
+    return item_from("pub fn json_stringify_pretty(s: string) -> string is\n    let __s1: string = replace(s, \"{{{{\", \"{{{{\\n  \")\n    let __s2: string = replace(__s1, \",\", \",\\n  \")\n    let __s3: string = replace(__s2, \"}}}}\", \"\\n}}}}\")\n    return __s3\nend\n")
+end
+
+;; does any node of the subtree satisfy `Ident(name)`?
+fn mentions_ident(n: ast::Node, name: string) -> bool is
+    if n.tag == "Ident" && n.text == name is return true end
+    for k in n.kids is
+        if mentions_ident(k, name) is return true end
+    end
+    return false
+end
+
+fn find_fn(items: [ast::Node], name: string) -> int is
+    let mut i: int = 0
+    while i < items.len() is
+        if items[i].tag == "Fn" && items[i].text == name is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; inject `built` unless the program already defines `name`; a self-recursive alias wrapper is REPLACED
+fn inject_fn_if_missing(items: [ast::Node], name: string, built: ast::Node) -> [ast::Node] is
+    let mut out: [ast::Node] = []
+    for it in items is out.push(it) end
+    let pos: int = find_fn(out, name)
+    if pos < 0 is
+        out.push(built)
+        return out
+    end
+    if mentions_ident(out[pos].kids[4], name) is out[pos] = built end
+    return out
+end
+
+pub fn inject_stdlib_shims(m: ast::Node) -> ast::Node is
+    let mut items: [ast::Node] = []
+    for it in m.kids[3].kids is items.push(it) end
+    let mut has_struct: bool = false
+    let mut has_fn: bool = false
+    let mut has_json_type: bool = false
+    for it in items is
+        if it.tag == "Struct" && it.text == "ProcResult" is has_struct = true end
+        if it.tag == "Fn" && (it.text == "proc_run_cmd" || it.text == "proc_run_cmd_live") is has_fn = true end
+        if it.tag == "TypeAlias" && it.text == "json" is has_json_type = true end
+    end
+    if !has_struct && !has_fn is
+        items.push(proc_result_struct())
+        items.push(run_cmd_fn("proc_run_cmd"))
+        items.push(run_cmd_fn("proc_run_cmd_live"))
+    end
+    items = inject_fn_if_missing(items, "str_split", str_split_fn())
+    items = inject_fn_if_missing(items, "str_count", str_count_fn())
+    items = inject_fn_if_missing(items, "iter_join", iter_join_fn())
+    items = inject_fn_if_missing(items, "json_empty_object", json_empty_object_fn())
+    items = inject_fn_if_missing(items, "json_parse", json_parse_fn())
+    items = inject_fn_if_missing(items, "json_stringify_pretty", json_stringify_pretty_fn())
+    if !has_json_type is
+        items.push(item_from("pub type json = string\n"))
+    end
+    return mk("Module", m.text, [m.kids[0], m.kids[1], m.kids[2], mk("Items", "", items)])
+end
