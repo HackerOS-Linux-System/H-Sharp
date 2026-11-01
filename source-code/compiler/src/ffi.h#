@@ -1,0 +1,312 @@
+use "workspace -> parser" from "lib -> *"
+
+fn is_none(n: ast::Node) -> bool is return n.tag == "None" end
+
+fn named_to_c(n: string) -> string is
+    if n == "int" || n == "i64" || n == "isize" is return "int64_t" end
+    if n == "uint" || n == "u64" || n == "usize" is return "uint64_t" end
+    if n == "i32" is return "int32_t" end
+    if n == "u32" is return "uint32_t" end
+    if n == "i16" is return "int16_t" end
+    if n == "u16" is return "uint16_t" end
+    if n == "i8" is return "int8_t" end
+    if n == "u8" is return "uint8_t" end
+    if n == "i128" is return "__int128" end
+    if n == "u128" is return "unsigned __int128" end
+    if n == "f64" || n == "float64" is return "double" end
+    if n == "f32" || n == "float32" is return "float" end
+    if n == "bool" is return "int" end
+    if n == "string" || n == "str" is return "const char*" end
+    if n == "bytes" || n == "byte" is return "uint8_t*" end
+    if n == "void" is return "void" end
+    if n == "char" is return "char" end
+    if n == "size_t" is return "size_t" end
+    return "void*"
+end
+
+fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+pub fn type_to_c(t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" || tag == "Generic" is return named_to_c(t.text) end
+    if tag == "Void" is return "void" end
+    if tag == "Ref" is return "const void*" end
+    if tag == "RefMut" is return "void*" end
+    if tag == "Optional" is
+        let inner: string = type_to_c(t.kids[0])
+        if ends_with(inner, "*") is return inner end
+        return inner + "*"
+    end
+    if tag == "Array" || tag == "Slice" is return type_to_c(t.kids[0]) + "*" end
+    return "void*"
+end
+
+fn named_to_rust(n: string) -> string is
+    if n == "int" || n == "i64" || n == "isize" is return "i64" end
+    if n == "uint" || n == "u64" || n == "usize" is return "u64" end
+    if n == "i32" is return "i32" end
+    if n == "u32" is return "u32" end
+    if n == "i16" is return "i16" end
+    if n == "u16" is return "u16" end
+    if n == "i8" is return "i8" end
+    if n == "u8" is return "u8" end
+    if n == "i128" is return "i128" end
+    if n == "u128" is return "u128" end
+    if n == "f64" || n == "float64" is return "f64" end
+    if n == "f32" || n == "float32" is return "f32" end
+    if n == "bool" is return "bool" end
+    if n == "string" || n == "str" is return "*const std::ffi::c_char" end
+    if n == "bytes" || n == "byte" is return "*mut u8" end
+    if n == "void" is return "()" end
+    if n == "char" is return "std::os::raw::c_char" end
+    if n == "size_t" is return "usize" end
+    return "*mut std::ffi::c_void"
+end
+
+pub fn type_to_rust(t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" || tag == "Generic" is return named_to_rust(t.text) end
+    if tag == "Void" is return "()" end
+    if tag == "Ref" is return "*const " + type_to_rust(t.kids[0]) end
+    if tag == "RefMut" is return "*mut " + type_to_rust(t.kids[0]) end
+    if tag == "Optional" is return "Option<*mut " + type_to_rust(t.kids[0]) + ">" end
+    if tag == "Array" || tag == "Slice" is return "*mut " + type_to_rust(t.kids[0]) end
+    return "*mut std::ffi::c_void"
+end
+
+fn join_with(xs: [string], sep: string) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is s = s + sep end
+        s = s + xs[i]
+        i += 1
+    end
+    return s
+end
+
+fn is_variadic(f: ast::Node) -> bool is return f.kids[2].text == "true" end
+
+pub fn c_decl(f: ast::Node) -> string is
+    let mut ret: string = "void"
+    if !is_none(f.kids[1]) is ret = type_to_c(f.kids[1]) end
+    let mut params: [string] = []
+    for p in f.kids[0].kids is params.push(type_to_c(p.kids[1]) + " " + p.text) end
+    if is_variadic(f) is params.push("...") end
+    let mut ps: string = "void"
+    if params.len() > 0 is ps = join_with(params, ", ") end
+    return ret + " " + f.text + "(" + ps + ");"
+end
+
+pub fn c_header_block(fns: [ast::Node]) -> string is
+    let mut out: string = "#include <stdint.h>\n#include <stdbool.h>\n\n"
+    for f in fns is out = out + c_decl(f) + "\n" end
+    return out
+end
+
+;; ── struct registry (name -> Fields node); later duplicates win, like HashMap::insert ──
+pub struct StructTable is
+    pub names: [string]
+    pub fields: [ast::Node]
+end
+
+pub fn new_struct_table() -> StructTable is
+    return StructTable { names: [], fields: [] }
+end
+
+pub fn add_struct(t: StructTable, name: string, fields: ast::Node) is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == name is
+            t.fields[i] = fields
+            return
+        end
+        i += 1
+    end
+    t.names.push(name)
+    t.fields.push(fields)
+end
+
+fn has_struct(t: StructTable, n: string) -> bool is
+    for x in t.names is
+        if x == n is return true end
+    end
+    return false
+end
+
+fn struct_fields(t: StructTable, n: string) -> ast::Node is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == n is return t.fields[i] end
+        i += 1
+    end
+    return ast::Node { tag: "Fields", text: "", kids: [] }
+end
+
+fn reinterpret_hint(field_name: string, t: ast::Node) -> string is
+    if t.tag != "Named" is return "" end
+    let n: string = t.text
+    if n == "f64" || n == "float64" is return "  /* f64: double v; memcpy(&v, &s." + field_name + ", 8); */" end
+    if n == "f32" || n == "float32" is
+        return "  /* f32 stored widened to f64 bits, then to this slot: double v; memcpy(&v, &s." + field_name + ", 8); float v32 = (float)v; */"
+    end
+    if n == "bool" is return "  /* bool: 0 or 1 */" end
+    if n == "string" || n == "str" is return "  /* string: (const char*)s." + field_name + " */" end
+    if n == "bytes" || n == "byte" is return "  /* bytes: (uint8_t*)s." + field_name + " */" end
+    return ""
+end
+
+fn reinterpret_hint_rust(t: ast::Node) -> string is
+    if t.tag != "Named" is return "" end
+    let n: string = t.text
+    if n == "f64" || n == "float64" is return "  // f64::from_bits(self.field as u64)" end
+    if n == "f32" || n == "float32" is return "  // f32 widened to f64 bits: (f64::from_bits(self.field as u64)) as f32" end
+    if n == "bool" is return "  // 0 or 1" end
+    if n == "string" || n == "str" is return "  // self.field as *const std::ffi::c_char" end
+    if n == "bytes" || n == "byte" is return "  // self.field as *mut u8" end
+    return ""
+end
+
+pub fn struct_c_def(name: string, fields: ast::Node) -> string is
+    let mut out: string = "/* H# struct `" + name + "` — every field is one int64_t slot, in\n"
+    out = out + " * declaration order (see hsh_struct_new/get/set in core.c). */\n"
+    out = out + "typedef struct {{\n"
+    for f in fields.kids is
+        out = out + "    int64_t " + f.text + ";" + reinterpret_hint(f.text, f.kids[1]) + "\n"
+    end
+    out = out + "}} " + name + ";\n"
+    return out
+end
+
+pub fn struct_rust_def(name: string, fields: ast::Node) -> string is
+    let mut out: string = "// H# struct `" + name + "` — every field is one i64 slot, in\n"
+    out = out + "// declaration order (see hsh_struct_new/get/set in core.c).\n"
+    out = out + "#[repr(C)]\n"
+    out = out + "pub struct " + name + " {{\n"
+    for f in fields.kids is
+        out = out + "    pub " + f.text + ": i64," + reinterpret_hint_rust(f.kids[1]) + "\n"
+    end
+    out = out + "}}\n"
+    return out
+end
+
+fn note_struct(t: ast::Node, structs: StructTable, out: [string]) -> [string] is
+    let mut name: string = ""
+    if t.tag == "Named" is name = t.text
+    elsif (t.tag == "Ref" || t.tag == "RefMut") && t.kids[0].tag == "Named" is name = t.kids[0].text end
+    if name == "" || !has_struct(structs, name) is return out end
+    for x in out is
+        if x == name is return out end
+    end
+    let mut res: [string] = []
+    for x in out is res.push(x) end
+    res.push(name)
+    return res
+end
+
+fn referenced_struct_names(fns: [ast::Node], structs: StructTable) -> [string] is
+    let mut out: [string] = []
+    for f in fns is
+        for p in f.kids[0].kids is out = note_struct(p.kids[1], structs, out) end
+        if !is_none(f.kids[1]) is out = note_struct(f.kids[1], structs, out) end
+    end
+    return out
+end
+
+fn c_type_str_with_structs(t: ast::Node, structs: StructTable) -> string is
+    if (t.tag == "Ref" || t.tag == "RefMut") && t.kids[0].tag == "Named" && has_struct(structs, t.kids[0].text) is
+        return t.kids[0].text + "*"
+    end
+    if t.tag == "Named" && has_struct(structs, t.text) is return t.text end
+    return type_to_c(t)
+end
+
+fn c_decl_with_structs(f: ast::Node, structs: StructTable) -> string is
+    let mut ret: string = "void"
+    if !is_none(f.kids[1]) is ret = c_type_str_with_structs(f.kids[1], structs) end
+    let mut params: [string] = []
+    for p in f.kids[0].kids is params.push(c_type_str_with_structs(p.kids[1], structs) + " " + p.text) end
+    if is_variadic(f) is params.push("...") end
+    let mut ps: string = "void"
+    if params.len() > 0 is ps = join_with(params, ", ") end
+    return ret + " " + f.text + "(" + ps + ");"
+end
+
+pub fn c_header_block_with_structs(fns: [ast::Node], structs: StructTable) -> string is
+    let mut out: string = "#include <stdint.h>\n#include <stdbool.h>\n\n"
+    for name in referenced_struct_names(fns, structs) is
+        out = out + struct_c_def(name, struct_fields(structs, name)) + "\n"
+    end
+    for f in fns is out = out + c_decl_with_structs(f, structs) + "\n" end
+    return out
+end
+
+;; ── Rust ──
+pub fn rust_extern_decl(f: ast::Node) -> string is
+    let mut ret: string = ""
+    if !is_none(f.kids[1]) is ret = " -> " + type_to_rust(f.kids[1]) end
+    let mut params: [string] = []
+    for p in f.kids[0].kids is params.push(p.text + ": " + type_to_rust(p.kids[1])) end
+    if is_variadic(f) is params.push("...") end
+    return "    pub fn " + f.text + "(" + join_with(params, ", ") + ")" + ret + ";"
+end
+
+pub fn rust_extern_block(fns: [ast::Node]) -> string is
+    let mut out: string = "unsafe extern \"C\" {{\n"
+    for f in fns is out = out + rust_extern_decl(f) + "\n" end
+    return out + "}}"
+end
+
+fn rust_type_str_with_structs(t: ast::Node, structs: StructTable) -> string is
+    if t.tag == "Ref" && t.kids[0].tag == "Named" && has_struct(structs, t.kids[0].text) is return "*const " + t.kids[0].text end
+    if t.tag == "RefMut" && t.kids[0].tag == "Named" && has_struct(structs, t.kids[0].text) is return "*mut " + t.kids[0].text end
+    return type_to_rust(t)
+end
+
+fn rust_extern_decl_with_structs(f: ast::Node, structs: StructTable) -> string is
+    let mut ret: string = ""
+    if !is_none(f.kids[1]) is ret = " -> " + rust_type_str_with_structs(f.kids[1], structs) end
+    let mut params: [string] = []
+    for p in f.kids[0].kids is params.push(p.text + ": " + rust_type_str_with_structs(p.kids[1], structs)) end
+    if is_variadic(f) is params.push("...") end
+    return "    pub fn " + f.text + "(" + join_with(params, ", ") + ")" + ret + ";"
+end
+
+pub fn rust_extern_block_with_structs(fns: [ast::Node], structs: StructTable) -> string is
+    let mut out: string = ""
+    for name in referenced_struct_names(fns, structs) is
+        out = out + struct_rust_def(name, struct_fields(structs, name)) + "\n"
+    end
+    out = out + "unsafe extern \"C\" {{\n"
+    for f in fns is out = out + rust_extern_decl_with_structs(f, structs) + "\n" end
+    return out + "}}"
+end
+
+;; ── Python trampolines ──
+pub fn python_trampoline_sig(fn_name: string, param_count: int) -> string is
+    let mut ps: [string] = []
+    let mut i: int = 0
+    while i < param_count is
+        ps.push("const char* arg" + to_string(i))
+        i += 1
+    end
+    let mut s: string = "void"
+    if param_count > 0 is s = join_with(ps, ", ") end
+    return "const char* hsh_py_" + fn_name + "(" + s + ");"
+end
+
+pub fn python_trampoline_body(module: string, fn_name: string, param_count: int) -> string is
+    let mut sig: string = python_trampoline_sig(fn_name, param_count)
+    while ends_with(sig, ";") is sig = sig[0..sig.len() - 1] end
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < param_count is
+        names.push("arg" + to_string(i))
+        i += 1
+    end
+    let mut args_body: string = "    const char* argv[] = {{ NULL }};\n"
+    if param_count != 0 is args_body = "    const char* argv[] = {{ " + join_with(names, ", ") + ", NULL }};\n" end
+    return sig + " {{\n" + args_body + "    return hsh_py_call(\"" + module + "\", \"" + fn_name + "\", " + to_string(param_count) + ", argv);\n}}"
+end
