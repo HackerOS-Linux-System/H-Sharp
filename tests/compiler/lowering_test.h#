@@ -1,0 +1,36 @@
+use "std -> test" from "test"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn dump(m: ast::Node) -> string is
+    let mut sb = strbuf::new()
+    ast::dump_plain(m, 0, sb)
+    return sb.build()
+end
+
+#[test]
+fn test_builtin_rename_and_strip_tests() is
+    let a: string = "fn f() is\n    let x = __builtin_str_split(\"a\", \",\")\n    let y = __builtin_str_join(x, \",\")\nend\n#[test]\nfn t() is\n    assert_eq(1, 1)\nend\nmod inner is\n    #[test]\n    fn t2() is\n        assert_eq(1, 1)\n    end\n    fn keep() is\n        let z = __builtin_str_split(\"b\", \";\")\n    end\nend\n"
+    let b: string = "fn f() is\n    let x = str_split(\"a\", \",\")\n    let y = iter_join(x, \",\")\nend\nmod inner is\n    fn keep() is\n        let z = str_split(\"b\", \";\")\n    end\nend\n"
+    let got: ast::Node = builtin_lowering::strip_test_fns(builtin_lowering::lower_string_builtins(parser::parse_source(a)))
+    assert_eq(dump(got), dump(parser::parse_source(b)))
+end
+
+#[test]
+fn test_reachability_from_main() is
+    let a: string = "fn main() is\n    a()\n    m::b()\nend\nfn a() is\n    c(1)\nend\nfn b() is\nend\nfn c(x: int) is\nend\nfn dead() is\n    c(2)\nend\n"
+    let r: [string] = reachability::compute_reachable(parser::parse_source(a))
+    assert_eq(r.len(), 4)
+    assert_eq(r[0], "a")
+    assert_eq(r[1], "b")
+    assert_eq(r[2], "c")
+    assert_eq(r[3], "main")
+end
+
+#[test]
+fn test_no_main_means_everything_reachable() is
+    let r: [string] = reachability::compute_reachable(parser::parse_source("fn p() is\nend\nfn q() is\nend\n"))
+    assert_eq(r.len(), 2)
+end
