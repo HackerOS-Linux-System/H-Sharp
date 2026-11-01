@@ -1,0 +1,6 @@
+use "workspace -> parser" from "lib -> *"
+
+pub fn expand_derives(m: ast::Node) -> [ast::Node] is
+    let none: [ast::Node] = []
+    return none
+end
