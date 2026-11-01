@@ -1,0 +1,26 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+#[test]
+fn test_struct_by_value_ffi_is_reported() is
+    let src: string = "struct P is\n    pub x: int\nend\nextern dynamic [c, \"libx\"] is\n    fn take(p: P) -> int\n    fn ok(p: &P) -> int\n    fn give() -> P\nend\n"
+    let d: [features::Diagnostic] = features::check_module_features(parser::parse_source(src), "Cpp")
+    assert_eq(d.len(), 2)
+    assert_eq(d[0].message, "passing a struct by value across an `extern` FFI boundary is not implemented yet (on any backend)")
+end
+
+#[test]
+fn test_cpp_backend_supports_closures_async_arena() is
+    let src: string = "async fn a() is\nend\nfn main() is\n    let f = |x: int| is x end\n    let r = unsafe arena(64) is 1 end\n    let z = await a()\nend\n"
+    let d: [features::Diagnostic] = features::check_module_features(parser::parse_source(src), "Cpp")
+    assert_eq(d.len(), 0)
+end
+
+#[test]
+fn test_python_extern_is_not_c_abi() is
+    let src: string = "struct P is\n    pub x: int\nend\nextern dynamic [python, \"numpy\"] is\n    fn take(p: P) -> int\nend\n"
+    let d: [features::Diagnostic] = features::check_module_features(parser::parse_source(src), "Cpp")
+    assert_eq(d.len(), 0)
+end
