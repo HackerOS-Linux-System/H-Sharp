@@ -1,0 +1,63 @@
+use "workspace -> parser" from "lib -> *"
+
+fn mentions(n: ast::Node, name: string) -> bool is
+    if n.tag == "Ident" && n.text == name is return true end
+    for k in n.kids is
+        if mentions(k, name) is return true end
+    end
+    return false
+end
+
+fn is_name(n: ast::Node, name: string) -> bool is return n.tag == "Ident" && n.text == name end
+
+;; true when `name` occurs somewhere in `n` in a way that could let the handle escape
+fn leaks(n: ast::Node, name: string) -> bool is
+    let t: string = n.tag
+    if t == "Ident" is return n.text == name end
+    if t == "Closure" is return mentions(n, name) end
+    if t == "Let" is
+        if n.text == name is return true end
+        return leaks(n.kids[2], name)
+    end
+    if t == "MethodCall" && is_name(n.kids[0], name) is
+        if n.text != "len" && n.text != "push" is return true end
+        for x in n.kids[1].kids is
+            if leaks(x, name) is return true end
+        end
+        return false
+    end
+    if t == "IndexAccess" && is_name(n.kids[0], name) is return leaks(n.kids[1], name) end
+    if t == "Assign" || t == "CompoundAssign" is
+        if is_name(n.kids[0], name) is return true end
+        return leaks(n.kids[0], name) || leaks(n.kids[1], name)
+    end
+    if t == "For" && is_name(n.kids[1], name) is return leaks(n.kids[2], name) end
+    for k in n.kids is
+        if leaks(k, name) is return true end
+    end
+    return false
+end
+
+;; names of the top-level array locals of `f` that are dropped at the end of `f`
+pub fn candidates(f: ast::Node) -> [string] is
+    let mut out: [string] = []
+    let body: [ast::Node] = f.kids[4].kids
+    let mut i: int = 0
+    while i < body.len() is
+        let s: ast::Node = body[i]
+        if s.tag == "Let" && s.kids[2].tag == "ArrayLit" && (s.kids[1].tag == "None" || s.kids[1].tag == "Array") is
+            let mut ok: bool = !leaks(s.kids[2], s.text)
+            let mut j: int = 0
+            while j < body.len() && ok is
+                if j != i && leaks(body[j], s.text) is ok = false end
+                j += 1
+            end
+            for p in f.kids[2].kids is
+                if p.text == s.text is ok = false end
+            end
+            if ok is out.push(s.text) end
+        end
+        i += 1
+    end
+    return out
+end
