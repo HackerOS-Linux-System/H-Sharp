@@ -1,0 +1,127 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn has(xs: [string], s: string) -> bool is
+    for x in xs is
+        if x == s is return true end
+    end
+    return false
+end
+
+fn pos(xs: [string], s: string) -> int is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return i end
+        i += 1
+    end
+    return -1
+end
+
+#[test]
+fn test_sanitize_lib_names() is
+    assert_eq(ffi_linker::sanitize("libssl.so"), "ssl")
+    assert_eq(ffi_linker::sanitize("libssl"), "ssl")
+    assert_eq(ffi_linker::sanitize("ssl"), "ssl")
+    assert_eq(ffi_linker::sanitize("ssl.a"), "ssl")
+    assert_eq(ffi_linker::sanitize("libssl.a"), "ssl")
+    assert_eq(ffi_linker::sanitize("foo.dylib"), "foo")
+    assert_eq(ffi_linker::sanitize("foo.dll"), "foo")
+end
+
+#[test]
+fn test_dynamic_static_whole_archive_flags() is
+    let d: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    d.dynamic_libs = ["ssl", "crypto"]
+    let da: [string] = ffi_linker::to_cc_args(d)
+    assert_eq(has(da, "-lssl"), true)
+    assert_eq(has(da, "-lcrypto"), true)
+    assert_eq(has(da, "-Wl,-Bstatic"), false)
+    let s: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    s.static_libs = ["sqlite3"]
+    let sa: [string] = ffi_linker::to_cc_args(s)
+    assert_eq(has(sa, "-lsqlite3"), true)
+    assert_eq(has(sa, "-Wl,-Bstatic"), true)
+    assert_eq(has(sa, "-Wl,-Bdynamic"), true)
+    let r: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    r.rust_whole_archive_libs = ["mylib"]
+    let ra: [string] = ffi_linker::to_cc_args(r)
+    assert_eq(has(ra, "-lmylib"), true)
+    assert_eq(has(ra, "-Wl,--whole-archive"), true)
+    assert_eq(has(ra, "-Wl,--no-whole-archive"), true)
+end
+
+#[test]
+fn test_dedup_and_cpp_stdcpp() is
+    let f: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    f.dynamic_libs = ["ssl", "ssl", "crypto", "stdc++", "stdc++"]
+    ffi_linker::dedup(f)
+    assert_eq(f.dynamic_libs.len(), 3)
+    assert_eq(f.dynamic_libs[0], "ssl")
+    assert_eq(f.dynamic_libs[1], "crypto")
+end
+
+#[test]
+fn test_pkg_config_libs_come_after_static_libs() is
+    let f: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    f.static_libs = ["solvext", "solv"]
+    f.pkg_config_args = ["-L/opt/x/lib", "-lexpat"]
+    let a: [string] = ffi_linker::to_cc_args_ex(f, true)
+    assert_eq(pos(a, "-L/opt/x/lib") < pos(a, "-lsolvext"), true)
+    assert_eq(pos(a, "-lsolvext") < pos(a, "-lsolv"), true)
+    assert_eq(pos(a, "-lsolv") < pos(a, "-lexpat"), true)
+end
+
+#[test]
+fn test_python_note_no_link_flag_and_empty() is
+    let f: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    f.python_notes = ["python[numpy] — bridge, no link flag"]
+    assert_eq(ffi_linker::to_cc_args(f).len(), 0)
+    assert_eq(ffi_linker::is_empty(f), true)
+end
+
+#[test]
+fn test_missing_static_lib_without_shared_is_left_alone() is
+    let f: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    f.static_libs = ["definitely_not_a_real_lib_xyz"]
+    let notes: [string] = ffi_linker::resolve_missing_static_libs(f)
+    assert_eq(notes.len(), 0)
+    assert_eq(f.static_libs.len(), 1)
+    assert_eq(f.static_libs[0], "definitely_not_a_real_lib_xyz")
+end
+
+#[test]
+fn test_missing_static_lib_falls_back_to_shared() is
+    let dir: string = "/tmp/hs_ffi_fb_h"
+    fs::mkdir(dir)
+    fs::write(dir + "/libhsfaketest.so", "")
+    env::set("LIBRARY_PATH", dir)
+    let f: ffi_linker::LinkFlags = ffi_linker::new_flags()
+    f.static_libs = ["hsfaketest"]
+    let notes: [string] = ffi_linker::resolve_missing_static_libs(f)
+    env::remove("LIBRARY_PATH")
+    fs::rmdir_all(dir)
+    assert_eq(notes.len(), 1)
+    assert_eq(f.static_libs.len(), 0)
+    let args: [string] = ffi_linker::to_cc_args(f)
+    assert_eq(has(args, "-lhsfaketest"), true)
+    assert_eq(has(args, "-L" + dir), true)
+    assert_eq(has(args, "-Wl,-Bstatic"), false)
+end
+
+#[test]
+fn test_collect_from_extern_blocks() is
+    let src: string = "extern dynamic [python, \"numpy\"] is\n    fn a(x: int) -> int\nend\nextern dynamic [rust] is\n    fn b(x: int) -> int\nend\nextern static [rust, \"libfoo\"] is\n    fn c(x: int) -> int\nend\nextern dynamic [rust, \"libbar.so\"] is\n    fn d(x: int) -> int\nend\nextern dynamic [c++, \"hsnolib_zz\"] is\n    fn e(x: int) -> int\nend\n"
+    let f: ffi_linker::LinkFlags = ffi_linker::collect_link_flags(parser::parse_source(src))
+    assert_eq(f.python_notes.len(), 1)
+    assert_eq(f.diagnostics.len(), 1)
+    assert_eq(f.rust_whole_archive_libs[0], "foo")
+    assert_eq(has(f.dynamic_libs, "bar"), true)
+    assert_eq(has(f.dynamic_libs, "hsnolib_zz"), true)
+    assert_eq(has(f.dynamic_libs, "stdc++"), true)
+    assert_eq(has(f.rpath_hints, "-Wl,-rpath,$ORIGIN"), true)
+    assert_eq(ffi_linker::describe_flags(f), "dynamic: bar, hsnolib_zz, stdc++ | rust(whole-archive): foo | python-bridge: 1 block(s) | warnings: 1")
+end
