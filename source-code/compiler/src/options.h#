@@ -1,0 +1,73 @@
+mod target
+
+pub struct CompileOptions is
+    pub target: target::TargetTriple
+    pub optimize: bool
+    pub static_link: bool
+    pub debug_info: bool
+    pub output: string
+    pub output_kind: string
+    pub default_mem_mode: string   ;; "" = None, else "Safety" / "Default" / ...
+    pub strict_memory: bool
+    pub save_cpp: bool
+    pub test_mode: bool
+    pub verbose: bool
+end
+
+pub fn default_options(strict_env: bool) -> CompileOptions is
+    return CompileOptions { target: target::host(), optimize: true, static_link: true, debug_info: false,
+        output: "output", output_kind: "Binary", default_mem_mode: "", strict_memory: strict_env,
+        save_cpp: false, test_mode: false, verbose: false }
+end
+
+fn contains(s: string, pat: string) -> bool is
+    let n: int = s.len()
+    let m: int = pat.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == pat is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn file_suffix(kind: string, t: target::TargetTriple) -> string is
+    if kind == "Binary" is return "" end
+    if kind == "Object" is return ".o" end
+    if kind == "SharedLib" is
+        if contains(t.llvm_triple, "windows") is return ".dll" end
+        if contains(t.llvm_triple, "darwin") is return ".dylib" end
+        return ".so"
+    end
+    if kind == "StaticLib" is return ".a" end
+    return ".cpp"
+end
+
+pub struct KindLookup is
+    pub found: bool
+    pub kind: string
+end
+
+pub fn kind_from_str(s: string) -> KindLookup is
+    if s == "bin" || s == "binary" || s == "exe" is return KindLookup { found: true, kind: "Binary" } end
+    if s == "obj" || s == "object" || s == "o" is return KindLookup { found: true, kind: "Object" } end
+    if s == "so" || s == "dylib" || s == "dll" || s == "shared" || s == "shared-lib" is return KindLookup { found: true, kind: "SharedLib" } end
+    if s == "a" || s == "lib" || s == "static" || s == "static-lib" || s == "archive" is return KindLookup { found: true, kind: "StaticLib" } end
+    if s == "cpp" || s == "c++" || s == "cxx" is return KindLookup { found: true, kind: "Cpp" } end
+    return KindLookup { found: false, kind: "Binary" }
+end
+
+;; the `wasm32` guard at the top of `compile()`; "" when fine
+pub fn wasm_guard(o: CompileOptions) -> string is
+    if target::is_wasm(o.target) && o.output_kind != "Cpp" is
+        return "target wasm32 only supports `--emit cpp` (compile the emitted source with emscripten / wasi-sdk yourself)"
+    end
+    return ""
+end
+
+;; CompileError display texts
+pub fn strict_memory_error(n: int) -> string is
+    return "--strict-memory: " + to_string(n) + " memory-safety warning(s) treated as errors"
+end
+
+pub fn codegen_error(e: string) -> string is return "codegen: " + e end
