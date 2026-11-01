@@ -1,0 +1,151 @@
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+
+mod options
+mod traits
+mod derive_codegen
+mod const_lowering
+mod builtin_lowering
+mod stdlib_shims
+mod lifetimes
+mod features
+mod optimize
+mod cppgen
+mod monomorphize
+mod memory_safety
+mod ffi_linker
+mod cpp_build
+
+pub fn prepare(module: ast::Node, opts: options::CompileOptions) -> ast::Node is
+    let reg: traits::TraitRegistry = traits::new_registry()
+    for it in module.kids[3].kids is
+        if it.tag == "Trait" is traits::register_trait(reg, it) end
+        if it.tag == "Impl" is traits::register_impl(reg, it) end
+    end
+    let mut items: [ast::Node] = []
+    for it in module.kids[3].kids is items.push(it) end
+    for it in derive_codegen::expand_derives(module) is items.push(it) end
+    for f in traits::emit_fns(reg) is items.push(f) end
+    let mut m: ast::Node = ast::nd("Module", module.text, [module.kids[0], module.kids[1], module.kids[2], ast::nd("Items", "", items)])
+    checker::apply_file_mem_mode(m)
+    if opts.default_mem_mode != "" is
+        for it in m.kids[3].kids is checker::apply_mem_item(it, opts.default_mem_mode) end
+    end
+    if !opts.test_mode is m = builtin_lowering::strip_test_fns(m) end
+    m = const_lowering::lower_consts(m)
+    m = builtin_lowering::lower_string_builtins(m)
+    m = stdlib_shims::inject_stdlib_shims(m)
+    return m
+end
+
+;; pass 1 + 2 + 2.5: typecheck, feature/capability check (C++ backend), lifetime warnings.
+pub struct FrontResult is
+    pub diags: [diagnostics::Diag]
+    pub feature_diags: [features::Diagnostic]
+    pub lifetime_warnings: [string]
+end
+
+pub fn check_front(m: ast::Node, file: string) -> FrontResult is
+    let tc: checker::TypeChecker = checker::new_checker(file)
+    let diags: [diagnostics::Diag] = checker::check_module(tc, m)
+    let fd: [features::Diagnostic] = features::check_module_features(m, "Cpp")
+    let lc: lifetimes::LifetimeChecker = lifetimes::new_checker()
+    let mut warns: [string] = []
+    for e in lifetimes::check_module(lc, m) is warns.push("warning: " + lifetimes::error_text(e)) end
+    return FrontResult { diags: diags, feature_diags: fd, lifetime_warnings: warns }
+end
+
+;; pass 3 (compile(): `if opts.test_mode { module } else { optimize_ast::OptimizeContext::new().run(module).0 }`)
+pub fn optimize_pass(m: ast::Node, opts: options::CompileOptions) -> ast::Node is
+    if opts.test_mode is return m end
+    return optimize::optimize_module(m)
+end
+
+;; ── the whole of `compile()` ──────────────────────────────────────────────────
+;; ok=false, diag=true  : diagnostics were printed (the caller says "type errors above")
+;; ok=false, diag=false : `err` is the CompileError display text
+pub struct CompileResult is
+    pub ok: bool
+    pub diag: bool
+    pub err: string
+end
+
+fn fail_err(e: string) -> CompileResult is return CompileResult { ok: false, diag: false, err: e } end
+
+fn has_error(ds: [diagnostics::Diag]) -> bool is
+    for d in ds is
+        if d.sev == "E" is return true end
+    end
+    return false
+end
+
+pub struct FrontOut is
+    pub ok: bool
+    pub diag: bool
+    pub err: string
+    pub cpp: string
+    pub has_main: bool
+    pub link: ffi_linker::LinkFlags
+end
+
+fn front_fail(diag: bool, e: string) -> FrontOut is
+    return FrontOut { ok: false, diag: diag, err: e, cpp: "", has_main: false, link: ffi_linker::new_flags() }
+end
+
+;; everything in `compile()` before the toolchain: returns the C++ text + link flags
+;; phase 1 of the frontend: typecheck, features, lifetimes, memory audit, bound diagnostics (no code generation)
+pub fn check_phase(module: ast::Node, source: string, file: string, opts: options::CompileOptions) -> FrontOut is
+    let g: string = options::wasm_guard(opts)
+    if g != "" is return front_fail(false, g) end
+    let m0: ast::Node = prepare(module, opts)
+    let tc: checker::TypeChecker = checker::new_checker(file)
+    let mut diags: [diagnostics::Diag] = checker::check_module(tc, m0)
+    for fd in features::check_module_features(m0, "Cpp") is
+        diags.push(diagnostics::Diag { sev: "E", sp: fd.sp, file: file, msg: fd.message, hints: fd.hints })
+    end
+    let lc: lifetimes::LifetimeChecker = lifetimes::new_checker()
+    for e in lifetimes::check_module(lc, m0) is memory_safety::eprint("warning: " + lifetimes::error_text(e) + "\n") end
+    let findings: int = memory_safety::audit_module(m0, opts.strict_memory)
+    if diags.len() > 0 is diagnostics::print_diagnostics(diags, source, file) end
+    if opts.strict_memory && findings > 0 is return front_fail(false, options::strict_memory_error(findings)) end
+    if has_error(diags) is return front_fail(true, "") end
+
+    let viol: [monomorphize::Violation] = monomorphize::bound_violations(m0, tc)
+    if viol.len() > 0 is
+        let mut bd: [diagnostics::Diag] = []
+        for v in viol is
+            let d: diagnostics::Diag = diagnostics::error(v.sp, file, "type `{v.concrete_ty}` does not implement trait `{v.trait_name}` (required by `{v.type_param}: {v.trait_name}` on `{v.fn_name}`)")
+            bd.push(diagnostics::with_hint(d, "add `impl {v.concrete_ty} : {v.trait_name} is ... end` with the methods `{v.trait_name}` declares, or pass a different type here"))
+        end
+        diagnostics::print_diagnostics(bd, source, file)
+        return front_fail(true, "")
+    end
+    return FrontOut { ok: true, diag: false, err: "", cpp: "", has_main: false, link: ffi_linker::new_flags() }
+end
+
+;; phase 2: optimise + generate C++ (the module has already passed phase 1)
+pub fn gen_phase(module: ast::Node, opts: options::CompileOptions) -> FrontOut is
+    let m0: ast::Node = prepare(module, opts)
+    let m: ast::Node = optimize_pass(m0, opts)
+    let o: cppgen::GenOut = cppgen::generate(m, opts.test_mode)
+    if !o.ok is return front_fail(false, options::codegen_error(o.err)) end
+    for w in o.warnings is memory_safety::eprint("warning: " + w + "\n") end
+    return FrontOut { ok: true, diag: false, err: "", cpp: o.cpp, has_main: o.has_main, link: ffi_linker::collect_link_flags(m) }
+end
+
+;; both phases in one process (small programs, `lib build`)
+pub fn frontend(module: ast::Node, source: string, file: string, opts: options::CompileOptions) -> FrontOut is
+    let c: FrontOut = check_phase(module, source, file, opts)
+    if !c.ok is return c end
+    return gen_phase(module, opts)
+end
+
+pub fn compile(module: ast::Node, source: string, file: string, opts: options::CompileOptions) -> CompileResult is
+    let fo: FrontOut = frontend(module, source, file, opts)
+    if !fo.ok is return CompileResult { ok: false, diag: fo.diag, err: fo.err } end
+    let inp: cpp_build::BuildInput = cpp_build::BuildInput { cpp: fo.cpp, link: fo.link, has_main: fo.has_main || opts.test_mode,
+        strict_memory: opts.strict_memory, verbose: opts.verbose }
+    let be: string = cpp_build::build(inp, opts)
+    if be != "" is return fail_err(be) end
+    return CompileResult { ok: true, diag: false, err: "" }
+end
