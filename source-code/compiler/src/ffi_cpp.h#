@@ -1,0 +1,505 @@
+use "workspace -> parser" from "lib -> *"
+
+;; CppTy: kind = "void" "bool" "char" "i8" "i16" "i32" "i64" "u8" "u16" "u32" "u64" "f32" "f64"
+;;               "ptr" "ref" (inner[0], is_const) "string" "vector" "optional" (inner[0]) "opaque" (name)
+pub struct CppTy is
+    pub kind: string
+    pub name: string
+    pub is_const: bool
+    pub inner: [CppTy]
+end
+
+pub struct CppPath is
+    pub namespaces: [string]
+    pub has_class: bool
+    pub class_name: string
+    pub fn_name: string
+    pub is_const: bool
+end
+
+pub fn prim(kind: string) -> CppTy is
+    return CppTy { kind: kind, name: "", is_const: false, inner: [] }
+end
+
+pub fn wrap(kind: string, inner: CppTy, is_const: bool) -> CppTy is
+    return CppTy { kind: kind, name: "", is_const: is_const, inner: [inner] }
+end
+
+pub fn opaque(name: string) -> CppTy is
+    return CppTy { kind: "opaque", name: name, is_const: false, inner: [] }
+end
+
+fn named_to_cpp(n: string) -> CppTy is
+    if n == "i8" || n == "u8" || n == "i16" || n == "u16" || n == "i32" || n == "u32" || n == "f32" || n == "f64" || n == "bool" || n == "char" is
+        return prim(n)
+    end
+    if n == "i64" || n == "int" || n == "isize" is return prim("i64") end
+    if n == "u64" || n == "uint" || n == "usize" is return prim("u64") end
+    if n == "string" || n == "str" is return prim("string") end
+    if n == "void" is return prim("void") end
+    return opaque(n)
+end
+
+pub fn hsh_type_to_cpp(t: ast::Node) -> CppTy is
+    let tag: string = t.tag
+    if tag == "Void" is return prim("void") end
+    if tag == "Ref" is return wrap("ref", hsh_type_to_cpp(t.kids[0]), true) end
+    if tag == "RefMut" is return wrap("ref", hsh_type_to_cpp(t.kids[0]), false) end
+    if tag == "Optional" is return wrap("optional", hsh_type_to_cpp(t.kids[0]), false) end
+    if tag == "Array" || tag == "Slice" is return wrap("vector", hsh_type_to_cpp(t.kids[0]), false) end
+    if tag == "Generic" && t.text == "vector" && t.kids.len() == 1 is return wrap("vector", hsh_type_to_cpp(t.kids[0]), false) end
+    if tag == "Generic" && t.text == "optional" && t.kids.len() == 1 is return wrap("optional", hsh_type_to_cpp(t.kids[0]), false) end
+    if tag == "Named" is return named_to_cpp(t.text) end
+    return opaque("void")
+end
+
+;; ── Itanium mangling ───────────────────────────────────────────────────────
+pub struct Subs is
+    pub items: [string]
+end
+
+fn register_sub(frag: string, subs: Subs) -> string is
+    let mut i: int = 0
+    while i < subs.items.len() is
+        if subs.items[i] == frag is
+            if i == 0 is return "S_" end
+            return "S" + to_string(i - 1) + "_"
+        end
+        i += 1
+    end
+    subs.items.push(frag)
+    return frag
+end
+
+fn len_prefixed(s: string) -> string is
+    return to_string(s.len()) + s
+end
+
+fn mangle_one(t: CppTy, subs: Subs) -> string is
+    let k: string = t.kind
+    if k == "void" is return "v" end
+    if k == "bool" is return "b" end
+    if k == "char" is return "c" end
+    if k == "i8" is return "a" end
+    if k == "u8" is return "h" end
+    if k == "i16" is return "s" end
+    if k == "u16" is return "t" end
+    if k == "i32" is return "i" end
+    if k == "u32" is return "j" end
+    if k == "i64" is return "x" end
+    if k == "u64" is return "y" end
+    if k == "f32" is return "f" end
+    if k == "f64" is return "d" end
+    if k == "ptr" is
+        let inner_m: string = mangle_one(t.inner[0], subs)
+        let mut w: string = "P" + inner_m
+        if t.is_const is w = "PK" + inner_m end
+        return register_sub(w, subs)
+    end
+    if k == "ref" is
+        let inner_m: string = mangle_one(t.inner[0], subs)
+        let mut w: string = "R" + inner_m
+        if t.is_const is w = "RK" + inner_m end
+        return register_sub(w, subs)
+    end
+    if k == "string" is
+        return register_sub("NSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE", subs)
+    end
+    if k == "vector" is
+        let inner_m: string = mangle_one(t.inner[0], subs)
+        return register_sub("St6vectorI" + inner_m + "SaI" + inner_m + "EE", subs)
+    end
+    if k == "optional" is
+        let inner_m: string = mangle_one(t.inner[0], subs)
+        return register_sub("St8optionalI" + inner_m + "E", subs)
+    end
+    return register_sub(len_prefixed(t.name), subs)
+end
+
+pub fn mangle(path: CppPath, params: [CppTy]) -> string is
+    let mut out: string = "_Z"
+    if path.namespaces.len() > 0 || path.has_class is
+        out = out + "N"
+        if path.is_const is out = out + "K" end
+        for ns in path.namespaces is out = out + len_prefixed(ns) end
+        if path.has_class is out = out + len_prefixed(path.class_name) end
+        out = out + len_prefixed(path.fn_name) + "E"
+    else
+        out = out + len_prefixed(path.fn_name)
+    end
+    if params.len() == 0 is
+        out = out + "v"
+    else
+        let subs: Subs = Subs { items: [] }
+        for p in params is out = out + mangle_one(p, subs) end
+    end
+    return out
+end
+
+;; ── helpers for the shim generator ─────────────────────────────────────────
+fn is_flat_primitive_cpp(t: CppTy) -> bool is
+    let k: string = t.kind
+    return k == "bool" || k == "char" || k == "i8" || k == "u8" || k == "i16" || k == "u16" || k == "i32" || k == "u32" || k == "i64" || k == "u64" || k == "f32" || k == "f64"
+end
+
+fn is_sentinel_representable_cpp(t: CppTy) -> bool is
+    return is_flat_primitive_cpp(t) || t.kind == "string"
+end
+
+fn sentinel_expr_cpp(t: CppTy) -> string is
+    if t.kind == "string" is return "nullptr" end
+    if t.kind == "bool" is return "false" end
+    return "0"
+end
+
+pub fn cpp_type_name(t: CppTy) -> string is
+    let k: string = t.kind
+    if k == "i8" || k == "u8" || k == "i16" || k == "u16" || k == "i32" || k == "u32" || k == "i64" || k == "u64" is return k_to_int(k) end
+    if k == "f32" is return "float" end
+    if k == "f64" is return "double" end
+    if k == "ptr" is
+        if t.is_const is return "const " + cpp_type_name(t.inner[0]) + "*" end
+        return cpp_type_name(t.inner[0]) + "*"
+    end
+    if k == "ref" is
+        if t.is_const is return "const " + cpp_type_name(t.inner[0]) + "&" end
+        return cpp_type_name(t.inner[0]) + "&"
+    end
+    if k == "string" is return "std::string" end
+    if k == "vector" is return "std::vector<" + cpp_type_name(t.inner[0]) + ">" end
+    if k == "optional" is return "std::optional<" + cpp_type_name(t.inner[0]) + ">" end
+    if k == "opaque" is return t.name end
+    return k
+end
+
+fn k_to_int(k: string) -> string is
+    if k == "i8" is return "int8_t" end
+    if k == "u8" is return "uint8_t" end
+    if k == "i16" is return "int16_t" end
+    if k == "u16" is return "uint16_t" end
+    if k == "i32" is return "int32_t" end
+    if k == "u32" is return "uint32_t" end
+    if k == "i64" is return "int64_t" end
+    return "uint64_t"
+end
+
+fn join_with(xs: [string], sep: string) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is s = s + sep end
+        s = s + xs[i]
+        i += 1
+    end
+    return s
+end
+
+fn describe(path: CppPath, params: [CppTy]) -> string is
+    let mut parts: [string] = []
+    for ns in path.namespaces is parts.push(ns) end
+    if path.has_class is parts.push(path.class_name) end
+    parts.push(path.fn_name)
+    let mut ps: [string] = []
+    for p in params is ps.push(cpp_type_name(p)) end
+    return join_with(parts, "::") + "(" + join_with(ps, ", ") + ")"
+end
+
+;; ── struct registry: name -> Fields node ────────────────────────────────────
+pub struct StructTable is
+    pub names: [string]
+    pub fields: [ast::Node]
+end
+
+pub fn new_struct_table() -> StructTable is
+    return StructTable { names: [], fields: [] }
+end
+
+pub fn add_struct(t: StructTable, name: string, fields: ast::Node) is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == name is
+            t.fields[i] = fields
+            return
+        end
+        i += 1
+    end
+    t.names.push(name)
+    t.fields.push(fields)
+end
+
+fn struct_index(t: StructTable, n: string) -> int is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == n is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn struct_is_flattenable_cpp(fields: ast::Node) -> bool is
+    for f in fields.kids is
+        let c: CppTy = hsh_type_to_cpp(f.kids[1])
+        if !(is_flat_primitive_cpp(c) || c.kind == "string") is return false end
+    end
+    return true
+end
+
+fn flattenable(t: StructTable, name: string) -> bool is
+    let at: int = struct_index(t, name)
+    if at < 0 is return false end
+    return struct_is_flattenable_cpp(t.fields[at])
+end
+
+fn emit_struct_field_read_cpp(struct_ptr_var: string, idx: int, field: ast::Node, out_var: string) -> string is
+    let c: CppTy = hsh_type_to_cpp(field.kids[1])
+    let raw: string = "hsh_struct_get(" + struct_ptr_var + ", " + to_string(idx) + ")"
+    let v: string = out_var
+    if c.kind == "f64" is
+        return "        int64_t " + v + "_bits = " + raw + "; double " + v + "; std::memcpy(&" + v + ", &" + v + "_bits, sizeof(double));\n"
+    end
+    if c.kind == "f32" is
+        return "        int32_t " + v + "_bits = static_cast<int32_t>(" + raw + "); float " + v + "; std::memcpy(&" + v + ", &" + v + "_bits, sizeof(float));\n"
+    end
+    if c.kind == "bool" is return "        bool " + v + " = (" + raw + ") != 0;\n" end
+    if c.kind == "string" is
+        return "        const char* " + v + "_ptr = reinterpret_cast<const char*>(" + raw + ");\n        std::string " + v + "(" + v + "_ptr ? " + v + "_ptr : \"\");\n"
+    end
+    let t: string = cpp_type_name(c)
+    return "        " + t + " " + v + " = static_cast<" + t + ">(" + raw + ");\n"
+end
+
+;; ── shim generator ──────────────────────────────────────────────────────────
+pub struct ShimResult is
+    pub ok: bool
+    pub err: string      ;; message WITHOUT the "extern [c++]: " prefix
+    pub text: string
+end
+
+fn shim_err(m: string) -> ShimResult is
+    return ShimResult { ok: false, err: m, text: "" }
+end
+
+pub fn error_text(m: string) -> string is return "extern [c++]: " + m end
+
+fn index_of_int(xs: [int], v: int) -> int is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == v is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; f = ExternFn(name; Params[Param(name; B, type)], ret|None, B variadic)
+pub fn generate_shim(path: CppPath, f: ast::Node, structs: StructTable) -> ShimResult is
+    let mut ret_cpp: CppTy = prim("void")
+    if f.kids[1].tag != "None" is ret_cpp = hsh_type_to_cpp(f.kids[1]) end
+    let params: [ast::Node] = f.kids[0].kids
+    let mut pc: [CppTy] = []
+    for p in params is pc.push(hsh_type_to_cpp(p.kids[1])) end
+
+    ;; vector param i  ->  index j of its `<name>_len` companion
+    let mut data_idx: [int] = []
+    let mut data_len: [int] = []
+    let mut consumed: [int] = []
+    let mut i: int = 0
+    while i < params.len() is
+        if pc[i].kind == "vector" && is_flat_primitive_cpp(pc[i].inner[0]) is
+            let want: string = params[i].text + "_len"
+            let mut j: int = -1
+            let mut q: int = 0
+            while q < params.len() is
+                if j < 0 && params[q].text == want is j = q end
+                q += 1
+            end
+            if j >= 0 is
+                let k: string = pc[j].kind
+                if k == "i64" || k == "u64" || k == "i32" || k == "u32" is
+                    data_idx.push(i)
+                    data_len.push(j)
+                    consumed.push(j)
+                end
+            end
+        end
+        i += 1
+    end
+    let mut logical: [CppTy] = []
+    i = 0
+    while i < pc.len() is
+        if index_of_int(consumed, i) < 0 is logical.push(pc[i]) end
+        i += 1
+    end
+    let mangled: string = mangle(path, logical)
+
+    i = 0
+    while i < params.len() is
+        let p: ast::Node = params[i]
+        let c: CppTy = pc[i]
+        if c.kind == "vector" && index_of_int(data_idx, i) < 0 is
+            return shim_err("parameter `" + p.text + "` (std::vector<T>) has no bundled length at the ABI level this shim can read on its own — add a paired `" + p.text + "_len: int` parameter right after it in the `extern` signature (and pass the real length at the call site) so this shim can reconstruct a std::vector; only fixed-width element types (`is_flat_primitive_cpp`) are supported this way")
+        end
+        if c.kind == "optional" && !is_sentinel_representable_cpp(c.inner[0]) is
+            return shim_err("parameter `" + p.text + "` is std::optional<T> with a T this shim has no unambiguous sentinel for (only fixed-width scalars and std::string are supported — see `is_sentinel_representable_cpp`); accept the payload type directly plus a separate `has_value: bool` parameter instead")
+        end
+        if c.kind == "opaque" && !flattenable(structs, c.name) is
+            return shim_err("parameter `" + p.text + "` has opaque/user type `" + c.name + "`, which has no known stable layout to cross the FFI boundary by value — either pass a `ref`/`ref mut` (pointer) instead, or declare `" + c.name + "` as an H# `struct` with only fixed-width/`string` fields (see `struct_is_flattenable_cpp`) so this shim can flatten it; the real C++ struct/class on the other side must have the identical name (global namespace) and members in the same declared order — this shim mirrors the layout, it doesn't invent one")
+        end
+        i += 1
+    end
+    if ret_cpp.kind == "vector" is
+        return shim_err("std::vector<T> return values have no bundled-length convention on the H# side to read them back with — return std::string (supported) instead, or add an explicit `out_len: ref mut int` output parameter and marshal it by hand")
+    end
+    if ret_cpp.kind == "optional" && !is_sentinel_representable_cpp(ret_cpp.inner[0]) is
+        return shim_err("std::optional<T> return value wraps a T this shim has no unambiguous sentinel for on return (only fixed-width scalars and std::string are supported — see `is_sentinel_representable_cpp`); return the payload type directly and use a sentinel value (e.g. -1) for the empty case for now")
+    end
+    if ret_cpp.kind == "opaque" is
+        return shim_err("return type `" + ret_cpp.name + "` would need to cross the FFI boundary by value with no known stable layout on the H# side to receive it into (H#'s codegen only has a single flat `i64` return slot for any `extern` call — see `llvm_types::htype_to_llvm`) — opaque-by-value flattening (see the parameter-side `CppTy::Opaque` handling above) is deliberately only supported for *parameters*, not return values: a multi-field struct returned by value uses a *different* platform calling convention (e.g. SysV register-pair or hidden-pointer return) than the flat `i64` H#'s codegen expects at the call site, so this would silently miscompile rather than just fail to build, unlike the equivalent Rust-side case. Return a single scalar/std::string field, or write an accessor function per field instead")
+    end
+
+    let mut out: string = "// Auto-generated by hsharp's ffi_cpp shim generator. Do not edit by hand —\n"
+    out = out + "// regenerated on every `hsharp compile` / `bit build` that sees this\n"
+    out = out + "// `extern [c++]` block. See ffi_cpp.rs for the generator.\n"
+    out = out + "#include <cstdint>\n#include <cstring>\n#include <cstdlib>\n#include <string>\n#include <vector>\n#include <optional>\n#include <new>\n\n"
+    let mut uses_struct_get: bool = false
+    for c in pc is
+        if c.kind == "opaque" && flattenable(structs, c.name) is uses_struct_get = true end
+    end
+    if uses_struct_get is out = out + "extern \"C\" int64_t hsh_struct_get(int64_t s, int64_t idx);\n\n" end
+    let mut emitted: [string] = []
+    let mut all_tys: [CppTy] = []
+    for c in pc is all_tys.push(c) end
+    all_tys.push(ret_cpp)
+    for c in all_tys is
+        if c.kind == "opaque" is
+            let mut seen: bool = false
+            for e in emitted is
+                if e == c.name is seen = true end
+            end
+            if !seen && flattenable(structs, c.name) is
+                out = out + "struct " + c.name + " {{\n"
+                for fld in structs.fields[struct_index(structs, c.name)].kids is
+                    out = out + "    " + cpp_type_name(hsh_type_to_cpp(fld.kids[1])) + " " + fld.text + ";\n"
+                end
+                out = out + "}};\n\n"
+                emitted.push(c.name)
+            end
+        end
+    end
+    let mut lnames: [string] = []
+    for t in logical is lnames.push(cpp_type_name(t)) end
+    out = out + "extern \"C\" " + cpp_type_name(ret_cpp) + " " + mangled + "(" + join_with(lnames, ", ") + ");\n"
+    out = out + "// ^ real symbol, reconstructed via Itanium mangling of:\n//   " + describe(path, logical) + "\n\n"
+    let shim_name: string = "hsh_cpp_shim_" + f.text
+    let mut shim_params: [string] = []
+    i = 0
+    while i < params.len() is
+        let p: ast::Node = params[i]
+        let c: CppTy = pc[i]
+        if index_of_int(consumed, i) >= 0 is
+            shim_params.push(cpp_type_name(c) + " " + p.text)
+        elsif c.kind == "string" is
+            shim_params.push("const char* " + p.text + "_ptr")
+        elsif c.kind == "vector" is
+            shim_params.push("const " + cpp_type_name(c.inner[0]) + "* " + p.text + "_ptr")
+        elsif c.kind == "optional" && c.inner[0].kind == "string" is
+            shim_params.push("const char* " + p.text + "_ptr")
+        elsif c.kind == "optional" is
+            shim_params.push(cpp_type_name(c.inner[0]) + " " + p.text)
+        elsif c.kind == "opaque" is
+            shim_params.push("int64_t " + p.text)
+        else
+            shim_params.push(cpp_type_name(c) + " " + p.text)
+        end
+        i += 1
+    end
+    let mut flat_ret: string = cpp_type_name(ret_cpp)
+    if ret_cpp.kind == "string" is flat_ret = "const char*"
+    elsif ret_cpp.kind == "optional" && ret_cpp.inner[0].kind == "string" is flat_ret = "const char*"
+    elsif ret_cpp.kind == "optional" is flat_ret = cpp_type_name(ret_cpp.inner[0]) end
+    out = out + "extern \"C\" " + flat_ret + " " + shim_name + "(" + join_with(shim_params, ", ") + ") noexcept {{\n"
+    out = out + "    try {{\n"
+    let mut call_args: [string] = []
+    i = 0
+    while i < params.len() is
+        let p: ast::Node = params[i]
+        let n: string = p.text
+        let c: CppTy = pc[i]
+        if index_of_int(consumed, i) >= 0 is
+            i += 1
+            continue
+        end
+        if c.kind == "string" is
+            out = out + "        std::string " + n + "(" + n + "_ptr ? " + n + "_ptr : \"\");\n"
+            call_args.push(n)
+        elsif c.kind == "vector" is
+            let len_name: string = params[data_len[index_of_int(data_idx, i)]].text
+            out = out + "        std::vector<" + cpp_type_name(c.inner[0]) + "> " + n + "(" + n + "_ptr, " + n + "_ptr + " + len_name + ");\n"
+            call_args.push(n)
+        elsif c.kind == "optional" && c.inner[0].kind == "string" is
+            out = out + "        std::optional<std::string> " + n + " = " + n + "_ptr ? std::optional<std::string>(" + n + "_ptr) : std::nullopt;\n"
+            call_args.push(n)
+        elsif c.kind == "optional" is
+            let mut chk: string = n + " == " + sentinel_expr_cpp(c.inner[0])
+            if c.inner[0].kind == "bool" is chk = "!" + n end
+            let t: string = cpp_type_name(c.inner[0])
+            out = out + "        std::optional<" + t + "> " + n + "_opt = (" + chk + ") ? std::nullopt : std::optional<" + t + ">(" + n + ");\n"
+            call_args.push(n + "_opt")
+        elsif c.kind == "opaque" is
+            let fields: ast::Node = structs.fields[struct_index(structs, c.name)]
+            let mut field_vars: [string] = []
+            let mut fi: int = 0
+            for field in fields.kids is
+                let var: string = n + "_" + field.text
+                out = out + emit_struct_field_read_cpp(n, fi, field, var)
+                field_vars.push(var)
+                fi += 1
+            end
+            out = out + "        " + c.name + " " + n + "{{" + join_with(field_vars, ", ") + "}};\n"
+            call_args.push(n)
+        else
+            call_args.push(n)
+        end
+        i += 1
+    end
+    let call_expr: string = mangled + "(" + join_with(call_args, ", ") + ")"
+    let rk: string = ret_cpp.kind
+    if rk == "void" is
+        out = out + "        " + call_expr + ";\n"
+        out = out + "        return;\n"
+    elsif rk == "string" is
+        out = out + "        std::string __r = " + call_expr + ";\n"
+        out = out + "        char* __buf = static_cast<char*>(std::malloc(__r.size() + 1));\n"
+        out = out + "        if (!__buf) return nullptr;\n"
+        out = out + "        std::memcpy(__buf, __r.data(), __r.size());\n"
+        out = out + "        __buf[__r.size()] = '\\0';\n"
+        out = out + "        return __buf; // caller (H# runtime) owns this and must free() it\n"
+    elsif rk == "optional" is
+        out = out + "        auto __r = " + call_expr + ";\n"
+        out = out + "        if (__r.has_value()) {{\n"
+        if ret_cpp.inner[0].kind == "string" is
+            out = out + "            const std::string& __s = *__r;\n"
+            out = out + "            char* __buf = static_cast<char*>(std::malloc(__s.size() + 1));\n"
+            out = out + "            if (!__buf) return nullptr;\n"
+            out = out + "            std::memcpy(__buf, __s.data(), __s.size());\n"
+            out = out + "            __buf[__s.size()] = '\\0';\n"
+            out = out + "            return __buf; // caller (H# runtime) owns this and must free() it\n"
+        else
+            out = out + "            return *__r;\n"
+        end
+        out = out + "        }}\n"
+        out = out + "        return " + sentinel_expr_cpp(ret_cpp.inner[0]) + ";\n"
+    else
+        out = out + "        return " + call_expr + ";\n"
+    end
+    out = out + "    }} catch (...) {{\n"
+    out = out + "        // A C++ exception must never unwind across this `extern \"C\"` frame\n"
+    out = out + "        // into H#'s LLVM-generated code — that's undefined behavior. Convert\n"
+    out = out + "        // it into H#'s sentinel failure value instead.\n"
+    if rk == "void" is out = out + "        return;\n"
+    elsif rk == "string" is out = out + "        return nullptr;\n"
+    elsif rk == "f32" || rk == "f64" is out = out + "        return -1;\n"
+    elsif rk == "optional" is out = out + "        return " + sentinel_expr_cpp(ret_cpp.inner[0]) + ";\n"
+    else out = out + "        return static_cast<decltype(0)>(-1);\n" end
+    out = out + "    }}\n}}\n"
+    return ShimResult { ok: true, err: "", text: out }
+end
