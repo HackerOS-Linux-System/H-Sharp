@@ -1,0 +1,56 @@
+use "std -> test" from "test"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn names(m: ast::Node) -> [string] is
+    let mut out: [string] = []
+    for it in m.kids[3].kids is out.push(it.tag + ":" + it.text) end
+    return out
+end
+
+fn dump(n: ast::Node) -> string is
+    let mut sb = strbuf::new()
+    ast::dump_plain(n, 0, sb)
+    return sb.build()
+end
+
+#[test]
+fn test_empty_module_gets_all_shims_in_order() is
+    let r: [string] = names(stdlib_shims::inject_stdlib_shims(parser::parse_source("")))
+    assert_eq(r.len(), 10)
+    assert_eq(r[0], "Struct:ProcResult")
+    assert_eq(r[1], "Fn:proc_run_cmd")
+    assert_eq(r[2], "Fn:proc_run_cmd_live")
+    assert_eq(r[3], "Fn:str_split")
+    assert_eq(r[6], "Fn:json_empty_object")
+    assert_eq(r[9], "TypeAlias:json")
+end
+
+#[test]
+fn test_self_recursive_wrapper_is_replaced_and_user_fn_kept() is
+    let src: string = "fn str_split(s: string) -> [string] is\n    return str_split(s)\nend\nfn str_count(s: string, sub: string) -> i64 is\n    return 42\nend\n"
+    let m: ast::Node = stdlib_shims::inject_stdlib_shims(parser::parse_source(src))
+    let mut splits: int = 0
+    let mut counts: int = 0
+    for it in m.kids[3].kids is
+        if it.tag == "Fn" && it.text == "str_split" is
+            splits += 1
+            assert_eq(it.kids[2].kids.len(), 2)
+        end
+        if it.tag == "Fn" && it.text == "str_count" is
+            counts += 1
+            assert_eq(dump(it.kids[4]).len() < 80, true)
+        end
+    end
+    assert_eq(splits, 1)
+    assert_eq(counts, 1)
+end
+
+#[test]
+fn test_proc_result_not_injected_over_user_struct() is
+    let m: ast::Node = stdlib_shims::inject_stdlib_shims(parser::parse_source("struct ProcResult is\n    pub a: int\nend\n"))
+    let r: [string] = names(m)
+    assert_eq(r.len(), 8)
+end
