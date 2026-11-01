@@ -1,0 +1,64 @@
+use "std -> option" from "option"
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "std -> time" from "time"
+use "workspace -> hlib" from "lib -> *"
+
+
+fn die(m: string) is
+    write("ERR " + m)
+    exit(1)
+end
+
+;; repack <in.hlib> <out.hlib> [signing.key]: rebuild an archive from its own artifacts with the H# builder
+fn repack(a: [string]) is
+    let mut ar: hlib::HlibArchive = hlib::HlibArchive { manifest: hlib::empty_manifest(), entries: [] }
+    match hlib::archive_open(a[2]) is
+        option::Result::Ok(x) => is ar = x end
+        option::Result::Err(e) => is die(e) end
+    end
+    let m: hlib::Manifest = ar.manifest
+    let b: hlib::HlibBuilder = hlib::builder_new(m.name, m.version, m.language)
+    b.language_version = m.language_version
+    b.edition = m.edition
+    b.description = m.description
+    b.exports = m.exports
+    for art in m.artifacts is
+        let i: int = hlib::entry_index(ar, art.path)
+        match hlib::add_entry(b, art.path, art.kind, art.target, ar.entries[i].data) is
+            option::Result::Ok(_) => is end
+            option::Result::Err(e) => is die(e) end
+        end
+    end
+    let mut key: string = ""
+    if a.len() > 4 is key = fs::read(a[4]) end
+    match hlib::builder_finish(b, a[3], key) is
+        option::Result::Ok(mm) => is write("built " + to_string(mm.artifacts.len()) + " artifact(s)") end
+        option::Result::Err(e) => is die(e) end
+    end
+end
+
+fn main() is
+    let a: [string] = env_args()
+    if a[1] == "repack" is
+        repack(a)
+        return
+    end
+    let r = hlib::archive_open(a[1])
+    match r is
+        option::Result::Ok(ar) => is
+            write(hlib::manifest_json(ar.manifest))
+            match hlib::verify_checksums(ar) is
+                option::Result::Ok(_) => is write("checksums ok") end
+                option::Result::Err(e) => is write("CHECKSUM ERR " + e) end
+            end
+            if a.len() > 2 is
+                match hlib::verify_signature(ar, a[2]) is
+                    option::Result::Ok(_) => is write("signature ok") end
+                    option::Result::Err(e) => is write("SIG ERR " + e) end
+                end
+            end
+        end
+        option::Result::Err(e) => is write("ERR " + e) end
+    end
+end
