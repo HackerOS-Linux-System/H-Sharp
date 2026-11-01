@@ -1,0 +1,53 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn first_fn(src: string) -> ast::Node is
+    return parser::parse_source(src).kids[3].kids[0].kids[3].kids[0]
+end
+
+fn ty_of(src: string) -> ast::Node is
+    ;; type of the single parameter of `fn f(x: <src>)`
+    return first_fn("extern dynamic [c] is\n    fn f(x: " + src + ")\nend\n").kids[0].kids[0].kids[1]
+end
+
+#[test]
+fn test_c_decl_simple_variadic_noparams() is
+    let add: ast::Node = first_fn("extern dynamic [c] is\n    fn add(a: i64, b: i64) -> i64\nend\n")
+    assert_eq(ffi::c_decl(add), "int64_t add(int64_t a, int64_t b);")
+    let pf: ast::Node = first_fn("extern dynamic [c] is\n    fn printf(fmt: string, ..) -> i32\nend\n")
+    assert_eq(ffi::c_decl(pf), "int32_t printf(const char* fmt, ...);")
+    let gc: ast::Node = first_fn("extern dynamic [c] is\n    fn get_count() -> u64\nend\n")
+    assert_eq(ffi::c_decl(gc), "uint64_t get_count(void);")
+end
+
+#[test]
+fn test_rust_extern_decl_basic() is
+    let f: ast::Node = first_fn("extern dynamic [rust] is\n    fn my_fn(x: u8) -> bool\nend\n")
+    assert_eq(ffi::rust_extern_decl(f), "    pub fn my_fn(x: u8) -> bool;")
+end
+
+#[test]
+fn test_python_trampolines() is
+    assert_eq(ffi::python_trampoline_sig("compute", 2), "const char* hsh_py_compute(const char* arg0, const char* arg1);")
+    assert_eq(ffi::python_trampoline_sig("z", 0), "const char* hsh_py_z(void);")
+    let body: string = ffi::python_trampoline_body("numpy", "dot", 2)
+    assert_eq(body, "const char* hsh_py_dot(const char* arg0, const char* arg1) {{\n    const char* argv[] = {{ arg0, arg1, NULL }};\n    return hsh_py_call(\"numpy\", \"dot\", 2, argv);\n}}")
+    let b0: string = ffi::python_trampoline_body("m", "f", 0)
+    assert_eq(b0, "const char* hsh_py_f(void) {{\n    const char* argv[] = {{ NULL }};\n    return hsh_py_call(\"m\", \"f\", 0, argv);\n}}")
+end
+
+#[test]
+fn test_type_maps() is
+    assert_eq(ffi::type_to_c(ty_of("string")), "const char*")
+    assert_eq(ffi::type_to_c(ty_of("bytes")), "uint8_t*")
+    assert_eq(ffi::type_to_c(ty_of("u8?")), "uint8_t*")
+    assert_eq(ffi::type_to_c(ty_of("string?")), "const char*")
+    assert_eq(ffi::type_to_c(ty_of("[int]")), "int64_t*")
+    assert_eq(ffi::type_to_c(ty_of("Foo")), "void*")
+    assert_eq(ffi::type_to_rust(ty_of("u8?")), "Option<*mut u8>")
+    assert_eq(ffi::type_to_rust(ty_of("&i32")), "*const i32")
+    assert_eq(ffi::type_to_rust(ty_of("&mut i32")), "*mut i32")
+    assert_eq(ffi::type_to_rust(ty_of("string")), "*const std::ffi::c_char")
+end
