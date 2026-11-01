@@ -1,0 +1,1019 @@
+use "std -> option" from "option"
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "std -> time" from "time"
+
+extern static [c] is
+    fn malloc(n: int) -> int
+    fn calloc(n: int, sz: int) -> int
+    fn realloc(p: int, n: int) -> int
+    fn free(p: int)
+    fn memcpy(dst: int, src: int, n: int) -> int
+    fn strcpy(dst: int, src: string) -> int
+    fn strndup(p: int, n: int) -> string
+    fn fopen(path: string, mode: string) -> int
+    fn fread(p: int, sz: int, n: int, f: int) -> int
+    fn fwrite(p: int, sz: int, n: int, f: int) -> int
+    fn fclose(f: int) -> int
+    fn chmod(path: string, mode: int) -> int
+end
+
+extern static [c, "zstd"] is
+    fn ZSTD_compressBound(n: int) -> int
+    fn ZSTD_compress(dst: int, cap: int, src: int, n: int, level: int) -> int
+    fn ZSTD_isError(code: int) -> int
+    fn ZSTD_createDStream() -> int
+    fn ZSTD_initDStream(ds: int) -> int
+    fn ZSTD_decompressStream(ds: int, out: int, inp: int) -> int
+    fn ZSTD_freeDStream(ds: int) -> int
+end
+
+extern static [c, "sodium"] is
+    fn sodium_init() -> int
+    fn crypto_hash_sha256(out: int, inp: int, n: int) -> int
+    fn crypto_sign_keypair(pk: int, sk: int) -> int
+    fn crypto_sign_seed_keypair(pk: int, sk: int, seed: int) -> int
+    fn crypto_sign_detached(sig: int, siglen: int, m: int, mlen: int, sk: int) -> int
+    fn crypto_sign_verify_detached(sig: int, m: int, mlen: int, pk: int) -> int
+    fn crypto_core_ed25519_add(r: int, p: int, q: int) -> int
+end
+
+;; ── constants (manifest.rs / build.rs) ────────────────────────────────────────
+pub fn spec_version() -> int is return 1 end
+pub fn default_edition() -> string is return "2026" end
+pub fn supported_editions() -> [string] is return ["2026"] end
+fn manifest_entry() -> string is return "manifest.json" end
+fn checksums_entry() -> string is return "CHECKSUMS.sha256" end
+fn signature_entry() -> string is return "SIGNATURE.ed25519" end
+
+;; ── raw buffers ───────────────────────────────────────────────────────────────
+pub struct Buf is
+    pub p: int
+    pub n: int
+end
+
+pub fn buf_new(n: int) -> Buf is
+    return Buf { p: calloc(if n > 0 is n else 1 end, 1), n: n }
+end
+
+@pointers
+pub fn buf_get(b: Buf, i: int) -> int is
+    return ptr_read_i8(b.p, i) & 255
+end
+
+@pointers
+pub fn buf_set(b: Buf, i: int, v: int) is
+    ptr_write_i8(b.p, i, v)
+end
+
+;; text -> buffer (no trailing NUL in `n`)
+pub fn buf_from_str(s: string) -> Buf is
+    let n: int = s.len()
+    let b: Buf = buf_new(n + 1)
+    strcpy(b.p, s)
+    return Buf { p: b.p, n: n }
+end
+
+;; buffer -> text (stops at the first NUL, like every H# string)
+pub fn buf_to_str(b: Buf) -> string is
+    return strndup(b.p, b.n)
+end
+
+pub fn buf_slice(b: Buf, off: int, n: int) -> Buf is
+    let r: Buf = buf_new(n)
+    memcpy(r.p, b.p + off, n)
+    return r
+end
+
+pub fn buf_eq(a: Buf, b: Buf) -> bool is
+    if a.n != b.n is return false end
+    let mut i: int = 0
+    while i < a.n is
+        if buf_get(a, i) != buf_get(b, i) is return false end
+        i += 1
+    end
+    return true
+end
+
+;; ── errors: HlibError Display strings (error.rs) ──────────────────────────────
+fn io_err(path: string, what: string) -> string is
+    return "i/o error at " + path + ": " + what
+end
+
+pub fn read_file(path: string) -> option::Result<Buf, string> is
+    if !fs::exists(path) is return option::Result::Err(io_err(path, "No such file or directory (os error 2)")) end
+    let n: int = fs::size(path)
+    let f: int = fopen(path, "rb")
+    if f == 0 is return option::Result::Err(io_err(path, "Permission denied (os error 13)")) end
+    let b: Buf = buf_new(n)
+    let got: int = if n > 0 is fread(b.p, 1, n, f) else 0 end
+    fclose(f)
+    if got != n is return option::Result::Err(io_err(path, "short read")) end
+    return option::Result::Ok(b)
+end
+
+pub fn write_file(path: string, b: Buf) -> option::Result<bool, string> is
+    let f: int = fopen(path, "wb")
+    if f == 0 is return option::Result::Err(io_err(path, "cannot create file")) end
+    let put: int = if b.n > 0 is fwrite(b.p, 1, b.n, f) else 0 end
+    fclose(f)
+    if put != b.n is return option::Result::Err(io_err(path, "short write")) end
+    return option::Result::Ok(true)
+end
+
+;; ── hex / sha256 / small string helpers ───────────────────────────────────────
+fn hex_digit(v: int) -> string is
+    if v < 10 is return str_from_byte(48 + v) end
+    return str_from_byte(87 + v)
+end
+
+pub fn hex_encode(b: Buf) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < b.n is
+        let v: int = buf_get(b, i)
+        sb.push(hex_digit(v / 16))
+        sb.push(hex_digit(v % 16))
+        i += 1
+    end
+    return sb.build()
+end
+
+fn hex_val(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 87 end
+    if c >= 65 && c <= 70 is return c - 55 end
+    return -1
+end
+
+;; hex text -> bytes; Err(message) like `hex::decode` (wrapped as BadKey by the callers)
+pub fn hex_decode(s: string) -> option::Result<Buf, string> is
+    let n: int = s.len()
+    if n % 2 != 0 is return option::Result::Err("Odd number of digits") end
+    let b: Buf = buf_new(n / 2)
+    let mut i: int = 0
+    while i < n / 2 is
+        let hi: int = hex_val(byte_at(s, 2 * i))
+        let lo: int = hex_val(byte_at(s, 2 * i + 1))
+        if hi < 0 is return option::Result::Err("Invalid character " + quote_char(byte_at(s, 2 * i)) + " at position " + to_string(2 * i)) end
+        if lo < 0 is return option::Result::Err("Invalid character " + quote_char(byte_at(s, 2 * i + 1)) + " at position " + to_string(2 * i + 1)) end
+        buf_set(b, i, hi * 16 + lo)
+        i += 1
+    end
+    return option::Result::Ok(b)
+end
+
+fn quote_char(c: int) -> string is
+    return "'" + str_from_byte(c) + "'"
+end
+
+pub fn sha256_hex(b: Buf) -> string is
+    sodium_init()
+    let out: Buf = buf_new(32)
+    crypto_hash_sha256(out.p, b.p, b.n)
+    return hex_encode(out)
+end
+
+fn trim_s(s: string) -> string is
+    let mut a: int = 0
+    let mut e: int = s.len()
+    while a < e && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 10 || byte_at(s, a) == 13) is a += 1 end
+    while e > a && (byte_at(s, e - 1) == 32 || byte_at(s, e - 1) == 9 || byte_at(s, e - 1) == 10 || byte_at(s, e - 1) == 13) is e -= 1 end
+    return s[a..e]
+end
+
+;; byte-wise ordering, like Rust's `str::cmp`
+fn cmp_str(a: string, b: string) -> int is
+    let la: int = a.len()
+    let lb: int = b.len()
+    let mut i: int = 0
+    while i < la && i < lb is
+        let x: int = byte_at(a, i)
+        let y: int = byte_at(b, i)
+        if x != y is return if x < y is -1 else 1 end end
+        i += 1
+    end
+    if la == lb is return 0 end
+    return if la < lb is -1 else 1 end
+end
+
+;; ── zstd ──────────────────────────────────────────────────────────────────────
+pub fn zstd_compress(src: Buf, level: int) -> option::Result<Buf, string> is
+    let cap: int = ZSTD_compressBound(src.n)
+    let dst: Buf = buf_new(cap)
+    let c: int = ZSTD_compress(dst.p, cap, src.p, src.n, level)
+    if ZSTD_isError(c) != 0 is return option::Result::Err("zstd: compression failed") end
+    return option::Result::Ok(Buf { p: dst.p, n: c })
+end
+
+;; The Rust writer emits a streaming frame without a content size, so decode with the streaming API.
+@pointers
+pub fn zstd_decompress(src: Buf) -> option::Result<Buf, string> is
+    let ds: int = ZSTD_createDStream()
+    ZSTD_initDStream(ds)
+    let inb: int = calloc(3, 8)        ;; ZSTD_inBuffer  { src, size, pos }
+    let outb: int = calloc(3, 8)       ;; ZSTD_outBuffer { dst, size, pos }
+    ptr_write_i64(inb, 0, src.p)
+    ptr_write_i64(inb, 8, src.n)
+    ptr_write_i64(inb, 16, 0)
+    let chunk: int = 1048576
+    let mut total: int = 0
+    let mut base: int = malloc(chunk)
+    let mut cap: int = chunk
+    while true is
+        if cap - total < chunk is
+            cap = cap * 2
+            base = realloc(base, cap)
+        end
+        ptr_write_i64(outb, 0, base + total)
+        ptr_write_i64(outb, 8, cap - total)
+        ptr_write_i64(outb, 16, 0)
+        let r: int = ZSTD_decompressStream(ds, outb, inb)
+        if ZSTD_isError(r) != 0 is
+            ZSTD_freeDStream(ds)
+            return option::Result::Err("zstd: decompression failed")
+        end
+        total += ptr_read_i64(outb, 16)
+        let consumed: int = ptr_read_i64(inb, 16)
+        if r == 0 && consumed >= src.n is break end
+        if r != 0 && consumed >= src.n && ptr_read_i64(outb, 16) == 0 is
+            ZSTD_freeDStream(ds)
+            return option::Result::Err("zstd: truncated input")
+        end
+    end
+    ZSTD_freeDStream(ds)
+    return option::Result::Ok(Buf { p: base, n: total })
+end
+
+;; ── tar (GNU, deterministic: mode 0644, uid/gid/mtime 0) ──────────────────────
+pub struct Entry is
+    pub path: string
+    pub data: Buf
+end
+
+fn octal(v: int, width: int) -> string is
+    let mut digits: string = ""
+    let mut x: int = v
+    if x == 0 is digits = "0" end
+    while x > 0 is
+        digits = str_from_byte(48 + x % 8) + digits
+        x = x / 8
+    end
+    while digits.len() < width is digits = "0" + digits end
+    return digits
+end
+
+@pointers
+fn tar_header(path: string, size: int) -> Buf is
+    let h: Buf = buf_new(512)
+    strcpy(h.p, path)
+    strcpy(h.p + 100, octal(420, 7))            ;; mode 0644
+    strcpy(h.p + 124, octal(size, 11))
+    strcpy(h.p + 136, octal(0, 11))             ;; mtime 0
+    let mut i: int = 148
+    while i < 156 is ptr_write_i8(h.p, i, 32) i += 1 end
+    strcpy(h.p + 257, "ustar ")                  ;; magic; the NUL strcpy writes lands on `version`
+    ptr_write_i8(h.p, 263, 32)
+    ptr_write_i8(h.p, 264, 0)
+    let mut sum: int = 0
+    i = 0
+    while i < 512 is
+        sum += ptr_read_i8(h.p, i) & 255
+        i += 1
+    end
+    strcpy(h.p + 148, octal(sum, 7))
+    return h
+end
+
+pub fn tar_write(entries: [Entry]) -> option::Result<Buf, string> is
+    let mut total: int = 1024
+    for e in entries is
+        if e.path.len() > 100 is
+            return option::Result::Err("path `" + e.path + "` is longer than 100 bytes (GNU long names are not written yet)")
+        end
+        total += 512 + ((e.data.n + 511) / 512) * 512
+    end
+    let out: Buf = buf_new(total)
+    let mut off: int = 0
+    for e in entries is
+        let h: Buf = tar_header(e.path, e.data.n)
+        memcpy(out.p + off, h.p, 512)
+        free(h.p)
+        off += 512
+        if e.data.n > 0 is memcpy(out.p + off, e.data.p, e.data.n) end
+        off += ((e.data.n + 511) / 512) * 512
+    end
+    return option::Result::Ok(out)
+end
+
+fn parse_octal(b: Buf, off: int, len: int) -> int is
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < len is
+        let c: int = buf_get(b, off + i)
+        if c >= 48 && c <= 55 is v = v * 8 + (c - 48) end
+        if c == 0 || (c == 32 && v > 0) is break end
+        i += 1
+    end
+    return v
+end
+
+fn block_is_zero(b: Buf, off: int) -> bool is
+    let mut i: int = 0
+    while i < 512 is
+        if buf_get(b, off + i) != 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+;; None-like: Err("") means "not a tar archive"
+pub fn tar_read(tar: Buf) -> option::Result<[Entry], string> is
+    let mut out: [Entry] = []
+    let mut off: int = 0
+    let mut long_name: string = ""
+    while off + 512 <= tar.n is
+        if block_is_zero(tar, off) is break end
+        let size: int = parse_octal(tar, off + 124, 12)
+        let flag: int = buf_get(tar, off + 156)
+        let magic: string = strndup(tar.p + off + 257, 5)
+        if magic != "ustar" is return option::Result::Err("") end
+        let mut name: string = strndup(tar.p + off, 100)
+        let body: int = off + 512
+        if body + size > tar.n is return option::Result::Err("") end
+        if flag == 76 is                          ;; 'L' — GNU long name for the next entry
+            long_name = strndup(tar.p + body, size)
+        elsif flag == 48 || flag == 0 is
+            if long_name.len() > 0 is
+                name = long_name
+                long_name = ""
+            end
+            out.push(Entry { path: name, data: buf_slice(tar, body, size) })
+        end
+        off = body + ((size + 511) / 512) * 512
+    end
+    return option::Result::Ok(out)
+end
+
+;; ── manifest model (manifest.rs) ──────────────────────────────────────────────
+pub struct Artifact is
+    pub path: string
+    pub kind: string          ;; shared_object | bytecode | ast | header | extra
+    pub target: string        ;; "" = none
+    pub sha256: string
+    pub size: int
+end
+
+;; AbiType is kept as text: "i64", "ptr", "void", … or "opaque:<StructName>"
+pub struct Export is
+    pub name: string
+    pub kind: string          ;; function | struct | enum | trait | const | type_alias
+    pub signature: string
+    pub params: [string]
+    pub returns: string       ;; "" = none
+    pub generic: bool
+    pub is_macro: bool
+end
+
+pub struct Dependency is
+    pub name: string
+    pub version_req: string
+end
+
+pub struct Manifest is
+    pub spec_version: int
+    pub name: string
+    pub version: string
+    pub language: string      ;; hsharp | hackerlang | hackerscript
+    pub language_version: string
+    pub edition: string
+    pub abi_version: int
+    pub description: string
+    pub authors: [string]
+    pub created_at: string
+    pub dependencies: [Dependency]
+    pub artifacts: [Artifact]
+    pub exports: [Export]
+    pub signed: bool
+    pub sig_algorithm: string
+    pub sig_public_key: string
+    pub sig_entry: string
+end
+
+pub fn empty_manifest() -> Manifest is
+    return Manifest {
+        spec_version: spec_version(), name: "", version: "", language: "hsharp", language_version: "",
+        edition: default_edition(), abi_version: 1, description: "", authors: [], created_at: "",
+        dependencies: [], artifacts: [], exports: [], signed: false, sig_algorithm: "", sig_public_key: "", sig_entry: ""
+    }
+end
+
+pub fn language_from_str(s: string) -> option::Result<string, string> is
+    let mut l: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        l += str_from_byte(if c >= 65 && c <= 90 is c + 32 else c end)
+        i += 1
+    end
+    if l == "hsharp" || l == "h#" || l == "h-sharp" is return option::Result::Ok("hsharp") end
+    if l == "hackerlang" || l == "hl" || l == "hacker-lang" is return option::Result::Ok("hackerlang") end
+    if l == "hackerscript" || l == "hcs" || l == "hacker-script" is return option::Result::Ok("hackerscript") end
+    return option::Result::Err("unknown target language `" + l + "` (expected one of: hsharp, hackerlang, hackerscript)")
+end
+
+pub fn check_supported(m: Manifest) -> option::Result<bool, string> is
+    if m.spec_version > spec_version() is
+        return option::Result::Err("hlib spec version " + to_string(m.spec_version) + " is newer than the highest version this reader understands (" + to_string(spec_version()) + ")")
+    end
+    if m.language == "hsharp" is
+        let mut found: bool = false
+        for e in supported_editions() is
+            if e == m.edition is found = true end
+        end
+        if !found is
+            return option::Result::Err("hlib was written for H# edition \"" + m.edition + "\", which this toolchain doesn't support (supported: " + hlib_join(supported_editions(), ", ") + ") — upgrade H#, or rebuild the library with a supported edition")
+        end
+    end
+    return option::Result::Ok(true)
+end
+
+;; ── serde_json-compatible pretty printing ─────────────────────────────────────
+pub fn jstr_pub(s: string) -> string is
+    return jstr(s)
+end
+
+fn jstr(s: string) -> string is
+    let mut sb = strbuf::new()
+    sb.push("\"")
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 34 is sb.push("\\\"")
+        elsif c == 92 is sb.push("\\\\")
+        elsif c == 10 is sb.push("\\n")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 9 is sb.push("\\t")
+        elsif c == 8 is sb.push("\\b")
+        elsif c == 12 is sb.push("\\f")
+        elsif c < 32 is sb.push("\\u00" + hex_digit(c / 16) + hex_digit(c % 16))
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    sb.push("\"")
+    return sb.build()
+end
+
+fn pad(n: int) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < n is
+        s += "  "
+        i += 1
+    end
+    return s
+end
+
+;; one `{ "type": ... }` AbiType object at indent level `lv`
+fn abi_json(t: string, lv: int) -> string is
+    if t.len() > 7 && t[0..7] == "opaque:" is
+        return "\{\n" + pad(lv + 1) + "\"type\": \"opaque\",\n" + pad(lv + 1) + "\"struct_name\": " + jstr(t[7..t.len()]) + "\n" + pad(lv) + "}"
+    end
+    return "\{\n" + pad(lv + 1) + "\"type\": " + jstr(t) + "\n" + pad(lv) + "}"
+end
+
+pub fn export_json(e: Export, lv: int) -> string is
+    let mut f: [string] = []
+    f.push(pad(lv + 1) + "\"name\": " + jstr(e.name))
+    f.push(pad(lv + 1) + "\"kind\": " + jstr(e.kind))
+    f.push(pad(lv + 1) + "\"signature\": " + jstr(e.signature))
+    if e.params.len() == 0 is
+        f.push(pad(lv + 1) + "\"params\": []")
+    else
+        let mut ps: [string] = []
+        for p in e.params is ps.push(pad(lv + 2) + abi_json(p, lv + 2)) end
+        f.push(pad(lv + 1) + "\"params\": [\n" + hlib_join(ps, ",\n") + "\n" + pad(lv + 1) + "]")
+    end
+    if e.returns.len() > 0 is f.push(pad(lv + 1) + "\"returns\": " + abi_json(e.returns, lv + 1)) end
+    f.push(pad(lv + 1) + "\"generic\": " + (if e.generic is "true" else "false" end))
+    f.push(pad(lv + 1) + "\"is_macro\": " + (if e.is_macro is "true" else "false" end))
+    return "\{\n" + hlib_join(f, ",\n") + "\n" + pad(lv) + "}"
+end
+
+pub fn exports_json(exports: [Export]) -> string is
+    if exports.len() == 0 is return "[]" end
+    let mut items: [string] = []
+    for e in exports is items.push(pad(1) + export_json(e, 1)) end
+    return "[\n" + hlib_join(items, ",\n") + "\n]"
+end
+
+fn artifact_json(a: Artifact, lv: int) -> string is
+    let mut f: [string] = []
+    f.push(pad(lv + 1) + "\"path\": " + jstr(a.path))
+    f.push(pad(lv + 1) + "\"kind\": " + jstr(a.kind))
+    if a.target.len() > 0 is f.push(pad(lv + 1) + "\"target\": " + jstr(a.target)) end
+    f.push(pad(lv + 1) + "\"sha256\": " + jstr(a.sha256))
+    f.push(pad(lv + 1) + "\"size\": " + to_string(a.size))
+    return "\{\n" + hlib_join(f, ",\n") + "\n" + pad(lv) + "}"
+end
+
+pub fn manifest_json(m: Manifest) -> string is
+    let mut f: [string] = []
+    f.push("  \"hlib_spec_version\": " + to_string(m.spec_version))
+    f.push("  \"name\": " + jstr(m.name))
+    f.push("  \"version\": " + jstr(m.version))
+    f.push("  \"language\": " + jstr(m.language))
+    f.push("  \"language_version\": " + jstr(m.language_version))
+    f.push("  \"edition\": " + jstr(m.edition))
+    f.push("  \"abi_version\": " + to_string(m.abi_version))
+    f.push("  \"description\": " + jstr(m.description))
+    if m.authors.len() == 0 is
+        f.push("  \"authors\": []")
+    else
+        let mut a: [string] = []
+        for x in m.authors is a.push("    " + jstr(x)) end
+        f.push("  \"authors\": [\n" + hlib_join(a, ",\n") + "\n  ]")
+    end
+    f.push("  \"created_at\": " + jstr(m.created_at))
+    if m.dependencies.len() == 0 is
+        f.push("  \"dependencies\": []")
+    else
+        let mut d: [string] = []
+        for x in m.dependencies is
+            d.push("    \{\n      \"name\": " + jstr(x.name) + ",\n      \"version_req\": " + jstr(x.version_req) + "\n    }")
+        end
+        f.push("  \"dependencies\": [\n" + hlib_join(d, ",\n") + "\n  ]")
+    end
+    if m.artifacts.len() == 0 is
+        f.push("  \"artifacts\": []")
+    else
+        let mut a: [string] = []
+        for x in m.artifacts is a.push("    " + artifact_json(x, 2)) end
+        f.push("  \"artifacts\": [\n" + hlib_join(a, ",\n") + "\n  ]")
+    end
+    if m.exports.len() == 0 is
+        f.push("  \"exports\": []")
+    else
+        let mut e: [string] = []
+        for x in m.exports is e.push("    " + export_json(x, 2)) end
+        f.push("  \"exports\": [\n" + hlib_join(e, ",\n") + "\n  ]")
+    end
+    if m.signed is
+        f.push("  \"signature\": \{\n    \"algorithm\": " + jstr(m.sig_algorithm) + ",\n    \"public_key\": " + jstr(m.sig_public_key) + ",\n    \"signed_entry\": " + jstr(m.sig_entry) + "\n  }")
+    end
+    return "\{\n" + hlib_join(f, ",\n") + "\n}"
+end
+
+;; ── manifest parsing (via the lsp library's JSON reader) ──────────────────────
+fn str_or(raw: string, path: string, dflt: string) -> string is
+    if lsp_json::get(raw, path) == "" is return dflt end
+    return lsp_json::get_str(raw, path)
+end
+
+fn int_or(raw: string, path: string, dflt: int) -> int is
+    if lsp_json::get(raw, path) == "" is return dflt end
+    return lsp_json::get_int(raw, path)
+end
+
+pub fn manifest_parse(raw: string) -> option::Result<Manifest, string> is
+    if lsp_json::get(raw, "name") == "" || lsp_json::get(raw, "version") == "" is
+        return option::Result::Err("manifest (de)serialization failed: missing field `name` or `version`")
+    end
+    if lsp_json::get(raw, "artifacts") == "" is
+        return option::Result::Err("manifest (de)serialization failed: missing field `artifacts`")
+    end
+    let lang: string = lsp_json::get_str(raw, "language")
+    let mut language: string = ""
+    match language_from_str(lang) is
+        option::Result::Ok(l) => is language = l end
+        option::Result::Err(_) => is
+            return option::Result::Err("manifest (de)serialization failed: unknown variant `" + lang + "`, expected one of `hsharp`, `hackerlang`, `hackerscript`")
+        end
+    end
+    let mut authors: [string] = []
+    let na: int = lsp_json::array_length(lsp_json::get(raw, "authors"))
+    let mut i: int = 0
+    while i < na is
+        authors.push(lsp_json::get_str(raw, "authors." + to_string(i)))
+        i += 1
+    end
+    let mut deps: [Dependency] = []
+    let nd: int = lsp_json::array_length(lsp_json::get(raw, "dependencies"))
+    i = 0
+    while i < nd is
+        let b: string = "dependencies." + to_string(i)
+        deps.push(Dependency { name: lsp_json::get_str(raw, b + ".name"), version_req: lsp_json::get_str(raw, b + ".version_req") })
+        i += 1
+    end
+    let mut arts: [Artifact] = []
+    let nr: int = lsp_json::array_length(lsp_json::get(raw, "artifacts"))
+    i = 0
+    while i < nr is
+        let b: string = "artifacts." + to_string(i)
+        arts.push(Artifact {
+            path: lsp_json::get_str(raw, b + ".path"),
+            kind: lsp_json::get_str(raw, b + ".kind"),
+            target: str_or(raw, b + ".target", ""),
+            sha256: lsp_json::get_str(raw, b + ".sha256"),
+            size: lsp_json::get_int(raw, b + ".size")
+        })
+        i += 1
+    end
+    let mut exps: [Export] = []
+    let ne: int = lsp_json::array_length(lsp_json::get(raw, "exports"))
+    i = 0
+    while i < ne is
+        let b: string = "exports." + to_string(i)
+        let mut ps: [string] = []
+        let np: int = lsp_json::array_length(lsp_json::get(raw, b + ".params"))
+        let mut j: int = 0
+        while j < np is
+            let pb: string = b + ".params." + to_string(j)
+            let t: string = lsp_json::get_str(raw, pb + ".type")
+            if t == "opaque" is ps.push("opaque:" + lsp_json::get_str(raw, pb + ".struct_name")) else ps.push(t) end
+            j += 1
+        end
+        let mut ret: string = ""
+        if lsp_json::get(raw, b + ".returns") != "" is
+            ret = lsp_json::get_str(raw, b + ".returns.type")
+            if ret == "opaque" is ret = "opaque:" + lsp_json::get_str(raw, b + ".returns.struct_name") end
+        end
+        exps.push(Export {
+            name: lsp_json::get_str(raw, b + ".name"),
+            kind: lsp_json::get_str(raw, b + ".kind"),
+            signature: lsp_json::get_str(raw, b + ".signature"),
+            params: ps,
+            returns: ret,
+            generic: lsp_json::get_bool(raw, b + ".generic"),
+            is_macro: lsp_json::get_bool(raw, b + ".is_macro")
+        })
+        i += 1
+    end
+    let has_sig: bool = lsp_json::get(raw, "signature") != ""
+    let m: Manifest = Manifest {
+        spec_version: lsp_json::get_int(raw, "hlib_spec_version"),
+        name: lsp_json::get_str(raw, "name"),
+        version: lsp_json::get_str(raw, "version"),
+        language: language,
+        language_version: str_or(raw, "language_version", ""),
+        edition: str_or(raw, "edition", default_edition()),
+        abi_version: int_or(raw, "abi_version", 1),
+        description: str_or(raw, "description", ""),
+        authors: authors,
+        created_at: lsp_json::get_str(raw, "created_at"),
+        dependencies: deps,
+        artifacts: arts,
+        exports: exps,
+        signed: has_sig,
+        sig_algorithm: str_or(raw, "signature.algorithm", ""),
+        sig_public_key: str_or(raw, "signature.public_key", ""),
+        sig_entry: str_or(raw, "signature.signed_entry", "")
+    }
+    return option::Result::Ok(m)
+end
+
+;; ── sign.rs (Ed25519 through libsodium; deterministic, so signatures equal ed25519-dalek's) ──
+pub struct KeyPair is
+    pub signing_hex: string
+    pub verifying_hex: string
+end
+
+fn bad_key(m: string) -> string is
+    return "invalid ed25519 key material: " + m
+end
+
+fn key_bytes(hex: string, what: string) -> option::Result<Buf, string> is
+    match hex_decode(trim_s(hex)) is
+        option::Result::Err(e) => is return option::Result::Err(bad_key(e)) end
+        option::Result::Ok(b) => is
+            if b.n != 32 is return option::Result::Err(bad_key(what + " must be exactly 32 bytes (64 hex chars)")) end
+            return option::Result::Ok(b)
+        end
+    end
+end
+
+pub fn generate_keypair() -> KeyPair is
+    sodium_init()
+    let pk: Buf = buf_new(32)
+    let sk: Buf = buf_new(64)
+    crypto_sign_keypair(pk.p, sk.p)
+    return KeyPair { signing_hex: hex_encode(buf_slice(sk, 0, 32)), verifying_hex: hex_encode(pk) }
+end
+
+;; the public key (hex) belonging to a 32-byte signing key (hex)
+pub fn public_key_hex(signing_hex: string) -> option::Result<string, string> is
+    let seed: Buf = key_bytes(signing_hex, "signing key")?
+    let pk: Buf = buf_new(32)
+    let sk: Buf = buf_new(64)
+    sodium_init()
+    crypto_sign_seed_keypair(pk.p, sk.p, seed.p)
+    return option::Result::Ok(hex_encode(pk))
+end
+
+pub fn sign_bytes(signing_hex: string, message: Buf) -> option::Result<Buf, string> is
+    let seed: Buf = key_bytes(signing_hex, "signing key")?
+    let pk: Buf = buf_new(32)
+    let sk: Buf = buf_new(64)
+    sodium_init()
+    crypto_sign_seed_keypair(pk.p, sk.p, seed.p)
+    let sig: Buf = buf_new(64)
+    crypto_sign_detached(sig.p, 0, message.p, message.n, sk.p)
+    return option::Result::Ok(sig)
+end
+
+pub fn verify_bytes(pubkey_hex: string, message: Buf, sig: Buf) -> option::Result<bool, string> is
+    let pk: Buf = key_bytes(pubkey_hex, "public key")?
+    if sig.n != 64 is return option::Result::Err(bad_key("signature must be exactly 64 bytes")) end
+    sodium_init()
+    ;; dalek's VerifyingKey::from_bytes rejects keys that are not points on the curve; `add` checks exactly
+    ;; that (decompression + on-curve) and, unlike is_valid_point, not the subgroup
+    let probe: Buf = buf_new(32)
+    if crypto_core_ed25519_add(probe.p, pk.p, pk.p) != 0 is
+        return option::Result::Err(bad_key("signature error: Cannot decompress Edwards point"))
+    end
+    return option::Result::Ok(crypto_sign_verify_detached(sig.p, message.p, message.n, pk.p) == 0)
+end
+
+;; ── read.rs ───────────────────────────────────────────────────────────────────
+pub struct HlibArchive is
+    pub manifest: Manifest
+    pub entries: [Entry]
+end
+
+fn not_an_archive(path: string) -> string is
+    return "`" + path + "` is not a valid .hlib archive (not a zstd-compressed tar / bad header)"
+end
+
+pub fn entry_index(a: HlibArchive, path: string) -> int is
+    let mut i: int = 0
+    while i < a.entries.len() is
+        if a.entries[i].path == path is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn archive_open(path: string) -> option::Result<HlibArchive, string> is
+    let compressed: Buf = read_file(path)?
+    let mut tar: Buf = buf_new(0)
+    match zstd_decompress(compressed) is
+        option::Result::Ok(t) => is tar = t end
+        option::Result::Err(_) => is return option::Result::Err(not_an_archive(path)) end
+    end
+    let mut entries: [Entry] = []
+    match tar_read(tar) is
+        option::Result::Ok(es) => is entries = es end
+        option::Result::Err(_) => is return option::Result::Err(not_an_archive(path)) end
+    end
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < entries.len() is
+        if entries[i].path == manifest_entry() is idx = i end
+        i += 1
+    end
+    if idx < 0 is return option::Result::Err("archive is missing required entry `manifest.json`") end
+    let m: Manifest = manifest_parse(buf_to_str(entries[idx].data))?
+    check_supported(m)?
+    return option::Result::Ok(HlibArchive { manifest: m, entries: entries })
+end
+
+pub fn verify_checksums(a: HlibArchive) -> option::Result<bool, string> is
+    let ci: int = entry_index(a, checksums_entry())
+    if ci < 0 is return option::Result::Err("archive is missing required entry `CHECKSUMS.sha256`") end
+    let text: string = buf_to_str(a.entries[ci].data)
+    let mut start: int = 0
+    while start <= text.len() is
+        let mut e: int = start
+        while e < text.len() && byte_at(text, e) != 10 is e += 1 end
+        let line: string = trim_s(text[start..e])
+        start = e + 1
+        if line.len() == 0 is continue end
+        let mut sep: int = -1
+        let mut k: int = 0
+        while k + 1 < line.len() is
+            if byte_at(line, k) == 32 && byte_at(line, k + 1) == 32 is
+                sep = k
+                break
+            end
+            k += 1
+        end
+        if sep < 0 is return option::Result::Err("CHECKSUMS.sha256 line is malformed: `" + line + "`") end
+        let expected: string = line[0..sep]
+        let entry_path: string = line[sep + 2..line.len()]
+        let di: int = entry_index(a, entry_path)
+        if di < 0 is return option::Result::Err("archive is missing required entry `" + entry_path + "`") end
+        let actual: string = sha256_hex(a.entries[di].data)
+        if actual != expected is
+            return option::Result::Err("archive entry `" + entry_path + "` failed checksum verification (expected " + expected + ", got " + actual + ")")
+        end
+    end
+    return option::Result::Ok(true)
+end
+
+pub fn verify_signature(a: HlibArchive, expected_public_key_hex: string) -> option::Result<bool, string> is
+    let si: int = entry_index(a, signature_entry())
+    if si < 0 is return option::Result::Err("archive is not signed (no SIGNATURE.ed25519 entry) — cannot verify") end
+    let ci: int = entry_index(a, checksums_entry())
+    if ci < 0 is return option::Result::Err("archive is missing required entry `CHECKSUMS.sha256`") end
+    let ok: bool = verify_bytes(expected_public_key_hex, a.entries[ci].data, a.entries[si].data)?
+    if ok is return option::Result::Ok(true) end
+    return option::Result::Err("ed25519 signature verification failed for this archive")
+end
+
+;; mkdir -p
+pub fn make_dirs(path: string) is
+    if path.len() == 0 || fs::is_dir(path) is return end
+    let mut i: int = 1
+    while i < path.len() is
+        if byte_at(path, i) == 47 is
+            let part: string = path[0..i]
+            if !fs::is_dir(part) is fs::mkdir(part) end
+        end
+        i += 1
+    end
+    if !fs::is_dir(path) is fs::mkdir(path) end
+end
+
+pub fn parent_dir(p: string) -> string is
+    let mut i: int = p.len() - 1
+    while i >= 0 is
+        if byte_at(p, i) == 47 is return p[0..i] end
+        i -= 1
+    end
+    return ""
+end
+
+pub fn extract_to_dir(a: HlibArchive, dir: string) -> option::Result<bool, string> is
+    for e in a.entries is
+        let dest: string = dir + "/" + e.path
+        make_dirs(parent_dir(dest))
+        write_file(dest, e.data)?
+    end
+    return option::Result::Ok(true)
+end
+
+;; ── build.rs ──────────────────────────────────────────────────────────────────
+pub struct HlibBuilder is
+    pub name: string
+    pub version: string
+    pub language: string
+    pub language_version: string
+    pub edition: string
+    pub description: string
+    pub authors: [string]
+    pub dependencies: [Dependency]
+    pub exports: [Export]
+    pub artifacts: [Artifact]
+    pub entries: [Entry]
+end
+
+pub fn builder_new(name: string, version: string, language: string) -> HlibBuilder is
+    return HlibBuilder {
+        name: name, version: version, language: language, language_version: "", edition: default_edition(),
+        description: "", authors: [], dependencies: [], exports: [], artifacts: [], entries: []
+    }
+end
+
+pub fn add_entry(b: HlibBuilder, rel_path: string, kind: string, target: string, data: Buf) -> option::Result<bool, string> is
+    for e in b.entries is
+        if e.path == rel_path is return option::Result::Err("duplicate archive entry path `" + rel_path + "`") end
+    end
+    b.artifacts.push(Artifact { path: rel_path, kind: kind, target: target, sha256: sha256_hex(data), size: data.n })
+    b.entries.push(Entry { path: rel_path, data: data })
+    return option::Result::Ok(true)
+end
+
+pub fn add_shared_object(b: HlibBuilder, target: string, data: Buf) -> option::Result<bool, string> is
+    return add_entry(b, "native/" + target + "/" + b.name + ".so", "shared_object", target, data)
+end
+
+pub fn add_bytecode(b: HlibBuilder, data: Buf) -> option::Result<bool, string> is
+    return add_entry(b, "bytecode/" + b.name + ".hlbc", "bytecode", "", data)
+end
+
+pub fn add_ast(b: HlibBuilder, json: Buf) -> option::Result<bool, string> is
+    return add_entry(b, "ast/" + b.name + ".ast.json", "ast", "", json)
+end
+
+pub fn add_header(b: HlibBuilder, json: Buf) -> option::Result<bool, string> is
+    return add_entry(b, "headers/" + b.name + ".iface.json", "header", "", json)
+end
+
+pub fn add_extra(b: HlibBuilder, rel_name: string, data: Buf) -> option::Result<bool, string> is
+    let mut r: string = rel_name
+    while r.len() > 0 && byte_at(r, 0) == 47 is r = r[1..r.len()] end
+    return add_entry(b, "extra/" + r, "extra", "", data)
+end
+
+fn entry_rank(path: string) -> int is
+    if path == manifest_entry() is return 0 end
+    if path == checksums_entry() is return 1 end
+    if path == signature_entry() is return 2 end
+    return 3
+end
+
+;; the entries ordered by (rank, path) — a fixed prefix, then alphabetical (reproducible archives)
+fn sorted_entries(es: [Entry]) -> [Entry] is
+    let mut out: [Entry] = []
+    let mut used: [bool] = []
+    for e in es is used.push(false) end
+    let mut n: int = 0
+    while n < es.len() is
+        let mut best: int = -1
+        let mut i: int = 0
+        while i < es.len() is
+            if !used[i] is
+                if best < 0 is best = i
+                else
+                    let ra: int = entry_rank(es[i].path)
+                    let rb: int = entry_rank(es[best].path)
+                    if ra < rb || (ra == rb && cmp_str(es[i].path, es[best].path) < 0) is best = i end
+                end
+            end
+            i += 1
+        end
+        used[best] = true
+        out.push(es[best])
+        n += 1
+    end
+    return out
+end
+
+fn two(n: int) -> string is
+    return if n < 10 is "0" + to_string(n) else to_string(n) end
+end
+
+;; unix seconds -> "YYYY-MM-DDTHH:MM:SSZ" (chrono's `to_rfc3339_opts(Secs, true)` form)
+pub fn rfc3339(ts: int) -> string is
+    let days: int = ts / 86400
+    let rem: int = ts % 86400
+    let z: int = days + 719468
+    let era: int = z / 146097
+    let doe: int = z - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let mut y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let d: int = doy - (153 * mp + 2) / 5 + 1
+    let m: int = if mp < 10 is mp + 3 else mp - 9 end
+    if m <= 2 is y += 1 end
+    return to_string(y) + "-" + two(m) + "-" + two(d) + "T" + two(rem / 3600) + ":" + two((rem % 3600) / 60) + ":" + two(rem % 60) + "Z"
+end
+
+pub fn builder_finish(b: HlibBuilder, output_path: string, signing_key_hex: string) -> option::Result<Manifest, string> is
+    ;; CHECKSUMS.sha256 covers every artifact entry (not manifest.json), sorted by path
+    let mut pairs: [Entry] = []
+    for e in b.entries is pairs.push(e) end
+    let mut lines: [string] = []
+    let mut used: [bool] = []
+    for e in pairs is used.push(false) end
+    let mut n: int = 0
+    while n < pairs.len() is
+        let mut best: int = -1
+        let mut i: int = 0
+        while i < pairs.len() is
+            if !used[i] && (best < 0 || cmp_str(pairs[i].path, pairs[best].path) < 0) is best = i end
+            i += 1
+        end
+        used[best] = true
+        lines.push(sha256_hex(pairs[best].data) + "  " + pairs[best].path + "\n")
+        n += 1
+    end
+    let checksums: Buf = buf_from_str(hlib_join(lines, ""))
+
+    let mut signed: bool = false
+    let mut public_key: string = ""
+    if signing_key_hex.len() > 0 is
+        let sig: Buf = sign_bytes(signing_key_hex, checksums)?
+        public_key = public_key_hex(signing_key_hex)?
+        b.entries.push(Entry { path: signature_entry(), data: sig })
+        signed = true
+    end
+    b.entries.push(Entry { path: checksums_entry(), data: checksums })
+
+    let m: Manifest = Manifest {
+        spec_version: spec_version(), name: b.name, version: b.version, language: b.language,
+        language_version: b.language_version, edition: b.edition, abi_version: 1,
+        description: b.description, authors: b.authors, created_at: rfc3339(time::now_unix()),
+        dependencies: b.dependencies, artifacts: b.artifacts, exports: b.exports,
+        signed: signed, sig_algorithm: "ed25519", sig_public_key: public_key, sig_entry: checksums_entry()
+    }
+    b.entries.push(Entry { path: manifest_entry(), data: buf_from_str(manifest_json(m)) })
+
+    let tar: Buf = tar_write(sorted_entries(b.entries))?
+    let compressed: Buf = zstd_compress(tar, 19)?
+    write_file(output_path, compressed)?
+    return option::Result::Ok(m)
+end
+
+;; plain `join` (hlib used to borrow the one of the lsp library)
+pub fn hlib_join(parts: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < parts.len() is
+        if i > 0 is out += sep end
+        out += parts[i]
+        i += 1
+    end
+    return out
+end
