@@ -1,0 +1,228 @@
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "std -> sort" from "sort"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+use "workspace -> hlib" from "lib -> *"
+
+mod cli
+
+fn escape(s: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 10 is sb.push("\\n")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 9 is sb.push("\\t")
+        elsif c == 92 is sb.push("\\\\")
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    return sb.build()
+end
+
+fn cmd_lex(path: string) -> int is
+    let src: string = fs::read(path)
+    let lx: lexer::Lexed = lexer::lex(src, path)
+    if lx.errs.len() > 0 is
+        print(error::render_errors(lx.errs, src))
+        return 1
+    end
+    let mut out = strbuf::new()
+    for t in lx.toks is
+        out.push(t.kind)
+        out.push("\t")
+        out.push(escape(t.text))
+        out.push("\n")
+    end
+    print(out.build())
+    return 0
+end
+
+fn cmd_parse(path: string) -> int is
+    let src: string = fs::read(path)
+    let r: parser::ParseResult = parser::parse(src, path)
+    if parser::has_errors(r) is
+        print(parser::render_errors(r))
+        return 1
+    end
+    let mut sb = strbuf::new()
+    ast::dump_node(r.module, 0, sb)
+    print(sb.build())
+    return 0
+end
+
+fn cmd_parse_check(paths: [string]) -> int is
+    let mut bad: int = 0
+    let mut n: int = 0
+    for path in paths is
+        n += 1
+        let src: string = fs::read(path)
+        let r: parser::ParseResult = parser::parse(src, path)
+        if parser::has_errors(r) is
+            print(parser::render_errors(r))
+            bad += 1
+        else
+            write("ok: {path}")
+        end
+    end
+    write("{n - bad} of {n} file(s) parse cleanly")
+    if bad > 0 is return 1 end
+    return 0
+end
+
+;; canonical text form shared with the Rust reference dumper `dump_tc` (tools/difftest.py typecheck)
+fn cmd_typecheck(path: string, file_mem: bool, pretty: bool) -> int is
+    let src: string = fs::read(path)
+    let r: parser::ParseResult = parser::parse(src, path)
+    if parser::has_errors(r) is
+        write("ERRORS")
+        return 1
+    end
+    let m: ast::Node = r.module
+    if file_mem is checker::apply_file_mem_mode(m) end
+    let tc: checker::TypeChecker = checker::new_checker(path)
+    let diags: [diagnostics::Diag] = checker::check_module(tc, m)
+    if pretty is
+        if diags.len() > 0 is diagnostics::print_diagnostics(diags, src, path) end
+        if diagnostics::count_errors(diags) > 0 is return 1 end
+        return 0
+    end
+    let mut sb = strbuf::new()
+    for d in diags is
+        sb.push(d.sev + "\t" + d.file + "\t" + "{d.sp[0]}:{d.sp[1]}-{d.sp[3]}:{d.sp[4]}" + "\t" + escape(d.msg) + "\n")
+        for h in d.hints is sb.push("H\t" + escape(h) + "\n") end
+    end
+    for f in tc.test_fns is sb.push("test_fn\t" + f + "\n") end
+    for f in sort_strings(tc.inline_fns.items()) is sb.push("inline_fn\t" + f + "\n") end
+    for f in sort_strings(tc.must_use_fns.items()) is sb.push("must_use_fn\t" + f + "\n") end
+    for k in checker::deprecated_sorted(tc) is sb.push("deprecated\t" + k + "\t" + escape(checker::deprecated_msg(tc, k)) + "\n") end
+    print(sb.build())
+    if diagnostics::count_errors(diags) > 0 is return 1 end
+    return 0
+end
+
+fn cmd_builtins() -> int is
+    let tc: checker::TypeChecker = checker::new_checker("")
+    let mut sb = strbuf::new()
+    for name in checker::builtin_names(tc) is
+        let sig: checker::Sig = checker::fn_sig(tc, name)
+        let mut ps: [string] = []
+        for p in sig.params is ps.push(htype::display(p)) end
+        sb.push(name + "\t" + tc_util::join(ps, ";") + "\t" + htype::display(sig.ret) + "\n")
+    end
+    print(sb.build())
+    return 0
+end
+
+fn cmd_features(path: string) -> int is
+    let src: string = fs::read(path)
+    let r: parser::ParseResult = parser::parse(src, path)
+    if parser::has_errors(r) is
+        print(parser::render_errors(r))
+        return 1
+    end
+    let ds: [features::Diagnostic] = features::check_module_features(r.module, "Cpp")
+    for d in ds is
+        write("Error: " + d.message)
+        for h in d.hints is write("Hint: " + h) end
+    end
+    return 0
+end
+
+fn cmd_ffi_header(path: string, lang: string) -> int is
+    let src: string = fs::read(path)
+    let r: parser::ParseResult = parser::parse(src, path)
+    if parser::has_errors(r) is
+        print(parser::render_errors(r))
+        return 1
+    end
+    let m: ast::Node = r.module
+    let structs: ffi::StructTable = ffi::new_struct_table()
+    let mut blocks: [ast::Node] = []
+    for it in m.kids[3].kids is
+        if it.tag == "Struct" is ffi::add_struct(structs, it.text, it.kids[1]) end
+        if it.tag == "Extern" is blocks.push(it) end
+    end
+    if blocks.len() == 0 is
+        write("Note: no `extern` blocks found in {path}")
+        return 0
+    end
+    let is_rust: bool = lang == "rust" || lang == "rs"
+    let mut wrote: bool = false
+    for b in blocks is
+        if b.kids[0].text == "Python" is continue end
+        wrote = true
+        if is_rust is
+            write(ffi::rust_extern_block_with_structs(b.kids[3].kids, structs))
+        else
+            write(ffi::c_header_block_with_structs(b.kids[3].kids, structs))
+        end
+        write("")
+    end
+    if !wrote is write("Note: every `extern` block in {path} is `[python]` — no C/Rust header to generate") end
+    return 0
+end
+
+fn cmd_bit_use(args: [string]) -> int is
+    let name: string = args[2]
+    let start: string = args[3]
+    let mut has_version: bool = false
+    let mut version: string = ""
+    if args.len() >= 5 && args[4] != "-" is
+        has_version = true
+        version = args[4]
+    end
+    let dynamic_link: bool = args.len() >= 6 && args[5] == "dynamic"
+    let r: bit_resolve::UseResult = bit_resolve::resolve_bit_use(name, has_version, version, dynamic_link, start)
+    if r.ok is
+        write("OK " + r.entry)
+        return 0
+    end
+    write("ERR")
+    print(r.err)
+    return 1
+end
+
+fn rest_of(args: [string], from: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = from
+    while i < args.len() is
+        out.push(args[i])
+        i += 1
+    end
+    return out
+end
+
+fn main() is
+    let args: [string] = env_args()
+    if args.len() >= 3 && args[1] == "__lex" is exit(cmd_lex(args[2])) end
+    if args.len() >= 3 && args[1] == "__parse" is exit(cmd_parse(args[2])) end
+    if args.len() >= 2 && args[1] == "__parse-check" is exit(cmd_parse_check(rest_of(args, 2))) end
+    if args.len() >= 3 && args[1] == "__features" is exit(cmd_features(args[2])) end
+    if args.len() >= 3 && args[1] == "__ffi-header" is
+        let mut lang: string = "c"
+        if args.len() >= 4 is lang = args[3] end
+        exit(cmd_ffi_header(args[2], lang))
+    end
+    if args.len() >= 4 && args[1] == "__bit-use" is exit(cmd_bit_use(args)) end
+    if args.len() >= 3 && args[1] == "__typecheck" is
+        if args[2] == "--builtins" is exit(cmd_builtins()) end
+        let mut file_mem: bool = false
+        let mut pretty: bool = false
+        let mut path: string = ""
+        let mut i: int = 2
+        while i < args.len() is
+            if args[i] == "--file-mem" is file_mem = true
+            elsif args[i] == "--pretty" is pretty = true
+            else path = args[i] end
+            i += 1
+        end
+        exit(cmd_typecheck(path, file_mem, pretty))
+    end
+    if args.len() >= 2 && args[1] == "__lsp-job" is exit(cli::lsp_job(args)) end
+    ;; everything else is the `h#` command line
+    exit(cli::run(rest_of(args, 1)))
+end
