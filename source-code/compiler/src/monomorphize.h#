@@ -1,0 +1,410 @@
+use "std -> map" from "map"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+mod cg
+
+pub struct Violation is
+    pub fn_name: string
+    pub type_param: string
+    pub trait_name: string
+    pub concrete_ty: string
+    pub file: string
+    pub sp: [int]
+end
+
+pub struct Mono is
+    pub generic_fns: map::Map<string, ast::Node>
+    pub impls: map::Map<string, [string]>
+    pub tc: checker::TypeChecker
+    pub wl_name: [string]
+    pub wl_args: [[htype::HType]]
+    pub out: [Violation]
+end
+
+fn any_t() -> htype::HType is return htype::simple("any") end
+
+fn clone_locals(m: map::Map<string, htype::HType>) -> map::Map<string, htype::HType> is
+    let c: map::Map<string, htype::HType> = map::Map::new()
+    for k in m.key_list() is c.put(k, m.get(k).unwrap_or(any_t())) end
+    return c
+end
+
+;; ── bounds ────────────────────────────────────────────────────────────────────
+fn concrete_name(t: htype::HType) -> string is
+    if t.k == "int" is return "int" end
+    if t.k == "uint" is return "uint" end
+    if t.k == "Named" && t.name != "any" is return t.name end
+    return ""
+end
+
+fn check_bounds(m: Mono, f: ast::Node, targs: [htype::HType], at: ast::Node) is
+    let tps: [ast::Node] = f.kids[1].kids
+    let mut i: int = 0
+    while i < tps.len() && i < targs.len() is
+        let tp: ast::Node = tps[i]
+        if tp.kids.len() > 0 is
+            let cn: string = concrete_name(targs[i])
+            if cn != "" is
+                let implemented: [string] = m.impls.get(cn).unwrap_or([])
+                for b in tp.kids is
+                    if !cg::in_list(implemented, b.text) is
+                        m.out.push(Violation { fn_name: f.text, type_param: tp.text, trait_name: b.text, concrete_ty: cn,
+                            file: at.fl, sp: [at.sl, at.sc, at.so, at.el, at.ec, at.eo] })
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+end
+
+;; ── type-argument inference ───────────────────────────────────────────────────
+fn type_mentions(t: ast::Node, name: string) -> bool is
+    let tag: string = t.tag
+    if tag == "Named" is return t.text == name end
+    if tag == "Generic" || tag == "Tuple" || tag == "Array" || tag == "Optional" || tag == "Ref" || tag == "RefMut" is
+        for k in t.kids is
+            if type_mentions(k, name) is return true end
+        end
+        return false
+    end
+    if tag == "Fn" is
+        for k in t.kids[0].kids is
+            if type_mentions(k, name) is return true end
+        end
+        return type_mentions(t.kids[1], name)
+    end
+    return false
+end
+
+fn is_wrapper(k: string) -> bool is return k == "Optional" || k == "Array" || k == "Ref" || k == "RefMut" end
+
+fn bind_type_param(p: ast::Node, a: htype::HType, out: map::Map<string, htype::HType>) is
+    let tag: string = p.tag
+    if tag == "Named" is
+        if !out.has(p.text) is out.put(p.text, a) end
+        return
+    end
+    if (tag == "Ref" || tag == "RefMut") && (a.k == "Ref" || a.k == "RefMut") is
+        bind_type_param(p.kids[0], a.kids[0], out)
+        return
+    end
+    if tag == "Array" && a.k == "Array" is
+        bind_type_param(p.kids[0], a.kids[0], out)
+        return
+    end
+    if tag == "Optional" && a.k == "Optional" is
+        bind_type_param(p.kids[0], a.kids[0], out)
+        return
+    end
+    if tag == "Generic" is
+        if p.kids.len() > 0 && is_wrapper(a.k) is bind_type_param(p.kids[0], a.kids[0], out) end
+    end
+end
+
+pub struct Inferred is
+    pub ok: bool
+    pub args: [htype::HType]
+end
+
+fn infer_type_args(m: Mono, f: ast::Node, call_args: [ast::Node], locals: map::Map<string, htype::HType>, expected: htype::HType, has_expected: bool) -> Inferred is
+    let resolved: map::Map<string, htype::HType> = map::Map::new()
+    let params: [ast::Node] = f.kids[2].kids
+    let mut i: int = 0
+    while i < params.len() && i < call_args.len() is
+        let ae: ast::Node = call_args[i]
+        let mut at: htype::HType = any_t()
+        if ae.tag == "Ident" && locals.has(ae.text) is
+            at = locals.get(ae.text).unwrap_or(any_t())
+        else
+            at = checker::infer_expr(m.tc, ae)
+        end
+        bind_type_param(params[i].kids[1], at, resolved)
+        i += 1
+    end
+    if !cg::is_none(f.kids[3]) && has_expected is bind_type_param(f.kids[3], expected, resolved) end
+    let mut out: [htype::HType] = []
+    for tp in f.kids[1].kids is
+        if resolved.has(tp.text) is
+            out.push(resolved.get(tp.text).unwrap_or(any_t()))
+        else
+            let mut mentioned: bool = false
+            for p in params is
+                if type_mentions(p.kids[1], tp.text) is mentioned = true end
+            end
+            if mentioned is
+                out.push(any_t())
+            else
+                return Inferred { ok: false, args: [] }
+            end
+        end
+    end
+    return Inferred { ok: true, args: out }
+end
+
+fn qualified_key(m: Mono, callee: ast::Node) -> string is
+    let segs: [string] = cg::split_on_str(callee.text, "::")
+    if segs.len() < 2 is return "" end
+    let joined: string = cg::join_with(segs, "_")
+    if m.generic_fns.has(joined) is return joined end
+    let last: string = segs[segs.len() - 1]
+    if m.generic_fns.has(last) is return last end
+    return ""
+end
+
+;; ── collection ────────────────────────────────────────────────────────────────
+fn push_use(m: Mono, name: string, f: ast::Node, e: ast::Node, locals: map::Map<string, htype::HType>, expected: htype::HType, has_expected: bool) is
+    let inf: Inferred = infer_type_args(m, f, e.kids[1].kids, locals, expected, has_expected)
+    if inf.ok is
+        check_bounds(m, f, inf.args, e)
+        m.wl_name.push(name)
+        m.wl_args.push(inf.args)
+    end
+end
+
+fn collect_in_expr(m: Mono, e: ast::Node, locals: map::Map<string, htype::HType>, expected: htype::HType, has_expected: bool) is
+    if e.tag == "Call" is
+        let callee: ast::Node = e.kids[0]
+        if callee.tag == "Path" is
+            let name: string = qualified_key(m, callee)
+            if name != "" is push_use(m, name, m.generic_fns.get(name).unwrap_or(ast::nn()), e, locals, expected, has_expected) end
+        end
+        if callee.tag == "Ident" && m.generic_fns.has(callee.text) is
+            push_use(m, callee.text, m.generic_fns.get(callee.text).unwrap_or(ast::nn()), e, locals, expected, has_expected)
+        end
+    end
+    let owned: map::Map<string, htype::HType> = clone_locals(locals)
+    for x in sub_exprs(e) is collect_in_expr(m, x, owned, any_t(), false) end
+    for b in sub_blocks(e) is collect_in_block(m, b, owned) end
+end
+
+fn collect_in_block(m: Mono, stmts: [ast::Node], locals: map::Map<string, htype::HType>) is
+    for s in stmts is
+        if s.tag == "Let" is
+            let ty: ast::Node = s.kids[1]
+            let value: ast::Node = s.kids[2]
+            if !cg::is_none(ty) is
+                locals.put(s.text, htype::from_type(ty))
+            elsif !cg::is_none(value) is
+                locals.put(s.text, checker::infer_expr(m.tc, value))
+            end
+            let mut expected: htype::HType = any_t()
+            let mut has_expected: bool = false
+            if !cg::is_none(ty) is
+                expected = htype::from_type(ty)
+                has_expected = true
+            end
+            if !cg::is_none(value) is collect_in_expr(m, value, locals, expected, has_expected) end
+        elsif s.tag == "Return" is
+            if !cg::is_none(s.kids[0]) is collect_in_expr(m, s.kids[0], locals, any_t(), false) end
+        elsif s.tag == "ExprStmt" is
+            collect_in_expr(m, s.kids[0], locals, any_t(), false)
+        end
+    end
+end
+
+fn locals_for(params: [ast::Node]) -> map::Map<string, htype::HType> is
+    let l: map::Map<string, htype::HType> = map::Map::new()
+    for p in params is l.put(p.text, htype::from_type(p.kids[1])) end
+    return l
+end
+
+fn collect_item(m: Mono, it: ast::Node) is
+    if it.tag == "Fn" is
+        collect_in_block(m, it.kids[4].kids, locals_for(it.kids[2].kids))
+    elsif it.tag == "Impl" is
+        for me in it.kids[1].kids is
+            let l: map::Map<string, htype::HType> = locals_for(me.kids[2].kids)
+            l.put("self", htype::named(it.text))
+            ;; Rust inserts `self` first, then the params (which include `self: Self`) — params win
+            for p in me.kids[2].kids is l.put(p.text, htype::from_type(p.kids[1])) end
+            collect_in_block(m, me.kids[4].kids, l)
+        end
+    end
+    if it.tag == "ModDecl" && it.kids[1].tag == "Inline" is
+        for x in it.kids[1].kids is collect_item(m, x) end
+    end
+end
+
+;; ── sub-expression / sub-block walks (Rust walk_sub_exprs / walk_sub_blocks) ──
+fn sub_exprs(e: ast::Node) -> [ast::Node] is
+    let t: string = e.tag
+    let mut out: [ast::Node] = []
+    if t == "BinOp" || t == "Range" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" is
+        out.push(e.kids[0])
+        out.push(e.kids[1])
+    elsif t == "UnOp" || t == "Cast" || t == "Try" || t == "Await" || t == "FieldAccess" is
+        out.push(e.kids[0])
+    elsif t == "MethodCall" || t == "Call" is
+        out.push(e.kids[0])
+        for a in e.kids[1].kids is out.push(a) end
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for x in e.kids is out.push(x) end
+    elsif t == "StructLit" is
+        for f in e.kids is out.push(f.kids[0]) end
+    elsif t == "ReturnE" is
+        if !cg::is_none(e.kids[0]) is out.push(e.kids[0]) end
+    elsif t == "If" || t == "While" || t == "Match" is
+        out.push(e.kids[0])
+    elsif t == "For" is
+        out.push(e.kids[1])
+    end
+    return out
+end
+
+fn sub_blocks(e: ast::Node) -> [[ast::Node]] is
+    let t: string = e.tag
+    let mut out: [[ast::Node]] = []
+    if t == "If" is
+        out.push(e.kids[1].kids)
+        for el in e.kids[2].kids is out.push(el.kids[1].kids) end
+        if !cg::is_none(e.kids[3]) is out.push(e.kids[3].kids) end
+    elsif t == "While" is
+        out.push(e.kids[1].kids)
+    elsif t == "For" is
+        out.push(e.kids[2].kids)
+    elsif t == "Do" || t == "Unsafe" is
+        out.push(e.kids[0].kids)
+    elsif t == "Match" is
+        for arm in e.kids[1].kids is out.push(arm.kids[2].kids) end
+    elsif t == "Closure" is
+        out.push(e.kids[2].kids)
+    end
+    return out
+end
+
+;; ── instantiation (type substitution) ─────────────────────────────────────────
+fn htype_to_node(h: htype::HType) -> ast::Node is
+    let k: string = h.k
+    if k == "Optional" || k == "Array" || k == "Ref" || k == "RefMut" is return ast::nd(k, "", [htype_to_node(h.kids[0])]) end
+    if k == "Tuple" is
+        let mut ks: [ast::Node] = []
+        for x in h.kids is ks.push(htype_to_node(x)) end
+        return ast::nd("Tuple", "", ks)
+    end
+    if k == "Fn" is
+        let mut ps: [ast::Node] = []
+        let mut i: int = 0
+        while i + 1 < h.kids.len() is
+            ps.push(htype_to_node(h.kids[i]))
+            i += 1
+        end
+        return ast::nd("Fn", "", [ast::nd("Params", "", ps), htype_to_node(h.kids[h.kids.len() - 1])])
+    end
+    if k == "Named" is return ast::lf("Named", h.name) end
+    if k == "void" is return ast::lf("Void", "") end
+    return ast::lf("Named", k)
+end
+
+fn subst_type(t: ast::Node, sub: map::Map<string, ast::Node>) -> ast::Node is
+    let tag: string = t.tag
+    if tag == "Named" is
+        if sub.has(t.text) is return sub.get(t.text).unwrap_or(t) end
+        return t
+    end
+    if tag == "Array" || tag == "Optional" || tag == "Ref" || tag == "RefMut" || tag == "Tuple" || tag == "Generic" is
+        let mut ks: [ast::Node] = []
+        for k in t.kids is ks.push(subst_type(k, sub)) end
+        return cg::clone_with(t, ks)
+    end
+    if tag == "Fn" is
+        let mut ps: [ast::Node] = []
+        for k in t.kids[0].kids is ps.push(subst_type(k, sub)) end
+        return cg::clone_with(t, [cg::clone_with(t.kids[0], ps), subst_type(t.kids[1], sub)])
+    end
+    return t
+end
+
+fn subst_expr(e: ast::Node, sub: map::Map<string, ast::Node>) is
+    if e.tag == "Cast" is e.kids[1] = subst_type(e.kids[1], sub) end
+    if e.tag == "Closure" && !cg::is_none(e.kids[1]) is e.kids[1] = subst_type(e.kids[1], sub) end
+    for x in sub_exprs(e) is subst_expr(x, sub) end
+    for b in sub_blocks(e) is subst_block(b, sub) end
+end
+
+fn subst_block(stmts: [ast::Node], sub: map::Map<string, ast::Node>) is
+    for s in stmts is
+        if s.tag == "Let" is
+            if !cg::is_none(s.kids[1]) is s.kids[1] = subst_type(s.kids[1], sub) end
+            if !cg::is_none(s.kids[2]) is subst_expr(s.kids[2], sub) end
+        elsif s.tag == "Return" || s.tag == "Break" is
+            if !cg::is_none(s.kids[0]) is subst_expr(s.kids[0], sub) end
+        elsif s.tag == "ExprStmt" is
+            subst_expr(s.kids[0], sub)
+        end
+    end
+end
+
+fn instantiate(f: ast::Node, targs: [htype::HType]) -> ast::Node is
+    let sub: map::Map<string, ast::Node> = map::Map::new()
+    let tps: [ast::Node] = f.kids[1].kids
+    let mut i: int = 0
+    while i < tps.len() && i < targs.len() is
+        sub.put(tps[i].text, htype_to_node(targs[i]))
+        i += 1
+    end
+    let inst: ast::Node = cg::deep_clone(f)
+    inst.kids[1] = ast::nd("TypeParams", "", [])
+    for p in inst.kids[2].kids is p.kids[1] = subst_type(p.kids[1], sub) end
+    if !cg::is_none(inst.kids[3]) is inst.kids[3] = subst_type(inst.kids[3], sub) end
+    subst_block(inst.kids[4].kids, sub)
+    return inst
+end
+
+fn sanitize(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128 is
+            out = out + str_from_byte(c)
+        else
+            out = out + "_"
+        end
+        i += 1
+    end
+    return out
+end
+
+fn mangle_suffix(targs: [htype::HType]) -> string is
+    let mut ps: [string] = []
+    for t in targs is ps.push(sanitize(htype::display(t))) end
+    return cg::join_with(ps, "_")
+end
+
+;; ── entry point ───────────────────────────────────────────────────────────────
+;; `tc` must already have run `check_module` on `module` (an item list holder: Module node).
+pub fn bound_violations(module: ast::Node, tc: checker::TypeChecker) -> [Violation] is
+    let m: Mono = Mono { generic_fns: map::Map::new(), impls: map::Map::new(), tc: tc, wl_name: [], wl_args: [], out: [] }
+    for it in module.kids[3].kids is
+        if it.tag == "Impl" && !cg::is_none(it.kids[0]) is
+            let mut ts: [string] = m.impls.get(it.text).unwrap_or([])
+            if !cg::in_list(ts, it.kids[0].text) is ts.push(it.kids[0].text) end
+            m.impls.put(it.text, ts)
+        end
+    end
+    let mut concrete: [ast::Node] = []
+    for it in module.kids[3].kids is
+        if it.tag == "Fn" && it.kids[1].kids.len() > 0 is
+            m.generic_fns.put(it.text, it)
+        elsif !(it.tag == "Struct" && it.kids[0].kids.len() > 0) is
+            concrete.push(it)
+        end
+    end
+    for it in concrete is collect_item(m, it) end
+    let seen: map::Set<string> = map::Set::new()
+    let mut head: int = 0
+    while head < m.wl_name.len() is
+        let name: string = m.wl_name[head]
+        let targs: [htype::HType] = m.wl_args[head]
+        head += 1
+        let key: string = name + "\u{1}" + mangle_suffix(targs)
+        if seen.has(key) is continue end
+        seen.add(key)
+        if m.generic_fns.has(name) is
+            let inst: ast::Node = instantiate(m.generic_fns.get(name).unwrap_or(ast::nn()), targs)
+            collect_item(m, inst)
+        end
+    end
+    return m.out
+end
