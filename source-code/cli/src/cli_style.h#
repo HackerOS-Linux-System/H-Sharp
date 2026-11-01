@@ -1,0 +1,132 @@
+use "bit -> colors"
+
+pub fn enable() is
+    colors::force()
+end
+
+pub fn disable() is
+    colors::disable()
+end
+
+pub fn on() -> bool is
+    return colors::enabled()
+end
+
+pub fn bold(s: string) -> string is return colors::bold(s) end
+pub fn dim(s: string) -> string is return colors::dim(s) end
+pub fn green(s: string) -> string is return colors::green(s) end
+pub fn red(s: string) -> string is return colors::bright_red(s) end
+pub fn yellow(s: string) -> string is return colors::yellow(s) end
+pub fn cyan(s: string) -> string is return colors::cyan(s) end
+pub fn white_b(s: string) -> string is return colors::bold(colors::bright_white(s)) end
+pub fn green_b(s: string) -> string is return colors::bold(colors::bright_green(s)) end
+pub fn cyan_b(s: string) -> string is return colors::bold(colors::bright_cyan(s)) end
+pub fn yellow_b(s: string) -> string is return colors::bold(colors::bright_yellow(s)) end
+pub fn red_b(s: string) -> string is return colors::bold(colors::bright_red(s)) end
+
+;; ── help texts ───────────────────────────────────────────────────────────────
+fn starts(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn split_lines(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 10 is
+            out.push(cur)
+            cur = ""
+        else
+            cur += str_from_byte(c)
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+fn indent_of(line: string) -> int is
+    let mut n: int = 0
+    while n < line.len() && byte_at(line, n) == 32 is n += 1 end
+    return n
+end
+
+;; `<VALUE>` / `[ARGS]...` yellow, flags cyan, anything else (a bare command) bold white
+fn style_key(key: string, flags: bool) -> string is
+    let mut out: string = ""
+    let mut tok: string = ""
+    let mut i: int = 0
+    while i <= key.len() is
+        if i == key.len() || byte_at(key, i) == 32 is
+            if tok.len() > 0 is
+                let c: int = byte_at(tok, 0)
+                if c == 60 || c == 91 is out += yellow(tok)
+                elsif flags is out += cyan_b(tok)
+                else out += white_b(tok) end
+            end
+            if i < key.len() is out += " " end
+            tok = ""
+        else
+            tok += str_from_byte(byte_at(key, i))
+        end
+        i += 1
+    end
+    return out
+end
+
+;; "  key   description" — key ends at the first run of two spaces
+fn style_entry(line: string, flags: bool) -> string is
+    let ind: int = indent_of(line)
+    if ind >= line.len() is return line end
+    let mut p: int = ind
+    while p + 1 < line.len() && !(byte_at(line, p) == 32 && byte_at(line, p + 1) == 32) is p += 1 end
+    if p + 1 >= line.len() is p = line.len() end
+    return line[0..ind] + style_key(line[ind..p], flags) + line[p..line.len()]
+end
+
+fn is_section(line: string) -> bool is
+    return line == "Commands:" || line == "Options:" || line == "Arguments:"
+end
+
+;; Colours a clap-style help text (captured verbatim in cli_help.h# / cli_help2.h#).  Plain text when colour is off.
+pub fn help(text: string) -> string is
+    if !on() is return text end
+    let lines: [string] = split_lines(text)
+    let mut section: string = ""
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        if i == 0 && starts(line, "h# — ") is
+            out.push(cyan_b("h#") + line[2..line.len()])
+        elsif starts(line, "Usage: ") is
+            let rest: string = line[7..line.len()]
+            out.push(yellow_b("Usage:") + " " + style_key(rest, false))
+        elsif is_section(line) is
+            section = line
+            out.push(yellow_b(line))
+        elsif starts(line, "Examples:") is
+            section = ""
+            out.push(yellow_b("Examples:") + dim(line[9..line.len()]))
+        elsif line.len() == 0 is
+            out.push(line)
+        elsif section == "Commands:" && indent_of(line) == 2 is
+            out.push(style_entry(line, false))
+        elsif (section == "Options:" || section == "Arguments:") && indent_of(line) >= 2 && indent_of(line) <= 6 is
+            out.push(style_entry(line, true))
+        else
+            out.push(line)
+        end
+        i += 1
+    end
+    let mut res: string = ""
+    let mut j: int = 0
+    while j < out.len() is
+        if j > 0 is res += "\n" end
+        res += out[j]
+        j += 1
+    end
+    return res
+end
