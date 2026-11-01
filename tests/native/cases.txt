@@ -1,0 +1,25 @@
+targets
+targets --help
+targets --foo
+targets extra
+ffi-header
+ffi-header --help
+ffi-header --foo x.h#
+ffi-header a.h# b.h#
+ffi-header -l
+ffi-header /nonexistent.h#
+ffi-header tests/native/ext.h#
+ffi-header tests/native/ext.h# -l rust
+ffi-header --lang=rs tests/native/ext.h#
+ffi-header tests/native/ok1.h#
+ffi-header tests/native/syntax.h#
+check --help
+check --foo
+check /nonexistent.h#
+check tests/native/typeerr.h#
+check tests/native/syntax.h#
+check tests/native/byval.h#
+check tests/native/ok1.h# tests/native/typeerr.h#
+check tests/native/ok1.h# tests/native/syntax.h# tests/native/byval.h#
+check tests/corpus/examples/hello-world.h#
+check tests/corpus/examples/02-mixed-files/main.h#
