@@ -1,0 +1,1268 @@
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "std -> strings" from "str"
+
+;; ── string / path helpers ──────────────────────────────────────────────────
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+fn trim_start_matches(s: string, p: string) -> string is
+    let mut r: string = s
+    while p.len() > 0 && starts_with(r, p) is r = r[p.len()..r.len()] end
+    return r
+end
+
+fn trim_end_matches(s: string, p: string) -> string is
+    let mut r: string = s
+    while p.len() > 0 && ends_with(r, p) is r = r[0..r.len() - p.len()] end
+    return r
+end
+
+fn find_sub(s: string, p: string) -> int is
+    let n: int = s.len()
+    let m: int = p.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == p is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn contains(s: string, p: string) -> bool is return find_sub(s, p) >= 0 end
+
+fn split_on(s: string, ch: int) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == ch is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+fn lower(s: string) -> string is return str::to_lower(s) end
+
+fn is_ascii_alnum(c: int) -> bool is
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+end
+
+fn is_hex_digit(c: int) -> bool is
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+end
+
+fn is_ws(c: int) -> bool is return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    for x in xs is
+        if x == s is return true end
+    end
+    return false
+end
+
+fn with(xs: [string], x: string) -> [string] is
+    let mut out: [string] = []
+    for y in xs is out.push(y) end
+    out.push(x)
+    return out
+end
+
+;; PathBuf::join
+pub fn pjoin(a: string, b: string) -> string is
+    if starts_with(b, "/") is return b end
+    if a == "" is return b end
+    if ends_with(a, "/") is return a + b end
+    return a + "/" + b
+end
+
+pub fn is_absolute(p: string) -> bool is return starts_with(p, "/") end
+
+;; Path::components, normalised like Rust: interior `.` and empty parts dropped (a leading `.` is kept)
+fn components(p: string) -> [string] is
+    let mut out: [string] = []
+    let mut first: bool = true
+    if starts_with(p, "/") is out.push("/") end
+    for part in split_on(p, 47) is
+        if part == "" is
+            continue
+        end
+        if part == "." && !(first && !starts_with(p, "/")) is
+            continue
+        end
+        out.push(part)
+        first = false
+    end
+    return out
+end
+
+pub fn path_eq(a: string, b: string) -> bool is
+    let ca: [string] = components(a)
+    let cb: [string] = components(b)
+    if ca.len() != cb.len() is return false end
+    let mut i: int = 0
+    while i < ca.len() is
+        if ca[i] != cb[i] is return false end
+        i += 1
+    end
+    return true
+end
+
+fn path_starts_with(p: string, base: string) -> bool is
+    let cp: [string] = components(p)
+    let cb: [string] = components(base)
+    if cb.len() > cp.len() is return false end
+    let mut i: int = 0
+    while i < cb.len() is
+        if cp[i] != cb[i] is return false end
+        i += 1
+    end
+    return true
+end
+
+fn join_comps(cs: [string], upto: int) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < upto is
+        if cs[i] == "/" is
+            s = "/"
+        elsif s == "" || s == "/" is
+            s = s + cs[i]
+        else
+            s = s + "/" + cs[i]
+        end
+        i += 1
+    end
+    return s
+end
+
+;; Path::parent -> (has_parent, parent)
+pub struct Parent is
+    pub has: bool
+    pub path: string
+end
+
+pub fn parent_of(p: string) -> Parent is
+    let cs: [string] = components(p)
+    if cs.len() == 0 is return Parent { has: false, path: "" } end
+    if cs.len() == 1 && cs[0] == "/" is return Parent { has: false, path: "" } end
+    return Parent { has: true, path: join_comps(cs, cs.len() - 1) }
+end
+
+;; Path::file_name -> "" when none (`/`, empty, or ends in `..`)
+pub fn file_name_of(p: string) -> string is
+    let cs: [string] = components(p)
+    if cs.len() == 0 is return "" end
+    let last: string = cs[cs.len() - 1]
+    if last == "/" || last == ".." is return "" end
+    return last
+end
+
+;; "" when `base` is not a prefix; otherwise the remaining path, found = true
+pub struct Stripped is
+    pub found: bool
+    pub rest: string
+end
+
+fn strip_prefix(p: string, base: string) -> Stripped is
+    if !path_starts_with(p, base) is return Stripped { found: false, rest: "" } end
+    let cp: [string] = components(p)
+    let cb: [string] = components(base)
+    let mut rest: string = ""
+    let mut i: int = cb.len()
+    while i < cp.len() is
+        if rest == "" is rest = cp[i] else rest = rest + "/" + cp[i] end
+        i += 1
+    end
+    return Stripped { found: true, rest: rest }
+end
+
+fn ends_with_path(p: string, suffix: string) -> bool is
+    let cp: [string] = components(p)
+    let cs: [string] = components(suffix)
+    if cs.len() > cp.len() is return false end
+    let mut i: int = 0
+    while i < cs.len() is
+        if cp[cp.len() - cs.len() + i] != cs[i] is return false end
+        i += 1
+    end
+    return true
+end
+
+;; fs::canonicalize, falling back to the input when it fails
+pub fn canonical(p: string) -> string is
+    let code: int = run_cmd_exec("realpath -- " + shell_escape(p) + " 2>/dev/null", 30)
+    if code != 0 is return p end
+    let out: string = str::trim(run_cmd_last_stdout())
+    if out == "" is return p end
+    return out
+end
+
+;; ── constants ───────────────────────────────────────────────────────────────
+fn root_search_depth() -> int is return 12 end
+
+fn manifests() -> [string] is return ["Bit.hk", "bit.hk"] end
+
+;; ── lock file ───────────────────────────────────────────────────────────────
+pub struct LockedBitLib is
+    pub name: string
+    pub version: string
+    pub commit: string
+    pub url: string
+    pub checksum: string
+    pub lang: string
+    pub output: string
+    pub installed_at: string
+end
+
+pub struct LockTable is
+    pub names: [string]
+    pub libs: [LockedBitLib]
+end
+
+fn lock_index(t: LockTable, name: string) -> int is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == name is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn lock_has(t: LockTable, name: string) -> bool is return lock_index(t, name) >= 0 end
+
+pub fn lock_get(t: LockTable, name: string) -> LockedBitLib is
+    return t.libs[lock_index(t, name)]
+end
+
+;; ── a small JSON reader (one object per line; only string members matter) ───
+pub struct JsonObj is
+    pub ok: bool
+    pub keys: [string]
+    pub vals: [string]
+end
+
+pub struct JP is
+    pub src: string
+    pub pos: int
+    pub bad: bool
+end
+
+fn jp_skip_ws(p: JP) is
+    while p.pos < p.src.len() && is_ws(byte_at(p.src, p.pos)) is p.pos += 1 end
+end
+
+;; parses a string literal at p.pos ('"'), returns decoded text
+fn jp_string(p: JP) -> string is
+    let mut out: string = ""
+    p.pos += 1
+    while true is
+        if p.pos >= p.src.len() is
+            p.bad = true
+            return out
+        end
+        let c: int = byte_at(p.src, p.pos)
+        if c == 34 is
+            p.pos += 1
+            return out
+        end
+        if c < 32 is
+            p.bad = true
+            return out
+        end
+        if c == 92 is
+            if p.pos + 1 >= p.src.len() is
+                p.bad = true
+                return out
+            end
+            let d: int = byte_at(p.src, p.pos + 1)
+            p.pos += 2
+            if d == 110 is out = out + "\n"
+            elsif d == 116 is out = out + "\t"
+            elsif d == 114 is out = out + "\r"
+            elsif d == 98 is out = out + str_from_byte(8)
+            elsif d == 102 is out = out + str_from_byte(12)
+            elsif d == 34 || d == 92 || d == 47 is out = out + str_from_byte(d)
+            elsif d == 117 is
+                if p.pos + 4 > p.src.len() is
+                    p.bad = true
+                    return out
+                end
+                let mut v: int = 0
+                let mut k: int = 0
+                while k < 4 is
+                    let h: int = byte_at(p.src, p.pos + k)
+                    if !is_hex_digit(h) is
+                        p.bad = true
+                        return out
+                    end
+                    let mut dv: int = h - 48
+                    if h >= 97 is dv = h - 87 elsif h >= 65 is dv = h - 55 end
+                    v = v * 16 + dv
+                    k += 1
+                end
+                p.pos += 4
+                if v < 128 is out = out + str_from_byte(v) else out = out + "?" end
+            else
+                p.bad = true
+                return out
+            end
+        else
+            out = out + str_from_byte(c)
+            p.pos += 1
+        end
+    end
+    return out
+end
+
+;; skips one JSON value; sets p.bad on a syntax error. Returns the string payload when the value is a string.
+fn jp_value(p: JP, depth: int) -> string is
+    jp_skip_ws(p)
+    if p.pos >= p.src.len() || depth > 128 is
+        p.bad = true
+        return ""
+    end
+    let c: int = byte_at(p.src, p.pos)
+    if c == 34 is return jp_string(p) end
+    if c == 123 is
+        p.pos += 1
+        jp_skip_ws(p)
+        if p.pos < p.src.len() && byte_at(p.src, p.pos) == 125 is
+            p.pos += 1
+            return ""
+        end
+        while true is
+            jp_skip_ws(p)
+            if p.pos >= p.src.len() || byte_at(p.src, p.pos) != 34 is
+                p.bad = true
+                return ""
+            end
+            let k: string = jp_string(p)
+            jp_skip_ws(p)
+            if p.bad || p.pos >= p.src.len() || byte_at(p.src, p.pos) != 58 is
+                p.bad = true
+                return ""
+            end
+            p.pos += 1
+            let v: string = jp_value(p, depth + 1)
+            if p.bad is return "" end
+            jp_skip_ws(p)
+            if p.pos >= p.src.len() is
+                p.bad = true
+                return ""
+            end
+            let d: int = byte_at(p.src, p.pos)
+            p.pos += 1
+            if d == 125 is return "" end
+            if d != 44 is
+                p.bad = true
+                return ""
+            end
+        end
+    end
+    if c == 91 is
+        p.pos += 1
+        jp_skip_ws(p)
+        if p.pos < p.src.len() && byte_at(p.src, p.pos) == 93 is
+            p.pos += 1
+            return ""
+        end
+        while true is
+            jp_value(p, depth + 1)
+            if p.bad is return "" end
+            jp_skip_ws(p)
+            if p.pos >= p.src.len() is
+                p.bad = true
+                return ""
+            end
+            let d: int = byte_at(p.src, p.pos)
+            p.pos += 1
+            if d == 93 is return "" end
+            if d != 44 is
+                p.bad = true
+                return ""
+            end
+        end
+    end
+    ;; literals / numbers
+    let start: int = p.pos
+    while p.pos < p.src.len() is
+        let d: int = byte_at(p.src, p.pos)
+        if d == 44 || d == 125 || d == 93 || is_ws(d) is break end
+        p.pos += 1
+    end
+    let tok: string = p.src[start..p.pos]
+    if tok == "true" || tok == "false" || tok == "null" is return "" end
+    if tok.len() == 0 is
+        p.bad = true
+        return ""
+    end
+    ;; number: -?digits[.digits][e[+-]digits]
+    let mut i: int = 0
+    if byte_at(tok, 0) == 45 is i = 1 end
+    let mut digits: int = 0
+    while i < tok.len() && byte_at(tok, i) >= 48 && byte_at(tok, i) <= 57 is
+        i += 1
+        digits += 1
+    end
+    if digits == 0 is
+        p.bad = true
+        return ""
+    end
+    if i < tok.len() && byte_at(tok, i) == 46 is
+        i += 1
+        let mut fd: int = 0
+        while i < tok.len() && byte_at(tok, i) >= 48 && byte_at(tok, i) <= 57 is
+            i += 1
+            fd += 1
+        end
+        if fd == 0 is
+            p.bad = true
+            return ""
+        end
+    end
+    if i < tok.len() && (byte_at(tok, i) == 101 || byte_at(tok, i) == 69) is
+        i += 1
+        if i < tok.len() && (byte_at(tok, i) == 43 || byte_at(tok, i) == 45) is i += 1 end
+        let mut ed: int = 0
+        while i < tok.len() && byte_at(tok, i) >= 48 && byte_at(tok, i) <= 57 is
+            i += 1
+            ed += 1
+        end
+        if ed == 0 is
+            p.bad = true
+            return ""
+        end
+    end
+    if i != tok.len() is p.bad = true end
+    return ""
+end
+
+;; top-level object members that are strings (others read as ""); ok=false when the line is not valid JSON
+pub fn parse_json_line(line: string) -> JsonObj is
+    let p: JP = JP { src: line, pos: 0, bad: false }
+    jp_skip_ws(p)
+    let mut keys: [string] = []
+    let mut vals: [string] = []
+    if p.pos < p.src.len() && byte_at(p.src, p.pos) == 123 is
+        p.pos += 1
+        jp_skip_ws(p)
+        if p.pos < p.src.len() && byte_at(p.src, p.pos) == 125 is
+            p.pos += 1
+        else
+            while true is
+                jp_skip_ws(p)
+                if p.pos >= p.src.len() || byte_at(p.src, p.pos) != 34 is
+                    p.bad = true
+                    break
+                end
+                let k: string = jp_string(p)
+                jp_skip_ws(p)
+                if p.bad || p.pos >= p.src.len() || byte_at(p.src, p.pos) != 58 is
+                    p.bad = true
+                    break
+                end
+                p.pos += 1
+                jp_skip_ws(p)
+                let is_str: bool = p.pos < p.src.len() && byte_at(p.src, p.pos) == 34
+                let v: string = jp_value(p, 1)
+                if p.bad is break end
+                ;; serde_json keeps the LAST duplicate key
+                let mut at: int = -1
+                let mut q: int = 0
+                while q < keys.len() is
+                    if keys[q] == k is at = q end
+                    q += 1
+                end
+                let mut sv: string = ""
+                if is_str is sv = v end
+                if at >= 0 is
+                    vals[at] = sv
+                else
+                    keys.push(k)
+                    vals.push(sv)
+                end
+                jp_skip_ws(p)
+                if p.pos >= p.src.len() is
+                    p.bad = true
+                    break
+                end
+                let d: int = byte_at(p.src, p.pos)
+                p.pos += 1
+                if d == 125 is break end
+                if d != 44 is
+                    p.bad = true
+                    break
+                end
+            end
+        end
+    else
+        jp_value(p, 0)
+    end
+    if !p.bad is
+        jp_skip_ws(p)
+        if p.pos != p.src.len() is p.bad = true end
+    end
+    return JsonObj { ok: !p.bad, keys: keys, vals: vals }
+end
+
+fn json_str(o: JsonObj, key: string) -> string is
+    let mut i: int = 0
+    while i < o.keys.len() is
+        if o.keys[i] == key is return o.vals[i] end
+        i += 1
+    end
+    return ""
+end
+
+pub fn read_bit_lock_from(path: string) -> LockTable is
+    let t: LockTable = LockTable { names: [], libs: [] }
+    if !fs::is_file(path) is return t end
+    let content: string = fs::read(path)
+    for raw in split_on(content, 10) is
+        let line: string = str::trim(raw)
+        if line == "" is continue end
+        let j: JsonObj = parse_json_line(line)
+        if !j.ok is continue end
+        let name: string = json_str(j, "name")
+        if name == "" is continue end
+        let lib: LockedBitLib = LockedBitLib { name: name, version: json_str(j, "version"), commit: json_str(j, "commit"),
+            url: json_str(j, "url"), checksum: json_str(j, "checksum"), lang: json_str(j, "lang"),
+            output: json_str(j, "output"), installed_at: json_str(j, "installed_at") }
+        let at: int = lock_index(t, name)
+        if at >= 0 is
+            t.libs[at] = lib
+        else
+            t.names.push(name)
+            t.libs.push(lib)
+        end
+    end
+    return t
+end
+
+;; ── directories ─────────────────────────────────────────────────────────────
+fn home_dir() -> string is
+    let h: string = env::get_or("HOME", "")
+    if h == "" is return "/tmp" end
+    return h
+end
+
+pub fn bit_default_libs_dir() -> string is return pjoin(home_dir(), ".hackeros/libs") end
+
+pub fn bit_libs_roots() -> [string] is
+    let mut out: [string] = []
+    for var in ["BIT_HOME", "BIT_LIBS"] is
+        let v: string = env::get_or(var, "")
+        if v != "" && !has_path(out, v) is out.push(v) end
+    end
+    let hp: string = env::get_or("HLIB_PATH", "")
+    if hp != "" is
+        for p in split_on(hp, 58) is
+            if p != "" && !has_path(out, p) is out.push(p) end
+        end
+    end
+    let d: string = bit_default_libs_dir()
+    if !has_path(out, d) is out.push(d) end
+    return out
+end
+
+fn has_path(xs: [string], p: string) -> bool is
+    for x in xs is
+        if path_eq(x, p) is return true end
+    end
+    return false
+end
+
+pub fn bit_state_dir() -> string is
+    let d: string = env::get_or("BIT_DIR", "")
+    if d != "" is return d end
+    return pjoin(home_dir(), ".hackeros/bit")
+end
+
+pub fn bit_lock_path() -> string is return pjoin(bit_state_dir(), "bit.lock") end
+
+pub fn read_bit_lock() -> LockTable is return read_bit_lock_from(bit_lock_path()) end
+
+pub fn short_hash(h: string) -> string is
+    if h.len() <= 12 is return h end
+    return h[0..12]
+end
+
+pub fn valid_lib_name(name: string) -> bool is
+    if name.len() == 0 is return false end
+    if !is_ascii_alnum(byte_at(name, 0)) is return false end
+    if name.len() > 64 is return false end
+    let mut i: int = 1
+    while i < name.len() is
+        let c: int = byte_at(name, i)
+        if !(is_ascii_alnum(c) || c == 46 || c == 95 || c == 45) is return false end
+        i += 1
+    end
+    return true
+end
+
+;; ── Bit.hk ──────────────────────────────────────────────────────────────────
+pub struct HkEntry is
+    pub section: string
+    pub key: string
+    pub value: string
+end
+
+fn unquote(s0: string) -> string is
+    let s: string = str::trim(s0)
+    if s.len() >= 2 && (byte_at(s, 0) == 34 || byte_at(s, 0) == 39) && byte_at(s, s.len() - 1) == byte_at(s, 0) is
+        return s[1..s.len() - 1]
+    end
+    return s
+end
+
+fn join_dots(xs: [string]) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is s = s + "." end
+        s = s + xs[i]
+        i += 1
+    end
+    return s
+end
+
+pub fn parse_hk(content: string) -> [HkEntry] is
+    let mut out: [HkEntry] = []
+    let mut section: string = ""
+    let mut stack: [string] = []
+    for raw in split_on(content, 10) is
+        let line: string = str::trim(raw)
+        if line == "" || starts_with(line, "!") || starts_with(line, ";;") is continue end
+        if starts_with(line, "[") && ends_with(line, "]") is
+            section = lower(str::trim(line[1..line.len() - 1]))
+            stack = []
+            continue
+        end
+        let mut dashes: int = 0
+        while dashes < line.len() && byte_at(line, dashes) == 45 is dashes += 1 end
+        if dashes == 0 || !starts_with(line[dashes..line.len()], ">") is continue end
+        let rest: string = str::trim(line[dashes + 1..line.len()])
+        let at: int = find_sub(rest, "=>")
+        let mut key: string = rest
+        let mut value: string = ""
+        let mut has_value: bool = false
+        if at >= 0 is
+            key = str::trim(rest[0..at])
+            value = unquote(rest[at + 2..rest.len()])
+            has_value = true
+        end
+        if key == "" is continue end
+        if stack.len() > dashes - 1 is
+            let mut cut: [string] = []
+            let mut i: int = 0
+            while i < dashes - 1 is
+                cut.push(stack[i])
+                i += 1
+            end
+            stack = cut
+        end
+        let mut dotted: string = key
+        if stack.len() > 0 is dotted = join_dots(stack) + "." + key end
+        stack = with(stack, key)
+        if has_value is out.push(HkEntry { section: section, key: dotted, value: value }) end
+    end
+    return out
+end
+
+;; "" = absent / empty (hk_get filters empty values; the FIRST matching entry decides)
+fn hk_get(hk: [HkEntry], section: string, key: string) -> string is
+    for e in hk is
+        if e.section == section && e.key == key is return e.value end
+    end
+    return ""
+end
+
+fn hk_has(hk: [HkEntry], section: string, key: string) -> bool is
+    return hk_get(hk, section, key) != ""
+end
+
+fn hk_list(v: string) -> [string] is
+    let t: string = trim_end_matches(trim_start_matches(str::trim(v), "["), "]")
+    let mut out: [string] = []
+    for part in split_on(t, 44) is
+        let u: string = unquote(part)
+        if u != "" is out.push(u) end
+    end
+    return out
+end
+
+;; "" when none
+pub fn manifest_in(dir: string) -> string is
+    for n in manifests() is
+        let p: string = pjoin(dir, n)
+        if fs::is_file(p) is return p end
+    end
+    return ""
+end
+
+fn load_hk(dir: string) -> [HkEntry] is
+    let m: string = manifest_in(dir)
+    if m == "" || !fs::exists(m) is return [] end
+    return parse_hk(fs::read(m))
+end
+
+;; ── project / workspace root ────────────────────────────────────────────────
+;; "" when none
+fn nearest_manifest_dir(start0: string) -> string is
+    let mut start: string = start0
+    if start == "" is start = "." end
+    let mut dir: string = canonical(start)
+    let mut i: int = 0
+    while i < root_search_depth() is
+        if manifest_in(dir) != "" is return dir end
+        let p: Parent = parent_of(dir)
+        if p.has && !path_eq(p.path, dir) is dir = p.path else break end
+        i += 1
+    end
+    return ""
+end
+
+pub fn find_bit_project_root(start_dir: string) -> string is
+    let n: string = nearest_manifest_dir(start_dir)
+    if n == "" is return start_dir end
+    return n
+end
+
+pub fn read_workspace_members(project_root: string) -> [string] is
+    let hk: [HkEntry] = load_hk(project_root)
+    let v: string = hk_get(hk, "workspace", "members")
+    if v == "" is return [] end
+    return hk_list(v)
+end
+
+fn workspace_lists_member(ws_dir: string, member_dir: string) -> bool is
+    let members: [string] = read_workspace_members(ws_dir)
+    if members.len() == 0 is return false end
+    let rel: Stripped = strip_prefix(member_dir, ws_dir)
+    let base: string = file_name_of(member_dir)
+    for m0 in members is
+        let m: string = trim_end_matches(trim_start_matches(m0, "./"), "/")
+        if rel.found && path_eq(rel.rest, m) is return true end
+        if base != "" && base == m is return true end
+    end
+    return false
+end
+
+pub fn find_bit_workspace_root(start_dir: string) -> string is
+    let near: string = nearest_manifest_dir(start_dir)
+    if near == "" is return start_dir end
+    let mut up: Parent = parent_of(near)
+    let mut i: int = 0
+    while i < root_search_depth() is
+        if !up.has is break end
+        let dir: string = up.path
+        if manifest_in(dir) != "" && workspace_lists_member(dir, near) is return dir end
+        up = parent_of(dir)
+        i += 1
+    end
+    return near
+end
+
+fn project_roots(start_dir: string) -> [string] is
+    let near: string = find_bit_project_root(start_dir)
+    let ws: string = find_bit_workspace_root(start_dir)
+    if path_eq(ws, near) is return [near] end
+    return [near, ws]
+end
+
+fn last_slash_component(m: string) -> string is
+    let parts: [string] = split_on(m, 47)
+    return parts[parts.len() - 1]
+end
+
+;; "" when not found
+pub fn find_workspace_member_dir(project_root: string, member: string) -> string is
+    for m0 in read_workspace_members(project_root) is
+        let m: string = trim_end_matches(trim_start_matches(m0, "./"), "/")
+        let base: string = last_slash_component(m)
+        if m == member || base == member is
+            let dir: string = pjoin(project_root, m)
+            if fs::is_dir(dir) is return dir end
+        end
+    end
+    let guess: string = pjoin(project_root, member)
+    if fs::is_dir(guess) is return guess end
+    return ""
+end
+
+;; ── entry file of a library directory ───────────────────────────────────────
+fn existing(dir: string, rel: string) -> string is
+    if rel == "" is return "" end
+    let p: string = pjoin(dir, rel)
+    if fs::is_file(p) is return p end
+    return ""
+end
+
+fn lib_dir_entry_depth(dir: string, name: string, depth: int) -> string is
+    let hk: [HkEntry] = load_hk(dir)
+    let mut src: string = hk_get(hk, "layout", "src")
+    if src == "" is src = "src" end
+    for key in ["hsharp-lib-entry", "lib-entry"] is
+        let p: string = existing(dir, hk_get(hk, "layout", key))
+        if p != "" is return p end
+    end
+    let p1: string = existing(dir, src + "/lib.h#")
+    if p1 != "" is return p1 end
+    for section in ["build", "package"] is
+        let p: string = existing(dir, hk_get(hk, section, "entry"))
+        if p != "" is return p end
+    end
+    for key in ["hsharp-entry", "entry"] is
+        let p: string = existing(dir, hk_get(hk, "layout", key))
+        if p != "" is return p end
+    end
+    let p2: string = existing(dir, src + "/main.h#")
+    if p2 != "" is return p2 end
+    for rel in ["src/lib.h#", "src/main.h#", "lib.h#", "main.h#"] is
+        let p: string = existing(dir, rel)
+        if p != "" is return p end
+    end
+    if name != "" is
+        for rel in [name + ".h#", "src/" + name + ".h#"] is
+            let p: string = existing(dir, rel)
+            if p != "" is return p end
+        end
+    end
+    if depth < 2 is
+        let mv: string = hk_get(hk, "workspace", "members")
+        if mv != "" is
+            let members: [string] = hk_list(mv)
+            for m in members is
+                if name != "" && last_slash_component(trim_end_matches(m, "/")) == name is
+                    let p: string = lib_dir_entry_depth(pjoin(dir, m), name, depth + 1)
+                    if p != "" is return p end
+                end
+            end
+            for m in members is
+                let p: string = lib_dir_entry_depth(pjoin(dir, m), name, depth + 1)
+                if p != "" is return p end
+            end
+        end
+    end
+    return ""
+end
+
+;; "" when there is no entry
+pub fn lib_dir_entry(dir: string, name: string) -> string is
+    return lib_dir_entry_depth(dir, name, 0)
+end
+
+pub fn workspace_member_entry(member_dir: string) -> string is
+    let e: string = lib_dir_entry(member_dir, "")
+    if e != "" is return e end
+    let hk: [HkEntry] = load_hk(member_dir)
+    let mut src: string = hk_get(hk, "layout", "src")
+    if src == "" is src = "src" end
+    return pjoin(pjoin(member_dir, src), "main.h#")
+end
+
+;; "" when the manifest has no [package] version
+pub fn manifest_version(dir: string) -> string is
+    return hk_get(load_hk(dir), "package", "version")
+end
+
+;; ── finding the library directory ───────────────────────────────────────────
+fn path_dependency_dirs(project_root: string, name: string) -> [string] is
+    let hk: [HkEntry] = load_hk(project_root)
+    let mut out: [string] = []
+    let mut raws: [string] = []
+    let v1: string = hk_get(hk, "dependencies", name + ".path")
+    if v1 != "" is raws.push(v1) end
+    let v2: string = hk_get(hk, "dependencies", name)
+    if v2 != "" is
+        let t: string = str::trim(v2)
+        let mut cut: int = -1
+        let mut i: int = 0
+        while i < t.len() && cut < 0 is
+            if is_ws(byte_at(t, i)) is cut = i end
+            i += 1
+        end
+        let mut first: string = t
+        let mut second: string = ""
+        if cut >= 0 is
+            first = t[0..cut]
+            second = t[cut + 1..t.len()]
+        end
+        if lower(first) == "path" is raws.push(second) end
+    end
+    for raw0 in raws is
+        let raw: string = str::trim(raw0)
+        if raw == "" is continue end
+        let mut p: string = raw
+        if !is_absolute(p) is p = pjoin(project_root, p) end
+        if !has_path(out, p) is out.push(p) end
+    end
+    return out
+end
+
+fn newest_version_dir(base: string) -> string is
+    if !fs::is_dir(base) is return "" end
+    let mut best: string = ""
+    let mut best_t: int = -1
+    for fname in fs::list_dir(base) is
+        let path: string = pjoin(base, fname)
+        if fname == "current" || starts_with(fname, ".") || !fs::is_dir(path) is continue end
+        let mt: int = fs::modified_time(path)
+        if best == "" || mt > best_t is
+            best = path
+            best_t = mt
+        end
+    end
+    return best
+end
+
+fn holds_sources(dir: string) -> bool is
+    if manifest_in(dir) != "" is return true end
+    if fs::is_dir(pjoin(dir, "src")) is return true end
+    if !fs::is_dir(dir) is return false end
+    for n in fs::list_dir(dir) is
+        if ends_with(n, ".h#") is return true end
+    end
+    return false
+end
+
+fn push_path(xs: [string], p: string) -> [string] is
+    if has_path(xs, p) is return xs end
+    return with(xs, p)
+end
+
+pub fn bit_lib_candidates(name: string, start_dir: string) -> [string] is
+    let mut out: [string] = []
+    let roots: [string] = project_roots(start_dir)
+    for root in roots is
+        out = push_path(out, pjoin(pjoin(root, "cache/libs"), name))
+        out = push_path(out, pjoin(pjoin(root, "cache/source"), name))
+    end
+    for root in roots is
+        for p in path_dependency_dirs(root, name) is out = push_path(out, p) end
+    end
+    let lock: LockTable = read_bit_lock()
+    for libs in bit_libs_roots() is
+        let base: string = pjoin(libs, name)
+        if lock_has(lock, name) is
+            let l: LockedBitLib = lock_get(lock, name)
+            if l.version != "" is out = push_path(out, pjoin(base, l.version)) end
+            if l.commit != "" is
+                out = push_path(out, pjoin(base, short_hash(l.commit)))
+                out = push_path(out, pjoin(base, l.commit))
+            end
+        end
+        out = push_path(out, pjoin(base, "current"))
+        let newest: string = newest_version_dir(base)
+        if newest != "" is out = push_path(out, newest) end
+        if holds_sources(base) is out = push_path(out, base) end
+    end
+    return out
+end
+
+pub fn dependency_source_dirs(start_dir: string) -> [string] is
+    let mut out: [string] = []
+    let roots: [string] = project_roots(start_dir)
+    let mut names: [string] = []
+    for root in roots is
+        for e in load_hk(root) is
+            if e.section != "dependencies" is continue end
+            let first: string = split_on(e.key, 46)[0]
+            if valid_lib_name(first) && !contains_str(names, first) is names.push(first) end
+        end
+    end
+    for name in names is
+        let mut dirs: [string] = []
+        for d in bit_lib_candidates(name, start_dir) is dirs.push(d) end
+        for root in roots is dirs.push(pjoin(pjoin(root, "libs"), name)) end
+        for dir in dirs is
+            if !fs::is_dir(dir) is continue end
+            let entry: string = lib_dir_entry(dir, name)
+            if entry != "" is
+                let par: Parent = parent_of(entry)
+                if par.has && fs::is_dir(par.path) && !has_path(out, par.path) is out.push(par.path) end
+            end
+            let s: string = pjoin(dir, "src")
+            if fs::is_dir(s) && !has_path(out, s) is out.push(s) end
+        end
+    end
+    return out
+end
+
+;; ── resolution ──────────────────────────────────────────────────────────────
+;; BitResolveError: kind "NotFound" (tried) / "NoEntry" (dir)
+pub struct FindResult is
+    pub ok: bool
+    pub dir: string
+    pub entry: string
+    pub err_kind: string
+    pub tried: [string]
+    pub err_dir: string
+end
+
+pub fn find_bit_lib(name: string, start_dir: string) -> FindResult is
+    let mut tried: [string] = []
+    let mut broken: string = ""
+    for dir in bit_lib_candidates(name, start_dir) is
+        tried.push(dir)
+        if !fs::is_dir(dir) is continue end
+        let entry: string = lib_dir_entry(dir, name)
+        if entry != "" is
+            return FindResult { ok: true, dir: dir, entry: entry, err_kind: "", tried: [], err_dir: "" }
+        end
+        if broken == "" is broken = dir end
+    end
+    for libs in bit_libs_roots() is
+        let flat: string = pjoin(libs, name + ".h#")
+        tried.push(flat)
+        if fs::is_file(flat) is
+            return FindResult { ok: true, dir: libs, entry: flat, err_kind: "", tried: [], err_dir: "" }
+        end
+    end
+    if broken != "" is
+        return FindResult { ok: false, dir: "", entry: "", err_kind: "NoEntry", tried: [], err_dir: broken }
+    end
+    return FindResult { ok: false, dir: "", entry: "", err_kind: "NotFound", tried: tried, err_dir: "" }
+end
+
+fn strip_v(s: string) -> string is
+    if starts_with(s, "v") || starts_with(s, "V") is return s[1..s.len()] end
+    return s
+end
+
+fn all_hex(s: string) -> bool is
+    let mut i: int = 0
+    while i < s.len() is
+        if !is_hex_digit(byte_at(s, i)) is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn version_matches(wanted: string, lock: LockedBitLib) -> bool is
+    let w: string = str::trim(wanted)
+    if w == "" || w == "*" || lower(w) == "latest" is return true end
+    if lock.version == "" && lock.commit == "" is return true end
+    if strip_v(w) == strip_v(lock.version) is return true end
+    return w.len() >= 7 && all_hex(w) && (starts_with(lock.commit, w) || starts_with(lock.version, w))
+end
+
+fn manifest_version_matches(wanted: string, have: string) -> bool is
+    let w: string = str::trim(wanted)
+    return w == "" || w == "*" || lower(w) == "latest" || strip_v(w) == strip_v(have)
+end
+
+fn is_global_install(dir: string) -> bool is
+    for r in bit_libs_roots() is
+        if path_starts_with(dir, r) is return true end
+    end
+    return false
+end
+
+;; ── messages (Rust `\` line continuations drop the next line's indentation; mirrored here) ──
+fn manual_placement_help(name: string) -> string is
+    let roots: [string] = bit_libs_roots()
+    let mut libs: string = bit_default_libs_dir()
+    if roots.len() > 0 is libs = roots[0] end
+    return "if it cannot be installed, put its sources in one of these places:\n" + libs + "/" + name + "/<version>/     (+ a symlink `current` -> <version>; sources, Bit.hk, src/)\n" + libs + "/" + name + "/               (sources directly inside)\n<project>/cache/libs/" + name + "/\nor point to it from Bit.hk:\n[dependencies]\n-> " + name + "\n--> path => ../" + name + "\n(override the libraries directory with BIT_HOME, or HLIB_PATH=dir1:dir2)\n"
+end
+
+pub fn missing_message(name: string, tried: [string]) -> string is
+    let mut locations: string = ""
+    let mut i: int = 0
+    while i < tried.len() is
+        if i > 0 is locations = locations + "\n" end
+        locations = locations + "  - " + tried[i]
+        i += 1
+    end
+    return "bit library '" + name + "' not found. Looked in:\n" + locations + "\n\ninstall it first:\nbit install " + name + "\nbit search " + name + "      (find the exact name in the index)\nor add it to [dependencies] in Bit.hk and run: bit install\n\n" + manual_placement_help(name)
+end
+
+pub fn no_entry_message(name: string, dir: string) -> string is
+    return "bit library '" + name + "' was found at " + dir + " but has no usable entry point.\n\nexpected one of (relative to that directory):\na Bit.hk with `[layout] -> hsharp-lib-entry => ...` (or `lib-entry`)\nsrc/lib.h#, src/main.h#, lib.h#, main.h#, " + name + ".h# or src/" + name + ".h#\n\nthe library may be written in another language (Hacker Lang / HackerScript) — those cannot be imported from H# with `use \"bit -> ...\"`.\nif the copy is damaged, reinstall it:  bit install " + name + " --force\n"
+end
+
+pub fn not_locked_message(name: string) -> string is
+    return "dynamic bit library '" + name + "' is not recorded in bit.lock (" + bit_lock_path() + ").\n\n`dynamic use \"bit -> " + name + "\"` requires it to have already been installed\nby bit on this machine:\nbit install " + name + "\n"
+end
+
+pub fn version_mismatch_message(name: string, wanted: string, have: string, source: string) -> string is
+    return "bit library '" + name + "' version mismatch: code requests '" + wanted + "', but " + source + " has '" + have + "' installed.\n\nrun one of:\nbit upgrade " + name + "              re-fetch the newest version\nbit install " + name + " --force      reinstall (pin a revision with `bit add " + name + " <rev>`)\nor change the import to `use \"bit -> " + name + "/" + have + "\"`\n"
+end
+
+pub fn invalid_name_message(name: string) -> string is
+    return "invalid bit library name '" + name + "' in `use \"bit -> " + name + "\"`: names contain letters, digits, `-`, `_` and `.`, start with a letter or digit, and are at most 64 characters long\n"
+end
+
+;; resolve_bit_use -> ok + entry, or the error message. `has_version`: Option<&str> is Some.
+pub struct UseResult is
+    pub ok: bool
+    pub entry: string
+    pub err: string
+end
+
+fn use_err(m: string) -> UseResult is return UseResult { ok: false, entry: "", err: m } end
+
+pub fn resolve_bit_use(name: string, has_version: bool, version: string, dynamic_link: bool, start_dir: string) -> UseResult is
+    if !valid_lib_name(name) is return use_err(invalid_name_message(name)) end
+    let lock: LockTable = read_bit_lock()
+    if dynamic_link && !lock_has(lock, name) is return use_err(not_locked_message(name)) end
+    let f: FindResult = find_bit_lib(name, start_dir)
+    if !f.ok is
+        if f.err_kind == "NotFound" is return use_err(missing_message(name, f.tried)) end
+        return use_err(no_entry_message(name, f.err_dir))
+    end
+    if has_version is
+        if lock_has(lock, name) && is_global_install(f.dir) is
+            let l: LockedBitLib = lock_get(lock, name)
+            if !version_matches(version, l) is
+                let mut have: string = l.version
+                if have == "" is have = l.commit end
+                return use_err(version_mismatch_message(name, version, have, "bit.lock"))
+            end
+        else
+            let have: string = manifest_version(f.dir)
+            if have != "" && !manifest_version_matches(version, have) is
+                return use_err(version_mismatch_message(name, version, have, "the Bit.hk in " + f.dir))
+            end
+        end
+    end
+    return UseResult { ok: true, entry: f.entry, err: "" }
+end
+
+pub fn find_bit_lib_entry(name: string, start_dir: string) -> string is
+    let f: FindResult = find_bit_lib(name, start_dir)
+    if f.ok is return f.entry end
+    return ""
+end
+
+;; ── [edition] (H# projects only) ────────────────────────────────────────────
+fn hk_lang_includes_hsharp(hk: [HkEntry]) -> bool is
+    let mut raw: string = hk_get(hk, "package", "lang")
+    if raw == "" is raw = hk_get(hk, "project", "lang") end
+    if raw == "" is raw = hk_get(hk, "build", "lang") end
+    if raw == "" is return false end
+    for l in hk_list(raw) is
+        let low: string = lower(l)
+        let mut t: string = ""
+        let mut i: int = 0
+        while i < low.len() is
+            let c: int = byte_at(low, i)
+            if !(c == 32 || c == 45 || c == 95 || c == 34 || c == 39 || c == 91 || c == 93) is t = t + str_from_byte(c) end
+            i += 1
+        end
+        if t == "h#" || t == "hsharp" || t == "hsh" || t == "hs#" is return true end
+    end
+    return false
+end
+
+;; Edition::parse for the editions this toolchain knows ({2026}); returns "" on success else the error pair
+pub struct EditionParse is
+    pub ok: bool
+    pub edition: string
+    pub message: string
+    pub hints: [string]
+end
+
+pub fn toolchain_version() -> string is return "0.9.0" end
+
+pub fn parse_edition(s: string) -> EditionParse is
+    let t: string = str::trim(s)
+    let mut four_digits: bool = t.len() == 4
+    let mut year: int = 0
+    let mut i: int = 0
+    while i < t.len() is
+        let c: int = byte_at(t, i)
+        if c < 48 || c > 57 is four_digits = false end
+        year = year * 10 + (c - 48)
+        i += 1
+    end
+    let latest: string = "2026"
+    if !four_digits is
+        return EditionParse { ok: false, edition: "",
+            message: "invalid edition `" + s + "` in `using` declaration (expected a four-digit year, e.g. \"" + latest + "\")",
+            hints: ["write it as `using \"" + latest + "\"`", "supported editions: " + latest] }
+    end
+    if year == 2026 is return EditionParse { ok: true, edition: "2026", message: "", hints: [] } end
+    if year > 2026 is
+        return EditionParse { ok: false, edition: "",
+            message: "edition \"" + to_string(year) + "\" is newer than this H# toolchain (v" + toolchain_version() + ") understands",
+            hints: ["upgrade H# (`hsharp --version` shows v" + toolchain_version() + "), or change the file to `using \"" + latest + "\"`",
+                    "this file was written for edition " + to_string(year), "supported editions: " + latest] }
+    end
+    return EditionParse { ok: false, edition: "",
+        message: "edition \"" + to_string(year) + "\" is no longer supported by this H# toolchain (v" + toolchain_version() + ")",
+        hints: ["migrate the file to `using \"" + latest + "\"`", "supported editions: " + latest] }
+end
+
+;; Result<Option<Edition>, String>
+pub struct ManifestEdition is
+    pub ok: bool
+    pub has: bool
+    pub edition: string
+    pub err: string
+end
+
+fn me_none() -> ManifestEdition is return ManifestEdition { ok: true, has: false, edition: "", err: "" } end
+
+pub fn manifest_edition(dir: string) -> ManifestEdition is
+    let manifest: string = manifest_in(dir)
+    if manifest == "" || !fs::exists(manifest) is return me_none() end
+    let hk: [HkEntry] = parse_hk(fs::read(manifest))
+    if !hk_lang_includes_hsharp(hk) is return me_none() end
+    let raw: string = hk_get(hk, "edition", "edition")
+    if raw == "" is return me_none() end
+    let e: EditionParse = parse_edition(raw)
+    if e.ok is return ManifestEdition { ok: true, has: true, edition: e.edition, err: "" } end
+    let mut hints: string = ""
+    let mut i: int = 0
+    while i < e.hints.len() is
+        if i > 0 is hints = hints + "; " end
+        hints = hints + e.hints[i]
+        i += 1
+    end
+    return ManifestEdition { ok: false, has: false, edition: "",
+        err: manifest + ": [edition] -> edition => " + raw + ": " + e.message + "\n  hint: " + hints }
+end
+
+;; "" when none
+pub fn manifest_dir_of(dir: string) -> string is
+    let d: string = nearest_manifest_dir(dir)
+    if d == "" is return "" end
+    return canonical(d)
+end
+
+pub fn project_edition(start_dir: string) -> ManifestEdition is
+    let d: string = nearest_manifest_dir(start_dir)
+    if d == "" is return me_none() end
+    return manifest_edition(d)
+end
+
+;; entry_root: has_root=false = None. Returns "" when there is no per-file edition.
+pub fn edition_for_file(file: string, has_root: bool, entry_root: string) -> string is
+    let par: Parent = parent_of(file)
+    if !par.has is return "" end
+    let owner: string = nearest_manifest_dir(par.path)
+    if owner == "" is return "" end
+    if has_root is
+        if path_eq(canonical(owner), canonical(entry_root)) is return "" end
+    end
+    let me: ManifestEdition = manifest_edition(owner)
+    if me.ok && me.has is return me.edition end
+    return ""
+end
+
+;; exposed for the tests / driver
+pub fn path_ends_with(p: string, suffix: string) -> bool is return ends_with_path(p, suffix) end
