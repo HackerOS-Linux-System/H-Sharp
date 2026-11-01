@@ -1,0 +1,404 @@
+use "bit -> lsp"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+
+;; ── tables (keep in sync with source-code/lsp/src/completion.rs) ──────────────
+fn keywords() -> [string] is
+    return ["fn", "let", "mut", "struct", "enum", "trait", "impl", "return",
+        "if", "is", "else", "elsif", "end", "match", "while", "for", "in",
+        "do", "break", "continue", "true", "false", "nil", "pub", "unsafe",
+        "extern", "mod", "use", "using", "async", "await", "arena", "manual"]
+end
+
+fn builtin_names() -> [string] is
+    return ["write", "print", "to_string", "string_len", "string_slice", "string_starts_with",
+        "string_ends_with", "string_split", "string_replace", "string_trim", "array_len", "exit", "panic"]
+end
+
+fn builtin_sigs() -> [string] is
+    return ["write(value: string)", "print(value: string)", "to_string(value: any) -> string",
+        "string_len(s: string) -> int", "string_slice(s: string, start: int, end: int) -> string",
+        "string_starts_with(s: string, prefix: string) -> bool", "string_ends_with(s: string, suffix: string) -> bool",
+        "string_split(s: string, sep: string) -> [string]", "string_replace(s: string, from: string, to: string) -> string",
+        "string_trim(s: string) -> string", "array_len(a: [T]) -> int", "exit(code: int)", "panic(message: string)"]
+end
+
+;; editions, oldest first (Edition::ALL); completion offers them newest first
+fn edition_names() -> [string] is
+    return ["2026"]
+end
+
+fn edition_summary(e: string) -> string is
+    return "baseline syntax: `is … end` blocks, `use \"std -> x\"`, `@: mode`, hlib/bit/workspace imports"
+end
+
+;; ── small JSON helpers ────────────────────────────────────────────────────────
+fn q(s: string) -> string is
+    return lsp::json::quote(s)
+end
+
+fn obj(fields: [string]) -> string is
+    return "\{" + lsp::json::join(fields, ",") + "}"
+end
+
+fn field(name: string, raw: string) -> string is
+    return q(name) + ":" + raw
+end
+
+;; ── H# (1-based) <-> LSP (0-based) positions, in ONE place ────────────────────
+fn l0(n: int) -> int is
+    if n <= 1 is return 0 end
+    return n - 1
+end
+
+fn range_of(n: ast::Node) -> string is
+    return lsp::proto::range(l0(n.sl), l0(n.sc), l0(n.el), l0(n.ec))
+end
+
+fn span_contains(n: ast::Node, line: int, col: int) -> bool is
+    if line < n.sl || line > n.el is return false end
+    if line == n.sl && col < n.sc is return false end
+    if line == n.el && col > n.ec is return false end
+    return true
+end
+
+;; ── type rendering (symbols.rs `type_name`) ───────────────────────────────────
+fn join(parts: [string], sep: string) -> string is
+    return lsp::json::join(parts, sep)
+end
+
+fn type_name(t: ast::Node) -> string is
+    if t.tag == "Void" is return "void" end
+    if t.tag == "Named" is return t.text end
+    if t.tag == "Array" || t.tag == "Slice" is return "[" + type_name(t.kids[0]) + "]" end
+    if t.tag == "Optional" is return type_name(t.kids[0]) + "?" end
+    if t.tag == "Ref" is return "ref " + type_name(t.kids[0]) end
+    if t.tag == "RefMut" is return "ref mut " + type_name(t.kids[0]) end
+    if t.tag == "Tuple" is
+        let mut parts: [string] = []
+        for k in t.kids is parts.push(type_name(k)) end
+        return "(" + join(parts, ", ") + ")"
+    end
+    if t.tag == "Generic" is
+        let mut parts: [string] = []
+        for k in t.kids is parts.push(type_name(k)) end
+        return t.text + "<" + join(parts, ", ") + ">"
+    end
+    if t.tag == "Fn" is
+        let mut parts: [string] = []
+        for k in t.kids[0].kids is parts.push(type_name(k)) end
+        return "fn(" + join(parts, ", ") + ") -> " + type_name(t.kids[1])
+    end
+    return t.text
+end
+
+;; ── item accessors on the uniform AST ─────────────────────────────────────────
+fn module_items(m: ast::Node) -> [ast::Node] is
+    let none: [ast::Node] = []
+    if m.tag != "Module" is return none end
+    return m.kids[3].kids
+end
+
+fn fn_params(f: ast::Node) -> [ast::Node] is
+    return f.kids[2].kids
+end
+
+;; `T` of an `Option<TypeExpr>` slot: tag "None" means absent
+fn present(n: ast::Node) -> bool is
+    return n.tag != "None"
+end
+
+fn fn_ret(f: ast::Node) -> string is
+    if present(f.kids[3]) is return type_name(f.kids[3]) end
+    return "void"
+end
+
+fn fn_param_types(f: ast::Node) -> string is
+    let mut parts: [string] = []
+    for p in fn_params(f) is parts.push(type_name(p.kids[1])) end
+    return join(parts, ", ")
+end
+
+fn fn_param_decls(f: ast::Node) -> string is
+    let mut parts: [string] = []
+    for p in fn_params(f) is parts.push(p.text + ": " + type_name(p.kids[1])) end
+    return join(parts, ", ")
+end
+
+;; ── diagnostics (diagnostics.rs) ──────────────────────────────────────────────
+fn diag_message(e: error::ParseError) -> string is
+    let mut m: string = e.message
+    for h in e.hints is m = m + "\nhint: " + h end
+    return m
+end
+
+fn err_range(e: error::ParseError) -> string is
+    return lsp::proto::range(l0(e.sl), l0(e.sc), l0(e.el), l0(e.ec))
+end
+
+fn has_external_mods(items: [ast::Node]) -> bool is
+    for it in items is
+        if it.tag == "ModDecl" && it.kids[1].tag != "Inline" is return true end
+    end
+    return false
+end
+
+;; typechecker span `[sl, sc, so, el, ec, eo, in_interp]` (1-based) -> LSP range (0-based); empty span -> first char
+fn tc_range(sp: [int]) -> string is
+    if sp.len() < 6 is return lsp::proto::range(0, 0, 0, 1) end
+    let mut ec: int = l0(sp[4])
+    if sp[3] == sp[0] && ec <= l0(sp[1]) is ec = l0(sp[1]) + 1 end
+    return lsp::proto::range(l0(sp[0]), l0(sp[1]), l0(sp[3]), ec)
+end
+
+fn tc_message(d: diagnostics::Diag) -> string is
+    let mut m: string = d.msg
+    for h in d.hints is m = m + "\nhint: " + h end
+    return m
+end
+
+fn compute_diagnostics(text: string) -> [string] is
+    let out: parser::ParseResult = parser::parse(text, "<lsp>")
+    let mut diags: [string] = []
+    for e in out.errors is
+        diags.push(lsp::proto::diagnostic(err_range(e), LSP_SEV_ERROR, "hsharp", diag_message(e)))
+    end
+    if out.errors.len() == 0 && !has_external_mods(out.module.kids[3].kids) is
+        let tc: checker::TypeChecker = checker::new_checker("<lsp>")
+        for d in checker::check_module(tc, out.module) is
+            if d.file != "<lsp>" && d.file != "" is continue end
+            let mut sev: int = LSP_SEV_ERROR
+            if d.sev == "W" is sev = LSP_SEV_WARNING end
+            diags.push(lsp::proto::diagnostic(tc_range(d.sp), sev, "hsharp", tc_message(d)))
+        end
+    end
+    return diags
+end
+
+;; NOTE: H# has no GC and `@arena` crashes here (invalid free when the JSON string is copied out),
+;; so every request leaks what it allocates — see "known limitations" in bootstraping/PROGRESS.md.
+fn diag_params(uri: string, text: string) -> string is
+    return lsp::proto::publish_diagnostics_params(uri, compute_diagnostics(text))
+end
+
+fn publish(srv: lsp::Server, uri: string) is
+    lsp::notify(srv, "textDocument/publishDiagnostics", run_job("diag", lsp::text(srv, uri), uri, 0, 0))
+end
+
+;; ── `///` docs (lib.rs `group_doc_comments` + ast `doc_for_line`) ─────────────
+;; The doc block attached to the item that starts on `line`, or "" (flag in `found`).
+fn doc_for_line(out: parser::ParseResult, line: int) -> string is
+    let kids: [ast::Node] = out.module.kids
+    if kids.len() < 5 is return "" end
+    for d in kids[4].kids is
+        if d.kids[0].text == "{line}" is return d.text end
+    end
+    return ""
+end
+
+;; ── symbols (symbols.rs) ──────────────────────────────────────────────────────
+fn symbol(name: string, detail: string, has_detail: bool, kind: int, rng: string, children: [string]) -> string is
+    let mut f: [string] = [field("name", q(name))]
+    if has_detail is f.push(field("detail", q(detail))) end
+    f.push(field("kind", to_string(kind)))
+    f.push(field("range", rng))
+    f.push(field("selectionRange", rng))
+    if children.len() > 0 is f.push(field("children", lsp::json::array(children))) end
+    return obj(f)
+end
+
+fn item_symbol(it: ast::Node) -> string is
+    let none: [string] = []
+    if it.tag == "Fn" is
+        return symbol(it.text, "(" + fn_param_types(it) + ") -> " + fn_ret(it), true, LSP_SYM_FUNCTION, range_of(it), none)
+    end
+    if it.tag == "Struct" is
+        let mut kids: [string] = []
+        for fd in it.kids[1].kids is
+            kids.push(symbol(fd.text, type_name(fd.kids[1]), true, LSP_SYM_FIELD, range_of(fd), none))
+        end
+        return symbol(it.text, "", false, LSP_SYM_STRUCT, range_of(it), kids)
+    end
+    if it.tag == "Enum" is return symbol(it.text, "", false, LSP_SYM_ENUM, range_of(it), none) end
+    if it.tag == "Trait" is return symbol(it.text, "", false, LSP_SYM_INTERFACE, range_of(it), none) end
+    if it.tag == "ConstDef" is
+        if present(it.kids[1]) is
+            return symbol(it.text, type_name(it.kids[1]), true, LSP_SYM_CONSTANT, range_of(it), none)
+        end
+        return symbol(it.text, "", false, LSP_SYM_CONSTANT, range_of(it), none)
+    end
+    return ""
+end
+
+fn document_symbols(text: string) -> string is
+    let out: parser::ParseResult = parser::parse(text, "<lsp>")
+    let mut syms: [string] = []
+    if out.errors.len() == 0 is
+        for it in module_items(out.module) is
+            let s: string = item_symbol(it)
+            if s.len() > 0 is syms.push(s) end
+        end
+    end
+    return lsp::json::array(syms)
+end
+
+;; ── hover (hover.rs) ──────────────────────────────────────────────────────────
+fn hover_reply(code: string, doc: string) -> string is
+    let mut value: string = "```hsharp\n" + code + "\n```"
+    if doc.len() > 0 is value = value + "\n\n---\n\n" + doc end
+    return obj([field("contents", obj([field("kind", q("markdown")), field("value", q(value))]))])
+end
+
+fn hover_at(text: string, line0: int, char0: int) -> string is
+    let out: parser::ParseResult = parser::parse(text, "<lsp>")
+    if out.errors.len() > 0 is return "null" end
+    let line: int = line0 + 1
+    let col: int = char0 + 1
+    for it in module_items(out.module) is
+        if it.tag == "Fn" && span_contains(it, line, col) is
+            let sig: string = "fn " + it.text + "(" + fn_param_decls(it) + ") -> " + fn_ret(it)
+            return hover_reply(sig, doc_for_line(out, it.sl))
+        end
+        if it.tag == "Struct" && span_contains(it, line, col) is
+            let mut lines: [string] = []
+            for fd in it.kids[1].kids is lines.push("    " + fd.text + ": " + type_name(fd.kids[1])) end
+            let sig: string = "struct " + it.text + " is\n" + join(lines, "\n") + "\nend"
+            return hover_reply(sig, doc_for_line(out, it.sl))
+        end
+        if it.tag == "ConstDef" && span_contains(it, line, col) is
+            let mut ty: string = "?"
+            if present(it.kids[1]) is ty = type_name(it.kids[1]) end
+            return hover_reply("const " + it.text + ": " + ty, doc_for_line(out, it.sl))
+        end
+    end
+    return "null"
+end
+
+;; ── completion (completion.rs) ────────────────────────────────────────────────
+fn citem(label: string, kind: int, detail: string, has_detail: bool) -> string is
+    let mut f: [string] = [field("label", q(label))]
+    if has_detail is f.push(field("detail", q(detail))) end
+    f.push(field("kind", to_string(kind)))
+    return obj(f)
+end
+
+fn builtin_items() -> [string] is
+    let mut items: [string] = []
+    for k in keywords() is items.push(citem(k, LSP_KIND_KEYWORD, "", false)) end
+    let names: [string] = builtin_names()
+    let sigs: [string] = builtin_sigs()
+    let mut i: int = 0
+    while i < names.len() is
+        items.push(citem(names[i], LSP_KIND_FUNCTION, sigs[i], true))
+        i += 1
+    end
+    let eds: [string] = edition_names()
+    let mut e: int = eds.len() - 1
+    while e >= 0 is
+        items.push(citem("using \"" + eds[e] + "\"", LSP_KIND_SNIPPET, "H# edition " + eds[e] + " — " + edition_summary(eds[e]), true))
+        e -= 1
+    end
+    return items
+end
+
+fn completions(text: string) -> string is
+    let out: parser::ParseResult = parser::parse(text, "<lsp>")
+    let mut items: [string] = builtin_items()
+    if out.errors.len() == 0 is
+        for it in module_items(out.module) is
+            if it.tag == "Fn" is
+                items.push(citem(it.text, LSP_KIND_FUNCTION, "fn(" + fn_param_decls(it) + ")", true))
+            elsif it.tag == "Struct" is
+                items.push(citem(it.text, LSP_KIND_STRUCT, "", false))
+            elsif it.tag == "Enum" is
+                items.push(citem(it.text, LSP_KIND_ENUM, "", false))
+            elsif it.tag == "ConstDef" is
+                if present(it.kids[1]) is
+                    items.push(citem(it.text, LSP_KIND_CONSTANT, type_name(it.kids[1]), true))
+                else
+                    items.push(citem(it.text, LSP_KIND_CONSTANT, "", false))
+                end
+            end
+        end
+    end
+    return lsp::json::array(items)
+end
+
+;; ── memory isolation: one short-lived worker process per request ─────────────
+;; H# has no GC, and a parse of a 70 KB file leaks ~150 MB. The server therefore keeps only the
+;; document texts and runs each request as `h# __lsp-job <op> <file> <uri> <line> <char>`; when the
+;; worker exits the OS reclaims everything, so a day-long editing session stays small.
+fn job_result(op: string, text: string, uri: string, line0: int, char0: int) -> string is
+    if op == "diag" is return lsp::proto::publish_diagnostics_params(uri, compute_diagnostics(text)) end
+    if op == "symbols" is return document_symbols(text) end
+    if op == "hover" is return hover_at(text, line0, char0) end
+    return completions(text)
+end
+
+;; `h# __lsp-job <op> <file> <uri> <line> <char>` — prints one JSON value on one line.
+pub fn job(args: [string]) -> int is
+    if args.len() < 7 is return 2 end
+    write(job_result(args[2], fs::read(args[3]), args[4], to_int(args[5]), to_int(args[6])))
+    return 0
+end
+
+fn strip_nl(s: string) -> string is
+    let mut e: int = s.len()
+    while e > 0 && (byte_at(s, e - 1) == 10 || byte_at(s, e - 1) == 13) is e -= 1 end
+    return s[0..e]
+end
+
+fn run_job(op: string, text: string, uri: string, line0: int, char0: int) -> string is
+    let exe: string = env_args()[0]
+    let tmp: string = fs::temp_file("hsls")
+    fs::write(tmp, text)
+    let out: string = strip_nl(process::run_args(exe, ["__lsp-job", op, tmp, uri, to_string(line0), to_string(char0)]))
+    fs::remove(tmp)
+    if out.len() == 0 is return job_result(op, text, uri, line0, char0) end   ;; worker failed: in-process fallback
+    return out
+end
+
+;; ── server loop (lib.rs `run`) ────────────────────────────────────────────────
+pub fn run() -> int is
+    let mut srv: lsp::Server = lsp::new_server("hsharp-lsp", "0.9.0")
+    srv = lsp::set_sync(srv, LSP_SYNC_FULL)
+    srv = lsp::enable(srv, "hoverProvider")
+    srv = lsp::enable(srv, "documentSymbolProvider")
+    srv = lsp::set_capability(srv, "completionProvider", lsp::proto::completion_options([":", "."], false))
+
+    while !lsp::finished(srv) is
+        srv = lsp::next(srv)
+        match lsp::method(srv) is
+            "textDocument/didOpen" | "textDocument/didChange" => is
+                publish(srv, lsp::uri(srv))
+            end
+            "textDocument/hover" => is
+                let uri: string = lsp::uri(srv)
+                if lsp::is_open(srv, uri) is
+                    lsp::reply(srv, run_job("hover", lsp::text(srv, uri), uri, lsp::pos_line(srv), lsp::pos_char(srv)))
+                else is
+                    lsp::reply(srv, "null")
+                end
+            end
+            "textDocument/completion" => is
+                let uri: string = lsp::uri(srv)
+                if lsp::is_open(srv, uri) is
+                    lsp::reply(srv, run_job("completion", lsp::text(srv, uri), uri, 0, 0))
+                else is
+                    lsp::reply(srv, lsp::json::array(builtin_items()))
+                end
+            end
+            "textDocument/documentSymbol" => is
+                let uri: string = lsp::uri(srv)
+                if lsp::is_open(srv, uri) is
+                    lsp::reply(srv, run_job("symbols", lsp::text(srv, uri), uri, 0, 0))
+                else is
+                    lsp::reply(srv, "[]")
+                end
+            end
+            "" => is end
+            _ => is srv = lsp::unhandled(srv) end
+        end
+    end
+    return lsp::exit_code(srv)
+end
