@@ -1,0 +1,625 @@
+use "std -> map" from "map"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+mod cg
+mod cgb
+mod modules
+mod builtins
+mod builtin_syms_table
+mod builtins_table
+
+pub struct GenOut is
+    pub ok: bool
+    pub err: string
+    pub cpp: string
+    pub has_main: bool
+    pub warnings: [string]
+end
+
+;; one function to emit (flattened like the old backend: impl methods -> `Type_method`)
+pub struct FnEnt is
+    pub f: ast::Node
+    pub is_method: bool
+    pub mname: string
+    pub owner: string        ;; "" = none
+    pub gens: [string]
+end
+
+fn is_item(t: string, want: string) -> bool is return t == want end
+
+fn type_params(tps: ast::Node) -> [string] is
+    let mut out: [string] = []
+    for t in tps.kids is out.push(t.text) end
+    return out
+end
+
+fn walk_types(g: cg::Gen, items: [ast::Node]) is
+    for it in items is
+        let t: string = it.tag
+        if t == "Struct" is
+            g.structs.put(it.text, cg::StructInfo { params: type_params(it.kids[0]), fields: it.kids[1].kids })
+        elsif t == "Enum" is
+            g.enums.put(it.text, cg::EnumInfo { params: type_params(it.kids[0]), variants: it.kids[1].kids })
+            for v in it.kids[1].kids is
+                let mut owners: [string] = g.variant_owner.get(v.text).unwrap_or([])
+                owners.push(it.text)
+                g.variant_owner.put(v.text, owners)
+            end
+        elsif t == "TypeAlias" is
+            g.aliases.put(it.text, it.kids[1])
+        elsif t == "ModDecl" is
+            if it.kids[1].tag == "Inline" is walk_types(g, it.kids[1].kids) end
+        end
+    end
+end
+
+fn param_names_text(ps: [ast::Node]) -> string is
+    let mut sb = strbuf::new()
+    for p in ps is
+        ast::dump_plain(p, 0, sb)
+    end
+    return sb.build()
+end
+
+;; structural signature (spans stripped): params, return type, body, async flag
+fn sig_text(f: ast::Node) -> string is
+    let mut sb = strbuf::new()
+    ast::dump_plain(f.kids[2], 0, sb)
+    ast::dump_plain(f.kids[3], 0, sb)
+    ast::dump_plain(f.kids[4], 0, sb)
+    if cg::has_sub("," + f.kids[5].text + ",", ",async,") is sb.push("async") end
+    return sb.build()
+end
+
+fn has_flag_async(f: ast::Node) -> bool is
+    return cg::has_sub("," + f.kids[5].text + ",", ",async,")
+end
+
+fn gather(g: cg::Gen, items: [ast::Node], out: [FnEnt]) is
+    for it in items is
+        let t: string = it.tag
+        if t == "Fn" is
+            let f: ast::Node = cg::deep_clone(it)
+            let hoisted: [ast::Node] = modules::hoist_nested_fns(f.kids[4], f.text)
+            let gens: [string] = type_params(f.kids[1])
+            out.push(FnEnt { f: f, is_method: false, mname: "", owner: "", gens: gens })
+            for h in hoisted is
+                out.push(FnEnt { f: h, is_method: false, mname: "", owner: "", gens: type_params(h.kids[1]) })
+            end
+        elsif t == "Impl" is
+            let tn: string = it.text
+            let mut sparams: [string] = []
+            if g.structs.has(tn) is sparams = g.structs.get(tn).unwrap_or(cg::StructInfo { params: [], fields: [] }).params
+            elsif g.enums.has(tn) is sparams = g.enums.get(tn).unwrap_or(cg::EnumInfo { params: [], variants: [] }).params end
+            let mut self_ty: ast::Node = ast::lf("Named", tn)
+            if sparams.len() > 0 is
+                let mut ks: [ast::Node] = []
+                for p in sparams is ks.push(ast::lf("Named", p)) end
+                self_ty = ast::nd("Generic", tn, ks)
+            end
+            for m in it.kids[1].kids is
+                let m2: ast::Node = cg::deep_clone(m)
+                m2.text = tn + "_" + m.text
+                for p in m2.kids[2].kids is
+                    p.kids[1] = cg::subst_self(p.kids[1], self_ty)
+                end
+                if !cg::is_none(m2.kids[3]) is m2.kids[3] = cg::subst_self(m2.kids[3], self_ty) end
+                let hoisted: [ast::Node] = modules::hoist_nested_fns(m2.kids[4], m2.text)
+                let mut gens: [string] = []
+                for p in sparams is gens.push(p) end
+                for p in type_params(m.kids[1]) is gens.push(p) end
+                let mut is_method: bool = false
+                if m.kids[2].kids.len() > 0 && m.kids[2].kids[0].text == "self" is is_method = true end
+                if is_method is
+                    out.push(FnEnt { f: m2, is_method: true, mname: m.text, owner: tn, gens: gens })
+                else
+                    out.push(FnEnt { f: m2, is_method: false, mname: "", owner: tn, gens: gens })
+                end
+                for h in hoisted is
+                    out.push(FnEnt { f: h, is_method: false, mname: "", owner: "", gens: gens })
+                end
+            end
+        elsif t == "ModDecl" is
+            if it.kids[1].tag == "Inline" is gather(g, it.kids[1].kids, out) end
+        end
+    end
+end
+
+fn collect_externs(g: cg::Gen, items: [ast::Node]) is
+    for it in items is
+        if it.tag == "Extern" is
+            for f in it.kids[3].kids is
+                g.externs.put(f.text, f)
+                if it.kids[0].text == "Python" is g.extern_py.put(f.text, it.kids[2].text) end
+            end
+        elsif it.tag == "ModDecl" is
+            if it.kids[1].tag == "Inline" is collect_externs(g, it.kids[1].kids) end
+        end
+    end
+end
+
+fn collect(g: cg::Gen) -> [FnEnt] is
+    let items: [ast::Node] = g.module.kids[3].kids
+    walk_types(g, items)
+    let all: [FnEnt] = []
+    gather(g, items, all)
+    ;; dedupe (same fn pulled in twice through different `use` paths)
+    let seen: map::Map<string, string> = map::Map::new()
+    let mut uniq: [FnEnt] = []
+    for fe in all is
+        let sg: string = sig_text(fe.f)
+        if seen.has(fe.f.text) is
+            if seen.get(fe.f.text).unwrap_or("") == sg is continue end
+            cg::fail_at(g, fe.f, "function `{fe.f.text}` is defined twice with different bodies (two modules mangle to the same name — rename one)")
+            return uniq
+        end
+        seen.put(fe.f.text, sg)
+        uniq.push(fe)
+    end
+    ;; trait-emitted fns (`Dog__Describable__describe(self: any)`): give `self` its real type
+    let mut known: [string] = []
+    for k in g.structs.key_list() is known.push(k) end
+    for k in g.enums.key_list() is known.push(k) end
+    for fe in uniq is
+        let ps: [ast::Node] = fe.f.kids[2].kids
+        if ps.len() > 0 && ps[0].text == "self" && ps[0].kids[1].tag == "Named" && (ps[0].kids[1].text == "any" || ps[0].kids[1].text == "Self") is
+            let parts: [string] = split_dunder(fe.f.text)
+            let mut owner: string = parts[0]
+            if !cg::in_list(known, owner) is
+                owner = ""
+                for k in known is
+                    if cg::has_prefix(fe.f.text, k + "_") && k.len() >= owner.len() is owner = k end
+                end
+            end
+            if owner != "" is ps[0].kids[1] = ast::lf("Named", owner) end
+        end
+    end
+    for fe in uniq is
+        let mut sparams: [ast::Node] = fe.f.kids[2].kids
+        g.fns.put(fe.f.text, cg::FnSig { params: sparams, ret: fe.f.kids[3], generics: fe.gens, is_async: has_flag_async(fe.f),
+            is_method: fe.is_method, method_name: fe.mname, self_ty: owner_of_method(fe), owner: fe.owner })
+    end
+    collect_externs(g, items)
+    for name in cg::sort_strs(g.externs.key_list()) is
+        if g.fns.has(name) is
+            cg::fail_raw(g, "function `{name}` is defined in H# but has the same name as a function declared in an `extern` block (a `mod m {{ fn foo }}` is mangled to `m_foo`) — rename one of them")
+            return uniq
+        end
+    end
+    return uniq
+end
+
+fn owner_of_method(fe: FnEnt) -> string is
+    if fe.is_method is return fe.owner end
+    return ""
+end
+
+fn split_dunder(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if i + 1 < s.len() && byte_at(s, i) == 95 && byte_at(s, i + 1) == 95 is
+            out.push(cur)
+            cur = ""
+            i += 2
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+            i += 1
+        end
+    end
+    out.push(cur)
+    return out
+end
+
+;; ── structs / enums ───────────────────────────────────────────────────────────
+fn gen_struct(g: cg::Gen, name: string) -> string is
+    let si: cg::StructInfo = g.structs.get(name).unwrap_or(cg::StructInfo { params: [], fields: [] })
+    g.tparams = si.params
+    let mut out: string = "{cg::template_hdr(si.params)}struct {cg::tname(name)} : hs::StructBase {{\n"
+    for f in si.fields is
+        out = out + "    {cg::ty(g, f.kids[1])} {cg::kw(f.text)};\n"
+    end
+    out = out + "}};\n"
+    g.tparams = []
+    return out
+end
+
+pub struct PField is
+    pub name: string
+    pub ty: string
+end
+
+fn gen_enum(g: cg::Gen, name: string) -> string is
+    let ei: cg::EnumInfo = g.enums.get(name).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+    let params: [string] = ei.params
+    let variants: [ast::Node] = ei.variants
+    g.tparams = params
+    let tn: string = cg::tname(name)
+    let generic: bool = params.len() > 0
+    let mut self_ty: string = tn
+    if generic is
+        let mut ps: [string] = []
+        for p in params is ps.push("Tp_" + p) end
+        self_ty = "{tn}<{cg::jc(ps)}>"
+    end
+    let mut out: string = "{cg::template_hdr(params)}struct {tn} : hs::EnumBase {{\n    int64_t tag = 0;\n"
+    let mut payload: [[PField]] = []
+    let mut vi: int = 0
+    while vi < variants.len() is
+        let v: ast::Node = variants[vi]
+        let mut fs: [PField] = []
+        let fk: ast::Node = v.kids[0]
+        if fk.tag == "Tuple" is
+            let mut j: int = 0
+            for t in fk.kids is
+                fs.push(PField { name: "f{vi}_{j}", ty: cg::ty(g, t) })
+                j += 1
+            end
+        elsif fk.tag == "StructV" is
+            let mut j: int = 0
+            for f in fk.kids[0].kids is
+                fs.push(PField { name: "f{vi}_{j}", ty: cg::ty(g, f.kids[1]) })
+                j += 1
+            end
+        end
+        for pf in fs is out = out + "    {pf.ty} {pf.name};\n" end
+        payload.push(fs)
+        vi += 1
+    end
+    ;; constructors
+    vi = 0
+    while vi < variants.len() is
+        let v: ast::Node = variants[vi]
+        let fs: [PField] = payload[vi]
+        if fs.len() == 0 is
+            out = out + "    static {self_ty}* mk_{v.text}() {{ static {self_ty}* s = nullptr; if (!s) {{ s = hs::mk<{self_ty}>(); s->tag = {vi}; }} return s; }}\n"
+        else
+            let mut ps: [string] = []
+            let mut asg: [string] = []
+            for pf in fs is
+                ps.push(pf.ty + " " + pf.name)
+                asg.push("r->{pf.name} = {pf.name};")
+            end
+            out = out + "    static {self_ty}* mk_{v.text}({cg::jc(ps)}) {{ {self_ty}* r = hs::mk<{self_ty}>(); r->tag = {vi}; {cg::jsp(asg)} return r; }}\n"
+        end
+        vi += 1
+    end
+    ;; `expr?` protocol for Result-like / Option-like enums
+    let mut okv: int = cg::variant_index(ei, "Ok")
+    if okv < 0 is okv = cg::variant_index(ei, "Some") end
+    let mut failv: int = cg::variant_index(ei, "Err")
+    if failv < 0 is failv = cg::variant_index(ei, "None") end
+    if okv >= 0 && failv >= 0 is
+        if payload[okv].len() > 0 is
+            out = out + "    bool try_fail_() const {{ return tag == {failv}; }}\n"
+            out = out + "    auto try_val_() const {{ return {payload[okv][0].name}; }}\n"
+            let fv: string = variants[failv].text
+            if payload[failv].len() == 0 is
+                out = out + "    template<class R> R try_ret_() const {{ return std::remove_pointer_t<R>::mk_{fv}(); }}\n"
+            else
+                out = out + "    template<class R> R try_ret_() const {{ return std::remove_pointer_t<R>::mk_{fv}({payload[failv][0].name}); }}\n"
+            end
+        end
+    end
+    ;; payload assignment from a tuple (used by generic constructor proxies)
+    out = out + "    template<class Tup> void set_(const Tup& t) {{ switch (tag) {{\n"
+    vi = 0
+    while vi < payload.len() is
+        let fs: [PField] = payload[vi]
+        if fs.len() > 0 is
+            out = out + "        case {vi}: "
+            let mut j: int = 0
+            for pf in fs is
+                out = out + "{pf.name} = std::get<{j}>(t); "
+                j += 1
+            end
+            out = out + "break;\n"
+        end
+        vi += 1
+    end
+    out = out + "        default: break; }} }}\n"
+    ;; structural equality
+    out = out + "    bool eq_(const {self_ty}* o) const {{ if (tag != o->tag) return false; switch (tag) {{\n"
+    vi = 0
+    while vi < payload.len() is
+        let fs: [PField] = payload[vi]
+        if fs.len() > 0 is
+            let mut conds: [string] = []
+            for pf in fs is conds.push("hs::eq({pf.name}, o->{pf.name})") end
+            out = out + "        case {vi}: return {cg::ja(conds)};\n"
+        end
+        vi += 1
+    end
+    out = out + "        default: return true; }} }}\n}};\n"
+    g.tparams = []
+    return out
+end
+
+;; ── externs ───────────────────────────────────────────────────────────────────
+fn gen_extern(g: cg::Gen, name: string) -> string is
+    let f: ast::Node = g.externs.get(name).unwrap_or(ast::nn())
+    let params: [ast::Node] = f.kids[0].kids
+    let ret: ast::Node = f.kids[1]
+    let variadic: bool = f.kids[2].text == "true"
+    let mut cps: [string] = []
+    for p in params is cps.push(cg::c_abi_ty(p.kids[1])) end
+    let mut cret: string = "void"
+    if !cg::is_none(ret) is cret = cg::c_abi_ty(ret) end
+    let hret: string = cg::ret_ty(g, ret)
+    let mut hps: [string] = []
+    let mut i: int = 0
+    while i < params.len() is
+        hps.push("{cg::ty(g, params[i].kids[1])} a{i}")
+        i += 1
+    end
+    if g.extern_py.has(name) is
+        let pymod: string = g.extern_py.get(name).unwrap_or("")
+        let pysrc: string = cg::cpp_str_lit("import " + pymod + "\nprint(" + pymod + "." + name + "(")
+        let mut code: string = "hs::Str({pysrc}) "
+        i = 0
+        while i < params.len() is
+            let pt: ast::Node = params[i].kids[1]
+            let is_s: bool = pt.tag == "Named" && pt.text == "string"
+            if i > 0 is code = code + " + hs::Str(\",\")" end
+            if is_s is
+                code = code + " + hs::Str(hsh_py_repr(a{i}.p))"
+            else
+                code = code + " + hs::Str(hsh_int_to_string(hs::pack(a{i})))"
+            end
+            i += 1
+        end
+        code = code + " + hs::Str(\"))\")"
+        let mut conv: string = "return;"
+        if !cg::is_none(ret) is
+            let c: string = cg::c_abi_ty(ret)
+            if c == "const char*" is conv = "return r;"
+            elsif c == "double" || c == "float" is conv = "return ({hret})hsh_atof(r.p);"
+            elsif c == "int8_t" is conv = "return hsh_atoll(r.p) != 0;"
+            else conv = "return ({hret})hsh_atoll(r.p);" end
+        end
+        return "inline {hret} {cg::fname(name)}({cg::jc(hps)}) {{ hs::Str r = hs::Str(hsh_trim(hsh_py_eval(({code}).p))); {conv} }}\n"
+    end
+    let mut vd: string = ""
+    if variadic is vd = ", ..." end
+    let mut out: string = "extern \"C\" {cret} hx_{name}({cg::jc(cps)}{vd}) __asm__(\"{name}\");\n"
+    let mut args: [string] = []
+    i = 0
+    while i < params.len() is
+        let c: string = cg::c_abi_ty(params[i].kids[1])
+        if c == "int64_t" is args.push("hs::pack(a{i})") else args.push("hs::cv<{c}>(a{i})") end
+        i += 1
+    end
+    let call: string = "hx_{name}({cg::jc(args)})"
+    let mut body: string = ""
+    if hret == "void" is body = call + ";"
+    elsif cret == "int64_t" is body = "return hs::unpack<{hret}>({call});"
+    else body = "return hs::cv<{hret}>({call});" end
+    out = out + "inline {hret} {cg::fname(name)}({cg::jc(hps)}) {{ {body} }}\n"
+    return out
+end
+
+;; ── registry-backed builtin wrappers ─────────────────────────────────────────
+fn gen_builtin_wrappers(g: cg::Gen) -> string is
+    let mut out: string = ""
+    let used: [string] = cg::sort_strs(g.used_builtins.items())
+    for n in used is
+        if g.hand.has(n) is continue end
+        let mut sym: string = ""
+        let mut ret: string = ""
+        let mut has_ret: bool = false
+        let rs: string = cg::registry_symbol(n)
+        if rs != "" is
+            sym = rs
+            ret = builtins_table::bt_ret()[builtins::find(n)]
+            has_ret = true
+        end
+        if sym == "" is sym = builtins::legacy_symbol(n) end
+        if sym == "" is
+            g.warnings.push("builtin `{n}` has no C/C++ implementation")
+            continue
+        end
+        if !has_ret && g.tc_ret.has(n) is
+            ret = g.tc_ret.get(n).unwrap_or("")
+            has_ret = true
+        end
+        let mut rt: string = "auto"
+        if has_ret is rt = cg::htype_cpp_text(ret) end
+        let e: int = builtins::find_ext(n)
+        if e >= 0 is
+            let k: string = builtin_syms_table::ext_kind()[e]
+            if k == "Str" is rt = "hs::Str"
+            elsif k == "Arr" is rt = "hs::Arr<hs::Any>"
+            elsif k == "Int" is rt = "int64_t"
+            elsif k == "F64" is rt = "double"
+            else rt = "bool" end
+        end
+        let mut ret_decl: string = "auto"
+        let mut body: string = ""
+        if rt == "void" is
+            ret_decl = "void"
+            body = "hs::ccall({sym}, a...);"
+        elsif rt == "auto" is
+            body = "return hs::call_wrap({sym}, a...);"
+        else
+            body = "return hs::call_fin<{rt}>({sym}, a...);"
+        end
+        out = out + "template<class... A> inline {ret_decl} hs_b_{n}(const A&... a) {{ {body} }}\n"
+    end
+    ;; method fallbacks, ordered by (method, builtin)
+    let mut keys: [string] = []
+    let mut i: int = 0
+    while i < g.mf_m.len() is
+        keys.push(g.mf_m[i] + "\u{1}" + g.mf_b[i])
+        i += 1
+    end
+    for k in cg::sort_strs(keys) is
+        let parts: [string] = cg::split_on(k, 1)
+        let m: string = parts[0]
+        let b: string = parts[1]
+        let mut target: string = "hs_b_" + b
+        if g.fns.has(b) is target = cg::fname(b) end
+        let mut mm: string = cg::kw(m)
+        while mm.len() > 0 && byte_at(mm, mm.len() - 1) == 95 is mm = mm[0..mm.len() - 1] end
+        out = out + "template<class R, class... A> inline auto hs_m_{mm}(R&& r, A&&... a) -> decltype({target}(std::forward<R>(r), std::forward<A>(a)...)) {{ return {target}(std::forward<R>(r), std::forward<A>(a)...); }}\n"
+    end
+    return out
+end
+
+fn fn_sig_text(g: cg::Gen, f: ast::Node, cname: string, gens: [string]) -> string is
+    let mut ret: string = cg::ret_ty(g, f.kids[3])
+    if has_flag_async(f) is ret = "hs::Task<" + ret + ">" end
+    let mut ps: [string] = []
+    for p in f.kids[2].kids is ps.push(cg::ty(g, p.kids[1]) + " " + cg::kw(p.text)) end
+    return "{cg::template_hdr(gens)}{ret} {cname}({cg::jc(ps)})"
+end
+
+fn has_attr(f: ast::Node, name: string) -> bool is
+    for a in f.kids[0].kids is
+        if a.text == name is return true end
+    end
+    return false
+end
+
+;; ── driver ────────────────────────────────────────────────────────────────────
+fn fail_out(g: cg::Gen) -> GenOut is
+    return GenOut { ok: false, err: g.err, cpp: "", has_main: false, warnings: g.warnings }
+end
+
+pub fn generate(module: ast::Node, test_mode: bool) -> GenOut is
+    let g: cg::Gen = cg::new_gen(module, test_mode)
+    let fns: [FnEnt] = collect(g)
+    if g.err != "" is return fail_out(g) end
+    let mut head: string = "// Generated by h# (C++ backend). Do not edit.\n#include \"hsharp_rt.hpp\"\n\n"
+    let defs_sb = strbuf::new()
+
+    ;; forward declarations + definitions of types
+    let snames: [string] = cg::sort_strs(g.structs.key_list())
+    let enames: [string] = cg::sort_strs(g.enums.key_list())
+    for n in snames is
+        head = head + "{cg::template_hdr(g.structs.get(n).unwrap_or(cg::StructInfo { params: [], fields: [] }).params)}struct {cg::tname(n)};\n"
+    end
+    for n in enames is
+        let mut ps: [string] = []
+        if g.structs.has(n) is ps = g.structs.get(n).unwrap_or(cg::StructInfo { params: [], fields: [] }).params
+        else ps = g.enums.get(n).unwrap_or(cg::EnumInfo { params: [], variants: [] }).params end
+        head = head + "{cg::template_hdr(ps)}struct {cg::tname(n)};\n"
+    end
+    let mut ty_defs: string = ""
+    let seen_types: map::Set<string> = map::Set::new()
+    let ord_names: [string] = []
+    let ord_struct: [bool] = []
+    order_types(g.module.kids[3].kids, ord_names, ord_struct)
+    let mut oi: int = 0
+    while oi < ord_names.len() is
+        let n: string = ord_names[oi]
+        if !seen_types.has(n) is
+            seen_types.add(n)
+            if ord_struct[oi] is ty_defs = ty_defs + gen_struct(g, n) else ty_defs = ty_defs + gen_enum(g, n) end
+        end
+        oi += 1
+    end
+
+    ;; extern wrappers
+    let mut ext_defs: string = ""
+    for n in cg::sort_strs(g.externs.key_list()) is ext_defs = ext_defs + gen_extern(g, n) end
+
+    ;; prototypes + method dispatch overloads (sorted by name)
+    let mut names: [string] = []
+    let by_name: map::Map<string, FnEnt> = map::Map::new()
+    for fe in fns is
+        names.push(fe.f.text)
+        by_name.put(fe.f.text, fe)
+    end
+    names = cg::sort_strs(names)
+    let mut protos: string = ""
+    let mut dispatch: string = ""
+    for n in names is
+        let fe: FnEnt = by_name.get(n).unwrap_or(fns[0])
+        g.tparams = fe.gens
+        let sig: string = fn_sig_text(g, fe.f, cg::fname(n), fe.gens)
+        protos = protos + sig + ";\n"
+        if g.fns.has(n) is
+            let info: cg::FnSig = g.fns.get(n).unwrap_or(fns_empty())
+            if info.is_method is
+                let tp: string = cg::template_hdr(fe.gens)
+                let mut ps: [string] = []
+                let mut args: [string] = []
+                let mut i: int = 0
+                for p in fe.f.kids[2].kids is
+                    ps.push("{cg::ty(g, p.kids[1])} a{i}")
+                    args.push("a{i}")
+                    i += 1
+                end
+                let mut mm: string = cg::kw(info.method_name)
+                while mm.len() > 0 && byte_at(mm, mm.len() - 1) == 95 is mm = mm[0..mm.len() - 1] end
+                dispatch = dispatch + "{tp}inline {cg::ret_ty(g, fe.f.kids[3])} hs_m_{mm}({cg::jc(ps)}) {{ return {cg::fname(n)}({cg::jc(args)}); }}\n"
+            end
+        end
+    end
+    ;; bodies
+    for n in names is
+        let fe: FnEnt = by_name.get(n).unwrap_or(fns[0])
+        defs_sb.push(cgb::gen_fn(g, fe.f, fe.gens))
+        defs_sb.push("\n")
+    end
+    if g.err != "" is return fail_out(g) end
+    ;; main / tests
+    let has_main: bool = g.fns.has("main")
+    let mut tail: string = ""
+    if g.test_mode is
+        let mut tests: [string] = []
+        for fe in fns is
+            if has_attr(fe.f, "test") is tests.push(fe.f.text) end
+        end
+        tail = "int main(int argc, char** argv) {{\n    _hsh_argc = argc; _hsh_argv = argv;\n    hs::TestState& st = hs::tstate();\n"
+        for t in cg::sort_strs(tests) is
+            tail = tail + "    st.cur = {cg::cpp_str_lit(t)}; st.cur_failed = false; st.run++;\n    printf(\"test %s ... \", {cg::cpp_str_lit(t)}); fflush(stdout);\n    {cg::fname(t)}();\n    if (st.cur_failed) {{ st.failed++; printf(\"FAILED\\n\"); }} else printf(\"ok\\n\");\n    fflush(stdout);\n"
+        end
+        tail = tail + "    printf(\"\\ntest result: %s. %d run; %d failed; %d skipped\\n\", st.failed ? \"FAILED\" : \"ok\", st.run, st.failed, st.skipped);\n    return st.failed ? 1 : 0;\n}}\n"
+    elsif has_main is
+        let msig: cg::FnSig = g.fns.get("main").unwrap_or(fns_empty())
+        let ret_int: bool = !cg::is_none(msig.ret) && msig.ret.tag != "Void"
+        let mut call: string = "f_main(); fflush(stdout); return 0;"
+        if ret_int is call = "int rc = (int)f_main(); fflush(stdout); return rc;" end
+        tail = "int main(int argc, char** argv) {{\n    _hsh_argc = argc; _hsh_argv = argv;\n    {call}\n}}\n"
+    end
+
+    ;; generated builtin wrappers (registry-backed)
+    let wrappers: string = gen_builtin_wrappers(g)
+    let mut out = strbuf::new()
+    out.push(head)
+    out.push(ty_defs)
+    out.push("\n")
+    out.push(ext_defs)
+    out.push("\n")
+    out.push(wrappers)
+    out.push("\n")
+    out.push(protos)
+    out.push("\n")
+    out.push(dispatch)
+    out.push("\n")
+    out.push(defs_sb.build())
+    out.push("\n")
+    out.push(tail)
+    return GenOut { ok: true, err: "", cpp: out.build(), has_main: has_main, warnings: g.warnings }
+end
+
+fn fns_empty() -> cg::FnSig is
+    return cg::FnSig { params: [], ret: ast::nn(), generics: [], is_async: false, is_method: false, method_name: "", self_ty: "", owner: "" }
+end
+
+fn order_types(items: [ast::Node], names: [string], is_struct: [bool]) is
+    for it in items is
+        if it.tag == "Struct" is
+            names.push(it.text)
+            is_struct.push(true)
+        elsif it.tag == "Enum" is
+            names.push(it.text)
+            is_struct.push(false)
+        elsif it.tag == "ModDecl" is
+            if it.kids[1].tag == "Inline" is order_types(it.kids[1].kids, names, is_struct) end
+        end
+    end
+end
