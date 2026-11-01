@@ -1,0 +1,741 @@
+use "std -> map" from "map"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+mod builtins
+mod builtin_syms_table
+
+pub struct StructInfo is
+    pub params: [string]
+    pub fields: [ast::Node]      ;; Field nodes: text = name, kids = [B pub, type]
+end
+
+pub struct EnumInfo is
+    pub params: [string]
+    pub variants: [ast::Node]    ;; Variant nodes: text = name, kids = [Unit | Tuple(types) | StructV(Fields)]
+end
+
+pub struct FnSig is
+    pub params: [ast::Node]      ;; Param nodes: text = name, kids = [B mut, type]
+    pub ret: ast::Node           ;; type node or `None`
+    pub generics: [string]
+    pub is_async: bool
+    pub is_method: bool
+    pub method_name: string
+    pub self_ty: string
+    pub owner: string            ;; "" = none
+end
+
+pub struct Gen is
+    pub module: ast::Node
+    pub test_mode: bool
+    pub structs: map::Map<string, StructInfo>
+    pub enums: map::Map<string, EnumInfo>
+    pub aliases: map::Map<string, ast::Node>
+    pub variant_owner: map::Map<string, [string]>
+    pub fns: map::Map<string, FnSig>
+    pub externs: map::Map<string, ast::Node>
+    pub extern_py: map::Map<string, string>
+    pub used_builtins: map::Set<string>
+    pub tparams: [string]
+    pub scopes: [map::Map<string, string>]
+    pub declared: map::Set<string>
+    pub var_tys: [map::Map<string, ast::Node>]
+    pub uniq: int
+    pub cur_ret: ast::Node       ;; `None` when absent
+    pub cur_mode: string
+    pub arc_tracked: [string]
+    pub drop_names: [string]     ;; @safety: array locals freed at scope end (drops.h#)
+    pub cur_fn: string
+    pub cur_fn_is_std: bool
+    pub warnings: [string]
+    pub mf_m: [string]           ;; method_fallbacks (m, b) pairs, kept sorted + unique
+    pub mf_b: [string]
+    pub err: string
+    pub depth: int
+    pub hand: map::Set<string>   ;; HAND_BUILTINS + EXTRA_HAND
+    pub tc_ret: map::Map<string, string>
+end
+
+pub fn new_gen(module: ast::Node, test_mode: bool) -> Gen is
+    let hand: map::Set<string> = map::Set::new()
+    for n in hand_builtins() is hand.add(n) end
+    for n in extra_hand() is hand.add(n) end
+    let tcr: map::Map<string, string> = map::Map::new()
+    for e in tc_builtins::builtin_table() is
+        let parts: [string] = split_on(e, 124)
+        if parts.len() == 3 is tcr.put(parts[0], parts[2]) end
+    end
+    return Gen { module: module, test_mode: test_mode, structs: map::Map::new(), enums: map::Map::new(), aliases: map::Map::new(),
+        variant_owner: map::Map::new(), fns: map::Map::new(), externs: map::Map::new(), extern_py: map::Map::new(),
+        used_builtins: map::Set::new(), tparams: [], scopes: [], declared: map::Set::new(), var_tys: [], uniq: 0,
+        cur_ret: ast::nn(), cur_mode: "Default", arc_tracked: [], drop_names: [], cur_fn: "", cur_fn_is_std: false, warnings: [],
+        mf_m: [], mf_b: [], err: "", depth: 0, hand: hand, tc_ret: tcr }
+end
+
+;; ── small string helpers ──────────────────────────────────────────────────────
+pub fn split_on(s: string, sep: int) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == sep is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(c)
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+pub fn has_prefix(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+pub fn has_suffix(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+pub fn has_sub(s: string, p: string) -> bool is
+    let n: int = s.len()
+    let m: int = p.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == p is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn join_with(xs: [string], sep: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is sb.push(sep) end
+        sb.push(xs[i])
+        i += 1
+    end
+    return sb.build()
+end
+
+pub fn in_list(xs: [string], s: string) -> bool is
+    for x in xs is
+        if x == s is return true end
+    end
+    return false
+end
+
+pub fn is_digits(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn is_upper_first(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let c: int = byte_at(s, 0)
+    return c >= 65 && c <= 90
+end
+
+;; the part after the last `::`
+pub fn rsplit_last(s: string) -> string is
+    let mut at: int = -1
+    let mut i: int = 0
+    while i + 1 < s.len() is
+        if byte_at(s, i) == 58 && byte_at(s, i + 1) == 58 is at = i end
+        i += 1
+    end
+    if at < 0 is return s end
+    return s[at + 2..s.len()]
+end
+
+;; `rsplit_once("::")` -> found flag in `ok`
+pub struct Split2 is
+    pub ok: bool
+    pub a: string
+    pub b: string
+end
+
+pub fn rsplit_once(s: string, sep: string) -> Split2 is
+    let mut at: int = -1
+    let mut i: int = 0
+    while i + sep.len() <= s.len() is
+        if s[i..i + sep.len()] == sep is at = i end
+        i += 1
+    end
+    if at < 0 is return Split2 { ok: false, a: s, b: "" } end
+    return Split2 { ok: true, a: s[0..at], b: s[at + sep.len()..s.len()] }
+end
+
+pub fn replace_all(s: string, from: string, to: string) -> string is
+    if from.len() == 0 is return s end
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        if i + from.len() <= s.len() && s[i..i + from.len()] == from is
+            sb.push(to)
+            i += from.len()
+        else
+            sb.push(str_from_byte(byte_at(s, i)))
+            i += 1
+        end
+    end
+    return sb.build()
+end
+
+pub fn sort_strs(xs: [string]) -> [string] is
+    let mut out: [string] = []
+    for x in xs is
+        out.push(x)
+    end
+    let mut i: int = 1
+    while i < out.len() is
+        let cur: string = out[i]
+        let mut j: int = i - 1
+        while j >= 0 && out[j] > cur is
+            out[j + 1] = out[j]
+            j -= 1
+        end
+        out[j + 1] = cur
+        i += 1
+    end
+    return out
+end
+
+fn oct3(b: int) -> string is
+    let a: int = b / 64
+    let c: int = (b / 8) % 8
+    let d: int = b % 8
+    return to_string(a) + to_string(c) + to_string(d)
+end
+
+pub fn cpp_str_lit(s: string) -> string is
+    let mut sb = strbuf::new()
+    sb.push("\"")
+    let mut i: int = 0
+    while i < s.len() is
+        let b: int = byte_at(s, i)
+        if b == 34 is sb.push("\\\"")
+        elsif b == 92 is sb.push("\\\\")
+        elsif b == 10 is sb.push("\\n")
+        elsif b == 13 is sb.push("\\r")
+        elsif b == 9 is sb.push("\\t")
+        elsif b >= 32 && b <= 126 && b != 63 is sb.push(str_from_byte(b))
+        else sb.push("\\" + oct3(b)) end
+        i += 1
+    end
+    sb.push("\"")
+    return sb.build()
+end
+
+;; ── identifier hygiene ───────────────────────────────────────────────────────
+fn reserved() -> [string] is
+    return ["alignas","alignof","and","and_eq","asm","auto","bitand","bitor","bool","break","case","catch","char",
+        "class","compl","const","constexpr","const_cast","continue","decltype","default","delete","do","double",
+        "dynamic_cast","else","enum","explicit","export","extern","false","float","for","friend","goto","if",
+        "inline","int","long","mutable","namespace","new","noexcept","not","not_eq","nullptr","operator","or",
+        "or_eq","private","protected","public","register","reinterpret_cast","return","short","signed","sizeof",
+        "static","static_assert","static_cast","struct","switch","template","this","thread_local","throw","true",
+        "try","typedef","typeid","typename","union","unsigned","using","virtual","void","volatile","while","xor",
+        "xor_eq","NULL","EOF","stdin","stdout","stderr","errno","hs","std","main","unix","linux","major","minor",
+        "assert","signbit","isnan","isinf","self_","tag","eq_","set_","Str","Any","Arr","Opt","Nil","nil"]
+end
+
+pub fn kw(n: string) -> string is
+    if in_list(reserved(), n) || has_prefix(n, "hs_") || has_prefix(n, "f_") || has_prefix(n, "T_") || has_prefix(n, "Tp_") || has_prefix(n, "_") is
+        let mut i: int = 0
+        while i < n.len() && byte_at(n, i) == 95 is i += 1 end
+        let mut r: string = replace_all(n[i..n.len()] + "_", "__", "_")
+        if has_prefix(n, "_") is r = r + "u" end
+        return r
+    end
+    return n
+end
+
+pub fn fname(n: string) -> string is return "f_" + n end
+pub fn tname(n: string) -> string is return "T_" + n end
+
+;; ── builtin name tables ───────────────────────────────────────────────────────
+pub fn hand_builtins() -> [string] is
+    return ["write","writeln","println","print","to_string","len","panic","exit","to_int","to_float","to_hex",
+        "sin","cos","tan","sqrt","floor","ceil","pow","abs","min","max",
+        "string_len","string_at","string_slice","starts_with","ends_with","contains","string_find","string_rfind",
+        "string_repeat","string_pad_right","string_trim_right",
+        "array_push","array_len","array_count","array_get","array_set","array_contains","array_concat","array_new",
+        "arc_alloc","arc_retain","arc_release","arc_count","arena_checkpoint","arena_rewind","arena_used","arena_capacity",
+        "ptr_read_i64","ptr_write_i64","ptr_read_i32","ptr_write_i32","ptr_read_i16","ptr_write_i16","ptr_read_i8",
+        "ptr_write_i8","ptr_read_f64","ptr_write_f64","ptr_read_f32","ptr_write_f32","ptr_read_ptr","ptr_write_ptr",
+        "ptr_is_null","ptr_add","env_args",
+        "assert_eq","assert_ne","assert_true","assert_false","assert_nil","assert_not_nil","assert_approx",
+        "assert_contains","assert_starts_with","assert_len","fail","skip"]
+end
+
+pub fn extra_hand() -> [string] is
+    return ["math_sqrt","math_floor","math_ceil","math_sin","math_cos","math_tan","math_pow","math_abs","math_min","math_max",
+        "array_pop","env_home","exec","db_query_bind","sort_by","sort_by_key","sort_ints","str_join","parse_int",
+        "to_int_from_hex","string_upper","string_lower","string_chars","string_replace_all","string_replace","string_trim_start",
+        "__builtin_tcp_connect","__builtin_tcp_send","__builtin_tcp_recv","__builtin_tcp_close","__builtin_atomic_add","__builtin_atomic_load","__builtin_atomic_store",
+        "__builtin_base64url_encode","__builtin_base64url_decode","__builtin_hmac_sha256_b64url","__builtin_str_replace_all","__builtin_str_reverse","__builtin_str_is_numeric","__builtin_str_trim_start","__builtin_str_trim_end",
+        "byte_at","str_from_byte","is_alpha_byte","is_digit_byte","is_alnum_byte","is_space_byte","hash_str","hash_key","sb_new","sb_push","sb_len","sb_build","sb_clear",
+        "string_to_bytes","array_remove","assert","math_pi","math_e","math_tau","math_fabs","math_fmin","math_fmax","min_int","max_int","math_clamp","math_fclamp","math_gcd","math_lcm","math_ipow"]
+end
+
+;; `x.method(args)` on a built-in receiver that is really a free builtin
+pub fn method_as_builtin(m: string) -> string is
+    if m == "to_upper" || m == "upper" is return "string_upper" end
+    if m == "to_lower" || m == "lower" is return "string_lower" end
+    if m == "trim" is return "trim" end
+    if m == "trim_start" is return "string_trim_start" end
+    if m == "trim_end" is return "string_trim_right" end
+    if m == "split" is return "str_split" end
+    if m == "replace_all" is return "string_replace_all" end
+    if m == "replace" is return "string_replace" end
+    if m == "chars" is return "string_chars" end
+    if m == "join" is return "str_join" end
+    return ""
+end
+
+;; registry symbol that really exists in the C runtime ("" when none)
+pub fn registry_symbol(name: string) -> string is
+    let idx: int = builtins::find(name)
+    if idx < 0 is return "" end
+    let s: string = builtins::spec_c_symbol(idx)
+    if s == "" is return "" end
+    if in_list(builtin_syms_table::rt_symbols(), s) is return s end
+    return ""
+end
+
+pub fn resolve_builtin(n: string) -> string is
+    if registry_symbol(n) != "" is return n end
+    if has_prefix(n, "__builtin_") is
+        let r: string = builtins::resolve_builtin_dunder_llvm(n)
+        if r != "" is return r end
+    end
+    return n
+end
+
+pub fn builtin_known(g: Gen, n: string) -> bool is
+    let r: string = resolve_builtin(n)
+    return g.hand.has(r) || registry_symbol(r) != "" || builtins::legacy_symbol(r) != ""
+end
+
+;; ── errors ────────────────────────────────────────────────────────────────────
+pub fn fail_at(g: Gen, n: ast::Node, msg: string) is
+    if g.err == "" is g.err = "{n.fl}:{n.sl}:{n.sc}: {msg}" end
+end
+
+pub fn fail_raw(g: Gen, msg: string) is
+    if g.err == "" is g.err = msg end
+end
+
+pub fn tmp(g: Gen, p: string) -> string is
+    g.uniq += 1
+    return "_{p}{g.uniq}"
+end
+
+pub fn loc(n: ast::Node) -> string is
+    return cpp_str_lit("{n.fl}:{n.sl}")
+end
+
+;; ── type mapping ──────────────────────────────────────────────────────────────
+pub fn tparam_has(g: Gen, n: string) -> bool is
+    return in_list(g.tparams, n)
+end
+
+pub fn template_hdr(gens: [string]) -> string is
+    if gens.len() == 0 is return "" end
+    let mut ps: [string] = []
+    for x in gens is ps.push("class Tp_" + x) end
+    return "template<" + join_with(ps, ", ") + "> "
+end
+
+pub fn ty(g: Gen, t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" is return named_ty(g, t.text, 0) end
+    if tag == "Generic" is
+        let n: string = t.text
+        if g.structs.has(n) || g.enums.has(n) is
+            let mut a: [string] = []
+            for x in t.kids is a.push(ty(g, x)) end
+            return tname(n) + "<" + join_with(a, ", ") + ">*"
+        end
+        if g.aliases.has(n) is return ty(g, g.aliases.get(n).unwrap_or(ast::nn())) end
+        return "hs::Any"
+    end
+    if tag == "Array" is return "hs::Arr<" + ty(g, t.kids[0]) + ">" end
+    if tag == "Tuple" is
+        let mut a: [string] = []
+        for x in t.kids is a.push(ty(g, x)) end
+        return "std::tuple<" + join_with(a, ", ") + ">"
+    end
+    if tag == "Fn" is
+        let mut a: [string] = []
+        for x in t.kids[0].kids is a.push(ty(g, x)) end
+        return "hs::Fn<" + ty(g, t.kids[1]) + "(" + join_with(a, ", ") + ")>"
+    end
+    if tag == "Optional" is return "hs::Opt<" + ty(g, t.kids[0]) + ">" end
+    if tag == "Ref" || tag == "RefMut" is return ty(g, t.kids[0]) end
+    if tag == "Void" is return "void" end
+    return "hs::Any"
+end
+
+pub fn named_ty(g: Gen, n: string, depth: int) -> string is
+    if n == "int" || n == "i64" || n == "i128" is return "int64_t" end
+    if n == "uint" || n == "u64" || n == "u128" is return "uint64_t" end
+    if n == "i8" is return "int8_t" end
+    if n == "i16" is return "int16_t" end
+    if n == "i32" is return "int32_t" end
+    if n == "u8" is return "uint8_t" end
+    if n == "u16" is return "uint16_t" end
+    if n == "u32" is return "uint32_t" end
+    if n == "f64" is return "double" end
+    if n == "f32" is return "float" end
+    if n == "bool" is return "bool" end
+    if n == "string" is return "hs::Str" end
+    if n == "bytes" is return "hs::Bytes" end
+    if n == "any" is return "hs::Any" end
+    if n == "void" is return "void" end
+    if tparam_has(g, n) is return "Tp_" + n end
+    if g.aliases.has(n) && depth < 8 is
+        let al: ast::Node = g.aliases.get(n).unwrap_or(ast::nn())
+        if al.tag == "Named" is return named_ty(g, al.text, depth + 1) end
+        return ty(g, al)
+    end
+    if g.structs.has(n) is
+        let si: StructInfo = g.structs.get(n).unwrap_or(StructInfo { params: [], fields: [] })
+        if si.params.len() == 0 is return tname(n) + "*" end
+        let mut a: [string] = []
+        for x in si.params is a.push("hs::Any") end
+        return tname(n) + "<" + join_with(a, ", ") + ">*"
+    end
+    if g.enums.has(n) is
+        let ei: EnumInfo = g.enums.get(n).unwrap_or(EnumInfo { params: [], variants: [] })
+        if ei.params.len() == 0 is return tname(n) + "*" end
+        let mut a: [string] = []
+        for x in ei.params is a.push("hs::Any") end
+        return tname(n) + "<" + join_with(a, ", ") + ">*"
+    end
+    return "hs::Any"
+end
+
+pub fn is_none(t: ast::Node) -> bool is return t.tag == "None" end
+
+pub fn ret_ty(g: Gen, t: ast::Node) -> string is
+    if is_none(t) is return "void" end
+    return ty(g, t)
+end
+
+;; C ABI type of an `extern` parameter/return
+pub fn c_abi_ty(t: ast::Node) -> string is
+    let n: string = t.text
+    if t.tag == "Void" is return "void" end
+    if t.tag != "Named" is return "int64_t" end
+    if n == "string" || n == "bytes" is return "const char*" end
+    if n == "f64" is return "double" end
+    if n == "f32" is return "float" end
+    if n == "bool" || n == "i8" || n == "u8" is return "int8_t" end
+    if n == "i16" || n == "u16" is return "int16_t" end
+    if n == "i32" || n == "u32" is return "int32_t" end
+    return "int64_t"
+end
+
+;; ── enum variants ─────────────────────────────────────────────────────────────
+pub struct VarRef is
+    pub ok: bool
+    pub en: string
+    pub idx: int
+end
+
+pub fn no_var() -> VarRef is return VarRef { ok: false, en: "", idx: 0 } end
+
+pub fn variant_index(e: EnumInfo, name: string) -> int is
+    let mut i: int = 0
+    while i < e.variants.len() is
+        if e.variants[i].text == name is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn variant_is_unit(v: ast::Node) -> bool is return v.kids[0].tag == "Unit" end
+
+pub fn is_unit_enum_variant(g: Gen, name: string) -> VarRef is
+    if !g.variant_owner.has(name) is return no_var() end
+    let owners: [string] = g.variant_owner.get(name).unwrap_or([])
+    for o in owners is
+        let e: EnumInfo = g.enums.get(o).unwrap_or(EnumInfo { params: [], variants: [] })
+        let i: int = variant_index(e, name)
+        if i >= 0 && variant_is_unit(e.variants[i]) is return VarRef { ok: true, en: o, idx: i } end
+    end
+    return no_var()
+end
+
+;; enum named `q`, tolerating module mangling (`Option` -> `option_Option`); "" when none / ambiguous
+pub fn resolve_enum(g: Gen, q: string) -> string is
+    if g.enums.has(q) is return q end
+    let suffix: string = "_" + q
+    let mut found: string = ""
+    let mut count: int = 0
+    for k in g.enums.key_list() is
+        if has_suffix(k, suffix) is
+            count += 1
+            found = k
+        end
+    end
+    if count == 1 is return found end
+    return ""
+end
+
+pub fn find_variant(g: Gen, qual: string, has_q: bool, variant: string) -> VarRef is
+    if has_q is
+        let q: string = rsplit_last(qual)
+        let en: string = resolve_enum(g, q)
+        if en != "" is
+            let i: int = variant_index(g.enums.get(en).unwrap_or(EnumInfo { params: [], variants: [] }), variant)
+            if i >= 0 is return VarRef { ok: true, en: en, idx: i } end
+        end
+    end
+    if !g.variant_owner.has(variant) is return no_var() end
+    let owners: [string] = g.variant_owner.get(variant).unwrap_or([])
+    if owners.len() == 0 is return no_var() end
+    let o: string = owners[0]
+    let i: int = variant_index(g.enums.get(o).unwrap_or(EnumInfo { params: [], variants: [] }), variant)
+    if i < 0 is return no_var() end
+    return VarRef { ok: true, en: o, idx: i }
+end
+
+;; ── scopes ────────────────────────────────────────────────────────────────────
+pub fn push_scope(g: Gen) is
+    let a: map::Map<string, string> = map::Map::new()
+    let b: map::Map<string, ast::Node> = map::Map::new()
+    g.scopes.push(a)
+    g.var_tys.push(b)
+end
+
+pub fn pop_scope(g: Gen) is
+    let mut s: [map::Map<string, string>] = []
+    let mut t: [map::Map<string, ast::Node>] = []
+    let mut i: int = 0
+    while i + 1 < g.scopes.len() is
+        s.push(g.scopes[i])
+        t.push(g.var_tys[i])
+        i += 1
+    end
+    g.scopes = s
+    g.var_tys = t
+end
+
+;; declare `name` (type node or `None`), returns the C++ identifier
+pub fn declare(g: Gen, name: string, t: ast::Node) -> string is
+    let base: string = kw(name)
+    let mut c: string = base
+    let mut n: int = 0
+    while g.declared.has(c) is
+        n += 1
+        c = base + "__" + to_string(n)
+    end
+    g.declared.add(c)
+    g.scopes[g.scopes.len() - 1].put(name, c)
+    if !is_none(t) is g.var_tys[g.var_tys.len() - 1].put(name, t) end
+    return c
+end
+
+;; "" when `name` is not a local
+pub fn lookup(g: Gen, name: string) -> string is
+    let mut i: int = g.scopes.len() - 1
+    while i >= 0 is
+        if g.scopes[i].has(name) is return g.scopes[i].get(name).unwrap_or("") end
+        i -= 1
+    end
+    return ""
+end
+
+pub fn lookup_ty(g: Gen, name: string) -> ast::Node is
+    let mut i: int = g.scopes.len() - 1
+    while i >= 0 is
+        if g.scopes[i].has(name) is
+            return g.var_tys[i].get(name).unwrap_or(ast::nn())
+        end
+        i -= 1
+    end
+    return ast::nn()
+end
+
+;; ── type-expression substitution ──────────────────────────────────────────────
+pub fn subst_self(t: ast::Node, self_ty: ast::Node) -> ast::Node is
+    let tag: string = t.tag
+    if tag == "Named" && t.text == "Self" is return self_ty end
+    if tag == "Generic" || tag == "Array" || tag == "Tuple" || tag == "Optional" || tag == "Ref" || tag == "RefMut" is
+        let mut ks: [ast::Node] = []
+        for k in t.kids is ks.push(subst_self(k, self_ty)) end
+        return clone_with(t, ks)
+    end
+    if tag == "Fn" is
+        let mut ps: [ast::Node] = []
+        for k in t.kids[0].kids is ps.push(subst_self(k, self_ty)) end
+        return clone_with(t, [clone_with(t.kids[0], ps), subst_self(t.kids[1], self_ty)])
+    end
+    return t
+end
+
+pub fn subst_params(t: ast::Node, params: [string], args: [ast::Node]) -> ast::Node is
+    let tag: string = t.tag
+    if tag == "Named" is
+        let mut i: int = 0
+        while i < params.len() is
+            if params[i] == t.text is
+                if i < args.len() is return args[i] end
+                return t
+            end
+            i += 1
+        end
+        return t
+    end
+    if tag == "Generic" || tag == "Array" || tag == "Tuple" || tag == "Optional" || tag == "Ref" || tag == "RefMut" is
+        let mut ks: [ast::Node] = []
+        for k in t.kids is ks.push(subst_params(k, params, args)) end
+        return clone_with(t, ks)
+    end
+    if tag == "Fn" is
+        let mut ps: [ast::Node] = []
+        for k in t.kids[0].kids is ps.push(subst_params(k, params, args)) end
+        return clone_with(t, [clone_with(t.kids[0], ps), subst_params(t.kids[1], params, args)])
+    end
+    return t
+end
+
+;; shallow copy of `n` with new kids
+pub fn clone_with(n: ast::Node, ks: [ast::Node]) -> ast::Node is
+    return ast::Node { tag: n.tag, text: n.text, kids: ks, sp: n.sp, sl: n.sl, sc: n.sc, so: n.so, el: n.el, ec: n.ec, eo: n.eo, ip: n.ip, fl: n.fl }
+end
+
+pub fn deep_clone(n: ast::Node) -> ast::Node is
+    let mut ks: [ast::Node] = []
+    for k in n.kids is ks.push(deep_clone(k)) end
+    return clone_with(n, ks)
+end
+
+;; ── always_returns / yields_value (typecheck helpers mirrored by cppgen) ───────
+pub fn always_returns(stmts: [ast::Node]) -> bool is
+    if stmts.len() == 0 is return false end
+    let last: ast::Node = stmts[stmts.len() - 1]
+    if last.tag == "Return" is return true end
+    if last.tag != "ExprStmt" is return false end
+    let e: ast::Node = last.kids[0]
+    if e.tag == "ReturnE" is return true end
+    if e.tag == "If" is
+        if is_none(e.kids[3]) is return false end
+        if !always_returns(e.kids[1].kids) is return false end
+        for el in e.kids[2].kids is
+            if !always_returns(el.kids[1].kids) is return false end
+        end
+        return always_returns(e.kids[3].kids)
+    end
+    if e.tag == "Match" is
+        let arms: [ast::Node] = e.kids[1].kids
+        if arms.len() == 0 is return false end
+        for a in arms is
+            if !always_returns(a.kids[2].kids) is return false end
+        end
+        return true
+    end
+    if e.tag == "Unsafe" is return always_returns(e.kids[0].kids) end
+    return false
+end
+
+fn branch_ok(b: [ast::Node]) -> bool is
+    return always_returns(b) || yields_value(b)
+end
+
+pub fn yields_value(stmts: [ast::Node]) -> bool is
+    if stmts.len() == 0 is return false end
+    let last: ast::Node = stmts[stmts.len() - 1]
+    if last.tag != "ExprStmt" is return false end
+    let e: ast::Node = last.kids[0]
+    let t: string = e.tag
+    if t == "If" is
+        if is_none(e.kids[3]) is return false end
+        if !branch_ok(e.kids[1].kids) is return false end
+        for el in e.kids[2].kids is
+            if !branch_ok(el.kids[1].kids) is return false end
+        end
+        return branch_ok(e.kids[3].kids)
+    end
+    if t == "Match" is
+        let arms: [ast::Node] = e.kids[1].kids
+        if arms.len() == 0 is return false end
+        for a in arms is
+            if !branch_ok(a.kids[2].kids) is return false end
+        end
+        return true
+    end
+    if t == "Do" is return branch_ok(e.kids[0].kids) end
+    if t == "Unsafe" is return branch_ok(e.kids[0].kids) end
+    if t == "While" || t == "For" || t == "Assign" || t == "CompoundAssign" || t == "ReturnE" is return false end
+    return true
+end
+
+pub fn is_stmt_expr(e: ast::Node) -> bool is
+    let t: string = e.tag
+    return t == "While" || t == "For" || t == "Assign" || t == "CompoundAssign" || t == "ReturnE"
+end
+
+pub fn is_value_expr(e: ast::Node) -> bool is return !is_stmt_expr(e) end
+
+;; ── registry-backed builtin wrapper return types ──────────────────────────────
+pub fn htype_cpp_text(s: string) -> string is
+    if s == "Str" || s == "string" is return "hs::Str" end
+    if s == "Int" || s == "int" || s == "i64" || s == "i128" || s == "Int64" is return "int64_t" end
+    if s == "Uint" || s == "uint" || s == "u64" || s == "u128" is return "uint64_t" end
+    if s == "I8" || s == "i8" is return "int8_t" end
+    if s == "I16" || s == "i16" is return "int16_t" end
+    if s == "I32" || s == "i32" is return "int32_t" end
+    if s == "U8" || s == "u8" is return "uint8_t" end
+    if s == "U16" || s == "u16" is return "uint16_t" end
+    if s == "U32" || s == "u32" is return "uint32_t" end
+    if s == "F32" || s == "HType::F32" || s == "f32" is return "float" end
+    if s == "F64" || s == "HType::F64" || s == "f64" is return "double" end
+    if s == "Bool" || s == "bool" is return "bool" end
+    if s == "Bytes" || s == "bytes" is return "hs::Bytes" end
+    if s == "Void" || s == "void" is return "void" end
+    if s.len() > 2 && byte_at(s, 0) == 91 && byte_at(s, s.len() - 1) == 93 is
+        return "hs::Arr<" + htype_cpp_text(s[1..s.len() - 1]) + ">"
+    end
+    if s.len() > 1 && byte_at(s, s.len() - 1) == 63 is
+        return "hs::Opt<" + htype_cpp_text(s[0..s.len() - 1]) + ">"
+    end
+    return "hs::Any"
+end
+
+pub fn jc(xs: [string]) -> string is return join_with(xs, ", ") end
+pub fn ja(xs: [string]) -> string is return join_with(xs, " && ") end
+pub fn jsp(xs: [string]) -> string is return join_with(xs, " ") end
+pub fn jcc(xs: [string]) -> string is return join_with(xs, "::") end
+
+;; split on a multi-byte separator
+pub fn split_on_str(s: string, sep: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if i + sep.len() <= s.len() && s[i..i + sep.len()] == sep is
+            out.push(cur)
+            cur = ""
+            i += sep.len()
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+            i += 1
+        end
+    end
+    out.push(cur)
+    return out
+end
