@@ -1,0 +1,812 @@
+use "std -> fs" from "fs"
+use "std -> map" from "map"
+
+use "workspace -> parser" from "lib -> *"
+mod htype
+mod diagnostics
+mod tc_helpers
+mod tc_builtins
+mod bit_resolve
+mod tc_util
+
+pub struct Sig is
+    pub params: [htype::HType]
+    pub ret:    htype::HType
+end
+
+pub struct FieldT is
+    pub name: string
+    pub ty:   htype::HType
+end
+
+pub struct StructInfo is
+    pub fields: [FieldT]
+end
+
+pub struct EnumInfo is
+    pub variants: [string]
+end
+
+pub struct Scope is
+    pub m: map::Map<string, int>
+end
+
+pub struct TypeChecker is
+    pub file:      string                          ;; the file being checked (Span::file of its own spans)
+    pub scopes:    [Scope]
+    pub vars:      [htype::HType]
+    pub fn_idx:    map::Map<string, int>
+    pub fn_sigs:   [Sig]
+    pub st_idx:    map::Map<string, int>
+    pub st_info:   [StructInfo]
+    pub en_idx:    map::Map<string, int>
+    pub en_info:   [EnumInfo]
+    pub const_idx: map::Map<string, int>
+    pub const_tys: [htype::HType]
+    pub has_ret:   bool
+    pub cur_ret:   htype::HType
+    pub has_fname: bool
+    pub cur_fname: string
+    pub has_impl:  bool
+    pub cur_impl:  string
+    pub diags:     [diagnostics::Diag]
+    pub test_fns:  [string]
+    pub inline_fns:  map::Set<string>
+    pub must_use_fns: map::Set<string>
+    pub dep_idx:   map::Map<string, int>
+    pub dep_names: [string]
+    pub dep_msgs:  [string]
+end
+
+;; ── construction ──────────────────────────────────────────────────────────────
+fn new_scope() -> Scope is
+    return Scope { m: map::Map::new() }
+end
+
+fn mk_sig(params: [htype::HType], ret: htype::HType) -> Sig is
+    return Sig { params: params, ret: ret }
+end
+
+pub fn put_fn(tc: TypeChecker, name: string, sig: Sig) is
+    if tc.fn_idx.has(name) is
+        tc.fn_sigs[tc.fn_idx.get(name).unwrap_or(0)] = sig
+    else
+        tc.fn_sigs.push(sig)
+        tc.fn_idx.put(name, tc.fn_sigs.len() - 1)
+    end
+end
+
+pub fn put_struct(tc: TypeChecker, name: string, fields: [FieldT]) is
+    let info: StructInfo = StructInfo { fields: fields }
+    if tc.st_idx.has(name) is
+        tc.st_info[tc.st_idx.get(name).unwrap_or(0)] = info
+    else
+        tc.st_info.push(info)
+        tc.st_idx.put(name, tc.st_info.len() - 1)
+    end
+end
+
+fn put_enum(tc: TypeChecker, name: string, variants: [string]) is
+    let info: EnumInfo = EnumInfo { variants: variants }
+    if tc.en_idx.has(name) is
+        tc.en_info[tc.en_idx.get(name).unwrap_or(0)] = info
+    else
+        tc.en_info.push(info)
+        tc.en_idx.put(name, tc.en_info.len() - 1)
+    end
+end
+
+fn put_const(tc: TypeChecker, name: string, ty: htype::HType) is
+    if tc.const_idx.has(name) is
+        tc.const_tys[tc.const_idx.get(name).unwrap_or(0)] = ty
+    else
+        tc.const_tys.push(ty)
+        tc.const_idx.put(name, tc.const_tys.len() - 1)
+    end
+end
+
+fn register_builtins(tc: TypeChecker) is
+    for row in tc_builtins::builtin_table() is
+        let parts: [string] = split(row, "|")
+        let mut ps: [htype::HType] = []
+        if parts[1].len() > 0 is
+            for p in split(parts[1], ";") is ps.push(htype::parse_display(p)) end
+        end
+        put_fn(tc, parts[0], mk_sig(ps, htype::parse_display(parts[2])))
+    end
+end
+
+;; TypeChecker::new(); `file` is the path the module was parsed from
+pub fn new_checker(file: string) -> TypeChecker is
+    let sc: [Scope] = [new_scope()]
+    let vs: [htype::HType] = []
+    let fs_: [Sig] = []
+    let sti: [StructInfo] = []
+    let eni: [EnumInfo] = []
+    let cts: [htype::HType] = []
+    let ds: [diagnostics::Diag] = []
+    let tf: [string] = []
+    let dn: [string] = []
+    let dm: [string] = []
+    let tc: TypeChecker = TypeChecker {
+        file: file, scopes: sc, vars: vs,
+        fn_idx: map::Map::new(), fn_sigs: fs_,
+        st_idx: map::Map::new(), st_info: sti,
+        en_idx: map::Map::new(), en_info: eni,
+        const_idx: map::Map::new(), const_tys: cts,
+        has_ret: false, cur_ret: htype::simple("void"),
+        has_fname: false, cur_fname: "",
+        has_impl: false, cur_impl: "",
+        diags: ds, test_fns: tf,
+        inline_fns: map::Set::new(), must_use_fns: map::Set::new(),
+        dep_idx: map::Map::new(), dep_names: dn, dep_msgs: dm
+    }
+    register_builtins(tc)
+    return tc
+end
+
+;; names of every registered function (builtins + user), sorted
+pub fn builtin_names(tc: TypeChecker) -> [string] is
+    return sort_strings(tc.fn_idx.key_list())
+end
+
+pub fn has_fn(tc: TypeChecker, name: string) -> bool is
+    return tc.fn_idx.has(name)
+end
+
+pub fn fn_sig(tc: TypeChecker, name: string) -> Sig is
+    return tc.fn_sigs[tc.fn_idx.get(name).unwrap_or(0)]
+end
+
+pub fn deprecated_sorted(tc: TypeChecker) -> [string] is
+    return sort_strings(tc.dep_names)
+end
+
+pub fn deprecated_msg(tc: TypeChecker, name: string) -> string is
+    return tc.dep_msgs[tc.dep_idx.get(name).unwrap_or(0)]
+end
+
+;; ── diagnostics ───────────────────────────────────────────────────────────────
+fn sp_file(tc: TypeChecker, sp: [int]) -> string is
+    return diagnostics::span_file(sp, tc.file)
+end
+
+fn err_hint(tc: TypeChecker, sp: [int], msg: string, hint: string) is
+    tc.diags.push(diagnostics::with_hint(diagnostics::error(sp, sp_file(tc, sp), msg), hint))
+end
+
+fn warn_hint(tc: TypeChecker, sp: [int], msg: string, hint: string) is
+    tc.diags.push(diagnostics::with_hint(diagnostics::warning(sp, sp_file(tc, sp), msg), hint))
+end
+
+fn err_plain(tc: TypeChecker, sp: [int], msg: string) is
+    tc.diags.push(diagnostics::error(sp, sp_file(tc, sp), msg))
+end
+
+;; ── scopes ────────────────────────────────────────────────────────────────────
+fn push_scope(tc: TypeChecker) is
+    tc.scopes.push(new_scope())
+end
+
+fn pop_scope(tc: TypeChecker) is
+    let mut n: [Scope] = []
+    let mut i: int = 0
+    while i < tc.scopes.len() - 1 is
+        n.push(tc.scopes[i])
+        i += 1
+    end
+    tc.scopes = n
+end
+
+fn define(tc: TypeChecker, name: string, ty: htype::HType) is
+    if tc.scopes.len() == 0 is return end
+    tc.vars.push(ty)
+    tc.scopes[tc.scopes.len() - 1].m.put(name, tc.vars.len() - 1)
+end
+
+;; index into `vars`, or -1
+fn lookup(tc: TypeChecker, name: string) -> int is
+    let mut i: int = tc.scopes.len() - 1
+    while i >= 0 is
+        if tc.scopes[i].m.has(name) is return tc.scopes[i].m.get(name).unwrap_or(-1) end
+        i -= 1
+    end
+    return -1
+end
+
+;; ── collect_signatures ────────────────────────────────────────────────────────
+fn param_types(params: ast::Node, skip_self: bool) -> [htype::HType] is
+    let mut out: [htype::HType] = []
+    for p in params.kids is
+        if skip_self && p.text == "self" is continue end
+        out.push(htype::from_type(p.kids[1]))
+    end
+    return out
+end
+
+fn struct_fields(fields: ast::Node) -> [FieldT] is
+    let mut out: [FieldT] = []
+    for f in fields.kids is
+        out.push(FieldT { name: f.text, ty: htype::from_type(f.kids[1]) })
+    end
+    return out
+end
+
+fn collect_signatures(tc: TypeChecker, item: ast::Node) is
+    let t: string = item.tag
+    if t == "Fn" is
+        put_fn(tc, item.text, mk_sig(param_types(item.kids[2], false), htype::opt_from_type(item.kids[3])))
+    elsif t == "Struct" is
+        put_struct(tc, item.text, struct_fields(item.kids[1]))
+    elsif t == "Enum" is
+        let mut vs: [string] = []
+        for v in item.kids[1].kids is vs.push(v.text) end
+        put_enum(tc, item.text, vs)
+    elsif t == "Impl" is
+        for m in item.kids[1].kids is
+            put_fn(tc, item.text + "_" + m.text, mk_sig(param_types(m.kids[2], true), htype::opt_from_type(m.kids[3])))
+        end
+    elsif t == "ModDecl" is
+        if item.kids[1].tag == "Inline" is collect_mod_signatures(tc, item.text, item.kids[1].kids) end
+    elsif t == "ConstDef" is
+        collect_const(tc, item)
+    end
+end
+
+fn collect_const(tc: TypeChecker, item: ast::Node) is
+    let mut inferred: htype::HType = htype::simple("any")
+    if item.kids[1].tag != "None" is
+        inferred = htype::from_type(item.kids[1])
+    else
+        inferred = infer_expr(tc, item.kids[2])
+    end
+    put_const(tc, item.text, inferred)
+end
+
+fn collect_mod_signatures(tc: TypeChecker, mod_name: string, items: [ast::Node]) is
+    for item in items is
+        let t: string = item.tag
+        if t == "Fn" is
+            let ps: [htype::HType] = param_types(item.kids[2], false)
+            let ret: htype::HType = htype::opt_from_type(item.kids[3])
+            put_fn(tc, mod_name + "::" + item.text, mk_sig(ps, ret))
+            put_fn(tc, item.text, mk_sig(ps, ret))
+        elsif t == "Struct" is
+            put_struct(tc, item.text, struct_fields(item.kids[1]))
+        elsif t == "ModDecl" is
+            if item.kids[1].tag == "Inline" is
+                collect_mod_signatures(tc, mod_name + "::" + item.text, item.kids[1].kids)
+            end
+        elsif t == "ConstDef" is
+            collect_const(tc, item)
+        end
+    end
+end
+
+;; ── infer_expr ────────────────────────────────────────────────────────────────
+fn is_ref_kind(k: string) -> bool is
+    return k == "Ref" || k == "RefMut"
+end
+
+pub fn infer_expr(tc: TypeChecker, e: ast::Node) -> htype::HType is
+    let t: string = e.tag
+    if t == "Int" is return htype::simple("int") end
+    if t == "Float" is return htype::simple("f64") end
+    if t == "Str" || t == "Interp" is return htype::simple("string") end
+    if t == "Bool" is return htype::simple("bool") end
+    if t == "Nil" is return htype::wrap("Optional", htype::simple("any")) end
+    if t == "Bytes" is return htype::simple("bytes") end
+    if t == "Ident" is
+        let name: string = e.text
+        if starts_with(name, "__bind:") || starts_with(name, "__closure_") is return htype::simple("any") end
+        let vi: int = lookup(tc, name)
+        if vi >= 0 is return tc.vars[vi] end
+        if tc.const_idx.has(name) is return tc.const_tys[tc.const_idx.get(name).unwrap_or(0)] end
+        return htype::simple("any")
+    end
+    if t == "StructLit" is return htype::named(e.text) end
+    if t == "BinOp" is
+        let lt: htype::HType = infer_expr(tc, e.kids[0])
+        let rt: htype::HType = infer_expr(tc, e.kids[1])
+        let op: string = e.text
+        if op == "Eq" || op == "NotEq" || op == "Lt" || op == "Gt" || op == "LtEq" || op == "GtEq" || op == "And" || op == "Or" is
+            return htype::simple("bool")
+        end
+        if op == "Add" && (lt.k == "string" || rt.k == "string") is return htype::simple("string") end
+        if htype::is_numeric(lt) && htype::is_numeric(rt) is return lt end
+        return htype::simple("any")
+    end
+    if t == "UnOp" is
+        let ty: htype::HType = infer_expr(tc, e.kids[0])
+        let op: string = e.text
+        if op == "Not" is return htype::simple("bool") end
+        if op == "Ref" is return htype::wrap("Ref", ty) end
+        if op == "RefMut" is return htype::wrap("RefMut", ty) end
+        return ty
+    end
+    if t == "Call" is
+        let callee: ast::Node = e.kids[0]
+        if callee.tag == "Ident" is
+            if tc.fn_idx.has(callee.text) is return fn_sig(tc, callee.text).ret end
+        end
+        if callee.tag == "Path" is
+            let full: string = callee.text
+            if tc.fn_idx.has(full) is return fn_sig(tc, full).ret end
+            let snake: string = string_replace_all(full, "::", "_")
+            if tc.fn_idx.has(snake) is return fn_sig(tc, snake).ret end
+            let last: string = tc_util::after_last(full, "::")
+            if tc.fn_idx.has(last) is return fn_sig(tc, last).ret end
+        end
+        return htype::simple("any")
+    end
+    if t == "Path" || t == "MethodCall" is return htype::simple("any") end
+    if t == "FieldAccess" is return infer_field_access(tc, e) end
+    if t == "IndexAccess" is
+        let bt: htype::HType = infer_expr(tc, e.kids[0])
+        if bt.k == "Array" is return bt.kids[0] end
+        return htype::simple("any")
+    end
+    if t == "ArrayLit" is
+        let mut inner: htype::HType = htype::simple("any")
+        if e.kids.len() > 0 is inner = infer_expr(tc, e.kids[0]) end
+        return htype::wrap("Array", inner)
+    end
+    if t == "TupleLit" is
+        let mut ks: [htype::HType] = []
+        for x in e.kids is ks.push(infer_expr(tc, x)) end
+        return htype::HType { k: "Tuple", name: "", kids: ks }
+    end
+    if t == "If" is
+        infer_expr(tc, e.kids[0])
+        let then_val: htype::HType = check_block_value(tc, e.kids[1])
+        for el in e.kids[2].kids is
+            infer_expr(tc, el.kids[0])
+            check_block_value(tc, el.kids[1])
+        end
+        if e.kids[3].tag != "None" is check_block_value(tc, e.kids[3]) end
+        return then_val
+    end
+    if t == "Cast" is
+        let from: htype::HType = infer_expr(tc, e.kids[0])
+        let to: htype::HType = htype::from_type(e.kids[1])
+        if !tc_helpers::cast_allowed(from, to) is
+            err_hint(tc, ast::sp7(e), "invalid cast: cannot cast `" + htype::display(from) + "` as `" + htype::display(to) + "`", "valid casts: numeric<->numeric, numeric<->bool, any<->concrete type")
+        end
+        return to
+    end
+    if t == "ReturnE" is return htype::simple("void") end
+    if t == "Self" is
+        if tc.has_impl is return htype::named(tc.cur_impl) end
+        return htype::named("Self")
+    end
+    if t == "Try" is
+        let ty: htype::HType = infer_expr(tc, e.kids[0])
+        if ty.k == "Optional" is return ty.kids[0] end
+        return ty
+    end
+    if t == "Assign" is return infer_expr(tc, e.kids[1]) end
+    if t == "CompoundAssign" is return infer_expr(tc, e.kids[0]) end
+    if t == "Range" is return htype::wrap("Array", htype::simple("int")) end
+    if t == "Closure" is
+        let mut pts: [htype::HType] = []
+        for p in e.kids[0].kids is pts.push(htype::from_type(p.kids[1])) end
+        let mut ret: htype::HType = htype::simple("void")
+        if e.kids[1].tag != "None" is
+            ret = htype::from_type(e.kids[1])
+        else
+            let body: [ast::Node] = e.kids[2].kids
+            if body.len() > 0 is
+                let last: ast::Node = body[body.len() - 1]
+                if last.tag == "ExprStmt" is ret = infer_expr(tc, last.kids[0]) else ret = htype::simple("any") end
+            end
+        end
+        pts.push(ret)
+        return htype::HType { k: "Fn", name: "", kids: pts }
+    end
+    if t == "Match" is
+        let subj: htype::HType = infer_expr(tc, e.kids[0])
+        let arms: [ast::Node] = e.kids[1].kids
+        check_match_exhaustive(tc, subj, arms, ast::sp7(e))
+        let mut result: htype::HType = htype::simple("any")
+        let mut i: int = 0
+        for arm in arms is
+            if arm.kids[1].tag != "None" is infer_expr(tc, arm.kids[1]) end
+            let val: htype::HType = check_block_value(tc, arm.kids[2])
+            if i == 0 is result = val end
+            i += 1
+        end
+        return result
+    end
+    if t == "While" is
+        infer_expr(tc, e.kids[0])
+        check_block_value(tc, e.kids[1])
+        return htype::simple("void")
+    end
+    if t == "For" is
+        infer_expr(tc, e.kids[1])
+        check_block_value(tc, e.kids[2])
+        return htype::simple("void")
+    end
+    if t == "Do" is return check_block_value(tc, e.kids[0]) end
+    return htype::simple("any")
+end
+
+fn infer_field_access(tc: TypeChecker, e: ast::Node) -> htype::HType is
+    let field: string = e.text
+    let base_ty: htype::HType = infer_expr(tc, e.kids[0])
+    let mut has_named: bool = false
+    let mut nname: string = ""
+    if base_ty.k == "Named" is
+        has_named = true
+        nname = base_ty.name
+    elsif is_ref_kind(base_ty.k) && base_ty.kids[0].k == "Named" is
+        has_named = true
+        nname = base_ty.kids[0].name
+    end
+    if base_ty.k == "Tuple" is
+        let n: int = base_ty.kids.len()
+        if tc_util::is_digit_str(field) && field.len() < 18 && to_int(field) < n is
+            return base_ty.kids[to_int(field)]
+        end
+        err_hint(tc, ast::sp7(e), "tuple of {n} element(s) has no field `.{field}`", "tuple fields are accessed positionally as `.0`, `.1`, ... up to (len - 1)")
+        return htype::simple("any")
+    end
+    if has_named && tc.st_idx.has(nname) is
+        let fields: [FieldT] = tc.st_info[tc.st_idx.get(nname).unwrap_or(0)].fields
+        for f in fields is
+            if f.name == field is return f.ty end
+        end
+        let mut names: [string] = []
+        for f in fields is names.push(f.name) end
+        let mut hint: string = "`" + nname + "` has no fields"
+        if names.len() > 0 is hint = "available fields: " + tc_util::join(names, ", ") end
+        err_hint(tc, ast::sp7(e), "struct `" + nname + "` has no field `" + field + "`", hint)
+        return htype::simple("any")
+    end
+    return htype::simple("any")
+end
+
+pub fn check_block_value(tc: TypeChecker, block: ast::Node) -> htype::HType is
+    let mut result: htype::HType = htype::simple("void")
+    for s in block.kids is result = check_stmt(tc, s) end
+    return result
+end
+
+;; ── match exhaustiveness ──────────────────────────────────────────────────────
+fn check_match_exhaustive(tc: TypeChecker, subj: htype::HType, arms: [ast::Node], msp: [int]) is
+    for arm in arms is
+        if arm.kids[1].tag == "None" && (arm.kids[0].tag == "PWild" || arm.kids[0].tag == "PIdent") is return end
+    end
+    if subj.k == "bool" is
+        let flags: [bool] = [false, false]
+        for arm in arms is
+            if arm.kids[1].tag != "None" is continue end
+            tc_helpers::collect_bool_pattern(arm.kids[0], flags)
+        end
+        if !(flags[0] && flags[1]) is
+            let mut missing: [string] = []
+            if !flags[0] is missing.push("true") end
+            if !flags[1] is missing.push("false") end
+            err_hint(tc, msp, "match on `bool` is not exhaustive: missing " + tc_util::join(missing, " and "), "add the missing arm(s), or a `_ => ...` catch-all")
+        end
+        return
+    end
+    if subj.k == "Named" is
+        if !tc.en_idx.has(subj.name) is return end
+        let variants: [string] = tc.en_info[tc.en_idx.get(subj.name).unwrap_or(0)].variants
+        let mut covered: [string] = []
+        for arm in arms is
+            if arm.kids[1].tag != "None" is continue end
+            covered = tc_helpers::collect_enum_pattern_variants(arm.kids[0], covered)
+        end
+        let mut missing: [string] = []
+        for v in variants is
+            let mut found: bool = false
+            for c in covered is
+                if c == v is found = true end
+            end
+            if !found is missing.push(v) end
+        end
+        if missing.len() > 0 is
+            err_hint(tc, msp, "match on `" + subj.name + "` is not exhaustive: missing variant(s) " + tc_util::join(missing, ", "), "add the missing arm(s), or a `_ => ...` catch-all")
+        end
+    end
+end
+
+;; ── items ─────────────────────────────────────────────────────────────────────
+fn check_item(tc: TypeChecker, item: ast::Node) is
+    let t: string = item.tag
+    if t == "Fn" is
+        check_fn(tc, item)
+    elsif t == "Impl" is
+        let saved_has: bool = tc.has_impl
+        let saved: string = tc.cur_impl
+        tc.has_impl = true
+        tc.cur_impl = item.text
+        for m in item.kids[1].kids is check_fn(tc, m) end
+        tc.has_impl = saved_has
+        tc.cur_impl = saved
+    elsif t == "ModDecl" is
+        if item.kids[1].tag == "Inline" is
+            for sub in item.kids[1].kids is check_item(tc, sub) end
+        end
+    end
+end
+
+fn has_attr(f: ast::Node, name: string) -> bool is
+    for a in f.kids[0].kids is
+        if a.text == name is return true end
+    end
+    return false
+end
+
+fn is_item_tag(t: string) -> bool is
+    return t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "Impl" || t == "TypeAlias" || t == "ConstDef" || t == "Extern" || t == "ModDecl"
+end
+
+fn check_fn(tc: TypeChecker, f: ast::Node) is
+    let name: string = f.text
+    if has_attr(f, "test") is tc.test_fns.push(name) end
+    if has_attr(f, "inline") || has_attr(f, "always_inline") is tc.inline_fns.add(name) end
+    if has_attr(f, "must_use") is tc.must_use_fns.add(name) end
+    for a in f.kids[0].kids is
+        if a.text == "deprecated" is
+            let mut msg: string = ""
+            let mut got: bool = false
+            for x in a.kids is
+                if !got && x.tag == "AKV" is
+                    let eq: int = tc_util::find_from(x.text, "=", 0)
+                    let k: string = x.text[0..eq]
+                    if k == "since" || k == "note" is
+                        msg = x.text[eq + 1..x.text.len()]
+                        got = true
+                    end
+                end
+            end
+            if tc.dep_idx.has(name) is
+                tc.dep_msgs[tc.dep_idx.get(name).unwrap_or(0)] = msg
+            else
+                tc.dep_names.push(name)
+                tc.dep_msgs.push(msg)
+                tc.dep_idx.put(name, tc.dep_names.len() - 1)
+            end
+            break
+        end
+    end
+    push_scope(tc)
+    let ret_ty: htype::HType = htype::opt_from_type(f.kids[3])
+    let saved_has_ret: bool = tc.has_ret
+    let saved_ret: htype::HType = tc.cur_ret
+    let saved_has_name: bool = tc.has_fname
+    let saved_name: string = tc.cur_fname
+    tc.has_ret = true
+    tc.cur_ret = ret_ty
+    tc.has_fname = true
+    tc.cur_fname = name
+    for p in f.kids[2].kids is
+        let pty: ast::Node = p.kids[1]
+        if pty.tag == "Named" && pty.text == "Self" && tc.has_impl is
+            define(tc, p.text, htype::named(tc.cur_impl))
+        else
+            define(tc, p.text, htype::from_type(pty))
+        end
+    end
+    let body: [ast::Node] = f.kids[4].kids
+    for s in body is check_stmt(tc, s) end
+    let mode: string = f.kids[6].text
+    check_mem_mode_block(tc, body, mode, false, name)
+    if ret_ty.k != "void" && !tc_helpers::block_always_returns(body) && !tc_helpers::block_yields_value(body) is
+        let mut sp: [int] = ast::sp7(f)
+        if body.len() > 0 is sp = tc_helpers::stmt_span(body[body.len() - 1]) end
+        let rd: string = htype::display(ret_ty)
+        err_hint(tc, sp, "function `" + name + "` has return type `" + rd + "` but does not return on all paths", "add a `return <" + rd + ">` at the end of the function, or in every branch of the final if/match")
+    end
+    pop_scope(tc)
+    tc.has_ret = saved_has_ret
+    tc.cur_ret = saved_ret
+    tc.has_fname = saved_has_name
+    tc.cur_fname = saved_name
+end
+
+;; ── §13 memory-mode gating ────────────────────────────────────────────────────
+fn in_list(xs: [string], x: string) -> bool is
+    for y in xs is
+        if y == x is return true end
+    end
+    return false
+end
+
+fn ptr_restricted() -> [string] is
+    return ["ptr_read_i64", "ptr_write_i64", "ptr_add", "ptr_is_null",
+        "ptr_read_i32", "ptr_write_i32", "ptr_read_i16", "ptr_write_i16",
+        "ptr_read_i8", "ptr_write_i8", "ptr_read_f64", "ptr_write_f64",
+        "ptr_read_f32", "ptr_write_f32", "ptr_read_ptr", "ptr_write_ptr",
+        "ptr_alloc_size", "ptr_copy", "ptr_compare", "ptr_field_offset",
+        "ptr_read_checked", "ptr_write_checked", "ptr_fill", "ptr_zero"]
+end
+
+fn arc_restricted() -> [string] is
+    return ["arc_alloc", "arc_retain", "arc_release", "arc_count", "arc_downgrade", "arc_upgrade", "arc_weak_release", "arc_weak_count"]
+end
+
+fn arena_restricted() -> [string] is
+    return ["arena_checkpoint", "arena_rewind", "arena_used", "arena_capacity"]
+end
+
+fn check_mem_mode_block(tc: TypeChecker, body: [ast::Node], mode: string, in_unsafe: bool, fn_name: string) is
+    for s in body is check_mem_mode_stmt(tc, s, mode, in_unsafe, fn_name) end
+end
+
+fn check_mem_mode_stmt(tc: TypeChecker, s: ast::Node, mode: string, in_unsafe: bool, fn_name: string) is
+    let t: string = s.tag
+    if t == "Let" is
+        if s.kids[2].tag != "None" is check_mem_mode_expr(tc, s.kids[2], mode, in_unsafe, fn_name) end
+    elsif t == "ExprStmt" is
+        check_mem_mode_expr(tc, s.kids[0], mode, in_unsafe, fn_name)
+    elsif t == "Return" || t == "Break" is
+        if s.kids[0].tag != "None" is check_mem_mode_expr(tc, s.kids[0], mode, in_unsafe, fn_name) end
+    elsif t == "Fn" is
+        check_mem_mode_block(tc, s.kids[4].kids, s.kids[6].text, false, s.text)
+    end
+end
+
+fn check_mem_mode_expr(tc: TypeChecker, e: ast::Node, mode: string, in_unsafe: bool, fn_name: string) is
+    let t: string = e.tag
+    if t == "Call" is
+        let callee: ast::Node = e.kids[0]
+        if callee.tag == "Ident" is check_mem_mode_call(tc, callee.text, mode, in_unsafe, fn_name, ast::sp7(e)) end
+        check_mem_mode_expr(tc, callee, mode, in_unsafe, fn_name)
+        for a in e.kids[1].kids is check_mem_mode_expr(tc, a, mode, in_unsafe, fn_name) end
+    elsif t == "MethodCall" is
+        check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name)
+        for a in e.kids[1].kids is check_mem_mode_expr(tc, a, mode, in_unsafe, fn_name) end
+    elsif t == "BinOp" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" is
+        check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name)
+        check_mem_mode_expr(tc, e.kids[1], mode, in_unsafe, fn_name)
+    elsif t == "UnOp" || t == "FieldAccess" || t == "Cast" || t == "Try" || t == "Await" is
+        check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name)
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for i in e.kids is check_mem_mode_expr(tc, i, mode, in_unsafe, fn_name) end
+    elsif t == "StructLit" is
+        for f in e.kids is check_mem_mode_expr(tc, f.kids[0], mode, in_unsafe, fn_name) end
+    elsif t == "ReturnE" is
+        if e.kids[0].tag != "None" is check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name) end
+    elsif t == "If" is
+        check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name)
+        check_mem_mode_block(tc, e.kids[1].kids, mode, in_unsafe, fn_name)
+        for el in e.kids[2].kids is
+            check_mem_mode_expr(tc, el.kids[0], mode, in_unsafe, fn_name)
+            check_mem_mode_block(tc, el.kids[1].kids, mode, in_unsafe, fn_name)
+        end
+        if e.kids[3].tag != "None" is check_mem_mode_block(tc, e.kids[3].kids, mode, in_unsafe, fn_name) end
+    elsif t == "Match" is
+        check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name)
+        for arm in e.kids[1].kids is
+            if arm.kids[1].tag != "None" is check_mem_mode_expr(tc, arm.kids[1], mode, in_unsafe, fn_name) end
+            check_mem_mode_block(tc, arm.kids[2].kids, mode, in_unsafe, fn_name)
+        end
+    elsif t == "While" is
+        check_mem_mode_expr(tc, e.kids[0], mode, in_unsafe, fn_name)
+        check_mem_mode_block(tc, e.kids[1].kids, mode, in_unsafe, fn_name)
+    elsif t == "For" is
+        check_mem_mode_expr(tc, e.kids[1], mode, in_unsafe, fn_name)
+        check_mem_mode_block(tc, e.kids[2].kids, mode, in_unsafe, fn_name)
+    elsif t == "Do" is
+        check_mem_mode_block(tc, e.kids[0].kids, mode, in_unsafe, fn_name)
+    elsif t == "Unsafe" is
+        check_mem_mode_block(tc, e.kids[0].kids, mode, true, fn_name)
+    elsif t == "Closure" is
+        check_mem_mode_block(tc, e.kids[2].kids, mode, in_unsafe, fn_name)
+    end
+end
+
+fn check_mem_mode_call(tc: TypeChecker, name: string, mode: string, in_unsafe: bool, fn_name: string, sp: [int]) is
+    if in_unsafe is return end
+    if in_list(ptr_restricted(), name) && mode != "Pointers" is
+        warn_hint(tc, sp, "`" + name + "` used in `" + fn_name + "`, which is not `@pointers`", "mark `" + fn_name + "` as `@pointers`, or wrap this call in `unsafe is ... end`")
+    end
+    if in_list(arc_restricted(), name) && mode != "Arc" is
+        warn_hint(tc, sp, "`" + name + "` used in `" + fn_name + "`, which is not `@arc`", "mark `" + fn_name + "` as `@arc`, or wrap this call in `unsafe is ... end`")
+    end
+    if in_list(arena_restricted(), name) && mode != "Arena" is
+        warn_hint(tc, sp, "`" + name + "` used in `" + fn_name + "`, which is not `@arena`", "mark `" + fn_name + "` as `@arena`, or wrap this call in `unsafe arena ... end`")
+    end
+end
+
+;; ── check_stmt ────────────────────────────────────────────────────────────────
+pub fn check_stmt(tc: TypeChecker, s: ast::Node) -> htype::HType is
+    let t: string = s.tag
+    if t == "Let" is
+        let mut inferred: htype::HType = htype::simple("any")
+        let mut has_inf: bool = false
+        if s.kids[2].tag != "None" is
+            inferred = infer_expr(tc, s.kids[2])
+            has_inf = true
+        end
+        let mut final_ty: htype::HType = htype::simple("any")
+        if s.kids[1].tag != "None" is
+            final_ty = htype::from_type(s.kids[1])
+        elsif has_inf is
+            final_ty = inferred
+        end
+        define(tc, s.text, final_ty)
+        return htype::simple("void")
+    end
+    if t == "Return" is
+        if tc.has_ret is
+            let ret_ty: htype::HType = tc.cur_ret
+            let mut expr_ty: htype::HType = htype::simple("void")
+            if s.kids[0].tag != "None" is expr_ty = infer_expr(tc, s.kids[0]) end
+            if !htype::compatible_with(expr_ty, ret_ty) is
+                let mut fname: string = "<unknown>"
+                if tc.has_fname is fname = tc.cur_fname end
+                err_hint(tc, ast::sp7(s), "return type mismatch in `" + fname + "`: expected `" + htype::display(ret_ty) + "`, found `" + htype::display(expr_ty) + "`", "convert the value to `" + htype::display(ret_ty) + "` before returning, or change the function's declared return type")
+            end
+        end
+        return htype::simple("void")
+    end
+    if t == "ExprStmt" is return infer_expr(tc, s.kids[0]) end
+    if is_item_tag(t) is
+        check_item(tc, s)
+        return htype::simple("void")
+    end
+    return htype::simple("void")
+end
+
+;; ── check_module ──────────────────────────────────────────────────────────────
+;; `module` is the Module node; returns every diagnostic (errors and warnings)
+pub fn check_module(tc: TypeChecker, module: ast::Node) -> [diagnostics::Diag] is
+    for imp in module.kids[2].kids is
+        if imp.text == "Std" is
+            let path: [ast::Node] = imp.kids[0].kids
+            let mut lib: string = ""
+            if path.len() > 0 is lib = path[path.len() - 1].text end
+            let std_path: string = tc_helpers::std_root_dir() + "/" + lib + ".h#"
+            if !fs::exists(std_path) is
+                tc.diags.push(diagnostics::error(ast::sp7(imp), sp_file(tc, ast::sp7(imp)), "std module `" + lib + "` not found at " + std_path + "\n\nplease install h# utils for HackerOS use:\nlinux:   hacker unpack h#-utils\nwindows: (not available yet — no install path is defined for Windows yet)\n"))
+            end
+        end
+        if imp.text == "BitRepo" is
+            let name: string = imp.kids[0].text
+            let mut has_ver: bool = false
+            let mut ver: string = ""
+            if imp.kids[1].tag != "None" is
+                has_ver = true
+                ver = imp.kids[1].text
+            end
+            let dynamic: bool = imp.kids[3].text == "Dynamic"
+            let r: bit_resolve::UseResult = bit_resolve::resolve_bit_use(name, has_ver, ver, dynamic, fs::cwd())
+            if !r.ok is
+                tc.diags.push(diagnostics::error(ast::sp7(imp), sp_file(tc, ast::sp7(imp)), r.err))
+                continue
+            end
+        end
+    end
+    for item in module.kids[3].kids is collect_signatures(tc, item) end
+    for item in module.kids[3].kids is check_item(tc, item) end
+    let out: [diagnostics::Diag] = tc.diags
+    let fresh: [diagnostics::Diag] = []
+    tc.diags = fresh
+    return out
+end
+
+;; `apply_file_mem_mode`: the file-level `@: mode` becomes the mode of every fn still at `Default`
+pub fn apply_file_mem_mode(module: ast::Node) is
+    let mode: string = module.kids[1].text
+    if mode.len() == 0 is return end
+    for item in module.kids[3].kids is apply_mem_item(item, mode) end
+end
+
+pub fn apply_mem_item(item: ast::Node, mode: string) is
+    if item.tag == "Fn" is
+        if item.kids[6].text == "Default" is item.kids[6].text = mode end
+    elsif item.tag == "Impl" is
+        for m in item.kids[1].kids is
+            if m.kids[6].text == "Default" is m.kids[6].text = mode end
+        end
+    elsif item.tag == "ModDecl" is
+        if item.kids[1].tag == "Inline" is
+            for sub in item.kids[1].kids is apply_mem_item(sub, mode) end
+        end
+    end
+end
