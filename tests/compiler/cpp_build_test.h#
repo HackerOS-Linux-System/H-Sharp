@@ -1,0 +1,61 @@
+use "std -> test" from "test"
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+#[test]
+fn test_cross_prefix_and_apt_hint() is
+    assert_eq(cpp_build::gnu_cross_prefix(target::linux_aarch64()), "aarch64-linux-gnu")
+    assert_eq(cpp_build::gnu_cross_prefix(target::linux_riscv64_musl()), "riscv64-linux-musl")
+    assert_eq(cpp_build::gnu_cross_prefix(target::linux_x86_64_musl()), "x86_64-linux-musl")
+    assert_eq(cpp_build::gnu_cross_prefix(target::windows_x86_64()), "")
+    assert_eq(cpp_build::apt_hint(target::windows_aarch64()), "g++-mingw-w64")
+    assert_eq(cpp_build::apt_hint(target::macos_aarch64()), "clang")
+end
+
+#[test]
+fn test_output_kind_helpers() is
+    assert_eq(options::kind_from_str("so").kind, "SharedLib")
+    assert_eq(options::kind_from_str("archive").kind, "StaticLib")
+    assert_eq(options::kind_from_str("c++").kind, "Cpp")
+    assert_eq(options::kind_from_str("zzz").found, false)
+    assert_eq(options::file_suffix("SharedLib", target::windows_x86_64()), ".dll")
+    assert_eq(options::file_suffix("SharedLib", target::macos_aarch64()), ".dylib")
+    assert_eq(options::file_suffix("SharedLib", target::linux_aarch64()), ".so")
+    assert_eq(options::wasm_guard(options::default_options(false)), "")
+end
+
+#[test]
+fn test_hash_is_stable_and_order_sensitive() is
+    assert_eq(cpp_build::hash_str(["a", "b"]), cpp_build::hash_str(["a", "b"]))
+    assert_eq(cpp_build::hash_str(["a", "b"]) != cpp_build::hash_str(["ab", ""]), true)
+end
+
+#[test]
+fn test_end_to_end_build_runs_the_program() is
+    env::set("HSHARP_CACHE_DIR", "/tmp/hs_cb_cache")
+    let cpp: string = fs::read("/tmp/hb/hello.cpp")
+    let o: options::CompileOptions = options::default_options(false)
+    o.output = "/tmp/hs_cb_out/hello_h"
+    o.static_link = false
+    fs::mkdir("/tmp/hs_cb_out")
+    let inp: cpp_build::BuildInput = cpp_build::BuildInput { cpp: cpp, link: ffi_linker::new_flags(), has_main: true, strict_memory: false, verbose: false }
+    let err: string = cpp_build::build(inp, o)
+    assert_eq(err, "")
+    assert_eq(fs::is_file("/tmp/hs_cb_out/hello_h"), true)
+end
+
+#[test]
+fn test_emit_cpp_writes_source_tree() is
+    env::set("HSHARP_CACHE_DIR", "/tmp/hs_cb_cache")
+    let o: options::CompileOptions = options::default_options(false)
+    o.output = "/tmp/hs_cb_emit/prog"
+    o.output_kind = "Cpp"
+    fs::mkdir("/tmp/hs_cb_emit")
+    let inp: cpp_build::BuildInput = cpp_build::BuildInput { cpp: "int main(){}", link: ffi_linker::new_flags(), has_main: true, strict_memory: false, verbose: false }
+    assert_eq(cpp_build::build(inp, o), "")
+    assert_eq(fs::read("/tmp/hs_cb_emit/prog.cpp"), "int main(){}")
+    assert_eq(fs::is_file("/tmp/hs_cb_emit/hsharp_core.c"), true)
+    assert_eq(fs::is_file("/tmp/hs_cb_emit/hsh_rt_decls.h"), true)
+end
