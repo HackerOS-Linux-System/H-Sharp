@@ -1,0 +1,98 @@
+use "workspace -> parser" from "lib -> *"
+
+fn mk(tag: string, text: string, kids: [ast::Node]) -> ast::Node is
+    return ast::Node { tag: tag, text: text, kids: kids }
+end
+
+
+;; rebuild `n` with new kids, keeping its span (the Rust passes mutate in place and so keep spans)
+fn rebuild(n: ast::Node, kids: [ast::Node]) -> ast::Node is
+    return ast::Node { tag: n.tag, text: n.text, kids: kids, sp: n.sp, sl: n.sl, sc: n.sc, so: n.so, el: n.el, ec: n.ec, eo: n.eo, ip: n.ip, fl: n.fl }
+end
+
+fn lowered_name(name: string) -> string is
+    if name == "__builtin_str_split" is return "str_split" end
+    if name == "__builtin_str_join" is return "iter_join" end
+    return ""
+end
+
+fn lower_expr(n: ast::Node) -> ast::Node is
+    if n.tag == "Ident" is
+        let t: string = lowered_name(n.text)
+        if t != "" is
+            let r: ast::Node = rebuild(n, [])
+            r.text = t
+            return r
+        end
+        return n
+    end
+    if n.tag == "Interp" is return n end
+    let mut kids: [ast::Node] = []
+    for k in n.kids is kids.push(lower_expr(k)) end
+    return rebuild(n, kids)
+end
+
+fn is_item_tag(t: string) -> bool is
+    return t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "Impl" || t == "TypeAlias" || t == "ConstDef" || t == "Extern" || t == "ModDecl"
+end
+
+fn lower_fn(f: ast::Node) -> ast::Node is
+    let mut stmts: [ast::Node] = []
+    for s in f.kids[4].kids is stmts.push(lower_stmt(s)) end
+    return rebuild(f, [f.kids[0], f.kids[1], f.kids[2], f.kids[3], rebuild(f.kids[4], stmts), f.kids[5], f.kids[6]])
+end
+
+fn lower_item(n: ast::Node) -> ast::Node is
+    if n.tag == "Fn" is return lower_fn(n) end
+    if n.tag == "Impl" is
+        let mut ms: [ast::Node] = []
+        for m in n.kids[1].kids is ms.push(lower_fn(m)) end
+        return rebuild(n, [n.kids[0], rebuild(n.kids[1], ms)])
+    end
+    if n.tag == "ModDecl" && n.kids[1].tag == "Inline" is
+        let mut items: [ast::Node] = []
+        for it in n.kids[1].kids is items.push(lower_item(it)) end
+        return rebuild(n, [n.kids[0], rebuild(n.kids[1], items)])
+    end
+    return n
+end
+
+fn lower_stmt(s: ast::Node) -> ast::Node is
+    if is_item_tag(s.tag) is return lower_item(s) end
+    if s.tag == "Import" || s.tag == "Continue" is return s end
+    return lower_expr(s)
+end
+
+fn with_items(m: ast::Node, items: [ast::Node]) -> ast::Node is
+    return mk("Module", m.text, [m.kids[0], m.kids[1], m.kids[2], mk("Items", "", items)])
+end
+
+pub fn lower_string_builtins(m: ast::Node) -> ast::Node is
+    let mut items: [ast::Node] = []
+    for it in m.kids[3].kids is items.push(lower_item(it)) end
+    return with_items(m, items)
+end
+
+fn is_test_fn(f: ast::Node) -> bool is
+    for a in f.kids[0].kids is
+        if a.text == "test" is return true end
+    end
+    return false
+end
+
+fn strip_items(items: [ast::Node]) -> [ast::Node] is
+    let mut out: [ast::Node] = []
+    for it in items is
+        if it.tag == "Fn" && is_test_fn(it) is continue end
+        if it.tag == "ModDecl" && it.kids[1].tag == "Inline" is
+            out.push(mk("ModDecl", it.text, [it.kids[0], mk("Inline", "", strip_items(it.kids[1].kids))]))
+        else
+            out.push(it)
+        end
+    end
+    return out
+end
+
+pub fn strip_test_fns(m: ast::Node) -> ast::Node is
+    return with_items(m, strip_items(m.kids[3].kids))
+end
