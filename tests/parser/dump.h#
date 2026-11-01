@@ -1,0 +1,44 @@
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+
+
+fn esc(s: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 92 is sb.push("\\\\")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 10 is sb.push("\\n")
+        elsif c == 9 is sb.push("\\t")
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    return sb.build()
+end
+
+fn main() is
+    let args: [string] = env_args()
+    if args.len() < 2 is
+        write("usage: dump <file.h#>")
+        exit(2)
+    end
+    let src: string = fs::read(args[1])
+    let r: parser::ParseResult = parser::parse(src, args[1])
+    let mut sb = strbuf::new()
+    if parser::has_errors(r) is
+        sb.push("ERRORS\n")
+        for e in r.errors is
+            sb.push("E\t" + esc(error::error_display(e)) + "\t{e.sl}:{e.sc}:{e.so}-{e.el}:{e.ec}:{e.eo}\t" + esc(e.kind) + "\n")
+            for h in e.hints is sb.push("H\t" + esc(h) + "\n") end
+        end
+        sb.push("RENDER\n")
+        sb.push(esc(parser::render_errors(r)))
+        sb.push("\n")
+        print(sb.build())
+        return
+    end
+    ast::dump_node(r.module, 0, sb)
+    print(sb.build())
+end
