@@ -1,0 +1,49 @@
+use "std -> env" from "env"
+
+extern static [c] is
+    fn getpid() -> int
+    fn getppid() -> int
+    fn getuid() -> int
+    fn getgid() -> int
+    fn isatty(fd: int) -> int
+    fn sysconf(name: int) -> int
+    fn time(t: int) -> int
+end
+
+;; hsh_getpid / hsh_proc_id
+pub fn pid() -> int is return getpid() end
+;; hsh_sys_get_ppid / get_uid / get_gid
+pub fn ppid() -> int is return getppid() end
+pub fn uid() -> int is return getuid() end
+pub fn gid() -> int is return getgid() end
+;; hsh_os_is_root
+pub fn is_root() -> bool is return getuid() == 0 end
+
+;; hsh_sys_page_size: sysconf(_SC_PAGE_SIZE) (30 on Linux), 4096 when unknown
+pub fn page_size() -> int is
+    let sz: int = sysconf(30)
+    if sz > 0 is return sz end
+    return 4096
+end
+
+;; hsh_sys_is_64bit / hsh_sys_is_little_endian: H# targets are 64-bit little-endian only (int is 64-bit, no BE target)
+pub fn is_64bit() -> bool is return true end
+pub fn is_little_endian() -> bool is return true end
+
+;; hsh_env_home / hsh_os_home_dir
+pub fn home_dir() -> string is
+    return env::get("HOME")
+end
+
+;; hsh_os_temp_dir: $TMPDIR, else /tmp
+pub fn temp_dir() -> string is
+    let t: string = env::get("TMPDIR")
+    if t.len() == 0 is return "/tmp" end
+    return t
+end
+
+;; hsh_term_is_tty (stdout)
+pub fn stdout_is_tty() -> bool is return isatty(1) != 0 end
+
+;; hsh_now_unix
+pub fn now_unix() -> int is return time(0) end
