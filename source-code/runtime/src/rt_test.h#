@@ -5,6 +5,8 @@ mod rt_path
 mod rt_codec
 mod rt_conv
 mod rt_date
+mod rt_num
+mod rt_sys
 
 ;; assert_eq takes `any` (pointer compare for strings); typed parameters make `==` a real string comparison
 fn eq_s(actual: string, expected: string) is
@@ -134,4 +136,33 @@ fn find_slice_split() is
     eq_i(rt_str::split_count("", ""), 1)
     eq_s(rt_str::split_part("a,b,c", ",", 1), "b")
     eq_s(rt_str::split_part("a,b,c", ",", 7), "")
+end
+
+fn eq_f(actual: f64, expected: f64) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+#[test]
+fn numbers() is
+    eq_i(rt_num::abs_i(-5), 5)
+    eq_i(rt_num::min_i(3, -2), -2)
+    eq_i(rt_num::max_i(3, -2), 3)
+    eq_f(rt_num::min_f(1.5, 2.5), 1.5)
+    eq_f(rt_num::fsqrt(9.0), 3.0)
+    eq_f(rt_num::ffloor(-1.5), -2.0)
+    eq_f(rt_num::fceil(1.2), 2.0)
+    eq_f(rt_num::fround(2.5), 3.0)
+    eq_f(rt_num::fpow(2.0, 10.0), 1024.0)
+    eq_i(rt_num::float_to_int(-3.9), -3)
+    eq_f(rt_num::to_float(" 3.5xyz"), 3.5)
+    eq_s(rt_num::fmt6(0.5), "500000")
+end
+
+#[test]
+fn system() is
+    eq_b(rt_sys::pid() > 0, true)
+    eq_b(rt_sys::page_size() >= 4096, true)
+    eq_b(rt_sys::is_64bit(), true)
+    eq_b(rt_sys::temp_dir().len() > 0, true)
+    eq_b(rt_sys::now_unix() > 1700000000, true)
 end
