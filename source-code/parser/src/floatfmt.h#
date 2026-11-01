@@ -1,0 +1,125 @@
+pub struct Fl is
+    pub kind: int        ;; 0 = finite, 1 = inf, 2 = NaN
+    pub neg: bool
+    pub digits: string   ;; no leading/trailing zeros; "" = zero
+    pub exp: int         ;; value = d.ddd * 10^exp
+end
+
+pub fn is_digit(c: int) -> bool is return c >= 48 && c <= 57 end
+
+pub fn fl_parse(t0: string) -> Fl is
+    let mut t: string = t0
+    let mut neg: bool = false
+    if t.len() > 0 && byte_at(t, 0) == 45 is
+        neg = true
+        t = t[1..t.len()]
+    end
+    if t == "inf" is return Fl { kind: 1, neg: neg, digits: "", exp: 0 } end
+    if t == "NaN" is return Fl { kind: 2, neg: neg, digits: "", exp: 0 } end
+    let mut mant: string = t
+    let mut expn: int = 0
+    let mut i: int = 0
+    while i < t.len() is
+        let c: int = byte_at(t, i)
+        if c == 101 || c == 69 is
+            mant = t[0..i]
+            let mut es: string = t[i + 1..t.len()]
+            let mut eneg: bool = false
+            if es.len() > 0 && byte_at(es, 0) == 45 is
+                eneg = true
+                es = es[1..es.len()]
+            elsif es.len() > 0 && byte_at(es, 0) == 43 is
+                es = es[1..es.len()]
+            end
+            let mut v: int = 0
+            let mut k: int = 0
+            while k < es.len() is
+                v = v * 10 + (byte_at(es, k) - 48)
+                k += 1
+            end
+            expn = if eneg is 0 - v else v end
+            break
+        end
+        i += 1
+    end
+    let mut ip: string = mant
+    let mut fp: string = ""
+    let mut j: int = 0
+    while j < mant.len() is
+        if byte_at(mant, j) == 46 is
+            ip = mant[0..j]
+            fp = mant[j + 1..mant.len()]
+            break
+        end
+        j += 1
+    end
+    let all: string = ip + fp
+    let mut lead: int = 0
+    while lead < all.len() && byte_at(all, lead) == 48 is lead += 1 end
+    if lead == all.len() is return Fl { kind: 0, neg: neg, digits: "", exp: 0 } end
+    let mut stop: int = all.len()
+    while stop > lead && byte_at(all, stop - 1) == 48 is stop -= 1 end
+    let digits: string = all[lead..stop]
+    let exp: int = ip.len() - 1 - lead + expn
+    return Fl { kind: 0, neg: neg, digits: digits, exp: exp }
+end
+
+pub fn repeat_zero(n: int) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < n is
+        s = s + "0"
+        i += 1
+    end
+    return s
+end
+
+;; Rust `{:?}`
+pub fn fl_debug(f: Fl) -> string is
+    let sign: string = if f.neg is "-" else "" end
+    if f.kind == 1 is return sign + "inf" end
+    if f.kind == 2 is return "NaN" end
+    if f.digits == "" is return sign + "0.0" end
+    let d: string = f.digits
+    if f.exp >= 16 || f.exp <= 0 - 5 is
+        let mut m: string = d[0..1]
+        if d.len() > 1 is m = m + "." + d[1..d.len()] end
+        return sign + m + "e" + to_string(f.exp)
+    end
+    if f.exp >= 0 is
+        if d.len() <= f.exp + 1 is return sign + d + repeat_zero(f.exp + 1 - d.len()) + ".0" end
+        return sign + d[0..f.exp + 1] + "." + d[f.exp + 1..d.len()]
+    end
+    return sign + "0." + repeat_zero(0 - f.exp - 1) + d
+end
+
+;; Rust `{}` (never an exponent, no ".0")
+pub fn fl_display(f: Fl) -> string is
+    let sign: string = if f.neg is "-" else "" end
+    if f.kind == 1 is return sign + "inf" end
+    if f.kind == 2 is return "NaN" end
+    if f.digits == "" is return sign + "0" end
+    let d: string = f.digits
+    if f.exp >= 0 is
+        if d.len() <= f.exp + 1 is return sign + d + repeat_zero(f.exp + 1 - d.len()) end
+        return sign + d[0..f.exp + 1] + "." + d[f.exp + 1..d.len()]
+    end
+    return sign + "0." + repeat_zero(0 - f.exp - 1) + d
+end
+
+;; the runtime's `to_string(f64)` yields the shortest round-trip digits (`%g` outside 1e-5..1e16): re-spell them
+pub fn float_to_debug(x: f64) -> string is
+    return fl_debug(fl_parse(to_string(x)))
+end
+
+
+;; canonical spelling of a float literal as the Rust AST dump shows it: `{:?}` of the parsed f64
+pub fn float_canon(raw: string) -> string is
+    let mut t: string = ""
+    let mut i: int = 0
+    while i < raw.len() is
+        if byte_at(raw, i) != 95 is t = t + str_from_byte(byte_at(raw, i)) end
+        i += 1
+    end
+    return float_to_debug(to_float(t))
+end
