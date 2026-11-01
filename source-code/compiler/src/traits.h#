@@ -1,0 +1,154 @@
+use "workspace -> parser" from "lib -> *"
+
+pub struct TraitMethod is
+    pub name: string
+    pub params: ast::Node      ;; Params
+    pub return_type: ast::Node ;; type node or None
+end
+
+pub struct TraitDef2 is
+    pub name: string
+    pub methods: [TraitMethod]
+end
+
+pub struct ImplRecord is
+    pub trait_name: string
+    pub type_name: string
+    pub method_names: [string]
+    pub methods: [ast::Node]   ;; Fn nodes, mangled `Type__Trait__method`
+end
+
+pub struct TraitRegistry is
+    pub traits: [TraitDef2]
+    pub impls: [ImplRecord]
+end
+
+pub fn new_registry() -> TraitRegistry is
+    return TraitRegistry { traits: [], impls: [] }
+end
+
+;; Trait(name; TypeParams, Methods[Method(name; Params, ret, default|None)], B)
+pub fn register_trait(r: TraitRegistry, def: ast::Node) is
+    let mut ms: [TraitMethod] = []
+    for m in def.kids[1].kids is
+        ms.push(TraitMethod { name: m.text, params: m.kids[0], return_type: m.kids[1] })
+    end
+    let mut at: int = -1
+    let mut i: int = 0
+    while i < r.traits.len() is
+        if r.traits[i].name == def.text is at = i end
+        i += 1
+    end
+    if at >= 0 is
+        r.traits[at] = TraitDef2 { name: def.text, methods: ms }
+    else
+        r.traits.push(TraitDef2 { name: def.text, methods: ms })
+    end
+end
+
+fn mangled_fn(type_name: string, trait_name: string, m: ast::Node) -> ast::Node is
+    let old_flags: string = m.kids[5].text
+    let mut fl: [string] = []
+    if has_flag(old_flags, "pub") is fl.push("pub") end
+    if has_flag(old_flags, "unsafe") is fl.push("unsafe") end
+    let mut flags: string = ""
+    let mut i: int = 0
+    while i < fl.len() is
+        if i > 0 is flags = flags + "," end
+        flags = flags + fl[i]
+        i += 1
+    end
+    return ast::Node { tag: "Fn", text: type_name + "__" + trait_name + "__" + m.text, kids: [
+        ast::Node { tag: "Attrs", text: "", kids: [] },
+        ast::Node { tag: "TypeParams", text: "", kids: [] },
+        m.kids[2], m.kids[3], m.kids[4],
+        ast::Node { tag: "Flags", text: flags, kids: [] },
+        m.kids[6]] }
+end
+
+fn has_flag(flags: string, w: string) -> bool is
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i <= flags.len() is
+        if i == flags.len() || byte_at(flags, i) == 44 is
+            if cur == w is return true end
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(flags, i))
+        end
+        i += 1
+    end
+    return false
+end
+
+;; Impl(type_name; S trait | None, Methods[Fn]) — only trait impls are recorded
+pub fn register_impl(r: TraitRegistry, block: ast::Node) is
+    if block.kids[0].tag != "S" is return end
+    let trait_name: string = block.kids[0].text
+    let mut names: [string] = []
+    let mut fns: [ast::Node] = []
+    for m in block.kids[1].kids is
+        let f: ast::Node = mangled_fn(block.text, trait_name, m)
+        let mut at: int = -1
+        let mut i: int = 0
+        while i < names.len() is
+            if names[i] == m.text is at = i end
+            i += 1
+        end
+        if at >= 0 is
+            fns[at] = f
+        else
+            names.push(m.text)
+            fns.push(f)
+        end
+    end
+    r.impls.push(ImplRecord { trait_name: trait_name, type_name: block.text, method_names: names, methods: fns })
+end
+
+;; dispatch(type, method) -> index of the impl record holding it and the method slot, or [-1, -1]
+pub fn dispatch(r: TraitRegistry, type_name: string, method_name: string) -> [int] is
+    let mut i: int = 0
+    while i < r.impls.len() is
+        if r.impls[i].type_name == type_name is
+            let mut j: int = 0
+            while j < r.impls[i].method_names.len() is
+                if r.impls[i].method_names[j] == method_name is return [i, j] end
+                j += 1
+            end
+        end
+        i += 1
+    end
+    return [-1, -1]
+end
+
+;; the mangled Fn node for `dispatch`, or a None node
+pub fn dispatch_fn(r: TraitRegistry, type_name: string, method_name: string) -> ast::Node is
+    let d: [int] = dispatch(r, type_name, method_name)
+    if d[0] < 0 is return ast::Node { tag: "None", text: "", kids: [] } end
+    return r.impls[d[0]].methods[d[1]]
+end
+
+pub fn implements(r: TraitRegistry, type_name: string, trait_name: string) -> bool is
+    for i in r.impls is
+        if i.type_name == type_name && i.trait_name == trait_name is return true end
+    end
+    return false
+end
+
+pub fn all_methods_for(r: TraitRegistry, type_name: string) -> [ast::Node] is
+    let mut out: [ast::Node] = []
+    for i in r.impls is
+        if i.type_name == type_name is
+            for f in i.methods is out.push(f) end
+        end
+    end
+    return out
+end
+
+pub fn emit_fns(r: TraitRegistry) -> [ast::Node] is
+    let mut out: [ast::Node] = []
+    for i in r.impls is
+        for f in i.methods is out.push(f) end
+    end
+    return out
+end
