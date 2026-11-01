@@ -1,9 +1,17 @@
 [package]
--> name        => H#
--> version     => 1.1.0
--> description => Source code for H#.
--> author      => HackerOS Team
+-> name        => H# Programing Language
+-> version     => 1.0.0
+-> description => H# compiler written in H# (bootstrapping workspace)
 -> license     => MPL-2.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
 
 [workspace]
--> members => [source-code/parser, source-code/typecheck, source-code/hlib, source-code/interpreter, source-code/compiler, source-code/cli, source-code/lsp, source-code/playground]
+-> members => [source-code/parser, source-code/typecheck, source-code/hlib, source-code/compiler, source-code/cli, source-code/lsp, source-code/runtime]
+
+[dependencies]
+-> lsp    => newest
+-> colors => newest
+-> nidus  => newest
