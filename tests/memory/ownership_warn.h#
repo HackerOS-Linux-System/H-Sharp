@@ -1,0 +1,88 @@
+struct Box is
+    pub items: [int]
+end
+
+fn consume(v: [int]) -> int is return v.len() end
+fn peek(v: &[int]) -> int is return v.len() end
+fn grow(v: &mut [int]) is v.push(1) end
+fn pair(a: &mut [int], b: &[int]) is a.push(b.len()) end
+
+fn m001() -> int is
+    let a: [int] = [1, 2, 3]
+    let b: [int] = a
+    return a.len() + b.len()          ;; EXPECT M001 (a)
+end
+
+@safety
+fn m001_call() -> int is
+    let a: [int] = [1, 2, 3]
+    let n: int = consume(a)
+    return n + a.len()                ;; EXPECT M001 (a moved into consume)
+end
+
+@safety
+fn borrow_ok() -> int is
+    let a: [int] = [1, 2, 3]
+    let n: int = peek(&a)
+    grow(&mut a)
+    return n + a.len()                ;; no warning: only borrowed
+end
+
+@safety
+fn m002(flag: bool) -> int is
+    let a: [int] = [1]
+    if flag is
+        let b: [int] = a
+    end
+    return a.len()                    ;; EXPECT M002
+end
+
+@safety
+fn m003() -> int is
+    let a: [int] = [1]
+    let mut i: int = 0
+    while i < 3 is
+        let b: [int] = a              ;; EXPECT M003
+        i += 1
+    end
+    return i
+end
+
+@safety
+fn m004() -> int is
+    let x: int = 1
+    x = 2                             ;; EXPECT M004
+    return x
+end
+
+fn m005() -> int is
+    let buf = arc_alloc(8)
+    arc_release(buf)
+    return ptr_read_i64(buf, 0)       ;; EXPECT M005
+end
+
+fn m006() is
+    let buf = arc_alloc(8)
+    arc_release(buf)
+    arc_release(buf)                  ;; EXPECT M006
+end
+
+@safety
+fn m007() is
+    let buf = arc_alloc(8)
+    ptr_write_i64(buf, 0, 1)          ;; EXPECT M007 (never released)
+end
+
+fn m008() -> &[int] is
+    let a: [int] = [1]
+    return &a                         ;; EXPECT M008
+end
+
+fn m009() is
+    let a: [int] = [1]
+    pair(&mut a, &a)                  ;; EXPECT M009
+end
+
+fn main() is
+    println(to_string(m001()))
+end
