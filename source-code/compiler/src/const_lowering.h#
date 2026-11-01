@@ -1,0 +1,112 @@
+use "std -> map" from "map"
+
+use "workspace -> parser" from "lib -> *"
+
+fn thunk_name(name: string) -> string is
+    return "__hsh_const_" + name
+end
+
+fn mk(tag: string, text: string, kids: [ast::Node]) -> ast::Node is
+    return ast::Node { tag: tag, text: text, kids: kids }
+end
+
+
+;; rebuild `n` with new kids, keeping its span (the Rust passes mutate in place and so keep spans)
+fn rebuild(n: ast::Node, kids: [ast::Node]) -> ast::Node is
+    return ast::Node { tag: n.tag, text: n.text, kids: kids, sp: n.sp, sl: n.sl, sc: n.sc, so: n.so, el: n.el, ec: n.ec, eo: n.eo, ip: n.ip, fl: n.fl }
+end
+
+fn leaf(tag: string, text: string) -> ast::Node is
+    let k: [ast::Node] = []
+    return mk(tag, text, k)
+end
+
+;; ConstDef(name; B pub, type|None, value)  ->  Fn(thunk; Attrs, TypeParams, Params, ret, Block[Return[value]], Flags, Mem)
+fn make_thunk(c: ast::Node) -> ast::Node is
+    let is_pub: ast::Node = c.kids[0]
+    let ret_ty: ast::Node = c.kids[1]
+    let value: ast::Node = c.kids[2]
+    let mut flags: string = ""
+    if is_pub.text == "true" is flags = "pub" end
+    let ret_stmt: ast::Node = mk("Return", "", [value])
+    return mk("Fn", thunk_name(c.text), [
+        leaf("Attrs", ""), leaf("TypeParams", ""), leaf("Params", ""),
+        ret_ty, mk("Block", "", [ret_stmt]), leaf("Flags", flags), leaf("Mem", "Default")])
+end
+
+fn rewrite_expr(n: ast::Node, names: map::Set<string>) -> ast::Node is
+    if n.tag == "Ident" && names.has(n.text) is
+        let c: ast::Node = rebuild(n, [leaf("Ident", thunk_name(n.text)), leaf("Args", "")])
+        c.tag = "Call"
+        c.text = ""
+        return c
+    end
+    ;; string interpolation parts are not rewritten (Literal(..) => {} in Rust)
+    if n.tag == "Interp" is return n end
+    ;; patterns / types never contain `Ident` expression nodes, so a plain descent is exact
+    let mut kids: [ast::Node] = []
+    for k in n.kids is
+        kids.push(rewrite_expr(k, names))
+    end
+    return rebuild(n, kids)
+end
+
+;; Rust only descends into Fn / Impl / ModDecl{inline}; Stmt::Item(it) goes through rewrite_item too
+fn rewrite_item(n: ast::Node, names: map::Set<string>) -> ast::Node is
+    if n.tag == "Fn" is
+        return rewrite_fn(n, names)
+    end
+    if n.tag == "Impl" is
+        let methods: ast::Node = n.kids[1]
+        let mut ms: [ast::Node] = []
+        for m in methods.kids is ms.push(rewrite_fn(m, names)) end
+        return rebuild(n, [n.kids[0], rebuild(n.kids[1], ms)])
+    end
+    if n.tag == "ModDecl" && n.kids[1].tag == "Inline" is
+        let mut items: [ast::Node] = []
+        for it in n.kids[1].kids is items.push(rewrite_item(it, names)) end
+        return rebuild(n, [n.kids[0], rebuild(n.kids[1], items)])
+    end
+    return n
+end
+
+;; Fn kids: Attrs, TypeParams, Params, ret, Block, Flags, Mem — only the body (kid 4) has expressions
+fn rewrite_fn(f: ast::Node, names: map::Set<string>) -> ast::Node is
+    let body: ast::Node = f.kids[4]
+    let mut stmts: [ast::Node] = []
+    for s in body.kids is stmts.push(rewrite_stmt(s, names)) end
+    return rebuild(f, [f.kids[0], f.kids[1], f.kids[2], f.kids[3], rebuild(f.kids[4], stmts), f.kids[5], f.kids[6]])
+end
+
+fn is_item_tag(t: string) -> bool is
+    return t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "Impl" || t == "TypeAlias" || t == "ConstDef" || t == "Extern" || t == "ModDecl"
+end
+
+fn rewrite_stmt(s: ast::Node, names: map::Set<string>) -> ast::Node is
+    if is_item_tag(s.tag) is return rewrite_item(s, names) end
+    if s.tag == "Import" || s.tag == "Continue" is return s end
+    return rewrite_expr(s, names)
+end
+
+;; Module(Edition, FileMem, Imports, Items) -> Module with consts lowered
+pub fn lower_consts(m: ast::Node) -> ast::Node is
+    let items: ast::Node = m.kids[3]
+    let mut names: map::Set<string> = map::Set::new()
+    let mut new_items: [ast::Node] = []
+    let mut has_const: bool = false
+    for it in items.kids is
+        if it.tag == "ConstDef" is
+            names.add(it.text)
+            has_const = true
+            new_items.push(make_thunk(it))
+        else
+            new_items.push(it)
+        end
+    end
+    if !has_const is
+        return mk("Module", m.text, [m.kids[0], m.kids[1], m.kids[2], mk("Items", "", new_items)])
+    end
+    let mut lowered: [ast::Node] = []
+    for it in new_items is lowered.push(rewrite_item(it, names)) end
+    return mk("Module", m.text, [m.kids[0], m.kids[1], m.kids[2], mk("Items", "", lowered)])
+end
