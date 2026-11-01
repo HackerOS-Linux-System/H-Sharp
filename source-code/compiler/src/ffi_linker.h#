@@ -1,0 +1,312 @@
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "std -> strings" from "str"
+
+use "workspace -> parser" from "lib -> *"
+
+pub struct LinkFlags is
+    pub static_libs: [string]
+    pub dynamic_libs: [string]
+    pub rust_whole_archive_libs: [string]
+    pub pkg_config_args: [string]
+    pub rpath_hints: [string]
+    pub python_notes: [string]
+    pub diagnostics: [string]
+end
+
+pub fn new_flags() -> LinkFlags is
+    return LinkFlags { static_libs: [], dynamic_libs: [], rust_whole_archive_libs: [], pkg_config_args: [],
+                       rpath_hints: [], python_notes: [], diagnostics: [] }
+end
+
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+fn trim_start_matches(s: string, p: string) -> string is
+    let mut r: string = s
+    while p.len() > 0 && starts_with(r, p) is r = r[p.len()..r.len()] end
+    return r
+end
+
+fn trim_end_matches(s: string, p: string) -> string is
+    let mut r: string = s
+    while p.len() > 0 && ends_with(r, p) is r = r[0..r.len() - p.len()] end
+    return r
+end
+
+;; "libssl.so" / "libssl" / "ssl.a" / "ssl" -> "ssl"
+pub fn sanitize(lib: string) -> string is
+    let mut r: string = trim_start_matches(lib, "lib")
+    r = trim_end_matches(r, ".a")
+    r = trim_end_matches(r, ".so")
+    r = trim_end_matches(r, ".dylib")
+    r = trim_end_matches(r, ".dll")
+    return r
+end
+
+fn dedup_vec(v: [string]) -> [string] is
+    let mut out: [string] = []
+    for s in v is
+        let mut seen: bool = false
+        for t in out is
+            if t == s is seen = true end
+        end
+        if !seen is out.push(s) end
+    end
+    return out
+end
+
+pub fn dedup(f: LinkFlags) is
+    f.static_libs = dedup_vec(f.static_libs)
+    f.dynamic_libs = dedup_vec(f.dynamic_libs)
+    f.rust_whole_archive_libs = dedup_vec(f.rust_whole_archive_libs)
+    f.pkg_config_args = dedup_vec(f.pkg_config_args)
+    f.rpath_hints = dedup_vec(f.rpath_hints)
+end
+
+;; `pkg-config [--static] --libs name` -> flags, [] when unavailable / empty
+fn try_pkg_config(name: string, is_static: bool) -> [string] is
+    let mut cmd: string = "pkg-config "
+    if is_static is cmd = cmd + "--static " end
+    cmd = cmd + "--libs " + shell_escape(name) + " 2>/dev/null"
+    let code: int = run_cmd_exec(cmd, 30)
+    if code != 0 is return [] end
+    return str::split_whitespace(run_cmd_last_stdout())
+end
+
+fn push_all(dst: [string], src: [string]) -> [string] is
+    let mut out: [string] = []
+    for x in dst is out.push(x) end
+    for x in src is out.push(x) end
+    return out
+end
+
+fn with(dst: [string], x: string) -> [string] is
+    let mut out: [string] = []
+    for y in dst is out.push(y) end
+    out.push(x)
+    return out
+end
+
+fn process_c_like(link: string, lib: string, has_lib: bool, flags: LinkFlags, need_stdcpp: bool) is
+    if has_lib is
+        let name: string = sanitize(lib)
+        let pc: [string] = try_pkg_config(name, link == "Static")
+        if pc.len() > 0 is
+            flags.pkg_config_args = push_all(flags.pkg_config_args, pc)
+        elsif link == "Static" is
+            flags.static_libs = with(flags.static_libs, name)
+        else
+            flags.dynamic_libs = with(flags.dynamic_libs, name)
+        end
+    end
+    if need_stdcpp is flags.dynamic_libs = with(flags.dynamic_libs, "stdc++") end
+end
+
+;; Extern(Lang, Link, S lib | None, Fns)
+fn process_extern_block(ext: ast::Node, flags: LinkFlags) is
+    let lang: string = ext.kids[0].text
+    let link: string = ext.kids[1].text
+    let has_lib: bool = ext.kids[2].tag == "S"
+    let lib: string = ext.kids[2].text
+    if lang == "Python" is
+        if has_lib is
+            flags.python_notes = with(flags.python_notes, "python[" + lib + "] — bridge, no link flag")
+        else
+            flags.python_notes = with(flags.python_notes, "python — bridge, no link flag")
+        end
+    elsif lang == "Rust" is
+        if has_lib && link == "Static" is
+            flags.rust_whole_archive_libs = with(flags.rust_whole_archive_libs, sanitize(lib))
+        elsif has_lib is
+            flags.dynamic_libs = with(flags.dynamic_libs, sanitize(lib))
+            flags.rpath_hints = with(flags.rpath_hints, "-Wl,-rpath,$ORIGIN")
+        elsif link == "Static" is
+            flags.diagnostics = with(flags.diagnostics, "extern static [rust]: no library name given — declared fn(s) must already be provided by another linked object (no -l flag emitted)")
+        else
+            flags.diagnostics = with(flags.diagnostics, "extern dynamic [rust]: no library name given — symbol must be in an already-linked cdylib")
+        end
+    elsif lang == "C" is
+        process_c_like(link, lib, has_lib, flags, false)
+    elsif lang == "Cpp" is
+        process_c_like(link, lib, has_lib, flags, true)
+        flags.dynamic_libs = with(flags.dynamic_libs, "stdc++")
+    end
+end
+
+pub fn collect_link_flags(m: ast::Node) -> LinkFlags is
+    let flags: LinkFlags = new_flags()
+    for it in m.kids[3].kids is
+        if it.tag == "Extern" is process_extern_block(it, flags) end
+    end
+    dedup(flags)
+    return flags
+end
+
+pub fn to_cc_args_ex(f: LinkFlags, fully_static: bool) -> [string] is
+    let mut args: [string] = []
+    let mut pc_libs: [string] = []
+    for a in f.pkg_config_args is
+        if starts_with(a, "-l") is pc_libs.push(a) else args.push(a) end
+    end
+    if f.static_libs.len() > 0 is
+        if !fully_static is args.push("-Wl,-Bstatic") end
+        for lib in f.static_libs is args.push("-l" + lib) end
+        if !fully_static is args.push("-Wl,-Bdynamic") end
+    end
+    for a in pc_libs is args.push(a) end
+    for lib in f.dynamic_libs is args.push("-l" + lib) end
+    if f.rust_whole_archive_libs.len() > 0 is
+        args.push("-Wl,--whole-archive")
+        for lib in f.rust_whole_archive_libs is args.push("-l" + lib) end
+        args.push("-Wl,--no-whole-archive")
+    end
+    for a in f.rpath_hints is args.push(a) end
+    return args
+end
+
+pub fn to_cc_args(f: LinkFlags) -> [string] is
+    return to_cc_args_ex(f, false)
+end
+
+fn add_dir(dirs: [string], p: string) -> [string] is
+    if p == "" || !fs::is_dir(p) is return dirs end
+    for d in dirs is
+        if d == p is return dirs end
+    end
+    return with(dirs, p)
+end
+
+fn split_on(s: string, ch: int) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == ch is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+fn all_digits(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return false end
+        i += 1
+    end
+    return true
+end
+
+fn static_lib_search_dirs(lib: string) -> [string] is
+    let mut dirs: [string] = []
+    let lp: string = env::get_or("LIBRARY_PATH", "")
+    for d in split_on(lp, 58) is dirs = add_dir(dirs, d) end
+    let ld: string = env::get_or("LDFLAGS", "")
+    for t in str::split_whitespace(ld) is
+        if starts_with(t, "-L") is dirs = add_dir(dirs, t[2..t.len()]) end
+    end
+    if starts_with(lib, "LLVM-") && all_digits(lib[5..lib.len()]) is
+        let ver: string = lib[5..lib.len()]
+        for cfg in ["llvm-config-" + ver, "llvm-config" + ver, "llvm-config"] is
+            let code: int = run_cmd_exec(cfg + " --libdir 2>/dev/null", 30)
+            if code == 0 is dirs = add_dir(dirs, str::trim(run_cmd_last_stdout())) end
+        end
+        for d in ["/usr/lib/llvm-" + ver + "/lib", "/usr/lib64/llvm" + ver + "/lib", "/usr/lib/llvm" + ver + "/lib",
+                  "/usr/local/lib/llvm-" + ver, "/usr/local/opt/llvm@" + ver + "/lib", "/opt/homebrew/opt/llvm@" + ver + "/lib"] is
+            dirs = add_dir(dirs, d)
+        end
+    end
+    for d in ["/usr/lib", "/usr/lib64", "/usr/local/lib", "/lib", "/lib64", "/usr/lib/x86_64-linux-gnu",
+              "/usr/lib/aarch64-linux-gnu", "/lib/x86_64-linux-gnu", "/lib/aarch64-linux-gnu", "/opt/homebrew/lib"] is
+        dirs = add_dir(dirs, d)
+    end
+    return dirs
+end
+
+;; static libs with no lib<name>.a but a lib<name>.so are moved to dynamic_libs (+ -L and rpath); returns notes
+pub fn resolve_missing_static_libs(f: LinkFlags) -> [string] is
+    let mut notes: [string] = []
+    let mut keep: [string] = []
+    let libs: [string] = f.static_libs
+    f.static_libs = []
+    for lib in libs is
+        let dirs: [string] = static_lib_search_dirs(lib)
+        let mut has_static: bool = false
+        for d in dirs is
+            if fs::is_file(d + "/lib" + lib + ".a") is has_static = true end
+        end
+        if has_static is
+            keep.push(lib)
+        else
+            let mut found: string = ""
+            for d in dirs is
+                if found == "" && fs::exists(d + "/lib" + lib + ".so") is found = d end
+            end
+            if found != "" is
+                notes.push("extern static `" + lib + "`: no lib" + lib + ".a found, linking the shared library from " + found + " instead")
+                let mut pc: [string] = ["-L" + found]
+                for a in f.pkg_config_args is pc.push(a) end
+                f.pkg_config_args = pc
+                f.rpath_hints = with(f.rpath_hints, "-Wl,-rpath," + found)
+                f.dynamic_libs = with(f.dynamic_libs, lib)
+            else
+                keep.push(lib)
+            end
+        end
+    end
+    f.static_libs = keep
+    dedup(f)
+    return notes
+end
+
+pub fn is_empty(f: LinkFlags) -> bool is
+    return f.static_libs.len() == 0 && f.dynamic_libs.len() == 0 && f.rust_whole_archive_libs.len() == 0 && f.pkg_config_args.len() == 0
+end
+
+pub fn has_warnings(f: LinkFlags) -> bool is
+    return f.diagnostics.len() > 0
+end
+
+;; lines `print_warnings` writes to stderr (ANSI colours included)
+pub fn warning_lines(f: LinkFlags) -> [string] is
+    let mut out: [string] = []
+    for d in f.diagnostics is out.push("  \x1b[33mwarn\x1b[0m  [extern] " + d) end
+    for n in f.python_notes is out.push("  \x1b[2mnote\x1b[0m  [extern] " + n) end
+    return out
+end
+
+fn join_with(xs: [string], sep: string) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is s = s + sep end
+        s = s + xs[i]
+        i += 1
+    end
+    return s
+end
+
+pub fn describe_flags(f: LinkFlags) -> string is
+    if is_empty(f) && f.diagnostics.len() == 0 is return "" end
+    let mut parts: [string] = []
+    if f.static_libs.len() > 0 is parts.push("static: " + join_with(f.static_libs, ", ")) end
+    if f.dynamic_libs.len() > 0 is parts.push("dynamic: " + join_with(f.dynamic_libs, ", ")) end
+    if f.rust_whole_archive_libs.len() > 0 is parts.push("rust(whole-archive): " + join_with(f.rust_whole_archive_libs, ", ")) end
+    if f.pkg_config_args.len() > 0 is parts.push("pkg-config: " + to_string(f.pkg_config_args.len()) + " flag(s)") end
+    if f.python_notes.len() > 0 is parts.push("python-bridge: " + to_string(f.python_notes.len()) + " block(s)") end
+    if f.diagnostics.len() > 0 is parts.push("warnings: " + to_string(f.diagnostics.len())) end
+    return join_with(parts, " | ")
+end
