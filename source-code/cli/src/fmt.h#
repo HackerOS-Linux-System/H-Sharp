@@ -1,0 +1,190 @@
+use "std -> strbuf" from "strbuf"
+
+fn f_is_space(c: int) -> bool is
+    return c == 32 || c == 9 || c == 13 || c == 10 || c == 11 || c == 12
+end
+
+fn f_trim_end(s: string) -> string is
+    let mut b: int = s.len()
+    while b > 0 && f_is_space(byte_at(s, b - 1)) is b -= 1 end
+    return s[0..b]
+end
+
+fn f_trim_start(s: string) -> string is
+    let mut a: int = 0
+    while a < s.len() && f_is_space(byte_at(s, a)) is a += 1 end
+    return s[a..s.len()]
+end
+
+fn f_find(s: string, pat: string, from: int) -> int is
+    let n: int = s.len()
+    let m: int = pat.len()
+    let mut i: int = from
+    while i + m <= n is
+        let mut j: int = 0
+        while j < m && byte_at(s, i + j) == byte_at(pat, j) is j += 1 end
+        if j == m is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn f_starts(s: string, pre: string) -> bool is
+    if s.len() < pre.len() is return false end
+    return s[0..pre.len()] == pre
+end
+
+fn word_delta(w: string) -> int is
+    if w == "is" || w == "do" is return 1 end
+    if w == "end" is return -1 end
+    return 0
+end
+
+fn starts_with_word(t: string, w: string) -> bool is
+    return t == w || f_starts(t, w + " ") || f_starts(t, w + "(")
+end
+
+;; word characters: ASCII alphanumerics, `_`, and every byte of a non-ASCII character
+fn is_word_byte(c: int) -> bool is
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128
+end
+
+;; [leading_dedent, net_delta]
+fn scan_line(t: string) -> [int] is
+    if f_starts(t, ";;") || f_starts(t, "#") || f_starts(t, "//") is return [0, 0] end
+    let first: int = byte_at(t, 0)
+    let mut dedent: int = 0
+    if starts_with_word(t, "end") || starts_with_word(t, "else") || starts_with_word(t, "elsif") || first == 41 || first == 125 || first == 93 is
+        dedent = 1
+    end
+    let mut delta: int = 0
+    let mut word: string = ""
+    let mut in_string: bool = false
+    let n: int = t.len()
+    let mut i: int = 0
+    while i < n is
+        let c: int = byte_at(t, i)
+        i += 1
+        if in_string is
+            if c == 92 is i += 1
+            elsif c == 34 is in_string = false end
+            continue
+        end
+        if c == 34 is
+            delta += word_delta(word)
+            word = ""
+            in_string = true
+        elsif c == 59 && byte_at(t, i) == 59 is
+            delta += word_delta(word)
+            word = ""
+            break
+        elsif c == 35 is
+            delta += word_delta(word)
+            word = ""
+            break
+        elsif c == 47 && byte_at(t, i) == 47 is
+            delta += word_delta(word)
+            word = ""
+            break
+        elsif c == 40 || c == 91 || c == 123 is
+            delta += word_delta(word)
+            word = ""
+            delta += 1
+        elsif c == 41 || c == 93 || c == 125 is
+            delta += word_delta(word)
+            word = ""
+            delta -= 1
+        elsif is_word_byte(c) is
+            word += str_from_byte(c)
+        else
+            delta += word_delta(word)
+            word = ""
+        end
+    end
+    delta += word_delta(word)
+    if starts_with_word(t, "elsif") || starts_with_word(t, "else") is delta = 0 end
+    return [dedent, delta]
+end
+
+fn opens_block_comment(t: string) -> bool is
+    let n: int = t.len()
+    let mut i: int = 0
+    let mut in_string: bool = false
+    while i < n is
+        let c: int = byte_at(t, i)
+        if in_string is
+            if c == 92 is
+                i += 2
+                continue
+            end
+            if c == 34 is in_string = false end
+        elsif c == 34 is
+            in_string = true
+        elsif c == 59 && byte_at(t, i + 1) == 59 is
+            return false
+        elsif c == 47 && byte_at(t, i + 1) == 47 is
+            if byte_at(t, i + 2) == 47 is return false end
+            return f_find(t, "\\\\", i + 2) < 0
+        end
+        i += 1
+    end
+    return false
+end
+
+pub fn format_source(src: string) -> string is
+    let mut sb = strbuf::new()
+    let mut depth: int = 0
+    let mut blank_run: int = 0
+    let mut in_block: bool = false
+    let n: int = src.len()
+    let mut pos: int = 0
+    let mut produced: int = 0
+    ;; `str::lines()`: split on \n, a final empty piece after a trailing \n is not a line
+    while pos < n is
+        let mut e: int = f_find(src, "\n", pos)
+        let mut next: int = 0
+        if e < 0 is
+            e = n
+            next = n
+        else
+            next = e + 1
+        end
+        let mut raw: string = src[pos..e]
+        pos = next
+        let line: string = f_trim_end(raw)
+        let t: string = f_trim_start(line)
+        if in_block is
+            sb.push(line)
+            sb.push("\n")
+            if f_find(line, "\\\\", 0) >= 0 is in_block = false end
+            blank_run = 0
+            continue
+        end
+        if t.len() == 0 is
+            blank_run += 1
+            if blank_run <= 1 is sb.push("\n") end
+            continue
+        end
+        blank_run = 0
+        let sc: [int] = scan_line(t)
+        let opens: bool = opens_block_comment(t)
+        let mut d: int = depth - sc[0]
+        if d < 0 is d = 0 end
+        let mut k: int = 0
+        while k < d is
+            sb.push("    ")
+            k += 1
+        end
+        sb.push(t)
+        sb.push("\n")
+        depth = depth + sc[1]
+        if depth < 0 is depth = 0 end
+        if opens is in_block = true end
+    end
+    let mut out: string = sb.build()
+    while out.len() >= 2 && byte_at(out, out.len() - 1) == 10 && byte_at(out, out.len() - 2) == 10 is
+        out = out[0..out.len() - 1]
+    end
+    if out.len() == 0 || byte_at(out, out.len() - 1) != 10 is out += "\n" end
+    return out
+end
