@@ -1,0 +1,208 @@
+fn is_ws4(c: int) -> bool is
+    return c == 32 || c == 9 || c == 10 || c == 13
+end
+
+fn is_ws6(c: int) -> bool is
+    return is_ws4(c) || c == 11 || c == 12
+end
+
+;; core.c hsh_trim
+pub fn trim(s: string) -> string is
+    let mut a: int = 0
+    let mut b: int = s.len()
+    while a < b && is_ws4(byte_at(s, a)) is a += 1 end
+    while b > a && is_ws4(byte_at(s, b - 1)) is b -= 1 end
+    return s[a..b]
+end
+
+;; core.c hsh_trim_start
+pub fn trim_start(s: string) -> string is
+    let mut a: int = 0
+    while a < s.len() && is_ws6(byte_at(s, a)) is a += 1 end
+    return s[a..s.len()]
+end
+
+;; core.c hsh_trim_end
+pub fn trim_end(s: string) -> string is
+    let mut b: int = s.len()
+    while b > 0 && is_ws6(byte_at(s, b - 1)) is b -= 1 end
+    return s[0..b]
+end
+
+;; core.c hsh_str_index_of: byte offset of the first occurrence, -1 when absent, 0 for an empty `sub` (strstr)
+pub fn index_of(s: string, sub: string) -> int is
+    let n: int = s.len()
+    let m: int = sub.len()
+    if m == 0 is return 0 end
+    let mut i: int = 0
+    while i + m <= n is
+        let mut j: int = 0
+        while j < m && byte_at(s, i + j) == byte_at(sub, j) is j += 1 end
+        if j == m is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; core.c hsh_str_contains
+pub fn contains(s: string, sub: string) -> bool is
+    return index_of(s, sub) >= 0
+end
+
+;; core.c hsh_to_upper / hsh_to_lower
+pub fn to_upper(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c >= 97 && c <= 122 is out += str_from_byte(c - 32) else out += s[i..i + 1] end
+        i += 1
+    end
+    return out
+end
+
+pub fn to_lower(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c >= 65 && c <= 90 is out += str_from_byte(c + 32) else out += s[i..i + 1] end
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_hex_encode: lowercase hex of every byte
+pub fn hex_encode(s: string) -> string is
+    let digits: string = "0123456789abcdef"
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        out += digits[c / 16..c / 16 + 1]
+        out += digits[c % 16..c % 16 + 1]
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_starts_with / hsh_ends_with
+pub fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+pub fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+;; core.c hsh_str_replace: every non-overlapping occurrence, left to right; an empty `from` changes nothing
+pub fn replace(s: string, from: string, to: string) -> string is
+    if from.len() == 0 is return s end
+    let mut out: string = ""
+    let mut at: int = 0
+    while true is
+        let rest: string = s[at..s.len()]
+        let k: int = index_of(rest, from)
+        if k < 0 is
+            out += rest
+            return out
+        end
+        out += rest[0..k] + to
+        at += k + from.len()
+    end
+    return out
+end
+
+;; core.c hsh_string_repeat: "" for n <= 0
+pub fn repeat(s: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out += s
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_string_pad_right: pads with spaces up to `width` BYTES; longer strings are returned unchanged
+pub fn pad_right(s: string, width: int) -> string is
+    if s.len() >= width is return s end
+    return s + repeat(" ", width - s.len())
+end
+
+;; core.c hsh_string_find (strstr: "" matches at 0) / hsh_string_rfind (last occurrence; "" -> len)
+pub fn find(s: string, sub: string) -> int is
+    return index_of(s, sub)
+end
+
+pub fn rfind(s: string, sub: string) -> int is
+    let n: int = s.len()
+    let m: int = sub.len()
+    if m > n is return -1 end
+    let mut i: int = n - m
+    while i >= 0 is
+        if s[i..i + m] == sub is return i end
+        i -= 1
+    end
+    return -1
+end
+
+;; core.c hsh_string_at: the single BYTE at idx, "" when out of range (a UTF-8 lead byte alone is not valid text)
+pub fn at(s: string, idx: int) -> string is
+    if idx < 0 || idx >= s.len() is return "" end
+    return s[idx..idx + 1]
+end
+
+;; core.c hsh_string_slice: byte range [start, end), clamped; "" when empty
+pub fn slice(s: string, start0: int, stop0: int) -> string is
+    let mut start: int = start0
+    let mut stop: int = stop0
+    if start < 0 is start = 0 end
+    if stop > s.len() is stop = s.len() end
+    if start >= stop is return "" end
+    return s[start..stop]
+end
+
+;; core.c hsh_string_trim_right (isspace: also \v \f)
+pub fn trim_right(s: string) -> string is
+    return trim_end(s)
+end
+
+;; core.c hsh_str_split_count / hsh_str_split_part: split on a separator; "" separates every byte
+pub fn split_count(s: string, sep: string) -> int is
+    if sep.len() == 0 is
+        if s.len() == 0 is return 1 end
+        return s.len()
+    end
+    let mut count: int = 1
+    let mut at_: int = 0
+    while true is
+        let k: int = index_of(s[at_..s.len()], sep)
+        if k < 0 is return count end
+        count += 1
+        at_ += k + sep.len()
+    end
+    return count
+end
+
+pub fn split_part(s: string, sep: string, index: int) -> string is
+    if index < 0 is return "" end
+    if sep.len() == 0 is
+        if index >= s.len() is return "" end
+        return s[index..index + 1]
+    end
+    let mut at_: int = 0
+    let mut cur: int = 0
+    while true is
+        let rest: string = s[at_..s.len()]
+        let k: int = index_of(rest, sep)
+        if cur == index is
+            if k < 0 is return rest end
+            return rest[0..k]
+        end
+        if k < 0 is return "" end
+        at_ += k + sep.len()
+        cur += 1
+    end
+    return ""
+end
