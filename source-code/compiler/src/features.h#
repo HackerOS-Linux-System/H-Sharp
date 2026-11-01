@@ -1,0 +1,211 @@
+use "std -> map" from "map"
+
+use "workspace -> parser" from "lib -> *"
+mod builtins
+
+pub struct Diagnostic is
+    pub severity: string
+    pub message: string
+    pub hints: [string]
+    pub line: int
+    pub col: int
+    pub sp: [int]
+end
+
+;; LangFeature names: Await AsyncFn UnsafeArena UnsafeManual Closures StructByValueFfi UnresolvedGeneric
+pub fn feature_supported_on(f: string, backend: string) -> bool is
+    if f == "Await" || f == "AsyncFn" is return true end
+    if f == "UnsafeArena" || f == "UnsafeManual" is return backend == "Cpp" end
+    if f == "Closures" is return backend == "Cpp" end
+    if f == "StructByValueFfi" is return false end
+    return true
+end
+
+pub fn feature_message(f: string, backend: string) -> string is
+    let bn: string = builtins::backend_name(backend)
+    if f == "Await" is return "`await` is not supported by the " + bn + " backend" end
+    if f == "AsyncFn" is return "`async fn` is not supported by the " + bn + " backend" end
+    if f == "UnsafeArena" is return "`unsafe arena(...)` is not supported by the " + bn + " backend" end
+    if f == "UnsafeManual" is return "`unsafe manual(...)` is not supported by the " + bn + " backend" end
+    if f == "Closures" is return "closures are not implemented by the " + bn + " backend yet (works fine with `hsharp preview` / the interpreter)" end
+    if f == "StructByValueFfi" is return "passing a struct by value across an `extern` FFI boundary is not implemented yet (on any backend)" end
+    return "generic function/type left unresolved after monomorphization"
+end
+
+pub fn feature_hint(f: string) -> string is
+    if f == "Await" || f == "AsyncFn" is return "restructure without `await`/`async`" end
+    if f == "UnsafeArena" is return "arena allocation is not available on this backend" end
+    if f == "UnsafeManual" is return "manual memory management requires a compiled backend; this code path is interpreter-only here" end
+    if f == "Closures" is return "closures need a compiled backend that can build a heap-allocated capture environment and a real function-pointer/env-pointer closure value — not implemented in this LLVM backend yet; run without --release (uses the interpreter) instead, or rewrite as a named top-level `fn` taking any 'captured' state as explicit parameters" end
+    if f == "StructByValueFfi" is return "pass a pointer instead: change the parameter/return type to `&MyStruct` (or `&mut MyStruct` if the C side writes to it) — every H# struct field is already a plain int64 slot in declaration order (see `hsharp ffi-header`'s generated `typedef struct {{ int64_t ...; }}`), so the C/Rust side can read/write it correctly through a pointer today" end
+    return "ensure every call site provides enough type information to infer the type parameter (e.g. via the let binding's declared type)"
+end
+
+fn node_sp(n: ast::Node) -> [int] is
+    return [n.sl, n.sc, n.so, n.el, n.ec, n.eo]
+end
+
+fn push_feature(out: [Diagnostic], f: string, backend: string, n: ast::Node) is
+    out.push(Diagnostic { severity: "error", message: feature_message(f, backend), hints: [feature_hint(f)], line: n.sl, col: n.sc, sp: node_sp(n) })
+end
+
+fn has_flag(flags: string, w: string) -> bool is
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i <= flags.len() is
+        if i == flags.len() || byte_at(flags, i) == 44 is
+            if cur == w is return true end
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(flags, i))
+        end
+        i += 1
+    end
+    return false
+end
+
+fn is_item_tag(t: string) -> bool is
+    return t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "Impl" || t == "TypeAlias" || t == "ConstDef" || t == "Extern" || t == "ModDecl"
+end
+
+fn check_fn(f: ast::Node, backend: string, structs: map::Set<string>, out: [Diagnostic]) is
+    if has_flag(f.kids[5].text, "async") && !feature_supported_on("AsyncFn", backend) is
+        push_feature(out, "AsyncFn", backend, f)
+    end
+    check_block(f.kids[4].kids, backend, structs, out)
+end
+
+fn check_item(it: ast::Node, backend: string, structs: map::Set<string>, out: [Diagnostic]) is
+    if it.tag == "Fn" is
+        check_fn(it, backend, structs, out)
+    elsif it.tag == "Impl" is
+        for m in it.kids[1].kids is check_fn(m, backend, structs, out) end
+    elsif it.tag == "ModDecl" is
+        if it.kids[1].tag == "Inline" is
+            for x in it.kids[1].kids is check_item(x, backend, structs, out) end
+        end
+    elsif it.tag == "Extern" is
+        check_extern_block(it, backend, structs, out)
+    end
+end
+
+;; Extern(Lang, Link, lib, Fns[ExternFn(Params, ret, B)])
+fn check_extern_block(ext: ast::Node, backend: string, structs: map::Set<string>, out: [Diagnostic]) is
+    let lang: string = ext.kids[0].text
+    if !(lang == "C" || lang == "Rust" || lang == "Cpp") is return end
+    for f in ext.kids[3].kids is
+        for p in f.kids[0].kids is
+            let ty: ast::Node = p.kids[1]
+            if ty.tag == "Named" && structs.has(ty.text) is push_feature(out, "StructByValueFfi", backend, f) end
+        end
+        let r: ast::Node = f.kids[1]
+        if r.tag == "Named" && structs.has(r.text) is push_feature(out, "StructByValueFfi", backend, f) end
+    end
+end
+
+fn check_block(stmts: [ast::Node], backend: string, structs: map::Set<string>, out: [Diagnostic]) is
+    for s in stmts is check_stmt(s, backend, structs, out) end
+end
+
+fn check_stmt(s: ast::Node, backend: string, structs: map::Set<string>, out: [Diagnostic]) is
+    if is_item_tag(s.tag) is
+        check_item(s, backend, structs, out)
+    elsif s.tag == "Let" is
+        if s.kids[2].tag != "None" is check_expr(s.kids[2], backend, structs, out) end
+    elsif s.tag == "Return" || s.tag == "Break" is
+        if s.kids[0].tag != "None" is check_expr(s.kids[0], backend, structs, out) end
+    elsif s.tag == "ExprStmt" is
+        check_expr(s.kids[0], backend, structs, out)
+    end
+end
+
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn check_expr(e: ast::Node, backend: string, structs: map::Set<string>, out: [Diagnostic]) is
+    let t: string = e.tag
+    if t == "Await" is
+        if !feature_supported_on("Await", backend) is push_feature(out, "Await", backend, e) end
+        check_expr(e.kids[0], backend, structs, out)
+    elsif t == "Unsafe" is
+        let mut feat: string = ""
+        if starts_with(e.text, "arena:") is feat = "UnsafeArena"
+        elsif starts_with(e.text, "manual:") is feat = "UnsafeManual" end
+        if feat != "" && !feature_supported_on(feat, backend) is push_feature(out, feat, backend, e) end
+        check_block(e.kids[0].kids, backend, structs, out)
+    elsif t == "Closure" is
+        if !feature_supported_on("Closures", backend) is push_feature(out, "Closures", backend, e) end
+        check_block(e.kids[2].kids, backend, structs, out)
+    elsif t == "Call" is
+        let callee: ast::Node = e.kids[0]
+        if callee.tag == "Ident" && !builtins::supported_on(callee.text, backend) is
+            let idx: int = builtins::find(callee.text)
+            let mut impl_on: [string] = []
+            if idx >= 0 is impl_on = builtins::spec_backends(idx) end
+            let mut names: [string] = []
+            for b in impl_on is names.push(builtins::backend_name(b)) end
+            let mut joined: string = ""
+            let mut i: int = 0
+            while i < names.len() is
+                if i > 0 is joined = joined + ", " end
+                joined = joined + names[i]
+                i += 1
+            end
+            let mut doc: string = ""
+            if idx >= 0 is doc = builtins::spec_doc(idx) end
+            out.push(Diagnostic { severity: "error",
+                message: "`" + callee.text + "` is not supported by the " + builtins::backend_name(backend) + " backend",
+                hints: [doc, "implemented on: " + joined], line: e.sl, col: e.sc, sp: node_sp(e) })
+        end
+        check_expr(callee, backend, structs, out)
+        for a in e.kids[1].kids is check_expr(a, backend, structs, out) end
+    elsif t == "If" is
+        check_expr(e.kids[0], backend, structs, out)
+        check_block(e.kids[1].kids, backend, structs, out)
+        for br in e.kids[2].kids is
+            check_expr(br.kids[0], backend, structs, out)
+            check_block(br.kids[1].kids, backend, structs, out)
+        end
+        if e.kids[3].tag != "None" is check_block(e.kids[3].kids, backend, structs, out) end
+    elsif t == "While" is
+        check_expr(e.kids[0], backend, structs, out)
+        check_block(e.kids[1].kids, backend, structs, out)
+    elsif t == "For" is
+        check_expr(e.kids[1], backend, structs, out)
+        check_block(e.kids[2].kids, backend, structs, out)
+    elsif t == "Do" is
+        check_block(e.kids[0].kids, backend, structs, out)
+    elsif t == "Match" is
+        check_expr(e.kids[0], backend, structs, out)
+        for arm in e.kids[1].kids is
+            if arm.kids[1].tag != "None" is check_expr(arm.kids[1], backend, structs, out) end
+            check_block(arm.kids[2].kids, backend, structs, out)
+        end
+    elsif t == "BinOp" || t == "Range" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" is
+        check_expr(e.kids[0], backend, structs, out)
+        check_expr(e.kids[1], backend, structs, out)
+    elsif t == "UnOp" || t == "Cast" || t == "Try" || t == "FieldAccess" is
+        check_expr(e.kids[0], backend, structs, out)
+    elsif t == "MethodCall" is
+        check_expr(e.kids[0], backend, structs, out)
+        for a in e.kids[1].kids is check_expr(a, backend, structs, out) end
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for x in e.kids is check_expr(x, backend, structs, out) end
+    elsif t == "StructLit" is
+        for f in e.kids is check_expr(f.kids[0], backend, structs, out) end
+    elsif t == "ReturnE" is
+        if e.kids[0].tag != "None" is check_expr(e.kids[0], backend, structs, out) end
+    end
+end
+
+;; check_module_features(module, backend)
+pub fn check_module_features(m: ast::Node, backend: string) -> [Diagnostic] is
+    let out: [Diagnostic] = []
+    let mut structs: map::Set<string> = map::Set::new()
+    for it in m.kids[3].kids is
+        if it.tag == "Struct" is structs.add(it.text) end
+    end
+    for it in m.kids[3].kids is check_item(it, backend, structs, out) end
+    return out
+end
