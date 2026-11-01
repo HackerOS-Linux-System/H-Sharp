@@ -1,0 +1,117 @@
+use "std -> map" from "map"
+use "std -> sort" from "sort"
+
+use "workspace -> parser" from "lib -> *"
+
+fn is_item_tag(t: string) -> bool is
+    return t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "Impl" || t == "TypeAlias" || t == "ConstDef" || t == "Extern" || t == "ModDecl"
+end
+
+fn last_segment(p: string) -> string is
+    let mut i: int = p.len() - 1
+    while i >= 1 is
+        if byte_at(p, i) == 58 && byte_at(p, i - 1) == 58 is return p[i + 1..p.len()] end
+        i -= 1
+    end
+    return p
+end
+
+fn contains_str(s: string, pat: string) -> bool is
+    let n: int = s.len()
+    let m: int = pat.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == pat is return true end
+        i += 1
+    end
+    return false
+end
+
+pub struct Bodies is
+    pub names: [string]
+    pub blocks: [ast::Node]
+    pub index: map::Map<string, int>
+end
+
+fn put_body(b: Bodies, name: string, block: ast::Node) is
+    let at: int = b.index.get(name).unwrap_or(-1)
+    if at >= 0 is
+        b.blocks[at] = block
+    else
+        b.index.put(name, b.names.len())
+        b.names.push(name)
+        b.blocks.push(block)
+    end
+end
+
+fn collect_fn_bodies(items: [ast::Node], out: Bodies) is
+    for it in items is
+        if it.tag == "Fn" is
+            put_body(out, it.text, it.kids[4])
+        elsif it.tag == "Impl" is
+            for m in it.kids[1].kids is put_body(out, "__impl_method__" + m.text, m.kids[4]) end
+        elsif it.tag == "ModDecl" && it.kids[1].tag == "Inline" is
+            collect_fn_bodies(it.kids[1].kids, out)
+        end
+    end
+end
+
+fn collect_calls(n: ast::Node, out: map::Set<string>) is
+    if n.tag == "Interp" is return end
+    if n.tag == "Fn" is
+        collect_calls(n.kids[4], out)
+        return
+    end
+    if n.tag == "ModDecl" is
+        if n.kids[1].tag == "Inline" is
+            for it in n.kids[1].kids is
+                if it.tag == "Fn" is collect_calls(it.kids[4], out) end
+            end
+        end
+        return
+    end
+    if is_item_tag(n.tag) is return end
+    if n.tag == "Import" is return end
+    if n.tag == "Call" is
+        let callee: ast::Node = n.kids[0]
+        if callee.tag == "Ident" is out.add(callee.text) end
+        if callee.tag == "Path" is out.add(last_segment(callee.text)) end
+    end
+    for k in n.kids is collect_calls(k, out) end
+end
+
+;; sorted list of reachable function names
+pub fn compute_reachable(m: ast::Node) -> [string] is
+    let bodies: Bodies = Bodies { names: [], blocks: [], index: map::Map::new() }
+    collect_fn_bodies(m.kids[3].kids, bodies)
+    let mut reach: map::Set<string> = map::Set::new()
+    let mut queue: [string] = []
+    for name in bodies.names is
+        if name == "main" is
+            reach.add(name)
+            queue.push(name)
+        end
+    end
+    for name in bodies.names is
+        if contains_str(name, "__impl_method__") is reach.add(name) end
+    end
+    if queue.len() == 0 && reach.len() == 0 is
+        return sort::sort_strings(bodies.names)
+    end
+    let mut head: int = 0
+    while head < queue.len() is
+        let name: string = queue[head]
+        head += 1
+        let at: int = bodies.index.get(name).unwrap_or(-1)
+        if at < 0 is continue end
+        let callees: map::Set<string> = map::Set::new()
+        for s in bodies.blocks[at].kids is collect_calls(s, callees) end
+        for c in callees.items() is
+            if !reach.has(c) is
+                reach.add(c)
+                queue.push(c)
+            end
+        end
+    end
+    return sort::sort_strings(reach.items())
+end
