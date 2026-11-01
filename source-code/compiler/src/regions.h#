@@ -1,0 +1,135 @@
+pub fn ty_needs_drop(ty: string) -> bool is
+    return ty != "scalar"
+end
+
+;; C runtime function that frees this type, "" when none
+pub fn ty_drop_fn(ty: string) -> string is
+    if ty == "string" is return "hsh_string_free" end
+    if ty == "bytes" is return "hsh_bytes_free" end
+    if ty.len() >= 6 && ty[0..6] == "array:" is return "hsh_array_free" end
+    return ""
+end
+
+pub fn ty_from_type_name(name: string) -> string is
+    if name == "string" is return "string" end
+    if name == "bytes" is return "bytes" end
+    if name == "int" || name == "uint" || name == "bool" || name == "f64" || name == "f32" is return "scalar" end
+    if name == "i8" || name == "i16" || name == "i32" || name == "i64" || name == "i128" is return "scalar" end
+    if name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "u128" is return "scalar" end
+    return "struct:" + name
+end
+
+pub struct RegionValue is
+    pub name: string
+    pub ty: string
+    pub moved: bool
+end
+
+pub struct Region is
+    pub id: int
+    pub parent: int          ;; -1 = none
+    pub kind: string
+    pub size: int
+    pub alive: bool
+    pub names: [string]
+    pub tys: [string]
+    pub moved: [bool]
+end
+
+;; result of `pop`: the kind of the popped region and the values that need a drop, in declaration order
+pub struct PopResult is
+    pub kind: string
+    pub drops: [RegionValue]
+end
+
+pub struct RegionStack is
+    pub regions: [Region]    ;; indexed by id (ids are never reused)
+    pub stack: [int]
+    pub next_id: int
+end
+
+pub fn new_stack() -> RegionStack is
+    return RegionStack { regions: [], stack: [], next_id: 0 }
+end
+
+fn push_kind(rs: RegionStack, kind: string, size: int) -> int is
+    let id: int = rs.next_id
+    rs.next_id += 1
+    let mut parent: int = -1
+    if rs.stack.len() > 0 is parent = rs.stack[rs.stack.len() - 1] end
+    rs.regions.push(Region { id: id, parent: parent, kind: kind, size: size, alive: true, names: [], tys: [], moved: [] })
+    rs.stack.push(id)
+    return id
+end
+
+pub fn push_scope(rs: RegionStack) -> int is return push_kind(rs, "scope", 0) end
+pub fn push_frame(rs: RegionStack) -> int is return push_kind(rs, "frame", 0) end
+pub fn push_arena(rs: RegionStack, sz: int) -> int is return push_kind(rs, "arena", sz) end
+pub fn push_manual(rs: RegionStack) -> int is return push_kind(rs, "manual", 0) end
+
+pub fn pop(rs: RegionStack) -> PopResult is
+    let mut drops: [RegionValue] = []
+    if rs.stack.len() == 0 is
+        return PopResult { kind: "scope", drops: drops }
+    end
+    let id: int = rs.stack[rs.stack.len() - 1]
+    let mut rest: [int] = []
+    let mut i: int = 0
+    while i < rs.stack.len() - 1 is
+        rest.push(rs.stack[i])
+        i += 1
+    end
+    rs.stack = rest
+    let r: Region = rs.regions[id]
+    if !r.alive is
+        return PopResult { kind: "scope", drops: drops }
+    end
+    r.alive = false
+    let mut j: int = 0
+    while j < r.names.len() is
+        if !r.moved[j] && ty_needs_drop(r.tys[j]) is
+            drops.push(RegionValue { name: r.names[j], ty: r.tys[j], moved: false })
+        end
+        j += 1
+    end
+    return PopResult { kind: r.kind, drops: drops }
+end
+
+;; register a `let` binding in the current region
+pub fn declare(rs: RegionStack, name: string, ty: string) is
+    if rs.stack.len() == 0 is return end
+    let r: Region = rs.regions[rs.stack[rs.stack.len() - 1]]
+    if !r.alive is return end
+    r.names.push(name)
+    r.tys.push(ty)
+    r.moved.push(false)
+end
+
+;; ownership transferred: skip the drop (innermost region that holds the name; first declaration wins)
+pub fn mark_moved(rs: RegionStack, name: string) is
+    let mut k: int = rs.stack.len() - 1
+    while k >= 0 is
+        let r: Region = rs.regions[rs.stack[k]]
+        if r.alive is
+            let mut j: int = 0
+            while j < r.names.len() is
+                if r.names[j] == name is
+                    r.moved[j] = true
+                    return
+                end
+                j += 1
+            end
+        end
+        k -= 1
+    end
+end
+
+pub fn in_unsafe(rs: RegionStack) -> bool is
+    let mut k: int = rs.stack.len() - 1
+    while k >= 0 is
+        let r: Region = rs.regions[rs.stack[k]]
+        if r.alive && (r.kind == "arena" || r.kind == "manual") is return true end
+        k -= 1
+    end
+    return false
+end
