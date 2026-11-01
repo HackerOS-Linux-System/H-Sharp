@@ -1,0 +1,26 @@
+use "std -> test" from "test"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn dump(m: ast::Node) -> string is
+    let mut sb = strbuf::new()
+    ast::dump_plain(m, 0, sb)
+    return sb.build()
+end
+
+#[test]
+fn test_const_becomes_thunk_and_uses_are_calls() is
+    let a: string = "const N: int = 5\npub const M: int = N + 1\nfn f() -> int is\n    return N + M\nend\nfn g() is\n    write(\"{{N}}\")\nend\n"
+    let b: string = "fn __hsh_const_N() -> int is\n    return 5\nend\npub fn __hsh_const_M() -> int is\n    return __hsh_const_N() + 1\nend\nfn f() -> int is\n    return __hsh_const_N() + __hsh_const_M()\nend\nfn g() is\n    write(\"{{N}}\")\nend\n"
+    let lowered: ast::Node = const_lowering::lower_consts(parser::parse_source(a))
+    let expected: ast::Node = parser::parse_source(b)
+    assert_eq(dump(lowered), dump(expected))
+end
+
+#[test]
+fn test_no_consts_is_identity() is
+    let a: string = "fn f() -> int is\n    return 1\nend\n"
+    let m: ast::Node = parser::parse_source(a)
+    assert_eq(dump(const_lowering::lower_consts(m)), dump(parser::parse_source(a)))
+end
