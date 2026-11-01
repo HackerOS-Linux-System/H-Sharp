@@ -1,0 +1,370 @@
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> hlib" from "lib -> *"
+mod cg
+
+pub fn ast_format_version() -> int is return 1 end
+
+;; ── encode ────────────────────────────────────────────────────────────────────
+fn enc_node(n: ast::Node, sb: strbuf::StringBuilder) is
+    sb.push("{\"t\":")
+    sb.push(hlib::jstr_pub(n.tag))
+    if n.text != "" is
+        sb.push(",\"x\":")
+        sb.push(hlib::jstr_pub(n.text))
+    end
+    if n.sp is
+        sb.push(",\"s\":[{n.sl},{n.sc},{n.so},{n.el},{n.ec},{n.eo}]")
+        if n.ip is sb.push(",\"i\":1") end
+        if n.fl != "" is
+            sb.push(",\"f\":")
+            sb.push(hlib::jstr_pub(n.fl))
+        end
+    end
+    if n.kids.len() > 0 is
+        sb.push(",\"k\":[")
+        let mut i: int = 0
+        while i < n.kids.len() is
+            if i > 0 is sb.push(",") end
+            enc_node(n.kids[i], sb)
+            i += 1
+        end
+        sb.push("]")
+    end
+    sb.push("}")
+end
+
+pub fn ast_encode(items: [ast::Node]) -> string is
+    let mut sb = strbuf::new()
+    let ver: string = to_string(ast_format_version())
+    sb.push("{\"format\":\"h#-ast\",\"version\":" + ver + ",\"items\":[\n")
+    let mut i: int = 0
+    while i < items.len() is
+        if i > 0 is sb.push(",\n") end
+        enc_node(items[i], sb)
+        i += 1
+    end
+    sb.push("\n]}\n")
+    return sb.build()
+end
+
+;; ── decode (a small recursive-descent reader for exactly this encoding) ──────────
+pub struct JP is
+    pub s: string
+    pub i: int
+    pub err: string
+end
+
+fn jp_ws(p: JP) is
+    while p.i < p.s.len() is
+        let c: int = byte_at(p.s, p.i)
+        if c == 32 || c == 10 || c == 13 || c == 9 is p.i += 1 else break end
+    end
+end
+
+fn jp_fail(p: JP, m: string) is
+    if p.err == "" is p.err = "{m} at byte {p.i}" end
+end
+
+fn jp_expect(p: JP, c: int) -> bool is
+    jp_ws(p)
+    if p.i < p.s.len() && byte_at(p.s, p.i) == c is
+        p.i += 1
+        return true
+    end
+    jp_fail(p, "expected `" + str_from_byte(c) + "`")
+    return false
+end
+
+fn hexv(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 87 end
+    if c >= 65 && c <= 70 is return c - 55 end
+    return 0
+end
+
+fn jp_string(p: JP) -> string is
+    if !jp_expect(p, 34) is return "" end
+    let mut sb = strbuf::new()
+    while p.i < p.s.len() is
+        let c: int = byte_at(p.s, p.i)
+        if c == 34 is
+            p.i += 1
+            return sb.build()
+        end
+        if c == 92 is
+            p.i += 1
+            if p.i >= p.s.len() is break end
+            let e: int = byte_at(p.s, p.i)
+            p.i += 1
+            if e == 110 is sb.push("\n")
+            elsif e == 114 is sb.push("\r")
+            elsif e == 116 is sb.push("\t")
+            elsif e == 98 is sb.push(str_from_byte(8))
+            elsif e == 102 is sb.push(str_from_byte(12))
+            elsif e == 117 is
+                if p.i + 4 <= p.s.len() is
+                    let v: int = hexv(byte_at(p.s, p.i)) * 4096 + hexv(byte_at(p.s, p.i + 1)) * 256 + hexv(byte_at(p.s, p.i + 2)) * 16 + hexv(byte_at(p.s, p.i + 3))
+                    p.i += 4
+                    sb.push(str_from_byte(v % 256))
+                end
+            else sb.push(str_from_byte(e)) end
+        else
+            sb.push(str_from_byte(c))
+            p.i += 1
+        end
+    end
+    jp_fail(p, "unterminated string")
+    return ""
+end
+
+fn jp_int(p: JP) -> int is
+    jp_ws(p)
+    let mut v: int = 0
+    let mut neg: bool = false
+    if p.i < p.s.len() && byte_at(p.s, p.i) == 45 is
+        neg = true
+        p.i += 1
+    end
+    let mut got: bool = false
+    while p.i < p.s.len() && byte_at(p.s, p.i) >= 48 && byte_at(p.s, p.i) <= 57 is
+        v = v * 10 + (byte_at(p.s, p.i) - 48)
+        p.i += 1
+        got = true
+    end
+    if !got is jp_fail(p, "expected a number") end
+    if neg is return 0 - v end
+    return v
+end
+
+fn dec_node(p: JP) -> ast::Node is
+    let n: ast::Node = ast::nn()
+    n.tag = ""
+    if !jp_expect(p, 123) is return n end
+    jp_ws(p)
+    if p.i < p.s.len() && byte_at(p.s, p.i) == 125 is
+        p.i += 1
+        return n
+    end
+    while p.err == "" && p.i < p.s.len() is
+        let key: string = jp_string(p)
+        if !jp_expect(p, 58) is return n end
+        if key == "t" is n.tag = jp_string(p)
+        elsif key == "x" is n.text = jp_string(p)
+        elsif key == "f" is n.fl = jp_string(p)
+        elsif key == "i" is
+            n.ip = jp_int(p) == 1
+        elsif key == "s" is
+            if !jp_expect(p, 91) is return n end
+            n.sp = true
+            n.sl = jp_int(p)
+            jp_expect(p, 44)
+            n.sc = jp_int(p)
+            jp_expect(p, 44)
+            n.so = jp_int(p)
+            jp_expect(p, 44)
+            n.el = jp_int(p)
+            jp_expect(p, 44)
+            n.ec = jp_int(p)
+            jp_expect(p, 44)
+            n.eo = jp_int(p)
+            jp_expect(p, 93)
+        elsif key == "k" is
+            if !jp_expect(p, 91) is return n end
+            jp_ws(p)
+            let mut ks: [ast::Node] = []
+            if p.i < p.s.len() && byte_at(p.s, p.i) == 93 is
+                p.i += 1
+            else
+                while p.err == "" is
+                    ks.push(dec_node(p))
+                    jp_ws(p)
+                    if p.i < p.s.len() && byte_at(p.s, p.i) == 44 is
+                        p.i += 1
+                    else
+                        jp_expect(p, 93)
+                        break
+                    end
+                end
+            end
+            n.kids = ks
+        else
+            jp_fail(p, "unknown key `" + key + "`")
+            return n
+        end
+        jp_ws(p)
+        if p.i < p.s.len() && byte_at(p.s, p.i) == 44 is
+            p.i += 1
+        else
+            jp_expect(p, 125)
+            break
+        end
+    end
+    return n
+end
+
+pub struct AstDecoded is
+    pub ok: bool
+    pub err: string
+    pub items: [ast::Node]
+end
+
+pub fn ast_decode(text: string) -> AstDecoded is
+    let p: JP = JP { s: text, i: 0, err: "" }
+    jp_ws(p)
+    if p.i < text.len() && byte_at(text, p.i) == 91 is
+        return AstDecoded { ok: false, items: [], err: "legacy `ast` artifact (a serde `Item` array written by the Rust toolchain) — rebuild this library with `h# lib build`" }
+    end
+    if !cg::has_prefix(text[p.i..text.len()], "{\"format\":\"h#-ast\"") is
+        return AstDecoded { ok: false, items: [], err: "unrecognised `ast` artifact (expected the h#-ast format)" }
+    end
+    let ix: int = text.len()
+    let mut at: int = -1
+    let mut j: int = 0
+    while j + 9 <= text.len() && at < 0 is
+        if text[j..j + 9] == "\"items\":[" is at = j + 9 end
+        j += 1
+    end
+    if at < 0 is return AstDecoded { ok: false, items: [], err: "ast artifact has no `items`" } end
+    p.i = at
+    let mut items: [ast::Node] = []
+    jp_ws(p)
+    if p.i < text.len() && byte_at(text, p.i) == 93 is
+        return AstDecoded { ok: true, items: items, err: "" }
+    end
+    while p.err == "" is
+        items.push(dec_node(p))
+        jp_ws(p)
+        if p.i < text.len() && byte_at(text, p.i) == 44 is
+            p.i += 1
+        else
+            break
+        end
+    end
+    if p.err != "" is return AstDecoded { ok: false, items: [], err: p.err } end
+    return AstDecoded { ok: true, items: items, err: "" }
+end
+
+;; ── export summary ────────────────────────────────────────────────────────────
+pub struct ExportSummary is
+    pub symbols: [hlib::Export]
+    pub pub_items: [ast::Node]
+end
+
+;; Rust `{:?}` of a TypeExpr (only used as the opaque name of a parameter that has no ABI lowering)
+fn type_debug(t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" is return "Named(\"" + t.text + "\")" end
+    if tag == "Void" is return "Void" end
+    if tag == "Array" || tag == "Optional" || tag == "Ref" || tag == "RefMut" is return tag + "(" + type_debug(t.kids[0]) + ")" end
+    if tag == "Tuple" || tag == "Generic" is
+        let mut xs: [string] = []
+        for k in t.kids is xs.push(type_debug(k)) end
+        if tag == "Generic" is return "Generic(\"" + t.text + "\", [" + cg::jc(xs) + "])" end
+        return "Tuple([" + cg::jc(xs) + "])"
+    end
+    if tag == "Fn" is
+        let mut xs: [string] = []
+        for k in t.kids[0].kids is xs.push(type_debug(k)) end
+        return "Fn([" + cg::jc(xs) + "], " + type_debug(t.kids[1]) + ")"
+    end
+    return tag
+end
+
+;; the ABI text of `t` ("opaque:<name>", "void"), "" = no lowering
+fn lower_type(t: ast::Node) -> string is
+    if t.tag == "Void" is return "void" end
+    if t.tag == "Named" is return "opaque:" + t.text end
+    return ""
+end
+
+fn lower_param(t: ast::Node) -> string is
+    let r: string = lower_type(t)
+    if r != "" is return r end
+    return "opaque:" + type_debug(t)
+end
+
+fn type_source(t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" is return t.text end
+    if tag == "Void" is return "void" end
+    if tag == "Array" is return "[" + type_source(t.kids[0]) + "]" end
+    if tag == "Optional" is return type_source(t.kids[0]) + "?" end
+    if tag == "Ref" is return "&" + type_source(t.kids[0]) end
+    if tag == "RefMut" is return "&mut " + type_source(t.kids[0]) end
+    if tag == "Tuple" || tag == "Generic" is
+        let mut xs: [string] = []
+        for k in t.kids is xs.push(type_source(k)) end
+        if tag == "Generic" is return t.text + "<" + cg::jc(xs) + ">" end
+        return "(" + cg::jc(xs) + ")"
+    end
+    if tag == "Fn" is
+        let mut xs: [string] = []
+        for k in t.kids[0].kids is xs.push(type_source(k)) end
+        return "fn(" + cg::jc(xs) + ") -> " + type_source(t.kids[1])
+    end
+    return tag
+end
+
+fn render_fn_signature(f: ast::Node) -> string is
+    let mut ps: [string] = []
+    for p in f.kids[2].kids is ps.push(p.text + ": " + type_source(p.kids[1])) end
+    let head: string = "fn " + f.text + "(" + cg::jc(ps) + ")"
+    if cg::is_none(f.kids[3]) is return head end
+    return head + " -> " + type_source(f.kids[3])
+end
+
+fn is_pub_fn(f: ast::Node) -> bool is
+    return cg::has_sub("," + f.kids[5].text + ",", ",pub,")
+end
+
+fn walk_items(items: [ast::Node], out: ExportSummary) is
+    for it in items is
+        let t: string = it.tag
+        if t == "Fn" && is_pub_fn(it) is
+            let mut params: [string] = []
+            for p in it.kids[2].kids is params.push(lower_param(p.kids[1])) end
+            let mut ret: string = ""
+            if !cg::is_none(it.kids[3]) is ret = lower_type(it.kids[3]) end
+            out.symbols.push(hlib::Export { name: it.text, kind: "function", signature: render_fn_signature(it), params: params,
+                returns: ret, generic: it.kids[1].kids.len() > 0, is_macro: false })
+            out.pub_items.push(it)
+        elsif t == "Struct" && it.kids[2].text == "true" is
+            out.symbols.push(hlib::Export { name: it.text, kind: "struct", signature: "struct " + it.text, params: [], returns: "",
+                generic: it.kids[0].kids.len() > 0, is_macro: false })
+            out.pub_items.push(it)
+        elsif t == "Enum" && it.kids[2].text == "true" is
+            let mut names: [string] = []
+            let mut payload: bool = false
+            for v in it.kids[1].kids is
+                names.push(v.text)
+                if v.kids[0].tag != "Unit" is payload = true end
+            end
+            out.symbols.push(hlib::Export { name: it.text, kind: "enum", signature: "enum " + it.text + " { " + cg::jc(names) + " }", params: [],
+                returns: "", generic: it.kids[0].kids.len() > 0 || payload, is_macro: false })
+            out.pub_items.push(it)
+        elsif t == "Trait" && it.kids[2].text == "true" is
+            out.symbols.push(hlib::Export { name: it.text, kind: "trait", signature: "trait " + it.text, params: [], returns: "",
+                generic: true, is_macro: false })
+            out.pub_items.push(it)
+        elsif t == "ConstDef" && it.kids[0].text == "true" is
+            let mut ret: string = ""
+            if !cg::is_none(it.kids[1]) is ret = lower_type(it.kids[1]) end
+            out.symbols.push(hlib::Export { name: it.text, kind: "const", signature: "const " + it.text, params: [], returns: ret,
+                generic: ret == "", is_macro: false })
+            out.pub_items.push(it)
+        elsif t == "TypeAlias" && it.kids[0].text == "true" is
+            out.symbols.push(hlib::Export { name: it.text, kind: "type_alias", signature: "type " + it.text, params: [], returns: "",
+                generic: false, is_macro: false })
+            out.pub_items.push(it)
+        elsif t == "ModDecl" && it.kids[0].text == "true" && it.kids[1].tag == "Inline" is
+            walk_items(it.kids[1].kids, out)
+        end
+    end
+end
+
+pub fn summarize_exports(items: [ast::Node]) -> ExportSummary is
+    let out: ExportSummary = ExportSummary { symbols: [], pub_items: [] }
+    walk_items(items, out)
+    return out
+end
