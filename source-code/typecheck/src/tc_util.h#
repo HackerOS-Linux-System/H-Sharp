@@ -1,0 +1,95 @@
+pub fn is_blank(s: string) -> bool is
+    return trim(s).len() == 0
+end
+
+;; text after the last occurrence of `sep` (the whole string when absent)
+pub fn after_last(s: string, sep: string) -> string is
+    let mut best: int = -1
+    let mut i: int = 0
+    let m: int = sep.len()
+    while i + m <= s.len() is
+        if s[i..i + m] == sep is best = i end
+        i += 1
+    end
+    if best < 0 is return s end
+    return s[best + m..s.len()]
+end
+
+;; index of `pat` in `s` at or after `from`, or -1
+pub fn find_from(s: string, pat: string, from: int) -> int is
+    let n: int = s.len()
+    let m: int = pat.len()
+    if m == 0 is return from end
+    let mut i: int = from
+    while i + m <= n is
+        if s[i..i + m] == pat is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn join(xs: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    for x in xs is
+        if i > 0 is out += sep end
+        out += x
+        i += 1
+    end
+    return out
+end
+
+;; the `lines()` of Rust: split on `\n`, drop a trailing `\r`, no empty last line
+pub fn lines_of(s: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = s.len()
+    let mut start: int = 0
+    let mut i: int = 0
+    while i < n is
+        if byte_at(s, i) == 10 is
+            let mut e: int = i
+            if e > start && byte_at(s, e - 1) == 13 is e -= 1 end
+            out.push(s[start..e])
+            start = i + 1
+        end
+        i += 1
+    end
+    if start < n is
+        let mut e: int = n
+        if e > start && byte_at(s, e - 1) == 13 is e -= 1 end
+        out.push(s[start..e])
+    end
+    return out
+end
+
+pub fn is_digit_str(s: string) -> bool is
+    if s.len() == 0 is return false end
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn repeat_str(s: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out += s
+        i += 1
+    end
+    return out
+end
+
+;; `{:>width$}` for an integer
+pub fn pad_left(s: string, width: int) -> string is
+    let mut out: string = s
+    while out.len() < width is out = " " + out end
+    return out
+end
+
+pub fn esc(c: int) -> string is
+    return str_from_byte(c)
+end
