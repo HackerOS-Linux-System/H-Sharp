@@ -1,0 +1,100 @@
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+
+mod rt_str
+mod rt_path
+mod rt_codec
+mod rt_conv
+mod rt_date
+
+fn nib(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    return c - 97 + 10
+end
+
+;; "-" is the empty string; otherwise hex of the raw bytes
+fn unhex(h: string) -> string is
+    if h == "-" || h.len() == 0 is return "" end
+    let mut bs: [int] = []
+    let mut i: int = 0
+    while i + 1 < h.len() is
+        bs.push(nib(byte_at(h, i)) * 16 + nib(byte_at(h, i + 1)))
+        i += 2
+    end
+    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+end
+
+fn bool_n(b: bool) -> string is
+    if b is return "1" end
+    return "0"
+end
+
+fn arg(parts: [string], i: int) -> string is
+    if i < parts.len() is return unhex(parts[i]) end
+    return ""
+end
+
+;; string results are returned as hex, numeric ones as "#<n>"
+fn run_op(op: string, a: string, b: string, c: string) -> string is
+    if op == "trim" is return rt_str::hex_encode(rt_str::trim(a)) end
+    if op == "trim_start" is return rt_str::hex_encode(rt_str::trim_start(a)) end
+    if op == "trim_end" is return rt_str::hex_encode(rt_str::trim_end(a)) end
+    if op == "upper" is return rt_str::hex_encode(rt_str::to_upper(a)) end
+    if op == "lower" is return rt_str::hex_encode(rt_str::to_lower(a)) end
+    if op == "hexe" is return rt_str::hex_encode(rt_str::hex_encode(a)) end
+    if op == "indexof" is return "#" + to_string(rt_str::index_of(a, b)) end
+    if op == "starts" is return "#" + bool_n(rt_str::starts_with(a, b)) end
+    if op == "ends" is return "#" + bool_n(rt_str::ends_with(a, b)) end
+    if op == "replace" is return rt_str::hex_encode(rt_str::replace(a, b, c)) end
+    if op == "repeat" is return rt_str::hex_encode(rt_str::repeat(a, to_int(b))) end
+    if op == "pad" is return rt_str::hex_encode(rt_str::pad_right(a, to_int(b))) end
+    if op == "join" is return rt_str::hex_encode(rt_path::join(a, b)) end
+    if op == "filename" is return rt_str::hex_encode(rt_path::filename(a)) end
+    if op == "stem" is return rt_str::hex_encode(rt_path::stem(a)) end
+    if op == "ext" is return rt_str::hex_encode(rt_path::extension(a)) end
+    if op == "parent" is return rt_str::hex_encode(rt_path::parent(a)) end
+    if op == "norm" is return rt_str::hex_encode(rt_path::normalize(a)) end
+    if op == "withext" is return rt_str::hex_encode(rt_path::with_extension(a, b)) end
+    if op == "isabs" is return "#" + bool_n(rt_path::is_absolute(a)) end
+    if op == "b64e" is return rt_str::hex_encode(rt_codec::base64_encode(a)) end
+    if op == "b64d" is return rt_str::hex_encode(rt_codec::base64_decode(a)) end
+    if op == "urle" is return rt_str::hex_encode(rt_codec::url_encode(a)) end
+    if op == "urld" is return rt_str::hex_encode(rt_codec::url_decode(a)) end
+    if op == "toint" is return "#" + to_string(rt_conv::to_int(a)) end
+    if op == "tointhex" is return "#" + to_string(rt_conv::to_int_from_hex(a)) end
+    if op == "charcode" is return "#" + to_string(rt_conv::char_code(a)) end
+    if op == "dyear" is return "#" + to_string(rt_date::year(to_int(a))) end
+    if op == "dmonth" is return "#" + to_string(rt_date::month(to_int(a))) end
+    if op == "dday" is return "#" + to_string(rt_date::day(to_int(a))) end
+    if op == "dweekday" is return rt_str::hex_encode(rt_date::weekday(to_int(a))) end
+    if op == "daddd" is return "#" + to_string(rt_date::add_days(to_int(a), to_int(b))) end
+    if op == "daddh" is return "#" + to_string(rt_date::add_hours(to_int(a), to_int(b))) end
+    if op == "ddiff" is return "#" + to_string(rt_date::diff_days(to_int(a), to_int(b))) end
+    if op == "dparse" is return "#" + to_string(rt_date::parse(a)) end
+    if op == "find" is return "#" + to_string(rt_str::find(a, b)) end
+    if op == "rfind" is return "#" + to_string(rt_str::rfind(a, b)) end
+    if op == "at" is return rt_str::hex_encode(rt_str::at(a, to_int(b))) end
+    if op == "slice" is return rt_str::hex_encode(rt_str::slice(a, to_int(b), to_int(c))) end
+    if op == "trimr" is return rt_str::hex_encode(rt_str::trim_right(a)) end
+    if op == "splitc" is return "#" + to_string(rt_str::split_count(a, b)) end
+    if op == "splitp" is return rt_str::hex_encode(rt_str::split_part(a, b, to_int(c))) end
+    return "?unknown-op"
+end
+
+fn main() is
+    let args: [string] = env::args()
+    let lines: [string] = fs::read_lines(args[1])
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = __builtin_str_split(lines[i], "\t")
+        if parts.len() > 0 && parts[0].len() > 0 is
+            let r: string = run_op(parts[0], arg(parts, 1), arg(parts, 2), arg(parts, 3))
+            if r.len() > 0 && byte_at(r, 0) == 35 is
+                write(parts[0] + "\t" + r[1..r.len()])
+            else
+                write(parts[0] + "\t" + r)
+            end
+        end
+        i += 1
+    end
+end
