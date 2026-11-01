@@ -1,0 +1,160 @@
+use "std -> os" from "os"
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+
+use "workspace -> parser" from "lib -> *"
+mod htype
+mod tc_util
+
+pub fn cast_allowed(from: htype::HType, to: htype::HType) -> bool is
+    if htype::eq(from, to) is return true end
+    if from.k == "any" || to.k == "any" is return true end
+    let fnb: bool = htype::is_numeric(from) || from.k == "bool"
+    let tnb: bool = htype::is_numeric(to) || to.k == "bool"
+    if fnb && tnb is return true end
+    let fr: bool = from.k == "Ref" || from.k == "RefMut"
+    let tr: bool = to.k == "Ref" || to.k == "RefMut"
+    if fr && tr is return true end
+    return false
+end
+
+;; `pat` is a pattern node; `flags` = [has_true, has_false]
+pub fn collect_bool_pattern(pat: ast::Node, flags: [bool]) is
+    let t: string = pat.tag
+    if t == "PLit" is
+        let l: ast::Node = pat.kids[0]
+        if l.tag == "Bool" is
+            if l.text == "true" is flags[0] = true else flags[1] = true end
+        end
+        return
+    end
+    if t == "POr" is
+        for p in pat.kids is collect_bool_pattern(p, flags) end
+        return
+    end
+    if t == "PWild" || t == "PIdent" is
+        flags[0] = true
+        flags[1] = true
+    end
+end
+
+pub fn collect_enum_pattern_variants(pat: ast::Node, covered: [string]) -> [string] is
+    let t: string = pat.tag
+    let mut r: [string] = []
+    for c in covered is r.push(c) end
+    if t == "PEnum" || t == "PIdent" is
+        r.push(pat.text)
+        return r
+    end
+    if t == "POr" is
+        for p in pat.kids is r = collect_enum_pattern_variants(p, r) end
+    end
+    return r
+end
+
+;; ── return-path reachability (stmts = the kids of a Block node) ──────────────
+pub fn block_always_returns(stmts: [ast::Node]) -> bool is
+    if stmts.len() == 0 is return false end
+    return stmt_always_returns(stmts[stmts.len() - 1])
+end
+
+pub fn block_yields_value(stmts: [ast::Node]) -> bool is
+    if stmts.len() == 0 is return false end
+    let last: ast::Node = stmts[stmts.len() - 1]
+    if last.tag != "ExprStmt" is return false end
+    return expr_yields_value(last.kids[0])
+end
+
+fn branch_ok(stmts: [ast::Node]) -> bool is
+    return block_always_returns(stmts) || block_yields_value(stmts)
+end
+
+fn expr_yields_value(e: ast::Node) -> bool is
+    let t: string = e.tag
+    if t == "If" is
+        if e.kids[3].tag == "None" is return false end
+        if !branch_ok(e.kids[1].kids) is return false end
+        for el in e.kids[2].kids is
+            if !branch_ok(el.kids[1].kids) is return false end
+        end
+        return branch_ok(e.kids[3].kids)
+    end
+    if t == "Match" is
+        let arms: [ast::Node] = e.kids[1].kids
+        if arms.len() == 0 is return false end
+        for a in arms is
+            if !branch_ok(a.kids[2].kids) is return false end
+        end
+        return true
+    end
+    if t == "Do" || t == "Unsafe" is return branch_ok(e.kids[0].kids) end
+    if t == "While" || t == "For" || t == "Assign" || t == "CompoundAssign" || t == "ReturnE" is return false end
+    return true
+end
+
+pub fn stmt_always_returns(s: ast::Node) -> bool is
+    let t: string = s.tag
+    if t == "Return" is return true end
+    if t != "ExprStmt" is return false end
+    let e: ast::Node = s.kids[0]
+    if e.tag == "ReturnE" is return true end
+    if e.tag == "If" is
+        if e.kids[3].tag == "None" is return false end
+        if !block_always_returns(e.kids[1].kids) is return false end
+        for el in e.kids[2].kids is
+            if !block_always_returns(el.kids[1].kids) is return false end
+        end
+        return block_always_returns(e.kids[3].kids)
+    end
+    if e.tag == "Match" is
+        let arms: [ast::Node] = e.kids[1].kids
+        if arms.len() == 0 is return false end
+        for a in arms is
+            if !block_always_returns(a.kids[2].kids) is return false end
+        end
+        return true
+    end
+    if e.tag == "Unsafe" is return block_always_returns(e.kids[0].kids) end
+    return false
+end
+
+;; stmt_span / item_span: every statement and item node carries its Rust span in `sp`
+pub fn stmt_span(s: ast::Node) -> [int] is
+    return ast::sp7(s)
+end
+
+pub fn item_span(i: ast::Node) -> [int] is
+    return ast::sp7(i)
+end
+
+;; ── std root lookup (tc_helpers::std_root_dir) ──────────────────────────────────
+pub fn exe_dir() -> string is
+    let p: string = trim(exec("readlink", "-f", "/proc/" + to_string(os::pid()) + "/exe", ""))
+    if p.len() == 0 is return "" end
+    let i: int = tc_util::find_from(p, "/", 0)
+    if i < 0 is return "" end
+    let mut last: int = i
+    let mut j: int = i
+    while j >= 0 is
+        last = j
+        j = tc_util::find_from(p, "/", j + 1)
+    end
+    return p[0..last]
+end
+
+pub fn std_root_dir() -> string is
+    let v: string = env::get("HSHARP_STD_DIR")
+    if v.len() > 0 is return v end
+    let d: string = exe_dir()
+    if d.len() > 0 is
+        for rel in ["../std", "std", "../../std"] is
+            let cand: string = d + "/" + rel
+            if fs::is_file(cand + "/strings.h#") is
+                let canon: string = trim(exec("readlink", "-f", cand, ""))
+                if canon.len() > 0 is return canon end
+                return cand
+            end
+        end
+    end
+    return "/usr/lib/HackerOS/H#/std"
+end
