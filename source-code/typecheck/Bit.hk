@@ -1,0 +1,12 @@
+[package]
+-> name        => typecheck
+-> version     => 1.0.0
+-> description => H# type checker + shared bit_resolve, written in H#
+-> license     => MPL-2.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
