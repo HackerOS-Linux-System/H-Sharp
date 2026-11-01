@@ -1,0 +1,70 @@
+fn is_space(c: int) -> bool is
+    return c == 32 || (c >= 9 && c <= 13)
+end
+
+;; strtoll base 10 -> [value, end_index, overflowed(0/1)]
+pub fn strtoll10(s: string, from: int) -> [int] is
+    let n: int = s.len()
+    let mut i: int = from
+    while i < n && is_space(byte_at(s, i)) is i += 1 end
+    let mut neg: bool = false
+    if i < n && (byte_at(s, i) == 45 || byte_at(s, i) == 43) is
+        neg = byte_at(s, i) == 45
+        i += 1
+    end
+    let digits_at: int = i
+    let mut v: int = 0
+    let mut over: bool = false
+    let max: int = 9223372036854775807
+    while i < n && byte_at(s, i) >= 48 && byte_at(s, i) <= 57 is
+        let d: int = byte_at(s, i) - 48
+        if !over is
+            ;; negative range goes one further (INT64_MIN), so accumulate as a negative number
+            if neg is
+                if v < (-max - 1 + d) / 10 is over = true else v = v * 10 - d end
+            else
+                if v > (max - d) / 10 is over = true else v = v * 10 + d end
+            end
+        end
+        i += 1
+    end
+    if i == digits_at is return [0, from, 0] end
+    if over is
+        if neg is return [-max - 1, i, 1] end
+        return [max, i, 1]
+    end
+    return [v, i, 0]
+end
+
+;; hsh_to_int / hsh_str_to_int
+pub fn to_int(s: string) -> int is
+    return strtoll10(s, 0)[0]
+end
+
+;; hsh_to_int_from_hex: value of the FIRST character only (0-9a-fA-F), 0 for anything else — not a hex-string parser
+pub fn to_int_from_hex(s: string) -> int is
+    if s.len() == 0 is return 0 end
+    let c: int = byte_at(s, 0)
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 97 + 10 end
+    if c >= 65 && c <= 70 is return c - 65 + 10 end
+    return 0
+end
+
+;; hsh_str_to_char_code: first UTF-8 scalar; a malformed / truncated lead falls back to the raw first byte
+pub fn char_code(s: string) -> int is
+    let n: int = s.len()
+    if n == 0 is return 0 end
+    let b0: int = byte_at(s, 0)
+    if b0 < 128 is return b0 end
+    if b0 / 32 == 6 && n > 1 is
+        return (b0 % 32) * 64 + byte_at(s, 1) % 64
+    end
+    if b0 / 16 == 14 && n > 2 is
+        return (b0 % 16) * 4096 + (byte_at(s, 1) % 64) * 64 + byte_at(s, 2) % 64
+    end
+    if b0 / 8 == 30 && n > 3 is
+        return (b0 % 8) * 262144 + (byte_at(s, 1) % 64) * 4096 + (byte_at(s, 2) % 64) * 64 + byte_at(s, 3) % 64
+    end
+    return b0
+end
