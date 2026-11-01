@@ -1,0 +1,550 @@
+use "std -> map" from "map"
+use "workspace -> parser" from "lib -> *"
+mod cg
+mod regions
+
+extern static [c] is
+    fn fdopen(fd: int, mode: string) -> int
+    fn fputs(s: string, f: int) -> int
+    fn fflush(f: int) -> int
+end
+
+pub fn eprint(s: string) is
+    fflush(0)
+    let f: int = fdopen(2, "w")
+    fputs(s, f)
+    fflush(f)
+end
+
+fn at(n: ast::Node) -> string is return "{n.fl}:{n.sl}:{n.sc}" end
+
+;; ── per-function audit state ─────────────────────────────────────────────────
+pub struct Audit is
+    pub msgs: [string]
+    pub full: bool                               ;; @safety or --strict-memory: show the "@safety" level checks too
+    pub moves_calls: bool                        ;; by-value args / literal members move (@safety, strict)
+    pub fn_name: string
+    pub owned_structs: map::Set<string>
+    pub fn_params: map::Map<string, string>      ;; fn name -> param kinds, one char each: o(wned) r(ef) c(opy)
+    pub tys: map::Map<string, string>            ;; local -> "owned" | "ref" | "copy"
+    pub muts: map::Map<string, string>           ;; local -> "imm" (let without mut, with initializer)
+    pub locals: map::Set<string>                 ;; names bound by `let` (not params), for M008
+    pub arcs: map::Map<string, string>           ;; arc_alloc local -> "live" | "gone"
+    pub lseed: map::Set<string>                  ;; names moved by an earlier loop iteration (M003 wording)
+end
+
+pub fn new_audit(full: bool) -> Audit is
+    return Audit { msgs: [], full: full, moves_calls: full, fn_name: "", owned_structs: map::Set::new(),
+        fn_params: map::Map::new(), tys: map::Map::new(), muts: map::Map::new(), locals: map::Set::new(),
+        arcs: map::Map::new(), lseed: map::Set::new() }
+end
+
+;; code, whether it needs the "full" level, text
+fn emit(a: Audit, code: string, full_only: bool, text: string) is
+    if full_only && !a.full is return end
+    a.msgs.push("warning[{code}]: {text}")
+end
+
+fn copy_moved(m: map::Map<string, string>) -> map::Map<string, string> is
+    let c: map::Map<string, string> = map::Map::new()
+    for k in m.key_list() is c.put(k, m.get(k).unwrap_or("")) end
+    return c
+end
+
+;; replace the contents of `dst` with those of `src`
+fn assign_moved(dst: map::Map<string, string>, src: map::Map<string, string>) is
+    for k in dst.key_list() is dst.remove(k) end
+    for k in src.key_list() is dst.put(k, src.get(k).unwrap_or("")) end
+end
+
+fn pos_of(v: string) -> string is
+    if v.len() >= 2 is return v[2..v.len()] end
+    return v
+end
+
+;; join of the states reached by several paths: a name moved on every path stays D (or R), on some paths becomes M.
+;; `all_paths` is false when some path (an `if` without `else`) falls through without a state of its own.
+fn join(outs: [map::Map<string, string>], base: map::Map<string, string>, all_paths: bool) -> map::Map<string, string> is
+    let acc: map::Map<string, string> = copy_moved(base)
+    let seen: map::Set<string> = map::Set::new()
+    for o in outs is
+        for k in o.key_list() is seen.add(k) end
+    end
+    for k in seen.items() is
+        let mut n: int = 0
+        let mut first: string = ""
+        let mut maybe: bool = false
+        for o in outs is
+            if o.has(k) is
+                n += 1
+                let v: string = o.get(k).unwrap_or("")
+                if first == "" is first = v end
+                if v.len() > 0 && v[0..1] == "M" is maybe = true end
+            end
+        end
+        if n == outs.len() && all_paths && !maybe is
+            acc.put(k, first)
+        else
+            acc.put(k, "M@" + pos_of(first))
+        end
+    end
+    return acc
+end
+
+fn field_move_key(e: ast::Node) -> string is
+    if e.tag == "FieldAccess" && e.kids[0].tag == "Ident" is return e.kids[0].text + "." + e.text end
+    return ""
+end
+
+;; ── ownership kinds ──────────────────────────────────────────────────────────
+fn kind_of_type(a: Audit, t: ast::Node) -> string is
+    if cg::is_none(t) is return "" end
+    if t.tag == "Array" is return "owned" end
+    if t.tag == "Ref" || t.tag == "RefMut" is return "ref" end
+    if t.tag == "Named" is
+        if t.text == "Self" is return "ref" end
+        if a.owned_structs.has(t.text) is return "owned" end
+        if cg::has_prefix(t.text, "map::") is return "owned" end
+        return "copy"
+    end
+    return "copy"
+end
+
+fn kind_of_expr(a: Audit, e: ast::Node) -> string is
+    if e.tag == "ArrayLit" || e.tag == "StructLit" is return "owned" end
+    if e.tag == "Ident" is return a.tys.get(e.text).unwrap_or("") end
+    if e.tag == "UnOp" && (e.text == "Ref" || e.text == "RefMut") is return "ref" end
+    return ""
+end
+
+fn is_owned_ident(a: Audit, e: ast::Node) -> bool is
+    return e.tag == "Ident" && a.tys.get(e.text).unwrap_or("") == "owned"
+end
+
+fn mark_moved(a: Audit, moved: map::Map<string, string>, name: string, where_: string) is
+    moved.put(name, "D@" + where_)
+end
+
+pub fn check_moves_basic(body: [ast::Node], fn_name: string) -> [string] is
+    let a: Audit = new_audit(true)
+    a.fn_name = fn_name
+    let moved: map::Map<string, string> = map::Map::new()
+    let _r: map::Map<string, string> = block(a, body, moved, fn_name, false)
+    return a.msgs
+end
+
+fn is_pointer_builtin(n: string) -> bool is
+    return cg::has_prefix(n, "ptr_") || (cg::has_prefix(n, "arc_") && n != "arc_alloc")
+end
+
+fn block(a: Audit, body: [ast::Node], moved_in: map::Map<string, string>, fn_name: string, silent: bool) -> map::Map<string, string> is
+    let moved: map::Map<string, string> = moved_in
+    for s in body is
+        let t: string = s.tag
+        if t == "Let" is
+            let ty: ast::Node = s.kids[1]
+            if !cg::is_none(s.kids[2]) is
+                let e: ast::Node = s.kids[2]
+                expr(a, e, moved, fn_name, silent)
+                let src_owned: bool = is_owned_ident(a, e)
+                let dst_owned: bool = ty.tag == "Array"
+                if src_owned || dst_owned is
+                    if e.tag == "Ident" is
+                        mark_moved(a, moved, e.text, at(s))
+                    else
+                        let key: string = field_move_key(e)
+                        if key != "" && dst_owned && a.full is mark_moved(a, moved, key, at(s)) end
+                    end
+                end
+                if e.tag == "Call" && e.kids[0].tag == "Ident" && e.kids[0].text == "arc_alloc" is a.arcs.put(s.text, "live") end
+            end
+            moved.remove(s.text)
+            a.lseed.remove(s.text)
+            a.locals.add(s.text)
+            let mut k: string = kind_of_type(a, ty)
+            if k == "" && !cg::is_none(s.kids[2]) is k = kind_of_expr(a, s.kids[2]) end
+            if k == "" is k = "copy" end
+            a.tys.put(s.text, k)
+            if s.kids[0].text != "true" && !cg::is_none(s.kids[2]) is a.muts.put(s.text, "imm") else a.muts.remove(s.text) end
+        elsif t == "Fn" is
+            let sub: Audit = new_audit(a.full)
+            sub.owned_structs = a.owned_structs
+            sub.fn_params = a.fn_params
+            fn_body(sub, s)
+            for m in sub.msgs is a.msgs.push(m) end
+        elsif t == "ExprStmt" is
+            expr(a, s.kids[0], moved, fn_name, silent)
+        elsif t == "Return" || t == "Break" is
+            if !cg::is_none(s.kids[0]) is
+                let r: ast::Node = s.kids[0]
+                if t == "Return" && !silent is check_return_borrow(a, r) end
+                expr(a, r, moved, fn_name, silent)
+                if r.tag == "Ident" is a.arcs.remove(r.text) end
+            end
+        end
+    end
+    return moved
+end
+
+;; M008: `return &local` / `return &local.field`
+fn check_return_borrow(a: Audit, r: ast::Node) is
+    if r.tag == "UnOp" && (r.text == "Ref" || r.text == "RefMut") is
+        let mut b: ast::Node = r.kids[0]
+        while b.tag == "FieldAccess" || b.tag == "IndexAccess" is b = b.kids[0] end
+        if b.tag == "Ident" && a.locals.has(b.text) is
+            let here: string = at(r)
+            emit(a, "M008", false, "{here}: returns a borrow of local `{b.text}` in `{a.fn_name}`, which is dropped when the function returns (Rust E0515)")
+        end
+    end
+end
+
+fn use_ident(a: Audit, e: ast::Node, moved: map::Map<string, string>, fn_name: string, key: string) is
+    let v: string = moved.get(key).unwrap_or("")
+    if v == "" is return end
+    let here: string = at(e)
+    let was: string = pos_of(v)
+    let kind: string = v[0..1]
+    if kind == "R" is
+        emit(a, "M005", false, "{here}: `{key}` used here after it was released at {was} in `{fn_name}` (use after free)")
+    elsif kind == "M" is
+        emit(a, "M002", true, "{here}: `{key}` used here but may have been moved at {was} in `{fn_name}`")
+    elsif a.lseed.has(key) is
+        emit(a, "M003", true, "{here}: `{key}` was moved at {was} in an earlier iteration of this loop, then used here in `{fn_name}`")
+    else
+        emit(a, "M001", false, "{here}: `{key}` used here after being moved (moved at {was}) in `{fn_name}`")
+    end
+end
+
+;; an argument that is a bare owned local is moved by a by-value call
+fn move_arg(a: Audit, x: ast::Node, moved: map::Map<string, string>, silent: bool) is
+    if !a.moves_calls is return end
+    if is_owned_ident(a, x) is mark_moved(a, moved, x.text, at(x)) end
+end
+
+fn expr(a: Audit, e: ast::Node, moved: map::Map<string, string>, fn_name: string, silent: bool) is
+    let t: string = e.tag
+    if t == "Ident" is
+        if silent is return end
+        use_ident(a, e, moved, fn_name, e.text)
+    elsif t == "Assign" is
+        expr(a, e.kids[1], moved, fn_name, silent)
+        let l: ast::Node = e.kids[0]
+        if l.tag == "Ident" is
+            if a.muts.get(l.text).unwrap_or("") == "imm" && !silent is
+                let here: string = at(e)
+                emit(a, "M004", true, "{here}: cannot assign twice to immutable `{l.text}` in `{fn_name}` — declare it `let mut` (Rust E0384)")
+            end
+            if a.moves_calls && is_owned_ident(a, e.kids[1]) is mark_moved(a, moved, e.kids[1].text, at(e)) end
+            moved.remove(l.text)
+        else
+            expr(a, l, moved, fn_name, silent)
+            if a.moves_calls && is_owned_ident(a, e.kids[1]) is mark_moved(a, moved, e.kids[1].text, at(e)) end
+            let lk: string = field_move_key(l)
+            if lk != "" is moved.remove(lk) end
+        end
+    elsif t == "CompoundAssign" is
+        expr(a, e.kids[0], moved, fn_name, silent)
+        expr(a, e.kids[1], moved, fn_name, silent)
+        let l: ast::Node = e.kids[0]
+        if l.tag == "Ident" && a.muts.get(l.text).unwrap_or("") == "imm" && !silent is
+            let here: string = at(e)
+            emit(a, "M004", true, "{here}: cannot assign twice to immutable `{l.text}` in `{fn_name}` — declare it `let mut` (Rust E0384)")
+        end
+    elsif t == "BinOp" || t == "IndexAccess" is
+        expr(a, e.kids[0], moved, fn_name, silent)
+        expr(a, e.kids[1], moved, fn_name, silent)
+    elsif t == "UnOp" || t == "Cast" || t == "Try" || t == "Await" is
+        expr(a, e.kids[0], moved, fn_name, silent)
+    elsif t == "FieldAccess" is
+        if !silent is
+            let key: string = field_move_key(e)
+            if key != "" && moved.has(key) is use_ident(a, e, moved, fn_name, key) end
+        end
+        expr(a, e.kids[0], moved, fn_name, silent)
+    elsif t == "Call" || t == "MethodCall" is
+        call(a, e, moved, fn_name, silent)
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for x in e.kids is
+            expr(a, x, moved, fn_name, silent)
+            move_arg(a, x, moved, silent)
+        end
+    elsif t == "StructLit" is
+        for f in e.kids is
+            expr(a, f.kids[0], moved, fn_name, silent)
+            move_arg(a, f.kids[0], moved, silent)
+        end
+    elsif t == "ReturnE" is
+        if !cg::is_none(e.kids[0]) is expr(a, e.kids[0], moved, fn_name, silent) end
+    elsif t == "If" is
+        expr(a, e.kids[0], moved, fn_name, silent)
+        let mut outs: [map::Map<string, string>] = [block(a, e.kids[1].kids, copy_moved(moved), fn_name, silent)]
+        for el in e.kids[2].kids is
+            expr(a, el.kids[0], moved, fn_name, silent)
+            outs.push(block(a, el.kids[1].kids, copy_moved(moved), fn_name, silent))
+        end
+        let has_else: bool = !cg::is_none(e.kids[3])
+        if has_else is outs.push(block(a, e.kids[3].kids, copy_moved(moved), fn_name, silent)) end
+        assign_moved(moved, join(outs, moved, has_else))
+    elsif t == "Match" is
+        expr(a, e.kids[0], moved, fn_name, silent)
+        let arms: [ast::Node] = e.kids[1].kids
+        if arms.len() > 0 is
+            let mut outs: [map::Map<string, string>] = []
+            for arm in arms is
+                if !cg::is_none(arm.kids[1]) is expr(a, arm.kids[1], moved, fn_name, silent) end
+                outs.push(block(a, arm.kids[2].kids, copy_moved(moved), fn_name, silent))
+            end
+            assign_moved(moved, join(outs, moved, true))
+        end
+    elsif t == "While" || t == "For" is
+        let mut bi: int = 1
+        if t == "For" is
+            expr(a, e.kids[1], moved, fn_name, silent)
+            bi = 2
+        else
+            expr(a, e.kids[0], moved, fn_name, silent)
+        end
+        let collected: map::Map<string, string> = block(a, e.kids[bi].kids, copy_moved(moved), fn_name, true)
+        let seed: map::Map<string, string> = copy_moved(moved)
+        for k in collected.key_list() is
+            if !moved.has(k) is
+                seed.put(k, collected.get(k).unwrap_or(""))
+                a.lseed.add(k)
+            end
+        end
+        let after: map::Map<string, string> = block(a, e.kids[bi].kids, seed, fn_name, silent)
+        for k in collected.key_list() is a.lseed.remove(k) end
+        ;; the loop may run zero times: whatever it moved is only "maybe" moved afterwards
+        for k in after.key_list() is
+            if !moved.has(k) is moved.put(k, "M@" + pos_of(after.get(k).unwrap_or(""))) end
+        end
+    elsif t == "Do" || t == "Unsafe" is
+        assign_moved(moved, block(a, e.kids[0].kids, copy_moved(moved), fn_name, silent))
+    elsif t == "Closure" is
+        let _r: map::Map<string, string> = block(a, e.kids[2].kids, copy_moved(moved), fn_name, silent)
+    end
+end
+
+fn call(a: Audit, e: ast::Node, moved: map::Map<string, string>, fn_name: string, silent: bool) is
+    let callee: ast::Node = e.kids[0]
+    let args: [ast::Node] = e.kids[1].kids
+    let mut cname: string = ""
+    if e.tag == "Call" && callee.tag == "Ident" is cname = callee.text end
+    ;; arc_release(x): releases; every later use of x is a use after free
+    if cname == "arc_release" && args.len() == 1 && args[0].tag == "Ident" is
+        let n: string = args[0].text
+        let prev: string = moved.get(n).unwrap_or("")
+        let was_released: bool = prev.len() > 0 && prev[0..1] == "R"
+        if !silent && !was_released is use_ident(a, args[0], moved, fn_name, n) end
+        if !silent && was_released is
+            let here: string = at(args[0])
+            let first: string = pos_of(moved.get(n).unwrap_or(""))
+            emit(a, "M006", false, "{here}: `{n}` released twice in `{fn_name}` (double free; first at {first})")
+        end
+        moved.put(n, "R@" + at(args[0]))
+        a.arcs.put(n, "gone")
+        return
+    end
+    if e.tag == "MethodCall" is expr(a, callee, moved, fn_name, silent) else
+        if callee.tag != "Ident" is expr(a, callee, moved, fn_name, silent) end
+    end
+    ;; M009: `&mut x` next to another borrow / use of x in the same call
+    if !silent is check_borrow_conflict(a, args, fn_name) end
+    let kinds: string = a.fn_params.get(cname).unwrap_or("")
+    let mut i: int = 0
+    while i < args.len() is
+        let x: ast::Node = args[i]
+        if x.tag == "Ident" && cname != "" && is_pointer_builtin(cname) && a.arcs.has(x.text) is
+            ;; arc_retain / ptr_* on a live block: a use, not an escape
+            if !silent is use_ident(a, x, moved, fn_name, x.text) end
+        else
+            expr(a, x, moved, fn_name, silent)
+            if x.tag == "Ident" && a.arcs.has(x.text) && a.arcs.get(x.text).unwrap_or("") == "live" && !is_pointer_builtin(cname) is
+                a.arcs.put(x.text, "gone")
+            end
+            if kinds != "" && i < kinds.len() && kinds[i..i + 1] == "o" is move_arg(a, x, moved, silent) end
+        end
+        i += 1
+    end
+end
+
+fn borrow_root(x: ast::Node) -> string is
+    let mut b: ast::Node = x
+    if b.tag == "UnOp" && (b.text == "Ref" || b.text == "RefMut") is b = b.kids[0] else return "" end
+    while b.tag == "FieldAccess" || b.tag == "IndexAccess" is b = b.kids[0] end
+    if b.tag == "Ident" is return b.text end
+    return ""
+end
+
+fn check_borrow_conflict(a: Audit, args: [ast::Node], fn_name: string) is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i].tag == "UnOp" && args[i].text == "RefMut" is
+            let r: string = borrow_root(args[i])
+            if r != "" is
+                let mut j: int = 0
+                while j < args.len() is
+                    if j != i is
+                        let o: string = borrow_root(args[j])
+                        let plain: bool = args[j].tag == "Ident" && args[j].text == r
+                        if o == r || plain is
+                            let here: string = at(args[i])
+                            emit(a, "M009", false, "{here}: `{r}` is borrowed mutably (`&mut`) and also used by another argument of the same call in `{fn_name}` (Rust E0499 / E0502)")
+                            return
+                        end
+                    end
+                    j += 1
+                end
+            end
+        end
+        i += 1
+    end
+end
+
+;; ── region drop audit (@safety) ───────────────────────────────────────────────
+fn region_ty(t: ast::Node) -> string is
+    if t.tag == "Array" is return "array:scalar" end
+    if t.tag == "Named" is return regions::ty_from_type_name(t.text) end
+    return "scalar"
+end
+
+;; Rust `{:?}` of a RegionTy
+fn ty_debug(s: string) -> string is
+    if s == "scalar" is return "Scalar" end
+    if s == "string" is return "String" end
+    if s == "bytes" is return "Bytes" end
+    if cg::has_prefix(s, "struct:") is return "Struct(\"" + s[7..s.len()] + "\")" end
+    if cg::has_prefix(s, "array:") is return "Array(" + ty_debug(s[6..s.len()]) + ")" end
+    return s
+end
+
+fn region_block(body: [ast::Node], rs: regions::RegionStack) is
+    for s in body is
+        let t: string = s.tag
+        if t == "Let" is
+            if s.kids[2].tag == "Ident" is regions::mark_moved(rs, s.kids[2].text) end
+            let mut rty: string = "scalar"
+            if !cg::is_none(s.kids[1]) is rty = region_ty(s.kids[1]) end
+            regions::declare(rs, s.text, rty)
+        end
+        if t == "ExprStmt" is
+            let e: ast::Node = s.kids[0]
+            if e.tag == "If" is
+                let a: int = regions::push_scope(rs)
+                region_block(e.kids[1].kids, rs)
+                let p1: regions::PopResult = regions::pop(rs)
+                for el in e.kids[2].kids is
+                    let b: int = regions::push_scope(rs)
+                    region_block(el.kids[1].kids, rs)
+                    let p2: regions::PopResult = regions::pop(rs)
+                end
+                if !cg::is_none(e.kids[3]) is
+                    let c: int = regions::push_scope(rs)
+                    region_block(e.kids[3].kids, rs)
+                    let p3: regions::PopResult = regions::pop(rs)
+                end
+            elsif e.tag == "While" || e.tag == "For" is
+                let mut bi: int = 1
+                if e.tag == "For" is bi = 2 end
+                let a: int = regions::push_scope(rs)
+                region_block(e.kids[bi].kids, rs)
+                let p1: regions::PopResult = regions::pop(rs)
+            elsif e.tag == "Do" || e.tag == "Unsafe" is
+                region_block(e.kids[0].kids, rs)
+            end
+        elsif t == "Return" || t == "Break" is
+            if s.kids[0].tag == "Ident" is regions::mark_moved(rs, s.kids[0].text) end
+        end
+    end
+end
+
+pub fn region_drop_audit(f: ast::Node) is
+    let rs: regions::RegionStack = regions::new_stack()
+    let a: int = regions::push_frame(rs)
+    region_block(f.kids[4].kids, rs)
+    let pr: regions::PopResult = regions::pop(rs)
+    let here: string = at(f)
+    for v in pr.drops is
+        let tyd: string = ty_debug(v.ty)
+        eprint("note: {here}: `{v.name}` ({tyd}) is still live when `{f.text}` returns — a full ownership implementation would free it here (this is exactly what `@arena`'s `hsh_arena_free` already does for its whole call, end-to-end); `@default`/`@safety` don't insert a drop yet, so today it's only reclaimed when the process exits\n")
+    end
+end
+
+fn param_kinds(a: Audit, f: ast::Node) -> string is
+    let mut k: string = ""
+    for p in f.kids[2].kids is
+        let kd: string = kind_of_type(a, p.kids[1])
+        if kd == "owned" is k += "o" elsif kd == "ref" is k += "r" else k += "c" end
+    end
+    return k
+end
+
+;; audit one function body into `a` (params first, then the statements, then the leak check)
+fn fn_body(a: Audit, f: ast::Node) is
+    a.fn_name = f.text
+    for p in f.kids[2].kids is a.tys.put(p.text, kind_of_type(a, p.kids[1])) end
+    let moved: map::Map<string, string> = map::Map::new()
+    let _r: map::Map<string, string> = block(a, f.kids[4].kids, moved, f.text, false)
+    if f.kids[6].text != "Arc" is
+        for n in a.arcs.key_list() is
+            if a.arcs.get(n).unwrap_or("") == "live" is
+                let here: string = at(f)
+                emit(a, "M007", true, "{here}: `{n}` comes from `arc_alloc` but is never released, returned or handed on in `{f.text}` (leak) — call `arc_release({n})`")
+            end
+        end
+    end
+end
+
+pub struct Ctx is
+    pub owned_structs: map::Set<string>
+    pub fn_params: map::Map<string, string>
+end
+
+pub fn audit_fn(f: ast::Node, strict: bool, c: Ctx) -> int is
+    let mode: string = f.kids[6].text
+    if mode == "Pointers" is return 0 end
+    let safety: bool = mode == "Safety"
+    let full: bool = safety || strict
+    let a: Audit = new_audit(full)
+    a.owned_structs = c.owned_structs
+    a.fn_params = c.fn_params
+    fn_body(a, f)
+    for m in a.msgs is eprint(m + "\n") end
+    if safety is region_drop_audit(f) end
+    if full is return a.msgs.len() end
+    return 0
+end
+
+fn collect_ctx(items: [ast::Node], c: Ctx) is
+    for it in items is
+        if it.tag == "Struct" is c.owned_structs.add(it.text) end
+        if it.tag == "ModDecl" && it.kids[1].tag == "Inline" is collect_ctx(it.kids[1].kids, c) end
+    end
+    let a: Audit = new_audit(false)
+    a.owned_structs = c.owned_structs
+    for it in items is
+        if it.tag == "Fn" is c.fn_params.put(it.text, param_kinds(a, it)) end
+    end
+end
+
+fn audit_item(it: ast::Node, strict: bool, c: Ctx) -> int is
+    let mut n: int = 0
+    if it.tag == "Fn" is
+        n += audit_fn(it, strict, c)
+    elsif it.tag == "Impl" is
+        for m in it.kids[1].kids is n += audit_fn(m, strict, c) end
+    elsif it.tag == "ModDecl" is
+        if it.kids[1].tag == "Inline" is
+            for x in it.kids[1].kids is n += audit_item(x, strict, c) end
+        end
+    end
+    return n
+end
+
+pub fn audit_module(module: ast::Node, strict: bool) -> int is
+    let c: Ctx = Ctx { owned_structs: map::Set::new(), fn_params: map::Map::new() }
+    collect_ctx(module.kids[3].kids, c)
+    let mut total: int = 0
+    for it in module.kids[3].kids is total += audit_item(it, strict, c) end
+    return total
+end
