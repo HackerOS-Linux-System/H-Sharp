@@ -1,0 +1,149 @@
+use "std -> fs" from "fs"
+use "std -> map" from "map"
+
+mod tc_util
+
+;; span: [start line, col, offset, end line, col, offset, 1 when the span lives in the `<interp>` snippet]
+pub struct Diag is
+    pub sev:   string        ;; "E" (Error) or "W" (Warning)
+    pub sp:    [int]
+    pub file:  string        ;; Span::file
+    pub msg:   string
+    pub hints: [string]
+end
+
+pub fn no_hints() -> [string] is
+    let h: [string] = []
+    return h
+end
+
+pub fn span_file(sp: [int], main_file: string) -> string is
+    if sp.len() > 6 && sp[6] == 1 is return "<interp>" end
+    return main_file
+end
+
+pub fn error(sp: [int], file: string, msg: string) -> Diag is
+    return Diag { sev: "E", sp: sp, file: file, msg: msg, hints: no_hints() }
+end
+
+pub fn warning(sp: [int], file: string, msg: string) -> Diag is
+    return Diag { sev: "W", sp: sp, file: file, msg: msg, hints: no_hints() }
+end
+
+pub fn with_hint(d: Diag, hint: string) -> Diag is
+    let mut hs: [string] = []
+    for h in d.hints is hs.push(h) end
+    hs.push(hint)
+    return Diag { sev: d.sev, sp: d.sp, file: d.file, msg: d.msg, hints: hs }
+end
+
+pub fn count_errors(ds: [Diag]) -> int is
+    let mut n: int = 0
+    for d in ds is
+        if d.sev == "E" is n += 1 end
+    end
+    return n
+end
+
+pub fn count_warnings(ds: [Diag]) -> int is
+    let mut n: int = 0
+    for d in ds is
+        if d.sev == "W" is n += 1 end
+    end
+    return n
+end
+
+fn max_int(a: int, b: int) -> int is
+    if a > b is return a end
+    return b
+end
+
+fn sat_sub(a: int, b: int) -> int is
+    if a < b is return 0 end
+    return a - b
+end
+
+;; Same text as `print_diagnostics` (ANSI colours included).  `source` is the text of `file`.
+pub fn print_diagnostics(diags: [Diag], source: string, file: string) is
+    let esc: string = str_from_byte(27)
+    let reset: string = esc + "[0m"
+    let bold: string = esc + "[1m"
+    let dim: string = esc + "[2m"
+    let red: string = esc + "[31m"
+    let yellow: string = esc + "[33m"
+    let cyan: string = esc + "[36m"
+    let mut other_keys: [string] = []
+    let mut other_texts: [string] = []
+    let mut other_ok: [bool] = []
+    for d in diags is
+        let diag_file: string = d.file
+        let mut lines: [string] = []
+        if diag_file == file is
+            lines = tc_util::lines_of(source)
+        else
+            let mut idx: int = -1
+            let mut i: int = 0
+            while i < other_keys.len() is
+                if other_keys[i] == diag_file is idx = i end
+                i += 1
+            end
+            if idx < 0 is
+                other_keys.push(diag_file)
+                if fs::is_file(diag_file) is
+                    other_texts.push(fs::read(diag_file))
+                    other_ok.push(true)
+                else
+                    other_texts.push("")
+                    other_ok.push(false)
+                end
+                idx = other_keys.len() - 1
+            end
+            if other_ok[idx] is lines = tc_util::lines_of(other_texts[idx]) end
+        end
+        let mut kind: string = "TYPE ERROR"
+        let mut accent: string = red
+        let mut label: string = "Error"
+        if d.sev == "W" is
+            kind = "WARNING"
+            accent = yellow
+            label = "Warning"
+        end
+        println(accent + bold + "-- " + kind + " (" + diag_file + ") -------" + reset)
+        println(cyan + "--> " + diag_file + ":" + "{d.sp[0]}" + ":" + "{d.sp[1]}" + reset)
+        println("")
+        let line_no: int = d.sp[0]
+        let col: int = d.sp[1]
+        let width: int = max_int(sat_sub(max_int(d.sp[4], col + 1), col), 1)
+        let gutter_w: int = max_int("{line_no}".len(), "{line_no + 1}".len()) + 1
+        if lines.len() == 0 is
+            println(dim + "  (source not available for context)" + reset)
+            println("")
+        else
+            if line_no >= 2 && line_no - 2 < lines.len() is
+                println(dim + "  " + tc_util::pad_left("{line_no - 1}", gutter_w) + " | " + lines[line_no - 2] + reset)
+            end
+            if line_no >= 1 && line_no - 1 < lines.len() is
+                println("  " + tc_util::pad_left("{line_no}", gutter_w) + " " + dim + "|" + reset + " " + lines[line_no - 1])
+            end
+            let pad: string = tc_util::repeat_str(" ", gutter_w + 3 + sat_sub(col, 1))
+            println(pad + accent + bold + tc_util::repeat_str("^", width) + reset)
+            if line_no < lines.len() is
+                println(dim + "  " + tc_util::pad_left("{line_no + 1}", gutter_w) + " | " + lines[line_no] + reset)
+            end
+            println("")
+        end
+        println(accent + bold + label + ":" + reset + " " + d.msg)
+        for h in d.hints is
+            println("")
+            println("  " + cyan + bold + "Hint:" + reset + " " + h)
+        end
+        println("")
+    end
+    let errs: int = count_errors(diags)
+    let warns: int = count_warnings(diags)
+    if errs > 0 is
+        println(red + bold + "error:" + reset + " " + "{errs}" + " error(s), " + "{warns}" + " warning(s)")
+    elsif warns > 0 is
+        println(yellow + bold + "warning:" + reset + " " + "{warns}" + " warning(s)")
+    end
+end
