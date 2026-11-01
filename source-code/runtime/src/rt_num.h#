@@ -1,0 +1,95 @@
+mod rt_conv
+
+extern static [c] is
+    fn sin(x: f64) -> f64
+    fn cos(x: f64) -> f64
+    fn tan(x: f64) -> f64
+    fn asin(x: f64) -> f64
+    fn acos(x: f64) -> f64
+    fn atan(x: f64) -> f64
+    fn atan2(y: f64, x: f64) -> f64
+    fn sqrt(x: f64) -> f64
+    fn pow(x: f64, y: f64) -> f64
+    fn exp(x: f64) -> f64
+    fn log(x: f64) -> f64
+    fn log2(x: f64) -> f64
+    fn log10(x: f64) -> f64
+    fn floor(x: f64) -> f64
+    fn ceil(x: f64) -> f64
+    fn round(x: f64) -> f64
+    fn trunc(x: f64) -> f64
+    fn fabs(x: f64) -> f64
+    fn llround(x: f64) -> int
+    fn strtod(s: string, endp: int) -> f64
+end
+
+;; hsh_abs_i
+pub fn abs_i(x: int) -> int is
+    if x < 0 is return -x end
+    return x
+end
+
+;; hsh_min_i / hsh_max_i
+pub fn min_i(a: int, b: int) -> int is
+    if a < b is return a end
+    return b
+end
+
+pub fn max_i(a: int, b: int) -> int is
+    if a > b is return a end
+    return b
+end
+
+;; hsh_min_f / hsh_max_f: `a < b ? a : b` — with a NaN the SECOND argument wins, exactly like the C
+pub fn min_f(a: f64, b: f64) -> f64 is
+    if a < b is return a end
+    return b
+end
+
+pub fn max_f(a: f64, b: f64) -> f64 is
+    if a > b is return a end
+    return b
+end
+
+;; libm one-liners (hsh_sin, hsh_cos, hsh_tan, hsh_sqrt, hsh_pow, hsh_floor, hsh_ceil, hsh_round, hsh_abs_f,
+;; hsh_math_asin/acos/atan/atan2/exp/log/log2/log10/round/trunc)
+pub fn fsin(x: f64) -> f64 is return sin(x) end
+pub fn fcos(x: f64) -> f64 is return cos(x) end
+pub fn ftan(x: f64) -> f64 is return tan(x) end
+pub fn fasin(x: f64) -> f64 is return asin(x) end
+pub fn facos(x: f64) -> f64 is return acos(x) end
+pub fn fatan(x: f64) -> f64 is return atan(x) end
+pub fn fatan2(y: f64, x: f64) -> f64 is return atan2(y, x) end
+pub fn fsqrt(x: f64) -> f64 is return sqrt(x) end
+pub fn fpow(x: f64, y: f64) -> f64 is return pow(x, y) end
+pub fn fexp(x: f64) -> f64 is return exp(x) end
+pub fn flog(x: f64) -> f64 is return log(x) end
+pub fn flog2(x: f64) -> f64 is return log2(x) end
+pub fn flog10(x: f64) -> f64 is return log10(x) end
+pub fn ffloor(x: f64) -> f64 is return floor(x) end
+pub fn fceil(x: f64) -> f64 is return ceil(x) end
+pub fn fround(x: f64) -> f64 is return round(x) end
+pub fn ftrunc(x: f64) -> f64 is return trunc(x) end
+pub fn fabs_f(x: f64) -> f64 is return fabs(x) end
+
+;; hsh_conv_float_to_int: C cast (int64_t)f — truncation toward zero (out of range is undefined in C, saturated here by llround)
+pub fn float_to_int(f: f64) -> int is
+    return llround(trunc(f))
+end
+
+;; hsh_to_float / hsh_atof: strtod(s, NULL)
+pub fn to_float(s: string) -> f64 is
+    return strtod(s, 0)
+end
+
+;; hsh_atoll == strtoll base 10 (saturating)
+pub fn atoll(s: string) -> int is
+    return rt_conv::to_int(s)
+end
+
+;; test helper: v * 1e6 rounded to an integer, "nan" / "big" for the cases that cannot be compared that way
+pub fn fmt6(v: f64) -> string is
+    if v != v is return "nan" end
+    if fabs(v) > 1000000000.0 is return "big" end
+    return to_string(llround(v * 1000000.0))
+end
