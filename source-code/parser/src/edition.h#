@@ -1,0 +1,305 @@
+use "std -> strbuf" from "strbuf"
+
+mod ast
+
+pub fn toolchain_version() -> string is
+    return "0.9.0"
+end
+
+pub fn latest_year() -> int is
+    return 2026
+end
+
+pub fn latest() -> string is
+    return "2026"
+end
+
+pub fn supported_list() -> string is
+    return "2026"
+end
+
+pub fn is_known_year(y: int) -> bool is
+    return y == 2026
+end
+
+;; kind: "Malformed" | "TooNew" | "Retired"
+pub struct EditionError is
+    pub kind: string
+    pub text: string
+    pub year: int
+end
+
+;; Edition::parse — `ok == true` -> year in `year`, else `err`
+pub struct EditionParse is
+    pub ok:   bool
+    pub year: int
+    pub err:  EditionError
+end
+
+fn trim_ws(s: string) -> string is
+    let mut a: int = 0
+    let mut b: int = s.len()
+    while a < b && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 10 || byte_at(s, a) == 13) is a += 1 end
+    while b > a && (byte_at(s, b - 1) == 32 || byte_at(s, b - 1) == 9 || byte_at(s, b - 1) == 10 || byte_at(s, b - 1) == 13) is b -= 1 end
+    return s[a..b]
+end
+
+pub fn parse_edition(s: string) -> EditionParse is
+    let t: string = trim_ws(s)
+    let mut digits: string = t
+    if t.len() > 0 && byte_at(t, 0) == 43 is digits = t[1..t.len()] end
+    let mut all_digits: bool = digits.len() > 0
+    let mut i: int = 0
+    while i < digits.len() is
+        let c: int = byte_at(digits, i)
+        if c < 48 || c > 57 is all_digits = false end
+        i += 1
+    end
+    if !all_digits || t.len() != 4 is
+        return EditionParse { ok: false, year: 0, err: EditionError { kind: "Malformed", text: s, year: 0 } }
+    end
+    let year: int = __builtin_conv_str_to_int(digits)
+    if is_known_year(year) is
+        return EditionParse { ok: true, year: year, err: EditionError { kind: "", text: "", year: 0 } }
+    end
+    if year > latest_year() is
+        return EditionParse { ok: false, year: 0, err: EditionError { kind: "TooNew", text: "", year: year } }
+    end
+    return EditionParse { ok: false, year: 0, err: EditionError { kind: "Retired", text: "", year: year } }
+end
+
+pub fn edition_error_message(e: EditionError) -> string is
+    let v: string = toolchain_version()
+    if e.kind == "Malformed" is
+        return "invalid edition `{e.text}` in `using` declaration (expected a four-digit year, e.g. \"2026\")"
+    end
+    if e.kind == "TooNew" is
+        return "edition \"{e.year}\" is newer than this H# toolchain (v{v}) understands"
+    end
+    return "edition \"{e.year}\" is no longer supported by this H# toolchain (v{v})"
+end
+
+pub fn edition_error_hints(e: EditionError) -> [string] is
+    let v: string = toolchain_version()
+    let mut h: [string] = []
+    if e.kind == "Malformed" is
+        h.push("write it as `using \"2026\"`")
+    elsif e.kind == "TooNew" is
+        h.push("upgrade H# (`hsharp --version` shows v{v}), or change the file to `using \"2026\"`")
+        h.push("this file was written for edition {e.year}")
+    else
+        h.push("migrate the file to `using \"2026\"`")
+    end
+    h.push("supported editions: " + supported_list())
+    return h
+end
+
+pub fn is_edition_diagnostic(message: string) -> bool is
+    return message.contains("edition \"") || message.contains("`using`") || message.contains("invalid edition") || message.contains("requires edition")
+end
+
+;; `effective_edition_with`: the declared edition if it parses, else the file default, else the global default (2026)
+pub fn effective_year(declared: string, has_declared: bool, file_default_year: int) -> int is
+    if has_declared is
+        let r: EditionParse = parse_edition(declared)
+        if r.ok is return r.year end
+    end
+    if file_default_year > 0 is return file_default_year end
+    return latest_year()
+end
+
+;; HSHARP_EDITION: Ok(0) when unset/blank, Ok(year), or the parse error
+pub fn default_year_from_env() -> EditionParse is
+    let v: string = env_get("HSHARP_EDITION")
+    if trim_ws(v).len() == 0 is
+        return EditionParse { ok: true, year: 0, err: EditionError { kind: "", text: "", year: 0 } }
+    end
+    return parse_edition(v)
+end
+
+;; Relation of an imported dependency's edition to the importer's: "Same" | "DependencyOlder" | "DependencyNewer"
+pub fn relate(importer: int, dependency: int) -> string is
+    if dependency == importer is return "Same" end
+    if dependency < importer is return "DependencyOlder" end
+    return "DependencyNewer"
+end
+
+pub struct EditionRecord is
+    pub file:     string
+    pub year:     int
+    pub declared: bool
+end
+
+pub struct EditionRecorder is
+    pub active:  bool
+    pub records: [EditionRecord]
+end
+
+pub fn new_recorder() -> EditionRecorder is
+    return EditionRecorder { active: false, records: [] }
+end
+
+pub fn start_recording(r: EditionRecorder) is
+    r.active = true
+    r.records = []
+end
+
+pub fn record(r: EditionRecorder, file: string, year: int, declared: bool) is
+    if r.active is r.records.push(EditionRecord { file: file, year: year, declared: declared }) end
+end
+
+;; take_records: first record per file
+pub fn take_records(r: EditionRecorder) -> [EditionRecord] is
+    let mut out: [EditionRecord] = []
+    for rec in r.records is
+        let mut seen: bool = false
+        for o in out is
+            if o.file == rec.file is seen = true end
+        end
+        if !seen is out.push(rec) end
+    end
+    r.active = false
+    r.records = []
+    return out
+end
+
+;; describe_mix: "" when fewer than two distinct editions are present
+pub fn describe_mix(records: [EditionRecord]) -> string is
+    let mut years: [int] = []
+    for r in records is
+        let mut seen: bool = false
+        for y in years is
+            if y == r.year is seen = true end
+        end
+        if !seen is years.push(r.year) end
+    end
+    if years.len() < 2 is return "" end
+    let mut s: string = "note: this build mixes H# editions (each file is compiled under its own):\n"
+    for y in years is
+        let mut n: int = 0
+        for r in records is
+            if r.year == y is n += 1 end
+        end
+        s += "  edition {y}: {n} file(s)\n"
+    end
+    return s
+end
+
+
+;; ── the rest of edition.rs ────────────────────────────────────────────────────
+;; Edition::status / summary / as_str / year / supports
+pub fn edition_status(year: int) -> string is
+    return "Stable"
+end
+
+pub fn edition_summary(year: int) -> string is
+    return "baseline syntax: `is … end` blocks, `use \"std -> x\"`, `@: mode`, hlib/bit/workspace imports"
+end
+
+pub fn std_edition() -> int is
+    return 2026
+end
+
+;; DEFAULT_YEAR static -> explicit state value (0 = unset -> LATEST)
+pub struct EditionState is
+    pub default_year: int
+end
+
+pub fn new_state() -> EditionState is
+    return EditionState { default_year: 0 }
+end
+
+pub fn default_edition(st: EditionState) -> int is
+    if is_known_year(st.default_year) is return st.default_year end
+    return latest_year()
+end
+
+pub fn set_default_edition(st: EditionState, year: int) is
+    st.default_year = year
+end
+
+pub fn reset_default_edition(st: EditionState) is
+    st.default_year = 0
+end
+
+;; init_default_from_env: sets the default from HSHARP_EDITION; Err -> `.ok == false`
+pub fn init_default_from_env(st: EditionState) -> EditionParse is
+    let r: EditionParse = default_year_from_env()
+    if r.ok && r.year > 0 is set_default_edition(st, r.year) end
+    return r
+end
+
+;; EditionFeature: "FileMemMode" | "StdImport" | "BitImport" | "HlibImport" | "WorkspaceImport"
+pub fn feature_since(feature: string) -> int is
+    return 2026
+end
+
+pub fn feature_name(feature: string) -> string is
+    if feature == "FileMemMode" is return "file-level `@: mode` directive" end
+    if feature == "StdImport" is return "`use \"std -> …\"` imports" end
+    if feature == "BitImport" is return "`use \"bit -> …\"` imports" end
+    if feature == "HlibImport" is return "`use \"hlib -> …\"` imports" end
+    return "`use \"workspace -> …\"` imports"
+end
+
+pub fn supports(year: int, feature: string) -> bool is
+    return year >= feature_since(feature)
+end
+
+pub struct FeatureViolation is
+    pub feature: string
+    pub year:    int
+    pub sp:      ast::Sp
+end
+
+pub fn violation_message(v: FeatureViolation) -> string is
+    let fname: string = feature_name(v.feature)
+    let since: int = feature_since(v.feature)
+    return "{fname} requires edition \"{since}\" or newer, but this file uses \"{v.year}\""
+end
+
+;; effective_edition_with(module, file_default): declared edition if it parses, else file default, else the state default
+pub fn effective_edition_with(module: ast::Node, file_default_year: int, st: EditionState) -> int is
+    let decl: string = module.kids[0].text
+    if decl.len() > 0 is
+        let r: EditionParse = parse_edition(decl)
+        if r.ok is return r.year end
+    end
+    if file_default_year > 0 is return file_default_year end
+    return default_edition(st)
+end
+
+pub fn effective_edition(module: ast::Node, st: EditionState) -> int is
+    return effective_edition_with(module, 0, st)
+end
+
+fn dummy_sp() -> ast::Sp is
+    return ast::Sp { sl: 1, sc: 1, so: 0, el: 1, ec: 1, eo: 0 }
+end
+
+;; check_features(module, edition) — Module = (Edition, FileMem, Imports, Items, …)
+pub fn check_features(module: ast::Node, year: int) -> [FeatureViolation] is
+    let mut out: [FeatureViolation] = []
+    let ed: ast::Node = module.kids[0]
+    let mut decl: ast::Sp = dummy_sp()
+    if ed.sp is decl = ast::sp_of(ed) end
+    if module.kids[1].text.len() > 0 && !supports(year, "FileMemMode") is
+        out.push(FeatureViolation { feature: "FileMemMode", year: year, sp: decl })
+    end
+    for im in module.kids[2].kids is
+        let mut f: string = ""
+        if im.text == "Std" || im.text == "Core" is f = "StdImport"
+        elsif im.text == "BitRepo" is f = "BitImport"
+        elsif im.text == "Hlib" is f = "HlibImport"
+        elsif im.text == "Workspace" is f = "WorkspaceImport" end
+        if f.len() > 0 && !supports(year, f) is
+            out.push(FeatureViolation { feature: f, year: year, sp: ast::sp_of(im) })
+        end
+    end
+    return out
+end
+
+;; lower_module: identity for the only edition
+pub fn lower_module(module: ast::Node, from: int) is
+    return
+end
