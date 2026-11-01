@@ -1,0 +1,357 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+
+
+fn eq_s(a: string, b: string) is
+    if a != b is
+        test::fail("expected `{b}`, got `{a}`")
+    end
+end
+
+fn ok(src: string) -> parser::ParseResult is
+    let r: parser::ParseResult = parser::parse(src, "t.h#")
+    if parser::has_errors(r) is
+        test::fail("unexpected parse errors: " + parser::render_errors(r))
+    end
+    return r
+end
+
+fn first_fn(r: parser::ParseResult) -> ast::Node is
+    for it in r.module.kids[3].kids is
+        if it.tag == "Fn" is return it end
+    end
+    return ast::nn()
+end
+
+;; ── lib.rs: qualified module types ────────────────────────────────────────────
+#[test]
+fn test_qualified_return_type_joins_segments() is
+    let r: parser::ParseResult = ok("fn build_git_info_for_prompt() -> git_info::GitInfo is\n    return git_info::git_fetch_info()\nend\n")
+    let f: ast::Node = first_fn(r)
+    eq_s(f.kids[3].tag, "Named")
+    eq_s(f.kids[3].text, "git_info_GitInfo")
+end
+
+#[test]
+fn test_qualified_return_type_joins_all_segments() is
+    let r: parser::ParseResult = ok("fn f() -> a::b::Type is\n    return a::b::make()\nend\n")
+    eq_s(first_fn(r).kids[3].text, "a_b_Type")
+end
+
+#[test]
+fn test_unqualified_return_type_is_unaffected() is
+    let r: parser::ParseResult = ok("fn f() -> GitInfo is\n    return GitInfo { branch: \"\" }\nend\n")
+    eq_s(first_fn(r).kids[3].text, "GitInfo")
+end
+
+#[test]
+fn test_qualified_struct_literal_joins_segments() is
+    let r: parser::ParseResult = ok("fn f() -> git_info::GitInfo is\n    return git_info::GitInfo { branch: \"\", dirty: false, ahead: 0, behind: 0 }\nend\n")
+    let f: ast::Node = first_fn(r)
+    eq_s(f.kids[3].text, "git_info_GitInfo")
+    eq_s(f.kids[4].kids[0].kids[0].tag, "StructLit")
+    eq_s(f.kids[4].kids[0].kids[0].text, "git_info_GitInfo")
+end
+
+;; ── lib.rs: bit imports ───────────────────────────────────────────────────────
+fn first_import(src: string) -> ast::Node is
+    let r: parser::ParseResult = ok(src)
+    return r.module.kids[2].kids[0]
+end
+
+#[test]
+fn test_plain_bit_import() is
+    let k: ast::Node = first_import("use \"bit -> mold\"\nfn main() is end\n")
+    eq_s(k.text, "BitRepo")
+    eq_s(k.kids[0].text, "mold")
+    eq_s(k.kids[1].tag, "None")
+    eq_s(k.kids[2].tag, "None")
+    eq_s(k.kids[3].text, "Static")
+end
+
+#[test]
+fn test_bit_import_with_alias_and_release_version() is
+    let k: ast::Node = first_import("use \"bit -> tui/1.0.2\" from \"t\"\nfn main() is end\n")
+    eq_s(k.kids[0].text, "tui")
+    eq_s(k.kids[1].text, "1.0.2")
+    eq_s(k.kids[2].text, "t")
+end
+
+#[test]
+fn test_bit_import_with_tag_or_commit_version() is
+    let a: ast::Node = first_import("use \"bit -> mold/v1.0\"\nfn main() is end\n")
+    eq_s(a.kids[0].text, "mold")
+    eq_s(a.kids[1].text, "v1.0")
+    let b: ast::Node = first_import("use \"bit -> mold/a1b2c3d4e5f6\"\nfn main() is end\n")
+    eq_s(b.kids[1].text, "a1b2c3d4e5f6")
+end
+
+#[test]
+fn test_dynamic_bit_import() is
+    let k: ast::Node = first_import("dynamic use \"bit -> mold\"\nfn main() is end\n")
+    eq_s(k.kids[3].text, "Dynamic")
+end
+
+#[test]
+fn test_dynamic_std_is_still_rejected() is
+    let r: parser::ParseResult = parser::parse("dynamic use \"std -> io\"\nfn main() is end\n", "test.h#")
+    test::assert_true(parser::has_errors(r))
+    test::assert_contains(parser::render_errors(r), "bit")
+end
+
+#[test]
+fn test_bytes_import_is_removed_with_a_helpful_error() is
+    let r: parser::ParseResult = parser::parse("use \"bytes -> scanner\"\nfn main() is end\n", "test.h#")
+    test::assert_true(parser::has_errors(r))
+    let rendered: string = parser::render_errors(r)
+    test::assert_contains(rendered, "bytes")
+    test::assert_contains(rendered, "use \"bit -> scanner\"")
+end
+
+#[test]
+fn test_bit_prefix_is_not_confused_with_other_heads() is
+    let r: parser::ParseResult = parser::parse("use \"bitmap -> x\"\nfn main() is end\n", "test.h#")
+    test::assert_true(parser::has_errors(r))
+end
+
+#[test]
+fn test_bare_use_is_an_error() is
+    let r: parser::ParseResult = parser::parse("use mold\nfn main() is end\n", "test.h#")
+    test::assert_true(parser::has_errors(r))
+    test::assert_contains(parser::render_errors(r), "hlib -> mold")
+end
+
+#[test]
+fn test_string_without_source_is_an_error() is
+    test::assert_true(parser::has_errors(parser::parse("use \"mold\"\nfn main() is end\n", "test.h#")))
+end
+
+#[test]
+fn test_explicit_forms_parse() is
+    eq_s(first_import("use \"hlib -> mold\" from \"mold\"\nfn main() is end\n").text, "Hlib")
+    eq_s(first_import("use \"bit -> mold\" from \"mold\"\nfn main() is end\n").text, "BitRepo")
+end
+
+;; ── lib.rs: comments ──────────────────────────────────────────────────────────
+#[test]
+fn test_doc_comments_before_items_are_collected_and_attached() is
+    let r: parser::ParseResult = ok("/// Adds two numbers.\n/// Both are ints.\nfn add(a: int, b: int) -> int is\n    return a + b\nend\n\n/// Entry point.\nfn main() is\nend\n")
+    let docs: ast::Node = r.module.kids[4]
+    test::assert_eq(docs.kids.len(), 2)
+    eq_s(docs.kids[0].text, "Adds two numbers.\nBoth are ints.")
+    eq_s(docs.kids[0].kids[0].text, "3")
+    eq_s(docs.kids[1].text, "Entry point.")
+    eq_s(docs.kids[1].kids[0].text, "8")
+end
+
+#[test]
+fn test_doc_comments_may_sit_on_fields_variants_and_in_bodies() is
+    ok("/// A point\nstruct P is\n    /// x coord\n    x: int\n    /// y coord\n    y: int\nend\n\nenum E is\n    /// first\n    A\n    /// second\n    B\nend\n\nfn main() is\n    /// not an item, still harmless\n    let a: int = 1\nend\n")
+end
+
+#[test]
+fn test_four_slashes_is_a_plain_comment_not_a_doc() is
+    let r: parser::ParseResult = parser::parse("//// banner \\\\\nfn main() is\nend\n", "t.h#")
+    test::assert_eq(r.module.kids[4].kids.len(), 0)
+end
+
+#[test]
+fn test_multiline_comment_is_ignored_even_with_keywords_inside() is
+    let r: parser::ParseResult = ok("// this is a\n   multi-line comment: fn end is struct\n   \"strings\" too \\\\\nfn main() is\n    write(\"x\")\nend\n")
+    test::assert_eq(r.module.kids[3].kids.len(), 1)
+end
+
+#[test]
+fn test_multiline_comment_inline_and_trailing() is
+    ok("fn main() is\n    // inline \\\\ write(\"y\")\nend\n")
+    ok("fn main() is\n    write(\"a\") // trailing \\\\\nend\n")
+end
+
+#[test]
+fn test_comment_markers_inside_strings_are_not_comments() is
+    let r: parser::ParseResult = ok("fn main() is\n    write(\"http://x.y /// not doc ;; nor this\")\nend\n")
+    test::assert_eq(r.module.kids[4].kids.len(), 0)
+end
+
+#[test]
+fn test_unterminated_multiline_comment_is_an_error_at_its_start() is
+    let r: parser::ParseResult = parser::parse("fn main() is\nend\n// never closed\nfn f() is\nend\n", "t.h#")
+    test::assert_true(parser::has_errors(r))
+    let msg: string = parser::render_errors(r)
+    test::assert_contains(msg, "unterminated block comment")
+    test::assert_contains(msg, ":3:1")
+end
+
+#[test]
+fn test_line_numbers_after_a_multiline_comment_are_exact() is
+    let r: parser::ParseResult = parser::parse("// line 1\nline 2 \\\\\nfn main() is\n    let x: int = = 1\nend\n", "t.h#")
+    test::assert_true(parser::has_errors(r))
+    test::assert_contains(parser::render_errors(r), ":4:")
+end
+
+;; ── edition.rs ────────────────────────────────────────────────────────────────
+#[test]
+fn test_parses_known_edition() is
+    test::assert_true(edition::parse_edition("2026").ok)
+    test::assert_eq(edition::parse_edition(" 2026 ").year, 2026)
+end
+
+#[test]
+fn test_classifies_bad_editions() is
+    eq_s(edition::parse_edition("2099").err.kind, "TooNew")
+    eq_s(edition::parse_edition("2015").err.kind, "Retired")
+    eq_s(edition::parse_edition("26").err.kind, "Malformed")
+    eq_s(edition::parse_edition("latest").err.kind, "Malformed")
+    eq_s(edition::parse_edition("").err.kind, "Malformed")
+end
+
+#[test]
+fn test_edition_error_messages_are_actionable() is
+    let e: edition::EditionError = edition::parse_edition("2099").err
+    test::assert_contains(edition::edition_error_message(e), "newer")
+    let hints: [string] = edition::edition_error_hints(e)
+    eq_s(hints[hints.len() - 1], "supported editions: 2026")
+    let m: edition::EditionError = edition::parse_edition("abc").err
+    test::assert_contains(edition::edition_error_message(m), "four-digit")
+end
+
+#[test]
+fn test_declared_edition_is_recorded_on_module() is
+    let r: parser::ParseResult = ok("using \"2026\"\nfn main() is\n    write(\"hi\")\nend\n")
+    eq_s(r.module.kids[0].text, "2026")
+    test::assert_true(r.module.kids[0].sp)
+end
+
+#[test]
+fn test_missing_using_falls_back_to_default() is
+    let r: parser::ParseResult = ok("fn main() is\n    write(\"hi\")\nend\n")
+    eq_s(r.module.kids[0].text, "")
+    test::assert_eq(edition::effective_year("", false, 0), 2026)
+end
+
+#[test]
+fn test_unknown_edition_is_a_parse_error() is
+    let r: parser::ParseResult = parser::parse("using \"2099\"\nfn main() is\nend\n", "t.h#")
+    test::assert_true(parser::has_errors(r))
+    let msg: string = parser::render_errors(r)
+    test::assert_contains(msg, "2099")
+    test::assert_contains(msg, "newer")
+end
+
+#[test]
+fn test_malformed_edition_is_a_parse_error() is
+    let r: parser::ParseResult = parser::parse("using \"soon\"\nfn main() is\nend\n", "t.h#")
+    test::assert_contains(parser::render_errors(r), "four-digit")
+end
+
+#[test]
+fn test_using_without_string_is_a_parse_error() is
+    test::assert_true(parser::has_errors(parser::parse("using\nfn main() is\nend\n", "t.h#")))
+end
+
+#[test]
+fn test_integer_form_is_accepted() is
+    let r: parser::ParseResult = ok("using 2026\nfn main() is\nend\n")
+    eq_s(r.module.kids[0].text, "2026")
+end
+
+#[test]
+fn test_duplicate_using_is_an_error() is
+    let r: parser::ParseResult = parser::parse("using \"2026\"\nusing \"2026\"\nfn main() is\nend\n", "t.h#")
+    test::assert_contains(parser::render_errors(r), "more than once")
+end
+
+#[test]
+fn test_using_after_items_is_an_error() is
+    let r: parser::ParseResult = parser::parse("fn main() is\nend\nusing \"2026\"\n", "t.h#")
+    test::assert_contains(parser::render_errors(r), "before")
+end
+
+#[test]
+fn test_using_may_follow_file_mem_mode_and_precede_imports() is
+    let r: parser::ParseResult = ok("@: safety\nusing \"2026\"\nuse \"std -> math\"\nfn main() is\nend\n")
+    eq_s(r.module.kids[0].text, "2026")
+    eq_s(r.module.kids[1].text, "Safety")
+    test::assert_eq(r.module.kids[2].kids.len(), 1)
+end
+
+#[test]
+fn test_mix_description_only_for_real_mixes() is
+    let one: [edition::EditionRecord] = [edition::EditionRecord { file: "a.h#", year: 2026, declared: true }, edition::EditionRecord { file: "b.h#", year: 2026, declared: false }]
+    eq_s(edition::describe_mix(one), "")
+    let none: [edition::EditionRecord] = []
+    eq_s(edition::describe_mix(none), "")
+end
+
+#[test]
+fn test_edition_diagnostics_are_recognised() is
+    let srcs: [string] = ["using \"2099\"\n", "using \"x\"\n", "using\n", "fn a() is\nend\nusing \"2026\"\n"]
+    for src in srcs is
+        let r: parser::ParseResult = parser::parse(src, "t.h#")
+        test::assert_true(parser::has_errors(r))
+        let mut hit: bool = false
+        for e in r.errors is
+            if edition::is_edition_diagnostic(e.message) is hit = true end
+        end
+        test::assert_true(hit)
+    end
+    test::assert_false(edition::is_edition_diagnostic("unexpected token `end`"))
+end
+
+#[test]
+fn test_features_are_all_available_in_2026() is
+    let r: parser::ParseResult = ok("@: arc\nusing \"2026\"\nuse \"std -> math\"\nuse \"bit -> mylib\"\nuse \"hlib -> other\"\nfn main() is\nend\n")
+    test::assert_eq(edition::check_features(r.module, 2026).len(), 0)
+    let feats: [string] = ["FileMemMode", "StdImport", "BitImport", "HlibImport", "WorkspaceImport"]
+    for f in feats is
+        test::assert_true(edition::supports(2026, f))
+        test::assert_eq(edition::feature_since(f), 2026)
+    end
+end
+
+#[test]
+fn test_default_override_roundtrip() is
+    let st: edition::EditionState = edition::new_state()
+    edition::set_default_edition(st, 2026)
+    test::assert_eq(edition::default_edition(st), 2026)
+    edition::reset_default_edition(st)
+    test::assert_eq(edition::default_edition(st), edition::latest_year())
+end
+
+#[test]
+fn test_per_file_default_applies_only_to_undeclared_files() is
+    let declared: parser::ParseResult = ok("using \"2026\"\nfn a() is\nend\n")
+    let bare: parser::ParseResult = parser::parse_with_default("fn a() is\nend\n", "b.h#", 2026, edition::new_recorder(), edition::new_state())
+    test::assert_false(parser::has_errors(bare))
+    let st: edition::EditionState = edition::new_state()
+    test::assert_eq(edition::effective_edition_with(declared.module, 2026, st), 2026)
+    test::assert_eq(edition::effective_edition_with(bare.module, 2026, st), 2026)
+    test::assert_eq(edition::std_edition(), 2026)
+end
+
+#[test]
+fn test_relation_and_recording() is
+    eq_s(edition::relate(2026, 2026), "Same")
+    eq_s(edition::relate(2026, 2020), "DependencyOlder")
+    eq_s(edition::relate(2026, 2030), "DependencyNewer")
+    let rec: edition::EditionRecorder = edition::new_recorder()
+    edition::start_recording(rec)
+    let r: parser::ParseResult = parser::parse_with_default("fn a() is\nend\n", "r.h#", 0, rec, edition::new_state())
+    let got: [edition::EditionRecord] = edition::take_records(rec)
+    test::assert_eq(got.len(), 1)
+    eq_s(got[0].file, "r.h#")
+    test::assert_false(got[0].declared)
+end
+
+#[test]
+fn test_doc_for_line_and_error_reporter() is
+    let r: parser::ParseResult = ok("/// Adds two numbers.\nfn add() is\nend\n")
+    eq_s(ast::doc_for_line(r.module, 2).text, "Adds two numbers.")
+    eq_s(ast::doc_for_line(r.module, 1).tag, "None")
+    let rep: error::ErrorReporter = error::new_reporter()
+    test::assert_false(error::reporter_has_errors(rep))
+    let bad: parser::ParseResult = parser::parse("fn f( is\nend\n", "t.h#")
+    for e in bad.errors is error::reporter_report(rep, e) end
+    test::assert_true(error::reporter_has_errors(rep))
+    test::assert_contains(error::reporter_render_all(rep, "fn f( is\nend\n"), "h#::syntax")
+end
