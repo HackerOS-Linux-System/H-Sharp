@@ -1,0 +1,102 @@
+use "std -> option" from "option"
+use "std -> strbuf" from "strbuf"
+
+mod ast
+mod floatfmt
+mod error
+mod lexer
+mod parser
+mod edition
+
+pub struct ParseResult is
+    pub module: ast::Node
+    pub errors: [error::ParseError]
+    pub source: string
+end
+
+pub fn has_errors(r: ParseResult) -> bool is
+    return r.errors.len() > 0
+end
+
+pub fn render_errors(r: ParseResult) -> string is
+    return error::render_errors(r.errors, r.source)
+end
+
+;; Module.doc_comments: one `DocComment[text]` node per `///` block, kids: Target(line|"")
+;; (span = first line's start .. last line's end)
+fn group_doc_comments(lines: [lexer::DocLine], toks: [lexer::Token]) -> ast::Node is
+    let mut out: [ast::Node] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let first: lexer::DocLine = lines[i]
+        let mut j: int = i
+        let mut text: string = first.text
+        while j + 1 < lines.len() && lines[j + 1].sl == lines[j].el + 1 is
+            j += 1
+            text += "\n" + lines[j].text
+        end
+        let last: lexer::DocLine = lines[j]
+        let end_off: int = last.eo
+        let mut target: string = ""
+        let mut found: bool = false
+        for t in toks is
+            if !found && t.so >= end_off && t.kind != "nl" && t.kind != "eof" is
+                found = true
+                target = "{t.sl}"
+            end
+        end
+        let sp: ast::Sp = ast::Sp { sl: first.sl, sc: first.sc, so: first.so, el: last.el, ec: last.ec, eo: last.eo }
+        out.push(ast::with_sp(ast::nd("DocComment", text, [ast::lf("Target", target)]), sp))
+        i = j + 1
+    end
+    return ast::nd("DocComments", "", out)
+end
+
+pub fn parse(source: string, file: string) -> ParseResult is
+    return parse_with_default(source, file, 0, edition::new_recorder(), edition::new_state())
+end
+
+;; `file_default_year` = 0 means "none"; `rec` is the (optional) edition recorder
+pub fn parse_with_default(source: string, file: string, file_default_year: int, rec: edition::EditionRecorder, st: edition::EditionState) -> ParseResult is
+    let lx: lexer::Lexed = lexer::lex(source, file)
+    let mut lex_errors: [error::ParseError] = []
+    let mut toks: [lexer::Token] = lx.toks
+    let mut docs: [lexer::DocLine] = lx.docs
+    if lx.errs.len() > 0 is
+        lex_errors = lx.errs
+        docs = []
+        ;; Rust: on a lexer error the token list is just a dummy EOF (span dummy: 1:1:0-1:1:0)
+        let mut eof: lexer::Token = lx.toks[lx.toks.len() - 1]
+        eof.sl = 1
+        eof.sc = 1
+        eof.so = 0
+        eof.el = 1
+        eof.ec = 1
+        eof.eo = 0
+        toks = [eof]
+    end
+    let doc_comments: ast::Node = group_doc_comments(docs, toks)
+    let p: parser::Parser = parser::Parser { toks: toks, pos: 0, file: file, errs: [] }
+    let module: ast::Node = parser::parse_module(p)
+    ast::stamp_file(module, file)
+    let mut errors: [error::ParseError] = lex_errors
+    for e in p.errs is errors.push(e) end
+    module.kids.push(doc_comments)
+    let declared: bool = module.kids[0].text.len() > 0
+    let y: int = edition::effective_edition_with(module, file_default_year, st)
+    for v in edition::check_features(module, y) is
+        let msg: string = edition::violation_message(v)
+        let since: int = edition::feature_since(v.feature)
+        errors.push(error::new_error("Custom", file, v.sp.sl, v.sp.sc, v.sp.so, v.sp.el, v.sp.ec, v.sp.eo, msg, ["use `using \"{since}\"` (or newer) at the top of the file"]))
+    end
+    edition::lower_module(module, y)
+    edition::record(rec, file, y, declared)
+    return ParseResult { module: module, errors: errors, source: source }
+end
+
+;; convenience for callers that only want the module: the tree, or a `None[text = rendered errors]` node on syntax errors
+pub fn parse_source(source: string) -> ast::Node is
+    let r: ParseResult = parse(source, "<source>")
+    if has_errors(r) is return ast::lf("None", render_errors(r)) end
+    return r.module
+end
