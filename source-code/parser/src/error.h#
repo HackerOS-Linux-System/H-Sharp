@@ -1,0 +1,261 @@
+use "std -> env" from "env"
+use "bit -> nidus"
+
+pub struct ParseError is
+    pub kind:    string          ;; UnexpectedToken | UnexpectedChar | UnexpectedEof | UnterminatedString | InvalidEscape | InvalidType | ExpectedIdent | ExpectedToken | Custom
+    pub file:    string
+    pub sl:      int
+    pub sc:      int
+    pub so:      int
+    pub el:      int
+    pub ec:      int
+    pub eo:      int
+    pub message: string
+    pub hints:   [string]
+end
+
+pub fn new_error(kind: string, file: string, sl: int, sc: int, so: int, el: int, ec: int, eo: int, message: string, hints: [string]) -> ParseError is
+    return ParseError { kind: kind, file: file, sl: sl, sc: sc, so: so, el: el, ec: ec, eo: eo, message: message, hints: hints }
+end
+
+;; `[line:col] message`   (impl Display for ParseError)
+pub fn error_display(e: ParseError) -> string is
+    return "[{e.sl}:{e.sc}] {e.message}"
+end
+
+;; `str::lines()`
+pub fn source_lines(src: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = src.len()
+    let mut pos: int = 0
+    while pos < n is
+        let mut e: int = pos
+        while e < n && byte_at(src, e) != 10 is e += 1 end
+        let mut stop: int = e
+        if stop > pos && byte_at(src, stop - 1) == 13 is stop -= 1 end
+        out.push(src[pos..stop])
+        pos = e + 1
+    end
+    return out
+end
+
+fn repeat_s(s: string, n: int) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        out += s
+        i += 1
+    end
+    return out
+end
+
+fn pad_left4(n: int) -> string is
+    let s: string = "{n}"
+    if s.len() >= 4 is return s end
+    return repeat_s(" ", 4 - s.len()) + s
+end
+
+;; `ParseError::render` without ANSI colours (what `colored` prints when stdout is not a terminal / NO_COLOR is set)
+pub fn render_error(e: ParseError, source: string) -> string is
+    return render_titled(e, source, "SYNTAX ERROR")
+end
+
+;; same layout as a syntax error, with another heading (CODEGEN ERROR, ...) — used for errors found after parsing
+fn line_start_offset(src: string, line: int) -> int is
+    if line <= 1 is return 0 end
+    let mut ln: int = 1
+    let mut i: int = 0
+    while i < src.len() is
+        if byte_at(src, i) == 10 is
+            ln += 1
+            if ln == line is return i + 1 end
+        end
+        i += 1
+    end
+    return src.len()
+end
+
+fn line_end_offset(src: string, from: int) -> int is
+    let mut i: int = from
+    while i < src.len() && byte_at(src, i) != 10 && byte_at(src, i) != 13 is i += 1 end
+    return i
+end
+
+fn is_word_byte(c: int) -> bool is
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+end
+
+;; end offset of the identifier starting at `from` (== from when there is none)
+fn word_end(src: string, from: int) -> int is
+    let mut i: int = from
+    while i < src.len() && is_word_byte(byte_at(src, i)) is i += 1 end
+    return i
+end
+
+fn msg_starts(m: string, p: string) -> bool is
+    return m.len() >= p.len() && m[0..p.len()] == p
+end
+
+;; `undefined fn: foo` -> `undefined_fn` (codegen errors have no kind of their own, only a message)
+fn msg_slug(m: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < m.len() && i < 32 && byte_at(m, i) != 58 is
+        let c: int = byte_at(m, i)
+        if c >= 65 && c <= 90 is out += str_from_byte(c + 32)
+        elsif is_word_byte(c) is out += str_from_byte(c)
+        elsif out.len() > 0 && byte_at(out, out.len() - 1) != 95 is out += "_" end
+        i += 1
+    end
+    while out.len() > 0 && byte_at(out, out.len() - 1) == 95 is out = out[0..out.len() - 1] end
+    if out == "" is return "error" end
+    return out
+end
+
+fn nidus_config() -> nidus::style::Config is
+    if env::get("HSHARP_COLOR") == "1" is return nidus::config_colored() end
+    if nidus::style::detect_unicode_support() is
+        return nidus::config_with(nidus::style::graphical(), nidus::theme_mono_unicode())
+    end
+    return nidus::config_with(nidus::style::ascii(), nidus::theme_mono())
+end
+
+fn kind_slug(kind: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < kind.len() is
+        let c: int = byte_at(kind, i)
+        if c >= 65 && c <= 90 is
+            if i > 0 is out += "_" end
+            out += str_from_byte(c + 32)
+        else
+            out += str_from_byte(c)
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ParseError -> nidus diagnostic -> text
+pub fn render_nidus(e: ParseError, source: string, title: string) -> string is
+    let mut start: int = line_start_offset(source, e.sl) + (if e.sc > 1 then e.sc - 1 else 0 end)
+    if start > source.len() is start = source.len() end
+    let mut stop: int = start + 1
+    if e.el == e.sl && e.ec > e.sc is stop = start + (e.ec - e.sc) end
+    if e.el > e.sl is stop = line_end_offset(source, start) end
+    if stop <= start is stop = start + 1 end
+    let mut label: string = "here"
+    let mut slug: string = kind_slug(e.kind)
+    if e.kind == "Custom" is
+        ;; codegen/type errors carry only a position: underline the whole identifier there and name the error by its message
+        let we: int = word_end(source, start)
+        if we > start && stop == start + 1 is stop = we end
+        slug = msg_slug(e.message)
+        if msg_starts(e.message, "undefined fn") is label = "no such function in scope" end
+        if msg_starts(e.message, "undefined var") is label = "no such variable in scope" end
+    end
+    let mut d: nidus::diagnostic::Diagnostic = nidus::error(e.message)
+    let mut kind: string = "syntax"
+    if title != "SYNTAX ERROR" is kind = "codegen" end
+    d = d.with_code("h#::" + kind + "::" + slug)
+    d = d.with_source(e.file, source)
+    d = d.with_label(nidus::primary_label(start, stop - start, label))
+    let mut hi: int = 0
+    while hi < e.hints.len() is
+        if hi == 0 is d = d.with_help(e.hints[hi]) else d = d.with_note(e.hints[hi]) end
+        hi += 1
+    end
+    if e.kind == "Custom" && e.hints.len() == 0 && msg_starts(e.message, "undefined fn") is
+        d = d.with_help("check the spelling, or `use` the module that defines it (library functions need their module prefix)")
+    end
+    return nidus::render(d, nidus_config())
+end
+
+pub fn render_titled(e: ParseError, source: string, title: string) -> string is
+    if env::get("HSHARP_ERROR_STYLE") != "classic" is return render_nidus(e, source, title) end
+    return render_classic(e, source, title)
+end
+
+pub fn render_classic(e: ParseError, source: string, title: string) -> string is
+    let mut out: string = ""
+    let mut line_idx: int = e.sl - 1
+    if line_idx < 0 is line_idx = 0 end
+    out += "-- {title} ({e.file}) -------\n"
+    out += "--> {e.file}:{e.sl}:{e.sc}\n\n"
+    let mut start_display: int = line_idx - 1
+    if start_display < 0 is start_display = 0 end
+    let lines: [string] = source_lines(source)
+    let mut i: int = start_display
+    let mut shown: int = 0
+    while i < lines.len() && shown < 3 is
+        let lineno: int = i + 1
+        let gutter: string = pad_left4(lineno) + " | "
+        let line: string = lines[i]
+        if lineno == e.sl is
+            out += gutter + line + "\n"
+            let mut sc1: int = e.sc - 1
+            if sc1 < 0 is sc1 = 0 end
+            let spaces: string = repeat_s(" ", gutter.len() + sc1)
+            let mut span_len: int = 1
+            if e.el == e.sl is
+                span_len = e.ec - e.sc
+                if span_len < 1 is span_len = 1 end
+            else
+                span_len = line.len() - sc1
+                if span_len < 1 is span_len = 1 end
+            end
+            out += spaces + repeat_s("^", span_len) + "\n"
+        else
+            out += gutter + line + "\n"
+        end
+        i += 1
+        shown += 1
+    end
+    out += "\n"
+    out += "Error: {e.message}\n"
+    if e.hints.len() > 0 is
+        out += "\n"
+        for h in e.hints is out += "  Hint: {h}\n" end
+    end
+    return out
+end
+
+pub fn render_errors(errs: [ParseError], source: string) -> string is
+    let mut out: string = ""
+    let mut first: bool = true
+    for e in errs is
+        if !first is out += "\n" end
+        out += render_error(e, source)
+        first = false
+    end
+    return out
+end
+
+;; ParseError::with_source — the `source_line` field is only informational in Rust; here it is returned, not stored
+pub fn source_line_of(e: ParseError, source: string) -> string is
+    let lines: [string] = source_lines(source)
+    let idx: int = e.sl - 1
+    if idx >= 0 && idx < lines.len() is return lines[idx] end
+    return ""
+end
+
+;; ErrorReporter
+pub struct ErrorReporter is
+    pub errors: [ParseError]
+end
+
+pub fn new_reporter() -> ErrorReporter is
+    return ErrorReporter { errors: [] }
+end
+
+pub fn reporter_report(r: ErrorReporter, e: ParseError) is
+    r.errors.push(e)
+end
+
+pub fn reporter_has_errors(r: ErrorReporter) -> bool is
+    return r.errors.len() > 0
+end
+
+pub fn reporter_render_all(r: ErrorReporter, source: string) -> string is
+    return render_errors(r.errors, source)
+end
