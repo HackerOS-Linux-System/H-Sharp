@@ -1,0 +1,182 @@
+use "std -> strbuf" from "strbuf"
+
+pub struct Node is
+    pub tag:  string
+    pub text: string
+    pub kids: [Node]
+    pub sp:   bool
+    pub sl:   int
+    pub sc:   int
+    pub so:   int
+    pub el:   int
+    pub ec:   int
+    pub eo:   int
+    pub ip:   bool
+    pub fl:   string   ;; source file of a span-carrying node (the Rust `Span.file`); stamped after parsing
+end
+
+;; a span value (Rust `Span`, without the file name)
+pub struct Sp is
+    pub sl: int
+    pub sc: int
+    pub so: int
+    pub el: int
+    pub ec: int
+    pub eo: int
+end
+
+pub fn nd(tag: string, text: string, kids: [Node]) -> Node is
+    return Node { tag: tag, text: text, kids: kids, sp: false, sl: 0, sc: 0, so: 0, el: 0, ec: 0, eo: 0, ip: false, fl: "" }
+end
+
+pub fn lf(tag: string, text: string) -> Node is
+    let k: [Node] = []
+    return nd(tag, text, k)
+end
+
+pub fn nn() -> Node is
+    return lf("None", "")
+end
+
+pub fn sn(t: string) -> Node is
+    return lf("S", t)
+end
+
+pub fn bn(v: bool) -> Node is
+    if v is return lf("B", "true") end
+    return lf("B", "false")
+end
+
+pub fn opt_s(has: bool, t: string) -> Node is
+    if has is return sn(t) end
+    return nn()
+end
+
+;; Span::merge — start of `a`, end of `b`
+pub fn sp_merge(a: Sp, b: Sp) -> Sp is
+    return Sp { sl: a.sl, sc: a.sc, so: a.so, el: b.el, ec: b.ec, eo: b.eo }
+end
+
+;; stamp every span-carrying node with the file it was parsed from (`<interp>` stays for unmapped sub-parse nodes)
+pub fn stamp_file(n: Node, file: string) is
+    if n.sp is
+        if n.ip is n.fl = "<interp>" else n.fl = file end
+    end
+    for k in n.kids is stamp_file(k, file) end
+end
+
+pub fn sp_of(n: Node) -> Sp is
+    return Sp { sl: n.sl, sc: n.sc, so: n.so, el: n.el, ec: n.ec, eo: n.eo }
+end
+
+pub fn with_sp(n: Node, s: Sp) -> Node is
+    n.sp = true
+    n.ip = false
+    n.sl = s.sl
+    n.sc = s.sc
+    n.so = s.so
+    n.el = s.el
+    n.ec = s.ec
+    n.eo = s.eo
+    return n
+end
+
+;; Expr::remap_span — only the variants/children the Rust version touches (nested bodies are left alone)
+pub fn remap_span(n: Node, s: Sp) is
+    let t: string = n.tag
+    if t == "BinOp" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" || t == "Range" is
+        remap_span(n.kids[0], s)
+        remap_span(n.kids[1], s)
+    elsif t == "UnOp" is
+        remap_span(n.kids[0], s)
+    elsif t == "If" || t == "Match" is
+        remap_span(n.kids[0], s)
+    elsif t == "While" is
+        remap_span(n.kids[0], s)
+    elsif t == "For" is
+        remap_span(n.kids[1], s)
+    end
+    let set: bool = t == "Int" || t == "Float" || t == "Bool" || t == "Str" || t == "Nil" || t == "Interp" || t == "Ident" || t == "FieldAccess" || t == "MethodCall" || t == "Call" || t == "StructLit" || t == "ArrayLit" || t == "TupleLit" || t == "Cast" || t == "Unsafe" || t == "ReturnE" || t == "Self" || t == "Try" || t == "Await" || t == "Path" || t == "BinOp" || t == "UnOp" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" || t == "Range" || t == "If" || t == "Match" || t == "While" || t == "For" || t == "Do" || t == "Closure"
+    if set is
+        n.sp = true
+        n.ip = false
+        n.sl = s.sl
+        n.sc = s.sc
+        n.so = s.so
+        n.el = s.el
+        n.ec = s.ec
+        n.eo = s.eo
+    end
+end
+
+;; every span-carrying node of a sub-parse lives in the `<interp>` snippet file (Rust `Span.file`) until remap_span moves it
+pub fn mark_interp(n: Node) is
+    if n.sp is n.ip = true end
+    for k in n.kids is mark_interp(k) end
+end
+
+;; span as the typechecker wants it: [] when the node has none, else [sl, sc, so, el, ec, eo, 1 when in `<interp>`]
+pub fn sp7(n: Node) -> [int] is
+    if !n.sp is
+        let none: [int] = []
+        return none
+    end
+    let mut f: int = 0
+    if n.ip is f = 1 end
+    return [n.sl, n.sc, n.so, n.el, n.ec, n.eo, f]
+end
+
+fn esc_text(s: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 92 is sb.push("\\\\")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 10 is sb.push("\\n")
+        elsif c == 9 is sb.push("\\t")
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    return sb.build()
+end
+
+;; canonical dump: `<indent>Tag<TAB>text[<TAB>@sl:sc:so-el:ec:eo]`
+pub fn dump_node(n: Node, depth: int, sb: strbuf::StringBuilder) is
+    let mut d: int = 0
+    while d < depth is
+        sb.push("  ")
+        d += 1
+    end
+    sb.push(n.tag)
+    sb.push("\t")
+    sb.push(esc_text(n.text))
+    if n.sp is sb.push("\t@{n.sl}:{n.sc}:{n.so}-{n.el}:{n.ec}:{n.eo}") end
+    sb.push("\n")
+    for k in n.kids is dump_node(k, depth + 1, sb) end
+end
+
+
+;; Module::doc_for_line — module kids: Edition FileMem Imports Items DocComments
+;; returns "" and found=false encoded as the tag of the returned node ("None")
+pub fn doc_for_line(module: Node, line: int) -> Node is
+    for d in module.kids[4].kids is
+        if d.kids[0].text == "{line}" is return d end
+    end
+    return nn()
+end
+
+;; same as dump_node but without spans (for comparing trees built by hand / by lowering passes)
+pub fn dump_plain(n: Node, depth: int, sb: strbuf::StringBuilder) is
+    if n.tag == "DocComments" is return end
+    let mut d: int = 0
+    while d < depth is
+        sb.push("  ")
+        d += 1
+    end
+    sb.push(n.tag)
+    sb.push("\t")
+    sb.push(esc_text(n.text))
+    sb.push("\n")
+    for k in n.kids is dump_plain(k, depth + 1, sb) end
+end
