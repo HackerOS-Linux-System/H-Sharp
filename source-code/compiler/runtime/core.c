@@ -50,7 +50,8 @@ typedef double      hsh_float;
 struct HshArray {
     int64_t len;
     int64_t cap;
-    int64_t data[1]; /* flexible array */
+    int64_t *data;   /* element buffer: inline (just after the header) until the first growth */
+    int64_t own;     /* 1 = `data` was malloc'ed by a growth and is freed with the array */
 };
 typedef struct HshArray HshArray;
 HshArray *hsh_array_new(void);
@@ -123,7 +124,7 @@ void hsh_panic(hsh_string msg) {
 /* ── RAII drop stubs ─────────────────────────────────────────────────────── */
 void hsh_string_free(hsh_string s) { (void)s; }
 void hsh_bytes_free(uint8_t* b)    { if (b) free(b); }
-void hsh_array_free(void* arr)     { if (arr) free(arr); }
+void hsh_array_free(void* arr)     { if (arr) { HshArray *h = (HshArray*)arr; if (h->own) free(h->data); free(arr); } }
 void hsh_struct_free(void* ptr)    { if (ptr) free(ptr); }
 
 /* ── Arena ────────────────────────────────────────────────────────────────── */
@@ -151,7 +152,10 @@ void hsh_struct_free(void* ptr)    { if (ptr) free(ptr); }
 #define HSH_ARENA_POOL_CHUNK   64
 #define HSH_ARENA_PAGE_SIZE    4096
 
-typedef struct { uint8_t* base; uint64_t cap; uint64_t used; int64_t kind; } HshArena;
+typedef struct HshArena { uint8_t* base; uint64_t cap; uint64_t used; int64_t kind; struct HshArena* prev; } HshArena;
+/* `prev` chains the exhausted blocks of a growing (General/Pool/Page) arena: when a block fills up a new
+ * one is malloc'd and the old one is kept on this list, so hsh_arena_free reclaims *everything* allocated
+ * in the arena — the property a compiler running parse/check/emit in one arena per phase relies on. */
 
 /* Thread-local stack of "current" arenas, so nested @arena function calls
  * compose correctly (LIFO): each @arena function pushes its own arena on
@@ -178,6 +182,7 @@ HshArena* hsh_arena_new_kind(uint64_t cap, int64_t kind) {
     a->cap  = cap;
     a->used = 0;
     a->kind = kind;
+    a->prev = NULL;
     return a;
 }
 /* Plain `hsh_arena_new` is always General-kind — this is what every
@@ -209,20 +214,26 @@ void* hsh_arena_alloc(HshArena* a, uint64_t n) {
              * steady state once the buffer has filled up once. */
             a->used = 0;
         } else {
-            /* General/Pool/Page (or a Ring request bigger than the whole
-             * buffer): degrade gracefully to a regular heap allocation
-             * rather than aborting the process. Note the returned pointer
-             * isn't necessarily arena memory even when an arena is active;
-             * see the caution on hsh_array_free etc. below about not
-             * blindly free()-ing arena-backed allocations. */
-            return malloc(n);
+            /* General/Pool/Page (or a Ring request bigger than the whole buffer): GROW — chain a fresh
+             * block (at least as large as the first one) so the arena keeps owning every allocation. */
+            uint64_t ncap = a->cap > aligned ? a->cap : aligned;
+            uint8_t* nb = (uint8_t*)malloc(ncap);
+            HshArena* old = (HshArena*)malloc(sizeof(HshArena));
+            if (!nb || !old) { free(nb); free(old); return malloc(n); }
+            old->base = a->base; old->cap = a->cap; old->used = a->used; old->kind = a->kind; old->prev = a->prev;
+            a->prev = old; a->base = nb; a->cap = ncap; a->used = 0;
         }
     }
     void* p = a->base + a->used;
     a->used += aligned;
     return p;
 }
-void hsh_arena_free(HshArena* a) { if (a) { free(a->base); free(a); } }
+void hsh_arena_free(HshArena* a) {
+    if (!a) return;
+    HshArena* b = a->prev;
+    while (b) { HshArena* nx = b->prev; free(b->base); free(b); b = nx; }
+    free(a->base); free(a);
+}
 
 /* Push `a` as the current arena for this thread (emitted at the entry of
  * every `@arena`-annotated function). Past HSH_ARENA_STACK_MAX levels of
@@ -264,6 +275,21 @@ static HshArena* hsh_arena_current(void) {
 static void* hsh_alloc(uint64_t n) {
     HshArena* a = hsh_arena_current();
     return a ? hsh_arena_alloc(a, n) : malloc(n);
+}
+
+/* Exported allocator for the C++ backend (arena-aware, same as hsh_alloc). */
+void* hsh_alloc_ex(uint64_t n) { return hsh_alloc(n); }
+
+/* Deterministic drop of an owned array (`@safety` scope-end drop, see compiler/src/drops.h#).  Only ever called for
+ * an array the compiler proved never leaves its function.  While an arena is active the header lives in (or was
+ * carved out of) that arena and is reclaimed with it, so only the malloc'd growth buffer is released. */
+void hsh_array_drop(void* arr) {
+    if (!arr) return;
+    HshArray *h = (HshArray*)arr;
+    if (h->own) { free(h->data); h->own = 0; h->data = (int64_t*)(h + 1); }
+    h->len = 0;
+    if (hsh_arena_current()) return;
+    free(arr);
 }
 
 /* ── @arena checkpoint / rewind ("basic v2") ─────────────────────────────────
@@ -2642,35 +2668,63 @@ int64_t hsh_run_cmd_exec(hsh_string cmd, int64_t timeout_secs) {
     close(out_pipe[1]);
     close(err_pipe[1]);
 
-    int status = 0;
+    /* Drain stdout/stderr WHILE the child runs.  Waiting first and reading afterwards deadlocks as soon as the
+     * child writes more than one pipe buffer (64 KiB) — e.g. a g++ error cascade — because the child then blocks
+     * on write() forever and never exits (the compiler used to hang here until the timeout, with no output). */
+    char *ob = NULL, *eb = NULL; size_t ol = 0, oc = 0, el = 0, ec = 0;
+    int ofd = out_pipe[0], efd = err_pipe[0];
+    fcntl(ofd, F_SETFL, fcntl(ofd, F_GETFL, 0) | O_NONBLOCK);
+    fcntl(efd, F_SETFL, fcntl(efd, F_GETFL, 0) | O_NONBLOCK);
+    time_t deadline = timeout_secs > 0 ? time(NULL) + (time_t)timeout_secs : 0;
+    int killed = 0, status = 0;
     int64_t exit_code;
-    if (timeout_secs <= 0) {
+    while (ofd >= 0 || efd >= 0) {
+        struct pollfd pf[2]; int np = 0, which[2];
+        if (ofd >= 0) { pf[np].fd = ofd; pf[np].events = POLLIN; which[np++] = 0; }
+        if (efd >= 0) { pf[np].fd = efd; pf[np].events = POLLIN; which[np++] = 1; }
+        poll(pf, (nfds_t)np, 50);
+        for (int i = 0; i < np; i++) {
+            if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            int fd = which[i] == 0 ? ofd : efd;
+            char chunk[8192];
+            for (;;) {
+                ssize_t n = read(fd, chunk, sizeof(chunk));
+                if (n > 0) {
+                    char **bp = which[i] == 0 ? &ob : &eb; size_t *lp = which[i] == 0 ? &ol : &el; size_t *cp = which[i] == 0 ? &oc : &ec;
+                    if (*lp + (size_t)n + 1 > *cp) {
+                        size_t nc = (*cp + (size_t)n + 1) * 2; char *nb = (char*)realloc(*bp, nc);
+                        if (!nb) { n = 0; } else { *bp = nb; *cp = nc; }
+                    }
+                    if (n > 0) { memcpy(*bp + *lp, chunk, (size_t)n); *lp += (size_t)n; continue; }
+                }
+                if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
+                if (which[i] == 0) { close(ofd); ofd = -1; } else { close(efd); efd = -1; }
+                break;
+            }
+        }
+        if (deadline && time(NULL) >= deadline) { kill(pid, SIGKILL); killed = 1; break; }
+    }
+    if (killed) {
         waitpid(pid, &status, 0);
-        exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     } else {
-        time_t deadline = time(NULL) + (time_t)timeout_secs;
-        int killed = 0;
         for (;;) {
             pid_t r = waitpid(pid, &status, WNOHANG);
             if (r == pid) break;
-            if (time(NULL) >= deadline) {
-                kill(pid, SIGKILL);
-                waitpid(pid, &status, 0);
-                killed = 1;
-                break;
-            }
-            struct timespec ts = { 0, 50 * 1000 * 1000 }; /* 50ms poll */
+            if (deadline && time(NULL) >= deadline) { kill(pid, SIGKILL); waitpid(pid, &status, 0); killed = 1; break; }
+            struct timespec ts = { 0, 20 * 1000 * 1000 };
             nanosleep(&ts, NULL);
         }
-        exit_code = killed ? -2 : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     }
+    exit_code = killed ? -2 : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    if (ofd >= 0) close(ofd);
+    if (efd >= 0) close(efd);
+    if (ob) ob[ol] = '\0';
+    if (eb) eb[el] = '\0';
 
     free(g_hsh_run_cmd_stdout);
     free(g_hsh_run_cmd_stderr);
-    g_hsh_run_cmd_stdout = hsh_drain_fd(out_pipe[0]);
-    g_hsh_run_cmd_stderr = hsh_drain_fd(err_pipe[0]);
-    close(out_pipe[0]);
-    close(err_pipe[0]);
+    g_hsh_run_cmd_stdout = ob ? ob : strdup("");
+    g_hsh_run_cmd_stderr = eb ? eb : strdup("");
     return exit_code;
 }
 
@@ -3516,10 +3570,12 @@ double  hsh_atof_export(hsh_string s)  { return hsh_atof(s); }
 
 static HshArray *hsh_arr_alloc(int64_t cap) {
     if (cap < 4) cap = 4;
-    HshArray *a = (HshArray*)hsh_alloc(sizeof(int64_t)*2 + sizeof(int64_t)*(size_t)cap);
+    HshArray *a = (HshArray*)hsh_alloc(sizeof(HshArray) + sizeof(int64_t)*(size_t)cap);
     if (!a) return NULL;
     a->len = 0;
     a->cap = cap;
+    a->data = (int64_t*)(a + 1);
+    a->own = 0;
     return a;
 }
 
@@ -3530,14 +3586,16 @@ HshArray *hsh_array_new(void) {
 HshArray *hsh_array_push(HshArray *a, int64_t val) {
     if (!a) a = hsh_array_new();
     if (a->len >= a->cap) {
+        /* grow IN PLACE: the header never moves, so every holder of this array (a caller that passed it to a
+         * callee which pushes, a struct field, a closure capture) keeps seeing the same len/cap/data. */
         int64_t new_cap = a->cap * 2;
-        HshArray *b = hsh_arr_alloc(new_cap);
-        if (!b) return a;
-        b->len = a->len;
-        b->cap = new_cap;
-        for (int64_t i = 0; i < a->len; i++) b->data[i] = a->data[i];
-        free(a);
-        a = b;
+        int64_t *nd = (int64_t*)malloc(sizeof(int64_t)*(size_t)new_cap);
+        if (!nd) return a;
+        for (int64_t i = 0; i < a->len; i++) nd[i] = a->data[i];
+        if (a->own) free(a->data);
+        a->data = nd;
+        a->own = 1;
+        a->cap = new_cap;
     }
     a->data[a->len++] = val;
     return a;
