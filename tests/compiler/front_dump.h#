@@ -1,0 +1,66 @@
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+fn esc(s: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 92 is sb.push("\\\\")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 10 is sb.push("\\n")
+        elsif c == 9 is sb.push("\\t")
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    return sb.build()
+end
+
+;; the Rust dumper prints every `__destructure_<n>` name as plain `__destructure_`
+fn norm(n: ast::Node) is
+    if n.text.len() > 14 && n.text[0..14] == "__destructure_" is n.text = "__destructure_" end
+    for k in n.kids is norm(k) end
+end
+
+fn main() is
+    let args: [string] = env_args()
+    if args.len() < 2 is
+        write("usage: front_dump <file.h#> [--test] [--mem Mode]")
+        exit(2)
+    end
+    let path: string = args[1]
+    let mut opts: options::CompileOptions = options::default_options(false)
+    let mut i: int = 2
+    while i < args.len() is
+        if args[i] == "--test" is opts.test_mode = true end
+        if args[i] == "--mem" && i + 1 < args.len() is opts.default_mem_mode = args[i + 1] end
+        i += 1
+    end
+    let rec: edition::EditionRecorder = edition::new_recorder()
+    let st: edition::EditionState = edition::new_state()
+    let r: parser::ParseResult = parser::parse_with_default(fs::read(path), path, 0, rec, st)
+    if parser::has_errors(r) is
+        print("ERRORS\n")
+        return
+    end
+    let res: modules::Resolver = modules::new_resolver(path, [], rec, st)
+    let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(path))
+    if !e.ok is
+        print("ERR\t" + esc(e.err) + "\n")
+        return
+    end
+    let m0: ast::Node = ast::nd("Module", "", [r.module.kids[0], r.module.kids[1], r.module.kids[2], ast::nd("Items", "", e.items)])
+    let mut m: ast::Node = pipeline::prepare(m0, opts)
+    let mut run_opt: bool = false
+    for a in args is
+        if a == "--opt" is run_opt = true end
+    end
+    if run_opt is m = pipeline::optimize_pass(m, opts) end
+    norm(m.kids[3])
+    let mut sb = strbuf::new()
+    ast::dump_plain(m.kids[3], 0, sb)
+    print(sb.build())
+end
