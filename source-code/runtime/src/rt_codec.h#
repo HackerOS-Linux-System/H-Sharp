@@ -1,0 +1,129 @@
+fn raw_string(bs: [int]) -> string is
+    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+end
+
+;; hsh_b64_val: -1 for padding / anything that is not in the alphabet
+fn b64_val(c: int) -> int is
+    if c >= 65 && c <= 90 is return c - 65 end
+    if c >= 97 && c <= 122 is return c - 97 + 26 end
+    if c >= 48 && c <= 57 is return c - 48 + 52 end
+    if c == 43 is return 62 end
+    if c == 47 is return 63 end
+    return -1
+end
+
+;; hsh_base64_encode (standard alphabet, '=' padding)
+pub fn base64_encode(s: string) -> string is
+    let tab: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    let n: int = s.len()
+    let mut out: string = ""
+    let mut i: int = 0
+    while i + 2 < n is
+        let v: int = byte_at(s, i) * 65536 + byte_at(s, i + 1) * 256 + byte_at(s, i + 2)
+        out += tab[v / 262144 % 64..v / 262144 % 64 + 1]
+        out += tab[v / 4096 % 64..v / 4096 % 64 + 1]
+        out += tab[v / 64 % 64..v / 64 % 64 + 1]
+        out += tab[v % 64..v % 64 + 1]
+        i += 3
+    end
+    let rem: int = n - i
+    if rem == 1 is
+        let v: int = byte_at(s, i) * 65536
+        out += tab[v / 262144 % 64..v / 262144 % 64 + 1]
+        out += tab[v / 4096 % 64..v / 4096 % 64 + 1]
+        out += "=="
+    elsif rem == 2 is
+        let v: int = byte_at(s, i) * 65536 + byte_at(s, i + 1) * 256
+        out += tab[v / 262144 % 64..v / 262144 % 64 + 1]
+        out += tab[v / 4096 % 64..v / 4096 % 64 + 1]
+        out += tab[v / 64 % 64..v / 64 % 64 + 1]
+        out += "="
+    end
+    return out
+end
+
+;; hsh_base64_decode: skips every character that is not in the alphabet (padding, whitespace, garbage)
+pub fn base64_decode(s: string) -> string is
+    let mut out: [int] = []
+    let mut buf: [int] = []
+    let mut i: int = 0
+    while i < s.len() is
+        let v: int = b64_val(byte_at(s, i))
+        if v >= 0 is
+            buf.push(v)
+            if buf.len() == 4 is
+                out.push((buf[0] * 4 + buf[1] / 16) % 256)
+                out.push((buf[1] % 16 * 16 + buf[2] / 4) % 256)
+                out.push((buf[2] % 4 * 64 + buf[3]) % 256)
+                buf = []
+            end
+        end
+        i += 1
+    end
+    if buf.len() == 2 is
+        out.push((buf[0] * 4 + buf[1] / 16) % 256)
+    elsif buf.len() == 3 is
+        out.push((buf[0] * 4 + buf[1] / 16) % 256)
+        out.push((buf[1] % 16 * 16 + buf[2] / 4) % 256)
+    end
+    return raw_string(out)
+end
+
+;; hsh_url_safe_char: RFC 3986 unreserved
+fn url_safe(c: int) -> bool is
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126
+end
+
+;; hsh_hex_val: -1 when not a hex digit
+fn hex_val(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 97 + 10 end
+    if c >= 65 && c <= 70 is return c - 65 + 10 end
+    return -1
+end
+
+;; hsh_url_encode: every byte that is not unreserved becomes %XX (uppercase hex); a space is %20, not '+'
+pub fn url_encode(s: string) -> string is
+    let hexd: string = "0123456789ABCDEF"
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if url_safe(c) is
+            out += s[i..i + 1]
+        else
+            out += "%" + hexd[c / 16..c / 16 + 1] + hexd[c % 16..c % 16 + 1]
+        end
+        i += 1
+    end
+    return out
+end
+
+;; hsh_url_decode: '+' -> ' ', %XX -> byte; a '%' not followed by two hex digits is kept as it is.
+;; Known limitation: output that is not valid UTF-8 (e.g. "%e5%bc") comes out lossy (U+FFFD) — the C version returns the raw bytes.
+pub fn url_decode(s: string) -> string is
+    let n: int = s.len()
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n is
+        let c: int = byte_at(s, i)
+        if c == 37 && i + 2 < n is
+            let hi: int = hex_val(byte_at(s, i + 1))
+            let lo: int = hex_val(byte_at(s, i + 2))
+            if hi >= 0 && lo >= 0 is
+                out.push(hi * 16 + lo)
+                i += 3
+            else
+                out.push(c)
+                i += 1
+            end
+        elsif c == 43 is
+            out.push(32)
+            i += 1
+        else
+            out.push(c)
+            i += 1
+        end
+    end
+    return raw_string(out)
+end
