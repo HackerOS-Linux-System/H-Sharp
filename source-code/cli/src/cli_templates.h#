@@ -1,0 +1,83 @@
+pub fn template_app() -> string is
+    return ";; H# Application\nfn main() is\n    let name: string = \"World\"\n    write(\"Hello, \" + name + \"!\")\n\n    let x: int = 42\n    let y: int = 8\n    write(\"Sum: \" + to_string(x + y))\n\n    for i in 1..=5 is\n        write(to_string(i) + \": \" + repeat(\"*\", i))\n    end\nend\n\nfn repeat(s: string, n: int) -> string is\n    let mut result: string = \"\"\n    let mut i: int = 0\n    while i < n is\n        result = result + s\n        i += 1\n    end\n    return result\nend\n"
+end
+
+pub fn readme_app() -> string is
+    return "# H# App\n\nA simple H# application.\n\n## Run\n```bash\nh# run src/main.h#\nh# compile src/main.h# --release -o build/app\n```\n\n## Build & check with bit\n```bash\nbit          # build (reads Bit.hk)\nbit check    # syntax + type check\n```\n"
+end
+
+pub fn test_app() -> string is
+    return ";; H# Application Tests\nuse \"std -> test\" from \"test\"\n\n#[test]\nfn test_repeat() is\n    ;; basic repeat\n    let r = repeat(\"*\", 3)\n    assert_eq(r, \"***\")\nend\n\n#[test]\nfn test_repeat_zero() is\n    let r = repeat(\"x\", 0)\n    assert_eq(r, \"\")\nend\n\nfn repeat(s: string, n: int) -> string is\n    let mut result: string = \"\"\n    let mut i: int = 0\n    while i < n is\n        result = result + s\n        i += 1\n    end\n    return result\nend\n"
+end
+
+pub fn template_cybersec() -> string is
+    return ";; H# CyberSec Tool\nuse \"std -> net_tcp\" from \"tcp\"\nuse \"std -> sec\"     from \"sec\"\nuse \"std -> fmt\"     from \"fmt\"\n\nfn main() is\n    write(fmt::bold(\"H# CyberSec Tool v0.1\"))\n    write(\"\")\n\n    let target: string = \"127.0.0.1\"\n    let port_start: int = 1\n    let port_end:   int = 1024\n\n    write(\"Target: \" + target)\n    write(\"Scanning ports \" + to_string(port_start) + \"..\" + to_string(port_end))\n    write(\"\")\n\n    let found: int = scan_range(target, port_start, port_end)\n    write(\"Open ports found: \" + to_string(found))\nend\n\nfn scan_range(host: string, start: int, end_port: int) -> int is\n    let mut found: int = 0\n    for port in start..=end_port is\n        if tcp::is_open(host, port) is\n            write(fmt::green(\"[OPEN] \") + to_string(port) + \"/tcp\")\n            found += 1\n        end\n    end\n    return found\nend\n\nfn xor_encrypt(data: string, key: string) -> string is\n    return sec::xor(data, key)\nend\n"
+end
+
+pub fn readme_cybersec() -> string is
+    return "# H# CyberSec Tool\n\nA cybersecurity tool template for H#.\n\n## Features\n- TCP port scanner\n- XOR cipher\n- Extensible with `std -> sec`, `std -> crypto`\n\n## Run\n```bash\nh# run src/main.h#\nh# compile src/main.h# --release -o build/tool\n```\n"
+end
+
+pub fn test_cybersec() -> string is
+    return ";; CyberSec Tests\nuse \"std -> test\" from \"test\"\nuse \"std -> sec\"  from \"sec\"\n\n#[test]\nfn test_xor_roundtrip() is\n    let plain = \"48656c6c6f\"\n    let key   = \"AABBCCDDEE\"\n    let enc   = sec::xor(plain, key)\n    let dec   = sec::xor(enc, key)\n    assert_eq(dec, plain)\nend\n\n#[test]\nfn test_rot13() is\n    let result = sec::rot13(\"Hello\")\n    assert_eq(result, \"Uryyb\")\n    assert_eq(sec::rot13(result), \"Hello\")\nend\n"
+end
+
+pub fn template_network() -> string is
+    return ";; H# Network Tool\nuse \"std -> net_tcp\"  from \"tcp\"\nuse \"std -> net_dns\"  from \"dns\"\nuse \"std -> net_http\" from \"http\"\nuse \"std -> fmt\"      from \"fmt\"\n\nfn main() is\n    write(fmt::bold(\"H# Network Tool v0.1\"))\n    write(\"\")\n\n    let host: string = \"example.com\"\n    write(\"Resolving: \" + host)\n\n    let ip = dns::resolve(host)\n    write(\"IP: \" + ip)\n    write(\"\")\n\n    write(\"HTTP GET https://\" + host)\n    let resp = http::get(\"https://\" + host)\n    write(\"Status: \" + to_string(resp.status))\n    write(\"Body length: \" + to_string(resp.body.len()) + \" bytes\")\nend\n"
+end
+
+pub fn readme_network() -> string is
+    return "# H# Network Tool\n\nA network utilities template for H#.\n\n## Features\n- DNS resolution\n- HTTP client\n- TCP utilities\n\n## Run\n```bash\nh# run src/main.h#\n```\n"
+end
+
+pub fn test_network() -> string is
+    return ";; Network Tests\nuse \"std -> test\"    from \"test\"\nuse \"std -> net_ip\"  from \"ip\"\n\n#[test]\nfn test_ip_parse() is\n    assert_true(ip::is_valid(\"192.168.1.1\"))\n    assert_true(ip::is_private(\"192.168.1.1\"))\n    assert_true(ip::is_private(\"10.0.0.1\"))\n    assert_true(!ip::is_private(\"8.8.8.8\"))\nend\n\n#[test]\nfn test_ip_invalid() is\n    assert_true(!ip::is_valid(\"999.999.999.999\"))\n    assert_true(!ip::is_valid(\"not-an-ip\"))\nend\n"
+end
+
+pub fn template_lib() -> string is
+    return ";; H# Library\n\n/// Add two integers together.\npub fn add(a: int, b: int) -> int = a + b\n\n/// Subtract b from a.\npub fn sub(a: int, b: int) -> int = a - b\n\n/// Multiply two integers.\npub fn mul(a: int, b: int) -> int = a * b\n\n/// Greet a name.\npub fn greet(name: string) -> string is\n    return \"Hello, \" + name + \"!\"\nend\n\n/// Clamp a value to [min, max].\npub fn clamp(val: int, min: int, max: int) -> int is\n    if val < min is return min end\n    if val > max is return max end\n    return val\nend\n"
+end
+
+pub fn readme_lib() -> string is
+    return "# H# Library\n\nA reusable H# library.\n\n## Usage\n```hsharp\nuse \"local -> mylib\" from \"lib\"\n\nfn main() is\n    write(lib::greet(\"World\"))\n    write(to_string(lib::add(2, 3)))\nend\n```\n"
+end
+
+pub fn test_lib() -> string is
+    return ";; Library Tests\nuse \"std -> test\" from \"test\"\n\n#[test]\nfn test_add() is\n    assert_eq(add(2, 3), 5)\n    assert_eq(add(-1, 1), 0)\n    assert_eq(add(0, 0), 0)\nend\n\n#[test]\nfn test_sub() is\n    assert_eq(sub(10, 3), 7)\n    assert_eq(sub(0, 5), -5)\nend\n\n#[test]\nfn test_mul() is\n    assert_eq(mul(3, 4), 12)\n    assert_eq(mul(-2, 5), -10)\nend\n\n#[test]\nfn test_clamp() is\n    assert_eq(clamp(5, 1, 10), 5)\n    assert_eq(clamp(-5, 0, 100), 0)\n    assert_eq(clamp(200, 0, 100), 100)\nend\n\n#[test]\nfn test_greet() is\n    assert_eq(greet(\"H#\"), \"Hello, H#!\")\nend\n\npub fn add(a: int, b: int) -> int = a + b\npub fn sub(a: int, b: int) -> int = a - b\npub fn mul(a: int, b: int) -> int = a * b\npub fn greet(name: string) -> string is return \"Hello, \" + name + \"!\" end\npub fn clamp(val: int, min: int, max: int) -> int is\n    if val < min is return min end\n    if val > max is return max end\n    return val\nend\n"
+end
+
+pub fn template_web() -> string is
+    return ";; H# Web Application\nuse \"std -> net_http\" from \"http\"\nuse \"std -> json\"     from \"json\"\nuse \"std -> log\"      from \"log\"\nuse \"std -> fmt\"      from \"fmt\"\n\nfn main() is\n    let port: int = 8080\n    write(fmt::bold(\"H# Web Server v0.1\"))\n    write(\"Listening on http://0.0.0.0:\" + to_string(port))\n    write(\"\")\n\n    http::listen(\"0.0.0.0\", port, handle_request)\nend\n\nfn handle_request(method: string, path: string, body: string) -> http::Response is\n    log::info(method + \" \" + path)\n\n    if path == \"/\" is\n        return http::ok(html_index(), \"text/html\")\n    end\n\n    if path == \"/api/hello\" && method == \"GET\" is\n        let data = json::object([\n            (\"message\", \"Hello from H#!\"),\n            (\"version\", \"0.9\"),\n            (\"lang\",    \"H#\")\n        ])\n        return http::json(200, data)\n    end\n\n    if path == \"/api/echo\" && method == \"POST\" is\n        return http::json(200, body)\n    end\n\n    return http::not_found(\"404 Not Found\")\nend\n\nfn html_index() -> string is\n    return \"<!DOCTYPE html><html><head><title>H# Web</title></head>\" +\n           \"<body><h1>H# Web Server</h1><p>Built with H# v0.9</p>\" +\n           \"<p><a href=\\\"/api/hello\\\">GET /api/hello</a></p>\" +\n           \"</body></html>\"\nend\n"
+end
+
+pub fn readme_web() -> string is
+    return "# H# Web Application\n\nA minimal HTTP web server template for H#.\n\n## Run\n```bash\nh# run src/main.h#\n# Open http://localhost:8080\n```\n\n## Routes\n- `GET /` — HTML index page\n- `GET /api/hello` — JSON hello response\n- `POST /api/echo` — Echo body as JSON\n"
+end
+
+pub fn test_web() -> string is
+    return ";; Web Application Tests\nuse \"std -> test\"     from \"test\"\nuse \"std -> net_http\" from \"http\"\nuse \"std -> json\"     from \"json\"\n\n#[test]\nfn test_json_response() is\n    let data = json::object([(\"key\", \"value\")])\n    let s = json::stringify(data)\n    assert_true(s.contains(\"key\"))\n    assert_true(s.contains(\"value\"))\nend\n\n#[test]\nfn test_json_parse() is\n    ;; {{{{ / }}}} are H#'s escaped-literal-brace syntax — JSON's braces would\n    ;; otherwise be parsed as string interpolation markers.\n    let raw = \"{{{{\\\"name\\\":\\\"H#\\\",\\\"version\\\":\\\"0.9\\\"}}}}\"\n    let obj = json::parse(raw)\n    assert_eq(json::get_str(obj, \"name\"), \"H#\")\nend\n"
+end
+
+pub fn template_tui() -> string is
+    return ";; H# TUI Application\nuse \"std -> term\" from \"term\"\nuse \"std -> fmt\"  from \"fmt\"\nuse \"std -> cli\"  from \"cli\"\n\nfn main() is\n    term::clear()\n    term::hide_cursor()\n\n    draw_header()\n    draw_menu()\n\n    let choice = read_choice()\n    handle_choice(choice)\n\n    term::show_cursor()\nend\n\nfn draw_header() is\n    let w = term::width()\n    write(fmt::bold(fmt::cyan(center(\"H# TUI App v0.1\", w))))\n    write(fmt::dim(repeat(\"─\", w)))\n    write(\"\")\nend\n\nfn draw_menu() is\n    write(\"  \" + fmt::green(\"[1]\") + \" Option A\")\n    write(\"  \" + fmt::green(\"[2]\") + \" Option B\")\n    write(\"  \" + fmt::green(\"[3]\") + \" Option C\")\n    write(\"  \" + fmt::red(\"[q]\") + \" Quit\")\n    write(\"\")\n    write(\"Choose: \")\nend\n\nfn read_choice() -> string is\n    return cli::prompt(\"\")\nend\n\nfn handle_choice(choice: string) is\n    if choice == \"1\" is\n        write(\"You chose: Option A\")\n    elsif choice == \"2\" is\n        write(\"You chose: Option B\")\n    elsif choice == \"3\" is\n        write(\"You chose: Option C\")\n    elsif choice == \"q\" is\n        write(\"Goodbye!\")\n    else is\n        write(\"Unknown choice: \" + choice)\n    end\nend\n\nfn center(s: string, width: int) -> string is\n    let pad = (width - s.len()) / 2\n    return repeat(\" \", pad) + s\nend\n\nfn repeat(s: string, n: int) -> string is\n    let mut r: string = \"\"\n    let mut i: int = 0\n    while i < n is r = r + s; i += 1 end\n    return r\nend\n"
+end
+
+pub fn readme_tui() -> string is
+    return "# H# TUI Application\n\nAn interactive terminal UI application template for H#.\n\n## Features\n- Terminal width detection\n- Color output\n- Interactive menu\n\n## Run\n```bash\nh# run src/main.h#\nh# compile src/main.h# --release -o build/app\n```\n"
+end
+
+pub fn test_tui() -> string is
+    return ";; TUI Tests\nuse \"std -> test\" from \"test\"\n\n#[test]\nfn test_center() is\n    let result = center(\"hi\", 10)\n    assert_eq(result.len(), 10)\n    assert_true(result.contains(\"hi\"))\nend\n\n#[test]\nfn test_repeat() is\n    assert_eq(repeat(\"─\", 3), \"───\")\n    assert_eq(repeat(\"x\", 0), \"\")\nend\n\nfn center(s: string, width: int) -> string is\n    let pad = (width - s.len()) / 2\n    return repeat(\" \", pad) + s\nend\n\nfn repeat(s: string, n: int) -> string is\n    let mut r: string = \"\"\n    let mut i: int = 0\n    while i < n is r = r + s; i += 1 end\n    return r\nend\n"
+end
+
+pub fn template_wasm() -> string is
+    return ";; H# WASM Module\n;; Compile: h# compile src/main.h# --target wasm32 -o build/module.wasm\n\n/// Add two numbers — exported to JavaScript as wasmAdd(a, b)\n#[export]\npub fn add(a: int, b: int) -> int = a + b\n\n/// Multiply — exported as wasmMul(a, b)\n#[export]\npub fn mul(a: int, b: int) -> int = a * b\n\n/// Fibonacci\n#[export]\npub fn fib(n: int) -> int is\n    if n <= 1 is return n end\n    return fib(n - 1) + fib(n - 2)\nend\n\n/// String length (from WASM memory)\n#[export]\npub fn str_len(s: string) -> int = s.len()\n"
+end
+
+pub fn readme_wasm() -> string is
+    return "# H# WASM Module\n\nA WebAssembly module template for H#.\n\n## Compile\n```bash\nh# compile src/main.h# --target wasm32 -o build/module.wasm\n```\n\n## Use from JavaScript\n```javascript\nconst wasm = await WebAssembly.instantiateStreaming(fetch('module.wasm'));\nconst {{ add, mul, fib }} = wasm.instance.exports;\nconsole.log(add(2, 3)); // 5\nconsole.log(fib(10));   // 55\n```\n"
+end
+
+pub fn test_wasm() -> string is
+    return ";; WASM Module Tests\nuse \"std -> test\" from \"test\"\n\n#[test]\nfn test_add() is\n    assert_eq(add(2, 3), 5)\n    assert_eq(add(-1, 1), 0)\nend\n\n#[test]\nfn test_mul() is\n    assert_eq(mul(3, 4), 12)\nend\n\n#[test]\nfn test_fib() is\n    assert_eq(fib(0), 0)\n    assert_eq(fib(1), 1)\n    assert_eq(fib(10), 55)\nend\n\npub fn add(a: int, b: int) -> int = a + b\npub fn mul(a: int, b: int) -> int = a * b\npub fn fib(n: int) -> int is\n    if n <= 1 is return n end\n    return fib(n - 1) + fib(n - 2)\nend\n"
+end
