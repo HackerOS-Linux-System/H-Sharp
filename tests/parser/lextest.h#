@@ -1,0 +1,52 @@
+use "std -> fs" from "fs"
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+
+
+fn escape(s: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 10 is sb.push("\\n")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 9 is sb.push("\\t")
+        elsif c == 92 is sb.push("\\\\")
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    return sb.build()
+end
+
+fn main() is
+    let args: [string] = env_args()
+    let src: string = fs::read(args[1])
+    let spans: bool = args.len() > 2 && args[2] == "--spans"
+    let lx: lexer::Lexed = lexer::lex(src, args[1])
+    let mut out = strbuf::new()
+    if lx.errs.len() > 0 is
+        for e in lx.errs is
+            if spans is
+                out.push("E\t" + escape(error::error_display(e)) + "\t{e.sl}:{e.sc}:{e.so}-{e.el}:{e.ec}:{e.eo}\t" + escape(e.kind) + "\n")
+                for h in e.hints is out.push("H\t" + escape(h) + "\n") end
+            else
+                out.push("err\t" + escape(e.kind) + "\n")
+            end
+        end
+        print(out.build())
+        return
+    end
+    for t in lx.toks is
+        out.push(t.kind)
+        out.push("\t")
+        out.push(escape(t.text))
+        if spans is out.push("\t{t.sl}:{t.sc}:{t.so}-{t.el}:{t.ec}:{t.eo}\t" + escape(t.disp)) end
+        out.push("\n")
+    end
+    if spans is
+        for d in lx.docs is
+            out.push("DOC\t" + escape(d.text) + "\t{d.sl}:{d.sc}:{d.so}-{d.el}:{d.ec}:{d.eo}\n")
+        end
+    end
+    print(out.build())
+end
