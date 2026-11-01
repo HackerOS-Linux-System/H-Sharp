@@ -1,0 +1,198 @@
+use "std -> test" from "test"
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+
+fn tmp(tag: string) -> string is
+    let d: string = "/tmp/bit_resolve_h_" + tag
+    fs::rmdir_all(d)
+    run_cmd_exec("mkdir -p " + shell_escape(d), 30)
+    return d
+end
+
+fn write_f(path: string, content: string) is
+    run_cmd_exec("mkdir -p \"$(dirname " + shell_escape(path) + ")\"", 30)
+    fs::write(path, content)
+end
+
+fn isolated_env(root: string) is
+    env::set("HOME", root + "/home")
+    env::set("BIT_HOME", root + "/libs")
+    env::set("BIT_DIR", root + "/state")
+    env::remove("BIT_LIBS")
+    env::remove("HLIB_PATH")
+end
+
+fn contains(s: string, p: string) -> bool is
+    let n: int = s.len()
+    let m: int = p.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == p is return true end
+        i += 1
+    end
+    return false
+end
+
+#[test]
+fn test_hk_parses_nested_keys_and_comments() is
+    let hk: [bit_resolve::HkEntry] = bit_resolve::parse_hk("! comment\n[package]\n-> name => \"x\"\n[dependencies]\n-> mine\n--> path => ../mine\n--> output => a\n-> tui => rev v1.0\n[workspace]\n-> members => [core, \"cli\"]\n")
+    let mut got: [string] = []
+    for e in hk is got.push(e.section + "|" + e.key + "|" + e.value) end
+    assert_eq(got.len(), 5)
+    assert_eq(got[0], "package|name|x")
+    assert_eq(got[1], "dependencies|mine.path|../mine")
+    assert_eq(got[2], "dependencies|mine.output|a")
+    assert_eq(got[3], "dependencies|tui|rev v1.0")
+    assert_eq(got[4], "workspace|members|[core, \"cli\"]")
+end
+
+#[test]
+fn test_lock_is_json_lines() is
+    let d: string = tmp("lock")
+    write_f(d + "/bit.lock", "{\"name\":\"mold\",\"version\":\"a1b2c3d4e5f6\",\"commit\":\"a1b2c3d4e5f6aaaaaaaa\",\"lang\":\"hsharp\"}\n\nnot json\n{\"name\":\"tui\",\"version\":\"111111111111\"}\n")
+    let l: bit_resolve::LockTable = bit_resolve::read_bit_lock_from(d + "/bit.lock")
+    assert_eq(l.names.len(), 2)
+    let m: bit_resolve::LockedBitLib = bit_resolve::lock_get(l, "mold")
+    assert_eq(m.lang, "hsharp")
+    assert_eq(bit_resolve::version_matches("a1b2c3d4e5f6", m), true)
+    assert_eq(bit_resolve::version_matches("a1b2c3d", m), true)
+    assert_eq(bit_resolve::version_matches("*", m), true)
+    assert_eq(bit_resolve::version_matches("1.0", m), false)
+end
+
+#[test]
+fn test_json_reader_edge_cases() is
+    assert_eq(bit_resolve::parse_json_line("{\"name\":\"a\\\"b\\u0041\",\"n\":12.5e3,\"o\":{\"x\":[1,2,{\"y\":null}]},\"t\":true}").ok, true)
+    assert_eq(bit_resolve::parse_json_line("{\"name\":\"a\",}").ok, false)
+    assert_eq(bit_resolve::parse_json_line("{\"name\":\"a\"} x").ok, false)
+    assert_eq(bit_resolve::parse_json_line("{name:1}").ok, false)
+    assert_eq(bit_resolve::parse_json_line("[1,2]").ok, true)
+    assert_eq(bit_resolve::parse_json_line("").ok, false)
+    let j: bit_resolve::JsonObj = bit_resolve::parse_json_line("{\"name\":\"x\",\"name\":\"y\",\"v\":3}")
+    assert_eq(j.vals[0], "y")
+    assert_eq(j.vals[1], "")
+end
+
+#[test]
+fn test_names_are_validated() is
+    assert_eq(bit_resolve::valid_lib_name("mold"), true)
+    assert_eq(bit_resolve::valid_lib_name("H2D"), true)
+    assert_eq(bit_resolve::valid_lib_name("a.b-c_d"), true)
+    assert_eq(bit_resolve::valid_lib_name(""), false)
+    assert_eq(bit_resolve::valid_lib_name(".."), false)
+    assert_eq(bit_resolve::valid_lib_name("../x"), false)
+    assert_eq(bit_resolve::valid_lib_name("-x"), false)
+end
+
+#[test]
+fn test_resolves_installed_current_and_flat_and_path_dep() is
+    let root: string = tmp("resolve")
+    isolated_env(root)
+    let v: string = root + "/libs/mold/aaaaaaaaaaaa"
+    write_f(v + "/Bit.hk", "[package]\n-> name => mold\n-> version => 0.3.0\n[layout]\n-> src => src\n")
+    write_f(v + "/src/lib.h#", "pub fn a() is end\n")
+    run_cmd_exec("ln -s aaaaaaaaaaaa " + root + "/libs/mold/current", 30)
+    write_f(root + "/state/bit.lock", "{\"name\":\"mold\",\"version\":\"aaaaaaaaaaaa\",\"commit\":\"aaaaaaaaaaaa1111\",\"lang\":\"hsharp\"}\n")
+    let proj: string = root + "/proj"
+    write_f(proj + "/Bit.hk", "[package]\n-> name => proj\n[dependencies]\n-> mine\n--> path => ../mine\n")
+    write_f(proj + "/src/main.h#", "fn main() is end\n")
+    let start: string = proj + "/src"
+
+    let e: bit_resolve::UseResult = bit_resolve::resolve_bit_use("mold", false, "", false, start)
+    assert_eq(e.ok, true)
+    assert_eq(bit_resolve::path_ends_with(e.entry, "src/lib.h#"), true)
+    assert_eq(bit_resolve::resolve_bit_use("mold", true, "aaaaaaaaaaaa", false, start).ok, true)
+    assert_eq(bit_resolve::resolve_bit_use("mold", true, "9.9.9", false, start).ok, false)
+    assert_eq(bit_resolve::resolve_bit_use("mold", false, "", true, start).ok, true)
+
+    write_f(root + "/libs/flat/lib.h#", "pub fn f() is end\n")
+    write_f(root + "/libs/flat/Bit.hk", "[package]\n-> version => 1.2.0\n")
+    assert_eq(bit_resolve::resolve_bit_use("flat", false, "", false, start).ok, true)
+    assert_eq(bit_resolve::resolve_bit_use("flat", true, "1.2.0", false, start).ok, true)
+    assert_eq(bit_resolve::resolve_bit_use("flat", true, "v1.2.0", false, start).ok, true)
+    assert_eq(bit_resolve::resolve_bit_use("flat", true, "2.0", false, start).ok, false)
+    assert_eq(bit_resolve::resolve_bit_use("flat", false, "", true, start).ok, false)
+
+    write_f(root + "/libs/single.h#", "pub fn s() is end\n")
+    assert_eq(bit_resolve::resolve_bit_use("single", false, "", false, start).ok, true)
+
+    write_f(proj + "/cache/libs/loc/src/lib.h#", "pub fn l() is end\n")
+    assert_eq(bit_resolve::resolve_bit_use("loc", false, "", false, start).ok, true)
+    write_f(root + "/mine/src/lib.h#", "pub fn m() is end\n")
+    assert_eq(bit_resolve::resolve_bit_use("mine", false, "", false, start).ok, true)
+
+    let err: bit_resolve::UseResult = bit_resolve::resolve_bit_use("nope", false, "", false, start)
+    assert_eq(err.ok, false)
+    assert_eq(contains(err.err, "bit install nope") && contains(err.err, "cache/libs/nope"), true)
+    assert_eq(bit_resolve::resolve_bit_use("../etc", false, "", false, start).ok, false)
+
+    write_f(root + "/libs/hollow/README", "x")
+    write_f(root + "/libs/hollow/Bit.hk", "[package]\n-> name => hollow\n")
+    let h: bit_resolve::FindResult = bit_resolve::find_bit_lib("hollow", start)
+    assert_eq(h.ok, false)
+    assert_eq(h.err_kind, "NoEntry")
+end
+
+#[test]
+fn test_workspace_root_promotion_and_members() is
+    let root0: string = tmp("ws")
+    let root: string = bit_resolve::manifest_dir_of(root0)
+    write_f(root0 + "/Bit.hk", "[workspace]\n-> members => [core, tools/cli]\n")
+    write_f(root0 + "/core/Bit.hk", "[package]\n-> name => core\n")
+    write_f(root0 + "/core/src/lib.h#", "")
+    write_f(root0 + "/tools/cli/Bit.hk", "[package]\n-> name => cli\n")
+    write_f(root0 + "/tools/cli/src/main.h#", "")
+    let r: string = bit_resolve::manifest_dir_of(root0)
+    assert_eq(bit_resolve::find_bit_project_root(root0 + "/core/src"), r + "/core")
+    assert_eq(bit_resolve::find_bit_workspace_root(root0 + "/core/src"), r)
+    assert_eq(bit_resolve::find_workspace_member_dir(root0, "cli"), root0 + "/tools/cli")
+    assert_eq(bit_resolve::path_ends_with(bit_resolve::workspace_member_entry(root0 + "/core"), "src/lib.h#"), true)
+    assert_eq(bit_resolve::path_ends_with(bit_resolve::workspace_member_entry(root0 + "/tools/cli"), "src/main.h#"), true)
+end
+
+#[test]
+fn test_edition_section_is_read_only_for_hsharp_projects() is
+    let root: string = tmp("edition_lang")
+    write_f(root + "/a/Bit.hk", "[package]\n-> name => a\n-> lang => h#\n[edition]\n-> edition => 2026\n")
+    write_f(root + "/b/Bit.hk", "[package]\n-> name => b\n-> lang => hs\n[edition]\n-> edition => 2026\n")
+    write_f(root + "/c/Bit.hk", "[package]\n-> name => c\n[edition]\n-> edition => 2026\n")
+    write_f(root + "/d/Bit.hk", "[package]\n-> name => d\n-> lang => h#\n")
+    write_f(root + "/e/Bit.hk", "[package]\n-> name => e\n-> lang => [\"HackerScript\", \"H-Sharp\"]\n[edition]\n-> edition => \"2026\"\n")
+    write_f(root + "/f/Bit.hk", "[package]\n-> name => f\n-> lang => h#\n[edition]\n-> edition => 2099\n")
+    write_f(root + "/g/Bit.hk", "[package]\n-> name => g\n-> lang => h#\n[edition]\n-> edition => soon\n")
+    let a: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/a")
+    assert_eq(a.ok && a.has && a.edition == "2026", true)
+    let b: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/b")
+    assert_eq(b.ok && !b.has, true)
+    let c: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/c")
+    assert_eq(c.ok && !c.has, true)
+    let d: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/d")
+    assert_eq(d.ok && !d.has, true)
+    let e: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/e")
+    assert_eq(e.ok && e.has && e.edition == "2026", true)
+    let f: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/f")
+    assert_eq(f.ok, false)
+    assert_eq(contains(f.err, "newer") && contains(f.err, "Bit.hk"), true)
+    assert_eq(contains(bit_resolve::manifest_edition(root + "/g").err, "four-digit"), true)
+    let n: bit_resolve::ManifestEdition = bit_resolve::manifest_edition(root + "/nowhere")
+    assert_eq(n.ok && !n.has, true)
+end
+
+#[test]
+fn test_edition_for_file_prefers_the_owning_project() is
+    let root: string = tmp("edition_owner")
+    let hk: string = "[package]\n-> name => x\n-> lang => h#\n[edition]\n-> edition => 2026\n"
+    write_f(root + "/app/Bit.hk", hk)
+    write_f(root + "/app/src/main.h#", "fn main() is end\n")
+    write_f(root + "/dep/Bit.hk", hk)
+    write_f(root + "/dep/src/lib.h#", "pub fn f() is end\n")
+    write_f(root + "/loose/x.h#", "fn x() is end\n")
+    let app: string = root + "/app"
+    assert_eq(bit_resolve::edition_for_file(app + "/src/main.h#", true, app), "")
+    assert_eq(bit_resolve::edition_for_file(root + "/dep/src/lib.h#", true, app), "2026")
+    assert_eq(bit_resolve::edition_for_file(root + "/loose/x.h#", true, app), "")
+    let p: bit_resolve::ManifestEdition = bit_resolve::project_edition(app + "/src")
+    assert_eq(p.ok && p.has && p.edition == "2026", true)
+end
