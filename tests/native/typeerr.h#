@@ -1,0 +1,5 @@
+fn main() is
+    let x: int = "hello"
+    let y = undefined_var + 1
+    foo(1, 2)
+end
