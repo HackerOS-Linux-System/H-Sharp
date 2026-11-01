@@ -1,0 +1,30 @@
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+
+mod target
+mod options
+mod builtins
+mod features
+mod const_lowering
+mod builtin_lowering
+mod reachability
+mod lifetimes
+mod regions
+mod drops
+mod ffi
+mod ffi_rust_native
+mod ffi_cpp
+mod ffi_linker
+mod hlib_export
+mod cpp_build
+mod stdlib_shims
+mod traits
+mod modules
+mod derive_codegen
+mod optimize
+mod cg
+mod cgb
+mod cppgen
+mod monomorphize
+mod memory_safety
+mod pipeline
