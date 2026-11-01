@@ -1,0 +1,21 @@
+[package]
+-> name        => lsp
+-> version     => 1.0.0
+-> description => H# language server (h# lsp): the lsp library (libs/lsp) + parser/typecheck of this workspace
+-> license     => MPL-2.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[lib]
+-> output => hlib
+
+[dependencies]
+-> lsp => newest
