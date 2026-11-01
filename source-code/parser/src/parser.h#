@@ -1,0 +1,2369 @@
+use "std -> option" from "option"
+use "std -> strbuf" from "strbuf"
+
+mod ast
+mod error
+mod lexer
+mod edition
+
+pub struct Parser is
+    pub toks: [lexer::Token]
+    pub pos:  int
+    pub file: string
+    pub errs: [error::ParseError]
+end
+
+;; ── wrappers ──────────────────────────────────────────────────────────────────
+fn nd(tag: string, text: string, kids: [ast::Node]) -> ast::Node is
+    return ast::nd(tag, text, kids)
+end
+
+fn lf(tag: string, text: string) -> ast::Node is
+    return ast::lf(tag, text)
+end
+
+fn nn() -> ast::Node is
+    return ast::nn()
+end
+
+fn bn(v: bool) -> ast::Node is
+    return ast::bn(v)
+end
+
+fn opt_s(has: bool, t: string) -> ast::Node is
+    return ast::opt_s(has, t)
+end
+
+fn ok(n: ast::Node) -> option::Result<ast::Node, error::ParseError> is
+    return option::Result::Ok(n)
+end
+
+fn fail(e: error::ParseError) -> option::Result<ast::Node, error::ParseError> is
+    return option::Result::Err(e)
+end
+
+fn t_sp(t: lexer::Token) -> ast::Sp is
+    return ast::Sp { sl: t.sl, sc: t.sc, so: t.so, el: t.el, ec: t.ec, eo: t.eo }
+end
+
+fn cur_sp(p: Parser) -> ast::Sp is
+    return t_sp(p_cur(p))
+end
+
+fn mrg(a: ast::Sp, b: ast::Sp) -> ast::Sp is
+    return ast::sp_merge(a, b)
+end
+
+fn spn(n: ast::Node, s: ast::Sp) -> ast::Node is
+    return ast::with_sp(n, s)
+end
+
+fn sp_of(n: ast::Node) -> ast::Sp is
+    return ast::sp_of(n)
+end
+
+;; ── token access ──────────────────────────────────────────────────────────────
+fn p_at(p: Parser, off: int) -> lexer::Token is
+    let n: int = p.toks.len()
+    let i: int = p.pos + off
+    if i < n is return p.toks[i] end
+    return p.toks[n - 1]
+end
+
+fn p_cur(p: Parser) -> lexer::Token is
+    return p_at(p, 0)
+end
+
+fn p_adv(p: Parser) is
+    if p.pos < p.toks.len() - 1 is p.pos += 1 end
+end
+
+fn is_kw_at(p: Parser, off: int, k: string) -> bool is
+    let t: lexer::Token = p_at(p, off)
+    return t.kind == "kw" && t.text == k
+end
+
+fn is_op_at(p: Parser, off: int, o: string) -> bool is
+    let t: lexer::Token = p_at(p, off)
+    return t.kind == "op" && t.text == o
+end
+
+fn at_kw(p: Parser, k: string) -> bool is
+    return is_kw_at(p, 0, k)
+end
+
+fn at_op(p: Parser, o: string) -> bool is
+    return is_op_at(p, 0, o)
+end
+
+fn at_kind(p: Parser, k: string) -> bool is
+    return p_cur(p).kind == k
+end
+
+fn at_eof(p: Parser) -> bool is
+    return p_cur(p).kind == "eof"
+end
+
+fn at_nl(p: Parser) -> bool is
+    return p_cur(p).kind == "nl"
+end
+
+fn skip_nl(p: Parser) is
+    while at_nl(p) is p_adv(p) end
+end
+
+fn at_ident_text(p: Parser, t: string) -> bool is
+    let c: lexer::Token = p_cur(p)
+    return c.kind == "ident" && c.text == t
+end
+
+fn at_use_import(p: Parser) -> bool is
+    if at_kw(p, "use") is return true end
+    if at_ident_text(p, "dynamic") && is_kw_at(p, 1, "use") is return true end
+    return false
+end
+
+;; ── errors ────────────────────────────────────────────────────────────────────
+fn err_at(p: Parser, kind: string, s: ast::Sp, msg: string, hints: [string]) -> error::ParseError is
+    return error::new_error(kind, p.file, s.sl, s.sc, s.so, s.el, s.ec, s.eo, msg, hints)
+end
+
+;; Parser::error — Custom error at the current token
+fn perr(p: Parser, msg: string, hints: [string]) -> error::ParseError is
+    return err_at(p, "Custom", cur_sp(p), msg, hints)
+end
+
+fn report(p: Parser, e: error::ParseError) is
+    p.errs.push(e)
+end
+
+;; token_kind_name: only these have their own name, everything else is "token"
+fn kind_name_op(o: string) -> string is
+    if o == "(" || o == ")" || o == "{" || o == "}" || o == "[" || o == "]" || o == ":" || o == "::" || o == "," || o == "->" || o == "=>" || o == "=" || o == ">" is return o end
+    return "token"
+end
+
+fn kind_name_kw(k: string) -> string is
+    if k == "is" || k == "end" || k == "in" is return k end
+    return "token"
+end
+
+fn expect_err(p: Parser, name: string) -> error::ParseError is
+    let found: string = p_cur(p).disp
+    return err_at(p, "ExpectedToken", cur_sp(p), "expected `{name}`, found `{found}`", ["add `{name}` here"])
+end
+
+fn p_expect_kw(p: Parser, k: string) -> option::Result<ast::Node, error::ParseError> is
+    if at_kw(p, k) is
+        p_adv(p)
+        return ok(nn())
+    end
+    return fail(expect_err(p, kind_name_kw(k)))
+end
+
+fn p_expect_op(p: Parser, o: string) -> option::Result<ast::Node, error::ParseError> is
+    if at_op(p, o) is
+        p_adv(p)
+        return ok(nn())
+    end
+    return fail(expect_err(p, kind_name_op(o)))
+end
+
+fn ident_err(p: Parser, s: ast::Sp) -> error::ParseError is
+    let found: string = p_cur(p).disp
+    return err_at(p, "ExpectedIdent", s, "expected identifier, found `{found}`", ["provide a valid identifier here"])
+end
+
+fn expect_ident(p: Parser) -> option::Result<string, error::ParseError> is
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "ident" is
+        p_adv(p)
+        return option::Result::Ok(c.text)
+    end
+    return option::Result::Err(ident_err(p, t_sp(c)))
+end
+
+fn is_path_kw(t: string) -> bool is
+    return t == "new" || t == "write" || t == "type" || t == "end" || t == "as" || t == "is" || t == "from" || t == "use" || t == "match" || t == "in" || t == "for" || t == "mod" || t == "async" || t == "await" || t == "self"
+end
+
+fn expect_path_segment(p: Parser) -> option::Result<string, error::ParseError> is
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "ident" is
+        p_adv(p)
+        return option::Result::Ok(c.text)
+    end
+    if c.kind == "kw" && is_path_kw(c.text) is
+        p_adv(p)
+        return option::Result::Ok(c.text)
+    end
+    return option::Result::Err(ident_err(p, t_sp(c)))
+end
+
+fn recover(p: Parser) is
+    if !at_eof(p) is p_adv(p) end
+    while true is
+        let c: lexer::Token = p_cur(p)
+        if c.kind == "eof" || c.kind == "nl" is break end
+        if c.kind == "kw" && (c.text == "fn" || c.text == "struct" || c.text == "enum" || c.text == "impl" || c.text == "pub" || c.text == "use" || c.text == "end") is break end
+        p_adv(p)
+    end
+end
+
+;; ── string helpers (byte based) ───────────────────────────────────────────────
+fn find_from(s: string, pat: string, from: int) -> int is
+    let n: int = s.len()
+    let m: int = pat.len()
+    if m == 0 is return from end
+    let mut i: int = from
+    while i + m <= n is
+        let mut j: int = 0
+        while j < m && byte_at(s, i + j) == byte_at(pat, j) is j += 1 end
+        if j == m is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn has_prefix(s: string, pre: string) -> bool is
+    if s.len() < pre.len() is return false end
+    return s[0..pre.len()] == pre
+end
+
+fn is_space_b(c: int) -> bool is
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+end
+
+fn trim_s(s: string) -> string is
+    let mut a: int = 0
+    let mut b: int = s.len()
+    while a < b && is_space_b(byte_at(s, a)) is a += 1 end
+    while b > a && is_space_b(byte_at(s, b - 1)) is b -= 1 end
+    return s[a..b]
+end
+
+fn after_first(s: string, sep: string) -> string is
+    let i: int = find_from(s, sep, 0)
+    if i < 0 is return "" end
+    return s[i + sep.len()..s.len()]
+end
+
+fn split_all(s: string, sep: string) -> [string] is
+    let mut out: [string] = []
+    let mut start: int = 0
+    while true is
+        let i: int = find_from(s, sep, start)
+        if i < 0 is
+            out.push(s[start..s.len()])
+            break
+        end
+        out.push(s[start..i])
+        start = i + sep.len()
+    end
+    return out
+end
+
+fn is_digit_b(c: int) -> bool is
+    return c >= 48 && c <= 57
+end
+
+fn join_str(xs: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    for x in xs is
+        if i > 0 is out += sep end
+        out += x
+        i += 1
+    end
+    return out
+end
+
+;; integer token -> decimal text, exactly like the Rust lexer (`parse().unwrap_or(0)`: out-of-range -> 0;
+;; hex/bin via from_str_radix; `0o…` is not a literal in H#)
+fn int_text(t: string) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < t.len() is
+        let c: int = byte_at(t, i)
+        if c != 95 is s += str_from_byte(c) end
+        i += 1
+    end
+    let mut base: int = 10
+    let mut st: int = 0
+    if s.len() >= 2 && byte_at(s, 0) == 48 is
+        let c1: int = byte_at(s, 1)
+        if c1 == 120 || c1 == 88 is
+            base = 16
+            st = 2
+        elsif c1 == 98 || c1 == 66 is
+            base = 2
+            st = 2
+        end
+    end
+    if base == 10 is
+        ;; strip leading zeros for the range check, keep a single "0"
+        let mut k: int = 0
+        while k < s.len() - 1 && byte_at(s, k) == 48 is k += 1 end
+        let digits: string = s[k..s.len()]
+        if digits.len() > 19 is return "0" end
+        if digits.len() == 19 && digits > "9223372036854775807" is return "0" end
+        return digits
+    end
+    let mut v: int = 0
+    let mut k: int = st
+    let mut sig: int = 0
+    while k < s.len() is
+        let c: int = byte_at(s, k)
+        let mut d: int = 0
+        if c >= 48 && c <= 57 is d = c - 48
+        elsif c >= 97 && c <= 102 is d = c - 87
+        else d = c - 55 end
+        if sig > 0 || d > 0 is sig += 1 end
+        if base == 16 && sig > 16 is return "0" end
+        if base == 2 && sig > 63 is return "0" end
+        if base == 16 && sig == 16 && d >= 8 && v >= 0 && false is return "0" end
+        v = v * base + d
+        k += 1
+    end
+    if s.len() <= st is return "0" end
+    if v < 0 is return "0" end
+    return "{v}"
+end
+;; ── use-path parsing (parse_use_path / split_* in parser.rs) ───────────────────
+fn split_bit_name_ver(s: string) -> [string] is
+    ;; [name, version-or-"~none~none"]
+    let i: int = find_from(s, "/", 0)
+    let mut out: [string] = []
+    if i < 0 is
+        out.push(trim_s(s))
+        out.push("~none~")
+        return out
+    end
+    let n: string = trim_s(s[0..i])
+    let v: string = trim_s(s[i + 1..s.len()])
+    out.push(n)
+    if v.len() > 0 is out.push(v) else out.push("~none~") end
+    return out
+end
+
+fn split_name_ver(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 47 is idx = i end
+        i += 1
+    end
+    if idx >= 0 is
+        let n: string = s[0..idx]
+        let v: string = s[idx + 1..s.len()]
+        if v.len() > 0 && is_digit_b(byte_at(v, 0)) is
+            out.push(n)
+            out.push(v)
+            return out
+        end
+    end
+    out.push(s)
+    out.push("~none~")
+    return out
+end
+
+fn opt_ver(v: string) -> ast::Node is
+    if v == "~none~" is return nn() end
+    return ast::sn(v)
+end
+
+fn path_parts(path: string, arrow: string, skip_head: string) -> [string] is
+    let mut parts: [string] = []
+    for piece in split_all(path, arrow) is
+        let t: string = trim_s(piece)
+        if t.len() > 0 && t != skip_head is parts.push(t) end
+    end
+    return parts
+end
+
+fn parts_node(parts: [string]) -> ast::Node is
+    let mut ks: [ast::Node] = []
+    for x in parts is ks.push(ast::sn(x)) end
+    return nd("Path", "", ks)
+end
+
+;; Returns an `Import` node (without the trailing alias child) or None when the path is invalid.
+fn parse_use_path(path: string, has_alias: bool, alias: string, dynamic: bool) -> ast::Node is
+    let arrow: string = " -> "
+    let has_arrow: bool = find_from(path, arrow, 0) >= 0
+    let head_i: int = find_from(path, arrow, 0)
+    let mut head: string = ""
+    if head_i >= 0 is head = trim_s(path[0..head_i]) end
+    if has_prefix(path, "workspace") && has_arrow is
+        let member: string = trim_s(after_first(path, arrow))
+        let mut has_m: bool = false
+        let mut has_i: bool = false
+        let mut m: string = ""
+        let mut it: string = ""
+        if has_alias is
+            if find_from(alias, arrow, 0) >= 0 is
+                let j: int = find_from(alias, arrow, 0)
+                m = trim_s(alias[0..j])
+                it = trim_s(after_first(alias, arrow))
+                has_m = true
+                has_i = true
+            else
+                m = trim_s(alias)
+                if m.len() > 0 is
+                    has_m = true
+                    has_i = true
+                    it = "*"
+                end
+            end
+        end
+        if member.len() == 0 is return nn() end
+        return nd("Import", "Workspace", [ast::sn(member), opt_s(has_m, m), opt_s(has_i, it)])
+    end
+    if head == "bit" is
+        let rest: string = trim_s(after_first(path, arrow))
+        let nv: [string] = split_bit_name_ver(rest)
+        if nv[0].len() == 0 is return nn() end
+        let lk: string = if dynamic is "Dynamic" else "Static" end
+        return nd("Import", "BitRepo", [ast::sn(nv[0]), opt_ver(nv[1]), opt_s(has_alias, alias), ast::sn(lk)])
+    end
+    if has_prefix(path, "hlib") && has_arrow is
+        let rest: string = trim_s(after_first(path, arrow))
+        let nv: [string] = split_name_ver(rest)
+        return nd("Import", "Hlib", [ast::sn(nv[0]), opt_ver(nv[1]), opt_s(has_alias, alias)])
+    end
+    if has_prefix(path, "python") && has_arrow is
+        let rest: string = trim_s(after_first(path, arrow))
+        let nv: [string] = split_name_ver(rest)
+        return nd("Import", "Python", [ast::sn(nv[0]), opt_ver(nv[1]), opt_s(has_alias, alias)])
+    end
+    if has_prefix(path, "std") && has_arrow is
+        let parts: [string] = path_parts(path, arrow, "std")
+        if parts.len() > 0 is return nd("Import", "Std", [parts_node(parts), opt_s(has_alias, alias)]) end
+    end
+    if has_prefix(path, "core") && has_arrow is
+        let parts: [string] = path_parts(path, arrow, "core")
+        if parts.len() > 0 is return nd("Import", "Core", [parts_node(parts), opt_s(has_alias, alias)]) end
+    end
+    if has_prefix(path, "github") && has_arrow is
+        let segs: [string] = split_all(path, arrow)
+        if segs.len() < 2 is return nn() end
+        return nd("Import", "Github", [ast::sn(trim_s(segs[1])), opt_s(has_alias, alias)])
+    end
+    if has_prefix(path, "github.com/") || has_prefix(path, "gitlab.com/") is
+        return nd("Import", "Github", [ast::sn(path), opt_s(has_alias, alias)])
+    end
+    if has_prefix(path, "std:") is
+        let rest: string = path[4..path.len()]
+        let parts: [string] = split_all(rest, "::")
+        return nd("Import", "Std", [parts_node(parts), opt_s(has_alias, alias)])
+    end
+    return nn()
+end
+
+
+fn sn(t: string) -> ast::Node is
+    return ast::sn(t)
+end
+
+;; ── Debug rendering of a token kind / span (only used in one hint, like Rust's `{:?}`) ──
+fn kw_variant(k: string) -> string is
+    if k == "self" is return "Self_" end
+    if k == "true" is return "Bool(true)" end
+    if k == "false" is return "Bool(false)" end
+    if k == "int" is return "TInt" end
+    if k == "uint" is return "TUint" end
+    if k == "i8" || k == "i16" || k == "i32" || k == "i64" || k == "i128" || k == "u8" || k == "u16" || k == "u32" || k == "u64" || k == "u128" || k == "f32" || k == "f64" is return "T" + upper_first(k) end
+    if k == "bool" is return "TBool" end
+    if k == "string" is return "TString" end
+    if k == "bytes" is return "TBytes" end
+    if k == "void" is return "TVoid" end
+    if k == "any" is return "TAny" end
+    return upper_first(k)
+end
+
+fn upper_first(s: string) -> string is
+    if s.len() == 0 is return s end
+    let c: int = byte_at(s, 0)
+    if c >= 97 && c <= 122 is return str_from_byte(c - 32) + s[1..s.len()] end
+    return s
+end
+
+fn op_variant(o: string) -> string is
+    if o == "(" is return "LParen" end
+    if o == ")" is return "RParen" end
+    if o == "{" is return "LBrace" end
+    if o == "}" is return "RBrace" end
+    if o == "[" is return "LBracket" end
+    if o == "]" is return "RBracket" end
+    if o == "," is return "Comma" end
+    if o == ":" is return "Colon" end
+    if o == "::" is return "ColonColon" end
+    if o == "->" is return "Arrow" end
+    if o == "=>" is return "FatArrow" end
+    if o == "=" is return "Assign" end
+    if o == "==" is return "Eq" end
+    if o == "!=" is return "NotEq" end
+    if o == "<" is return "Lt" end
+    if o == ">" is return "Gt" end
+    if o == "<=" is return "LtEq" end
+    if o == ">=" is return "GtEq" end
+    if o == "+" is return "Plus" end
+    if o == "-" is return "Minus" end
+    if o == "*" is return "Star" end
+    if o == "/" is return "Slash" end
+    if o == "%" is return "Percent" end
+    if o == "+=" is return "PlusAssign" end
+    if o == "-=" is return "MinusAssign" end
+    if o == "*=" is return "StarAssign" end
+    if o == "/=" is return "SlashAssign" end
+    if o == "&&" is return "And" end
+    if o == "||" is return "Or" end
+    if o == "|" is return "Pipe" end
+    if o == "&" is return "BitAnd" end
+    if o == "^" is return "BitXor" end
+    if o == "~" is return "BitNot" end
+    if o == "<<" is return "Shl" end
+    if o == ">>" is return "Shr" end
+    if o == "!" is return "Not" end
+    if o == ".." is return "DotDot" end
+    if o == "..=" is return "DotDotEq" end
+    if o == "." is return "Dot" end
+    if o == ";" is return "Semicolon" end
+    if o == "?" is return "Question" end
+    if o == "@" is return "At" end
+    if o == "#" is return "Hash" end
+    return o
+end
+
+fn kind_debug(t: lexer::Token) -> string is
+    if t.kind == "kw" is return kw_variant(t.text) end
+    if t.kind == "op" is return op_variant(t.text) end
+    if t.kind == "ident" is return "Ident(\"" + t.text + "\")" end
+    if t.kind == "int" is return "Integer(" + int_text(t.text) + ")" end
+    if t.kind == "str" is return "StringLit(\"" + t.text + "\")" end
+    if t.kind == "interp" is return "InterpStringLit(\"" + t.text + "\")" end
+    if t.kind == "nl" is return "Newline" end
+    if t.kind == "eof" is return "EOF" end
+    return t.kind
+end
+
+fn span_debug(s: ast::Sp, file: string) -> string is
+    return "Span { start: Position { line: {s.sl}, col: {s.sc}, offset: {s.so} }, end: Position { line: {s.el}, col: {s.ec}, offset: {s.eo} }, file: \"{file}\" }"
+end
+
+;; ── imports ───────────────────────────────────────────────────────────────────
+fn parse_import(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    let mut dynamic: bool = false
+    if at_ident_text(p, "dynamic") is
+        dynamic = true
+        p_adv(p)
+    end
+    if dynamic && !at_kw(p, "use") is
+        return fail(perr(p, "expected `use` after `dynamic`", ["write: dynamic use \"bit -> libname\""]))
+    end
+    p_adv(p)
+    let mut path_tok: string = ""
+    if at_kind(p, "str") is
+        path_tok = p_cur(p).text
+        p_adv(p)
+    else
+        return fail(perr(p, "expected use path string after `use`", ["the source is always explicit — write: use \"bit -> mold\" or use \"hlib -> mold\" (e.g. `use mold` alone is not valid)"]))
+    end
+    let mut has_alias: bool = false
+    let mut alias: string = ""
+    if at_kw(p, "from") is
+        p_adv(p)
+        if at_kind(p, "str") is
+            alias = p_cur(p).text
+            has_alias = true
+            p_adv(p)
+        else
+            return fail(perr(p, "expected alias string after `from`", []))
+        end
+    end
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    let hi: int = find_from(path_tok, " -> ", 0)
+    let mut head: string = ""
+    let mut has_head: bool = false
+    if hi >= 0 is
+        head = trim_s(path_tok[0..hi])
+        has_head = true
+    end
+    if has_head && head == "bytes" is
+        let libname: string = trim_s(after_first(path_tok, " -> "))
+        return fail(err_at(p, "Custom", span, "`use \"{path_tok}\"` is no longer supported", ["`bytes` was replaced by `bit` (bit.io) — H# libraries now come from bit", "write: use \"bit -> {libname}\"", "install libraries with: bit install <name>"]))
+    end
+    if dynamic && !(has_head && head == "bit") is
+        return fail(err_at(p, "Custom", span, "`dynamic use \"{path_tok}\"` is not allowed", ["std and core are always statically linked into the compiler", "only \"bit -> libname\" imports may be dynamic"]))
+    end
+    let k: ast::Node = parse_use_path(path_tok, has_alias, alias, dynamic)
+    if k.tag == "None" is
+        return fail(err_at(p, "Custom", span, "cannot parse use path `{path_tok}`", ["valid forms: \"std -> module\", \"bit -> lib/1.0\", \"hlib -> lib/1.0\", \"github -> owner/repo\""]))
+    end
+    let mut ks: [ast::Node] = []
+    for x in k.kids is ks.push(x) end
+    ks.push(opt_s(has_alias, alias))
+    return ok(spn(nd("Import", k.text, ks), span))
+end
+
+;; ── attributes / memory modes ─────────────────────────────────────────────────
+fn parse_attributes(p: Parser) -> ast::Node is
+    let mut attrs: [ast::Node] = []
+    while at_op(p, "#") is
+        let span: ast::Sp = cur_sp(p)
+        p_adv(p)
+        if !at_op(p, "[") is break end
+        p_adv(p)
+        let mut name: string = ""
+        match expect_ident(p) is
+            option::Result::Ok(s) => is name = s end
+            option::Result::Err(_) => is name = "" end
+        end
+        let mut args: [ast::Node] = []
+        if at_op(p, "(") is
+            p_adv(p)
+            while !at_op(p, ")") && !at_eof(p) is
+                let mut k: string = ""
+                match expect_ident(p) is
+                    option::Result::Ok(s) => is k = s end
+                    option::Result::Err(_) => is k = "" end
+                end
+                if at_op(p, "=") is
+                    p_adv(p)
+                    let mut v: string = ""
+                    if at_kind(p, "str") is
+                        v = p_cur(p).text
+                        p_adv(p)
+                    end
+                    args.push(lf("AKV", "{k}={v}"))
+                else
+                    args.push(lf("AIdent", k))
+                end
+                if at_op(p, ",") is p_adv(p) end
+            end
+            if at_op(p, ")") is p_adv(p) end
+        end
+        if at_op(p, "]") is p_adv(p) end
+        let end_sp: ast::Sp = cur_sp(p)
+        attrs.push(spn(nd("Attr", name, args), mrg(span, end_sp)))
+        skip_nl(p)
+    end
+    return nd("Attrs", "", attrs)
+end
+
+fn mem_mode_name(n: string) -> string is
+    if n == "default" is return "Default" end
+    if n == "safety" is return "Safety" end
+    if n == "arc" is return "Arc" end
+    if n == "arena" is return "Arena" end
+    if n == "pointers" is return "Pointers" end
+    return ""
+end
+
+;; Ok(("", span)) when there is no `@mode`; Ok(("Safety", span)) etc. otherwise
+fn parse_mem_mode(p: Parser) -> option::Result<[string], error::ParseError> is
+    if !at_op(p, "@") is return option::Result::Ok([""]) end
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let mut name: string = ""
+    let mut name_sp: ast::Sp = cur_sp(p)
+    if at_kw(p, "arena") is
+        name = "arena"
+        p_adv(p)
+    elsif at_kw(p, "manual") is
+        name = "manual"
+        p_adv(p)
+    else
+        name_sp = cur_sp(p)
+        name = expect_ident(p)?
+    end
+    let m: string = mem_mode_name(name)
+    if m == "" is
+        return option::Result::Err(perr(p, "unknown memory annotation `@{name}`", ["expected one of: @default, @safety, @arc, @arena, @pointers"]))
+    end
+    skip_nl(p)
+    let full: ast::Sp = mrg(start, name_sp)
+    return option::Result::Ok([m, "{full.sl}", "{full.sc}", "{full.so}", "{full.el}", "{full.ec}", "{full.eo}"])
+end
+
+;; ── types ─────────────────────────────────────────────────────────────────────
+fn is_prim_type_kw(t: string) -> bool is
+    return t == "int" || t == "uint" || t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "i128" || t == "u8" || t == "u16" || t == "u32" || t == "u64" || t == "u128" || t == "f32" || t == "f64" || t == "bool" || t == "string" || t == "bytes" || t == "any"
+end
+
+fn parse_type(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let mut ty: ast::Node = parse_type_base(p)?
+    if at_op(p, "?") is
+        p_adv(p)
+        ty = nd("Optional", "", [ty])
+    end
+    return ok(ty)
+end
+
+fn parse_type_base(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "kw" && is_prim_type_kw(c.text) is
+        p_adv(p)
+        return ok(lf("Named", c.text))
+    end
+    if c.kind == "kw" && c.text == "void" is
+        p_adv(p)
+        return ok(lf("Void", ""))
+    end
+    if c.kind == "kw" && c.text == "fn" is
+        p_adv(p)
+        p_expect_op(p, "(")?
+        let mut pts: [ast::Node] = []
+        while !at_op(p, ")") && !at_eof(p) is
+            pts.push(parse_type(p)?)
+            if at_op(p, ",") is p_adv(p) else break end
+        end
+        p_expect_op(p, ")")?
+        let mut ret: ast::Node = lf("Void", "")
+        if at_op(p, "->") is
+            p_adv(p)
+            ret = parse_type(p)?
+        end
+        return ok(nd("Fn", "", [nd("Params", "", pts), ret]))
+    end
+    if c.kind == "op" && c.text == "&" is
+        p_adv(p)
+        let mut m: bool = false
+        if at_kw(p, "mut") is
+            p_adv(p)
+            m = true
+        end
+        let inner: ast::Node = parse_type(p)?
+        if m is return ok(nd("RefMut", "", [inner])) end
+        return ok(nd("Ref", "", [inner]))
+    end
+    if c.kind == "op" && c.text == "[" is
+        p_adv(p)
+        let inner: ast::Node = parse_type(p)?
+        p_expect_op(p, "]")?
+        return ok(nd("Array", "", [inner]))
+    end
+    if c.kind == "op" && c.text == "(" is
+        p_adv(p)
+        let mut ts: [ast::Node] = []
+        while !at_op(p, ")") && !at_eof(p) is
+            ts.push(parse_type(p)?)
+            if at_op(p, ",") is p_adv(p) end
+        end
+        p_expect_op(p, ")")?
+        return ok(nd("Tuple", "", ts))
+    end
+    if c.kind == "ident" is
+        let mut name: string = c.text
+        p_adv(p)
+        while at_op(p, "::") is
+            p_adv(p)
+            if at_kind(p, "ident") is
+                name = name + "_" + p_cur(p).text
+                p_adv(p)
+            else
+                let found: string = p_cur(p).disp
+                return fail(perr(p, "expected identifier after `::` in type path, found `{found}`", ["valid form: module::Type"]))
+            end
+        end
+        if at_op(p, "<") is
+            p_adv(p)
+            let mut args: [ast::Node] = []
+            while !at_op(p, ">") && !at_eof(p) is
+                args.push(parse_type(p)?)
+                if at_op(p, ",") is p_adv(p) end
+            end
+            p_expect_op(p, ">")?
+            return ok(nd("Generic", name, args))
+        end
+        return ok(lf("Named", name))
+    end
+    let found2: string = c.disp
+    return fail(perr(p, "expected a type, found `{found2}`", ["valid types: int, string, bool, f64, [T], T?, or a struct name"]))
+end
+
+fn parse_generics_decl(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let mut params: [ast::Node] = []
+    if at_op(p, "<") is
+        p_adv(p)
+        while !at_op(p, ">") && !at_eof(p) is
+            let span: ast::Sp = cur_sp(p)
+            let name: string = expect_ident(p)?
+            let mut bounds: [ast::Node] = []
+            if at_op(p, ":") is
+                p_adv(p)
+                while true is
+                    let b: string = expect_ident(p)?
+                    bounds.push(sn(b))
+                    if at_op(p, "+") is p_adv(p) else break end
+                end
+            end
+            params.push(spn(nd("TypeParam", name, bounds), span))
+            if at_op(p, ",") is p_adv(p) end
+        end
+        p_expect_op(p, ">")?
+    end
+    return ok(nd("TypeParams", "", params))
+end
+
+;; ── items ─────────────────────────────────────────────────────────────────────
+fn parse_params(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let mut params: [ast::Node] = []
+    while !at_op(p, ")") && !at_eof(p) is
+        skip_nl(p)
+        if at_op(p, ")") is break end
+        let span: ast::Sp = cur_sp(p)
+        let mut m: bool = false
+        if at_kw(p, "mut") is
+            p_adv(p)
+            m = true
+        end
+        if at_kw(p, "self") is
+            let s: ast::Sp = cur_sp(p)
+            p_adv(p)
+            params.push(spn(nd("Param", "self", [bn(m), lf("Named", "Self")]), s))
+        else
+            let name: string = expect_path_segment(p)?
+            p_expect_op(p, ":")?
+            let ty: ast::Node = parse_type(p)?
+            params.push(spn(nd("Param", name, [bn(m), ty]), span))
+        end
+        if at_op(p, ",") is p_adv(p) else break end
+    end
+    return ok(nd("Params", "", params))
+end
+
+;; statements of a body: one `Block` node
+fn parse_block(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    skip_nl(p)
+    let mut stmts: [ast::Node] = []
+    if at_kw(p, "is") is
+        p_adv(p)
+        skip_nl(p)
+        while !at_kw(p, "end") && !at_eof(p) is
+            skip_nl(p)
+            if at_kw(p, "end") || at_eof(p) is break end
+            match parse_stmt(p) is
+                option::Result::Ok(sn_) => is
+                    for k in sn_.kids is stmts.push(k) end
+                end
+                option::Result::Err(em) => is
+                    report(p, em)
+                    recover(p)
+                end
+            end
+            skip_nl(p)
+        end
+        p_expect_kw(p, "end")?
+    elsif at_op(p, "=") is
+        p_adv(p)
+        let e: ast::Node = parse_expr(p, 0)?
+        stmts.push(spn(nd("Return", "", [e]), sp_of(e)))
+    else
+        return fail(perr(p, "expected `is` to start a block body", ["write `is` before the body and `end` after"]))
+    end
+    return ok(nd("Block", "", stmts))
+end
+
+fn parse_fn_with_attrs(p: Parser, pub_: bool, attrs: ast::Node, force_async: bool, mem: string) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let mut is_async: bool = false
+    if at_kw(p, "async") is
+        p_adv(p)
+        is_async = true
+    end
+    let mut is_unsafe: bool = false
+    if at_kw(p, "unsafe") is
+        p_adv(p)
+        is_unsafe = true
+    end
+    let name: string = expect_path_segment(p)?
+    let tps: ast::Node = parse_generics_decl(p)?
+    p_expect_op(p, "(")?
+    let params: ast::Node = parse_params(p)?
+    p_expect_op(p, ")")?
+    let mut ret: ast::Node = nn()
+    if at_op(p, "->") is
+        p_adv(p)
+        ret = parse_type(p)?
+    end
+    skip_nl(p)
+    let body: ast::Node = parse_block(p)?
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    if force_async is is_async = true end
+    let mut fl: string = ""
+    if pub_ is fl = "pub" end
+    if is_async is
+        if fl.len() > 0 is fl += "," end
+        fl += "async"
+    end
+    if is_unsafe is
+        if fl.len() > 0 is fl += "," end
+        fl += "unsafe"
+    end
+    let mut mm: string = "Default"
+    if mem.len() > 0 is mm = mem end
+    return ok(spn(nd("Fn", name, [attrs, tps, params, ret, body, lf("Flags", fl), lf("Mem", mm)]), span))
+end
+
+fn parse_mod_decl(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseError> is
+    let span: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let name: string = expect_ident(p)?
+    if at_kw(p, "is") is
+        p_adv(p)
+        skip_nl(p)
+        let mut inner: [ast::Node] = []
+        while !at_kw(p, "end") && !at_eof(p) is
+            skip_nl(p)
+            if at_kw(p, "end") || at_eof(p) is break end
+            match parse_item(p) is
+                option::Result::Ok(i) => is inner.push(i) end
+                option::Result::Err(em) => is
+                    report(p, em)
+                    recover(p)
+                end
+            end
+            skip_nl(p)
+        end
+        p_expect_kw(p, "end")?
+        let end_sp: ast::Sp = cur_sp(p)
+        return ok(spn(nd("ModDecl", name, [bn(pub_), nd("Inline", "", inner)]), mrg(span, end_sp)))
+    end
+    let end_sp2: ast::Sp = cur_sp(p)
+    return ok(spn(nd("ModDecl", name, [bn(pub_), nn()]), mrg(span, end_sp2)))
+end
+
+;; fields until `end` (the `end` is NOT consumed); `stop_eof_in_body`: struct bodies only break on End inside the loop
+fn parse_struct_fields(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let mut fields: [ast::Node] = []
+    while !at_kw(p, "end") && !at_eof(p) is
+        skip_nl(p)
+        if at_kw(p, "end") is break end
+        let mut fpub: bool = false
+        if at_kw(p, "pub") is
+            p_adv(p)
+            fpub = true
+        end
+        let fspan: ast::Sp = cur_sp(p)
+        let fname: string = expect_ident(p)?
+        p_expect_op(p, ":")?
+        let fty: ast::Node = parse_type(p)?
+        fields.push(spn(nd("Field", fname, [bn(fpub), fty]), fspan))
+        skip_nl(p)
+    end
+    return ok(nd("Fields", "", fields))
+end
+
+fn parse_struct(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let name: string = expect_ident(p)?
+    let tps: ast::Node = parse_generics_decl(p)?
+    skip_nl(p)
+    let mut fields: ast::Node = nd("Fields", "", [])
+    if at_kw(p, "is") is
+        p_adv(p)
+        skip_nl(p)
+        fields = parse_struct_fields(p)?
+        p_expect_kw(p, "end")?
+    end
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("Struct", name, [tps, fields, bn(pub_)]), span))
+end
+
+fn parse_enum(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let name: string = expect_ident(p)?
+    let tps: ast::Node = parse_generics_decl(p)?
+    skip_nl(p)
+    let mut variants: [ast::Node] = []
+    if at_kw(p, "is") is
+        p_adv(p)
+        skip_nl(p)
+        while !at_kw(p, "end") && !at_eof(p) is
+            skip_nl(p)
+            if at_kw(p, "end") is break end
+            let vspan: ast::Sp = cur_sp(p)
+            let vname: string = expect_ident(p)?
+            let mut fields: ast::Node = lf("Unit", "")
+            if at_op(p, "(") is
+                p_adv(p)
+                let mut types: [ast::Node] = []
+                while !at_op(p, ")") && !at_eof(p) is
+                    types.push(parse_type(p)?)
+                    if at_op(p, ",") is p_adv(p) end
+                end
+                p_expect_op(p, ")")?
+                fields = nd("Tuple", "", types)
+            elsif at_kw(p, "is") is
+                p_adv(p)
+                skip_nl(p)
+                let fs: ast::Node = parse_struct_fields(p)?
+                p_expect_kw(p, "end")?
+                fields = nd("StructV", "", [fs])
+            end
+            variants.push(spn(nd("Variant", vname, [fields]), vspan))
+            if at_op(p, ",") is p_adv(p) end
+            skip_nl(p)
+        end
+        p_expect_kw(p, "end")?
+    end
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("Enum", name, [tps, nd("Variants", "", variants), bn(pub_)]), span))
+end
+
+fn parse_trait(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let name: string = expect_ident(p)?
+    let tps: ast::Node = parse_generics_decl(p)?
+    skip_nl(p)
+    let mut methods: [ast::Node] = []
+    if at_kw(p, "is") is
+        p_adv(p)
+        skip_nl(p)
+        while !at_kw(p, "end") && !at_eof(p) is
+            skip_nl(p)
+            if at_kw(p, "end") is break end
+            if at_kw(p, "fn") is
+                p_adv(p)
+                let mspan: ast::Sp = cur_sp(p)
+                let mname: string = expect_ident(p)?
+                p_expect_op(p, "(")?
+                let params: ast::Node = parse_params(p)?
+                p_expect_op(p, ")")?
+                let mut ret: ast::Node = nn()
+                if at_op(p, "->") is
+                    p_adv(p)
+                    ret = parse_type(p)?
+                end
+                skip_nl(p)
+                let mut db: ast::Node = nn()
+                if at_kw(p, "is") is db = parse_block(p)? end
+                methods.push(spn(nd("Method", mname, [params, ret, db]), mspan))
+            else
+                report(p, perr(p, "expected `fn` in trait", []))
+                recover(p)
+            end
+            skip_nl(p)
+        end
+        p_expect_kw(p, "end")?
+    end
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("Trait", name, [tps, nd("Methods", "", methods), bn(pub_)]), span))
+end
+
+fn parse_impl(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let type_name: string = expect_ident(p)?
+    let mut tr: ast::Node = nn()
+    if at_op(p, ":") is
+        p_adv(p)
+        let t: string = expect_ident(p)?
+        tr = sn(t)
+    end
+    skip_nl(p)
+    let mut methods: [ast::Node] = []
+    if at_kw(p, "is") is
+        p_adv(p)
+        skip_nl(p)
+        while !at_kw(p, "end") && !at_eof(p) is
+            skip_nl(p)
+            if at_kw(p, "end") is break end
+            let mm: [string] = parse_mem_mode(p)?
+            let mut fpub: bool = false
+            if at_kw(p, "pub") is
+                p_adv(p)
+                fpub = true
+            end
+            if at_kw(p, "fn") is
+                match parse_fn_with_attrs(p, fpub, nd("Attrs", "", []), false, mm[0]) is
+                    option::Result::Ok(f) => is methods.push(f) end
+                    option::Result::Err(em) => is
+                        report(p, em)
+                        recover(p)
+                    end
+                end
+            else
+                report(p, perr(p, "expected `fn` in impl block", []))
+                recover(p)
+            end
+            skip_nl(p)
+        end
+        p_expect_kw(p, "end")?
+    end
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("Impl", type_name, [tr, nd("Methods", "", methods)]), span))
+end
+
+fn parse_type_alias(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let name: string = expect_ident(p)?
+    p_expect_op(p, "=")?
+    let ty: ast::Node = parse_type(p)?
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("TypeAlias", name, [bn(pub_), ty]), span))
+end
+
+fn parse_const_item(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let name: string = expect_path_segment(p)?
+    let mut ty: ast::Node = nn()
+    if at_op(p, ":") is
+        p_adv(p)
+        ty = parse_type(p)?
+    end
+    if !at_op(p, "=") is
+        return fail(perr(p, "top-level `{name}` requires an initializer", ["write: const {name} = <expr>   (or `let`/`pub let`)"]))
+    end
+    p_adv(p)
+    let value: ast::Node = parse_expr(p, 0)?
+    let span: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("ConstDef", name, [bn(pub_), ty, value]), span))
+end
+
+fn parse_extern_block_inline(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let span: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let mut link: string = "Static"
+    if at_kind(p, "ident") is
+        let kw: string = p_cur(p).text
+        if kw == "static" is
+            p_adv(p)
+            link = "Static"
+        elsif kw == "dynamic" is
+            p_adv(p)
+            link = "Dynamic"
+        end
+    end
+    let mut lang: string = "C"
+    let mut has_lib: bool = false
+    let mut lib: string = ""
+    if at_op(p, "[") is
+        p_adv(p)
+        let mut s: string = ""
+        if at_kind(p, "ident") is s = p_cur(p).text end
+        if s.len() > 0 is p_adv(p) end
+        if s == "c" && at_op(p, "+") && is_op_at(p, 1, "+") is
+            p_adv(p)
+            p_adv(p)
+            s = "c++"
+        end
+        if s == "rust" || s == "Rust" is lang = "Rust"
+        elsif s == "cpp" || s == "c++" is lang = "Cpp"
+        elsif s == "python" || s == "py" is lang = "Python"
+        else lang = "C" end
+        if at_op(p, ",") is
+            p_adv(p)
+            if at_kind(p, "str") is
+                lib = p_cur(p).text
+                has_lib = true
+                p_adv(p)
+            end
+        end
+        if at_op(p, "]") is p_adv(p) end
+    end
+    skip_nl(p)
+    if at_kw(p, "is") is p_adv(p) end
+    skip_nl(p)
+    let mut fns: [ast::Node] = []
+    while !at_kw(p, "end") && !at_eof(p) is
+        skip_nl(p)
+        if at_kw(p, "end") || at_eof(p) is break end
+        if at_kw(p, "fn") is
+            p_adv(p)
+            let fspan: ast::Sp = cur_sp(p)
+            let name: string = expect_ident(p)?
+            p_expect_op(p, "(")?
+            let mut params: [ast::Node] = []
+            let mut variadic: bool = false
+            while !at_op(p, ")") && !at_eof(p) is
+                if at_op(p, "..") is
+                    variadic = true
+                    p_adv(p)
+                    break
+                end
+                let pname: string = expect_ident(p)?
+                p_expect_op(p, ":")?
+                let ty: ast::Node = parse_type(p)?
+                params.push(spn(nd("Param", pname, [bn(false), ty]), fspan))
+                if at_op(p, ",") is p_adv(p) end
+            end
+            p_expect_op(p, ")")?
+            let mut ret: ast::Node = nn()
+            if at_op(p, "->") is
+                p_adv(p)
+                ret = parse_type(p)?
+            end
+            fns.push(spn(nd("ExternFn", name, [nd("Params", "", params), ret, bn(variadic)]), fspan))
+        else
+            let found: string = p_cur(p).disp
+            return fail(perr(p, "unexpected token `{found}` inside `extern` block — expected `fn <name>(...) -> Type` or `end`", ["only `fn` declarations are allowed inside an `extern` block body"]))
+        end
+        skip_nl(p)
+    end
+    p_expect_kw(p, "end")?
+    return ok(spn(nd("Extern", "", [lf("Lang", lang), lf("Link", link), opt_s(has_lib, lib), nd("Fns", "", fns)]), span))
+end
+
+fn parse_item(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    skip_nl(p)
+    let attrs: ast::Node = parse_attributes(p)
+    let mm: [string] = parse_mem_mode(p)?
+    let mem: string = mm[0]
+    let mut pub_: bool = false
+    if at_kw(p, "pub") is
+        p_adv(p)
+        pub_ = true
+    end
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "kw" is
+        if c.text == "fn" is return parse_fn_with_attrs(p, pub_, attrs, false, mem) end
+        if c.text == "struct" is return parse_struct(p, pub_) end
+        if c.text == "enum" is return parse_enum(p, pub_) end
+        if c.text == "trait" is return parse_trait(p, pub_) end
+        if c.text == "impl" is return parse_impl(p) end
+        if c.text == "type" is return parse_type_alias(p, pub_) end
+        if c.text == "const" || c.text == "let" is return parse_const_item(p, pub_) end
+        if c.text == "async" is
+            p_adv(p)
+            return parse_fn_with_attrs(p, pub_, attrs, true, mem)
+        end
+        if c.text == "mod" is return parse_mod_decl(p, pub_) end
+        if c.text == "extern" is return parse_extern_block_inline(p) end
+        if c.text == "using" is
+            let span: ast::Sp = cur_sp(p)
+            p_adv(p)
+            if at_kind(p, "str") || at_kind(p, "int") is p_adv(p) end
+            skip_nl(p)
+            report(p, err_at(p, "Custom", span, "`using` must come before any item", ["`using \"<edition>\"` belongs at the top of the file, not between an annotation and its item"]))
+            return parse_item(p)
+        end
+    end
+    if mem.len() > 0 is
+        let kd: string = kind_debug(c)
+        let msp: ast::Sp = ast::Sp { sl: __builtin_conv_str_to_int(mm[1]), sc: __builtin_conv_str_to_int(mm[2]), so: __builtin_conv_str_to_int(mm[3]), el: __builtin_conv_str_to_int(mm[4]), ec: __builtin_conv_str_to_int(mm[5]), eo: __builtin_conv_str_to_int(mm[6]) }
+        let sd: string = span_debug(msp, p.file)
+        return fail(perr(p, "memory annotations (`@arena`, `@safety`, ...) are only valid on `fn` right now", ["found `{kd}` right after the annotation, at {sd}"]))
+    end
+    let found: string = c.disp
+    return fail(perr(p, "unexpected token `{found}` at top level", ["expected fn, struct, enum, trait, impl, type, mod, or extern"]))
+end
+
+;; ── statements ────────────────────────────────────────────────────────────────
+;; returns a `Stmts` node whose kids are the statements (a tuple `let` expands to several)
+fn one(n: ast::Node) -> option::Result<ast::Node, error::ParseError> is
+    return ok(nd("Stmts", "", [n]))
+end
+
+fn expr_stmt(e: ast::Node) -> ast::Node is
+    return spn(nd("ExprStmt", "", [e]), sp_of(e))
+end
+
+fn parse_stmt(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    skip_nl(p)
+    if at_ident_text(p, "dynamic") && is_kw_at(p, 1, "use") is
+        let im: ast::Node = parse_import(p)?
+        return one(im)
+    end
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "kw" is
+        if c.text == "let" is return parse_let(p) end
+        if c.text == "return" is
+            let span: ast::Sp = cur_sp(p)
+            p_adv(p)
+            let mut e: ast::Node = nn()
+            let k: lexer::Token = p_cur(p)
+            let stop: bool = k.kind == "nl" || k.kind == "eof" || (k.kind == "kw" && (k.text == "end" || k.text == "else" || k.text == "elsif"))
+            if !stop is e = parse_expr(p, 0)? end
+            return one(spn(nd("Return", "", [e]), span))
+        end
+        if c.text == "use" is
+            let im: ast::Node = parse_import(p)?
+            return one(im)
+        end
+        if c.text == "break" is
+            let span: ast::Sp = cur_sp(p)
+            p_adv(p)
+            let mut e: ast::Node = nn()
+            let k: lexer::Token = p_cur(p)
+            let stop: bool = k.kind == "nl" || k.kind == "eof" || (k.kind == "kw" && k.text == "end")
+            if !stop is e = parse_expr(p, 0)? end
+            return one(spn(nd("Break", "", [e]), span))
+        end
+        if c.text == "continue" is
+            let span: ast::Sp = cur_sp(p)
+            p_adv(p)
+            return one(spn(lf("Continue", ""), span))
+        end
+        if c.text == "fn" || c.text == "struct" || c.text == "enum" || c.text == "trait" || c.text == "impl" || c.text == "type" || c.text == "pub" || c.text == "const" is
+            let it: ast::Node = parse_item(p)?
+            return one(it)
+        end
+    end
+    let e: ast::Node = parse_expr(p, 0)?
+    return one(expr_stmt(e))
+end
+
+fn parse_let(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let mut m: bool = false
+    if at_kw(p, "mut") is
+        p_adv(p)
+        m = true
+    end
+    if at_op(p, "(") is
+        p_adv(p)
+        let mut names: [string] = []
+        while !at_op(p, ")") && !at_eof(p) is
+            let n: string = expect_path_segment(p)?
+            names.push(n)
+            if at_op(p, ",") is p_adv(p) else break end
+        end
+        p_expect_op(p, ")")?
+        p_expect_op(p, "=")?
+        let value: ast::Node = parse_expr(p, 0)?
+        let span: ast::Sp = mrg(start, cur_sp(p))
+        let tmp: string = "__destructure_{span.sl}_{span.so}"
+        let mut out: [ast::Node] = []
+        out.push(spn(nd("Let", tmp, [bn(false), nn(), value]), span))
+        let mut idx: int = 0
+        for n in names is
+            let fa: ast::Node = spn(nd("FieldAccess", "{idx}", [spn(lf("Ident", tmp), span)]), span)
+            out.push(spn(nd("Let", n, [bn(m), nn(), fa]), span))
+            idx += 1
+        end
+        return ok(nd("Stmts", "", out))
+    end
+    let name: string = expect_path_segment(p)?
+    let mut ty: ast::Node = nn()
+    if at_op(p, ":") is
+        p_adv(p)
+        ty = parse_type(p)?
+    end
+    let mut value: ast::Node = nn()
+    if at_op(p, "=") is
+        p_adv(p)
+        value = parse_expr(p, 0)?
+    end
+    let span2: ast::Sp = mrg(start, cur_sp(p))
+    return one(spn(nd("Let", name, [bn(m), ty, value]), span2))
+end
+
+;; ── expressions (Pratt) ───────────────────────────────────────────────────────
+;; binding powers: [left, right], or [-1, -1] when the token is not infix
+fn infix_bp(t: lexer::Token) -> [int] is
+    let mut r: [int] = [-1, -1]
+    if t.kind == "kw" is
+        if t.text == "as" is r = [24, 25] end
+        return r
+    end
+    if t.kind != "op" is return r end
+    let o: string = t.text
+    if o == "?" is r = [100, 101]
+    elsif o == "=" || o == "+=" || o == "-=" || o == "*=" || o == "/=" is r = [2, 1]
+    elsif o == "||" is r = [4, 5]
+    elsif o == "&&" is r = [6, 7]
+    elsif o == "|" is r = [8, 9]
+    elsif o == "^" is r = [9, 10]
+    elsif o == "&" is r = [10, 11]
+    elsif o == "==" || o == "!=" is r = [14, 15]
+    elsif o == "<" || o == ">" || o == "<=" || o == ">=" is r = [16, 17]
+    elsif o == "<<" || o == ">>" is r = [18, 19]
+    elsif o == "+" || o == "-" is r = [20, 21]
+    elsif o == "*" || o == "/" || o == "%" is r = [22, 23]
+    elsif o == "." || o == "[" is r = [30, 31]
+    elsif o == ".." || o == "..=" is r = [18, 19]
+    end
+    return r
+end
+
+fn binop_name(o: string) -> string is
+    if o == "+" is return "Add" end
+    if o == "-" is return "Sub" end
+    if o == "*" is return "Mul" end
+    if o == "/" is return "Div" end
+    if o == "%" is return "Mod" end
+    if o == "==" is return "Eq" end
+    if o == "!=" is return "NotEq" end
+    if o == "<" is return "Lt" end
+    if o == ">" is return "Gt" end
+    if o == "<=" is return "LtEq" end
+    if o == ">=" is return "GtEq" end
+    if o == "&&" is return "And" end
+    if o == "||" is return "Or" end
+    if o == "&" is return "BitAnd" end
+    if o == "^" is return "BitXor" end
+    if o == "|" is return "BitOr" end
+    if o == "<<" is return "Shl" end
+    if o == ">>" is return "Shr" end
+    return ""
+end
+
+fn compound_name(o: string) -> string is
+    if o == "+=" is return "Add" end
+    if o == "-=" is return "Sub" end
+    if o == "*=" is return "Mul" end
+    if o == "/=" is return "Div" end
+    return ""
+end
+
+fn parse_expr(p: Parser, min_bp: int) -> option::Result<ast::Node, error::ParseError> is
+    let mut lhs: ast::Node = parse_prefix(p)?
+    while true is
+        let c0: lexer::Token = p_cur(p)
+        let mut term: bool = c0.kind == "eof" || c0.kind == "nl" || (c0.kind == "kw" && c0.text == "end")
+        if c0.kind == "op" && (c0.text == "," || c0.text == ")" || c0.text == "]" || c0.text == "}" || c0.text == ";") is term = true end
+        if term is
+            if c0.kind == "nl" is
+                let mut pk: int = p.pos
+                let n: int = p.toks.len()
+                while pk < n && p.toks[pk].kind == "nl" is pk += 1 end
+                if pk < n && p.toks[pk].kind == "op" && p.toks[pk].text == "." is
+                    skip_nl(p)
+                else
+                    break
+                end
+            else
+                break
+            end
+        end
+        let cur: lexer::Token = p_cur(p)
+        let bp: [int] = infix_bp(cur)
+        if bp[0] < 0 is break end
+        if bp[0] < min_bp is break end
+        let r_bp: int = bp[1]
+        p_adv(p)
+        let o: string = cur.text
+        let op_sp: ast::Sp = t_sp(cur)
+        let span: ast::Sp = mrg(sp_of(lhs), op_sp)
+        if cur.kind == "op" && o == "=" is
+            let rhs: ast::Node = parse_expr(p, r_bp)?
+            lhs = spn(nd("Assign", "", [lhs, rhs]), mrg(sp_of(lhs), sp_of(rhs)))
+            continue
+        end
+        if cur.kind == "op" && compound_name(o) != "" is
+            let rhs: ast::Node = parse_expr(p, r_bp)?
+            lhs = spn(nd("CompoundAssign", compound_name(o), [lhs, rhs]), mrg(sp_of(lhs), sp_of(rhs)))
+            continue
+        end
+        if cur.kind == "op" && o == "." is
+            if at_kind(p, "int") is
+                let idx_sp: ast::Sp = cur_sp(p)
+                let t: string = int_text(p_cur(p).text)
+                p_adv(p)
+                lhs = spn(nd("FieldAccess", t, [lhs]), mrg(sp_of(lhs), idx_sp))
+                continue
+            end
+            let name: string = expect_ident(p)?
+            if at_op(p, "(") is
+                p_adv(p)
+                let args: ast::Node = parse_call_args(p)?
+                lhs = spn(nd("MethodCall", name, [lhs, args]), mrg(sp_of(lhs), cur_sp(p)))
+            else
+                lhs = spn(nd("FieldAccess", name, [lhs]), mrg(sp_of(lhs), cur_sp(p)))
+            end
+            continue
+        end
+        if cur.kind == "op" && o == "[" is
+            let idx: ast::Node = parse_expr(p, 0)?
+            p_expect_op(p, "]")?
+            lhs = spn(nd("IndexAccess", "", [lhs, idx]), mrg(sp_of(lhs), cur_sp(p)))
+            continue
+        end
+        if cur.kind == "op" && (o == ".." || o == "..=") is
+            let rhs: ast::Node = parse_expr(p, r_bp)?
+            let incl: string = if o == "..=" is "true" else "false" end
+            lhs = spn(nd("Range", incl, [lhs, rhs]), mrg(sp_of(lhs), sp_of(rhs)))
+            continue
+        end
+        if cur.kind == "kw" && o == "as" is
+            let ty: ast::Node = parse_type(p)?
+            lhs = spn(nd("Cast", "", [lhs, ty]), span)
+            continue
+        end
+        if cur.kind == "op" && o == "?" is
+            lhs = spn(nd("Try", "", [lhs]), mrg(sp_of(lhs), op_sp))
+            continue
+        end
+        let bname: string = binop_name(o)
+        if bname != "" is
+            let rhs: ast::Node = parse_expr(p, r_bp)?
+            lhs = spn(nd("BinOp", bname, [lhs, rhs]), mrg(sp_of(lhs), sp_of(rhs)))
+        end
+    end
+    return ok(lhs)
+end
+
+fn parse_call_args(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let mut args: [ast::Node] = []
+    while !at_op(p, ")") && !at_eof(p) is
+        skip_nl(p)
+        if at_op(p, ")") is break end
+        args.push(parse_expr(p, 0)?)
+        if at_op(p, ",") is p_adv(p) end
+    end
+    p_expect_op(p, ")")?
+    return ok(nd("Args", "", args))
+end
+
+fn parse_struct_lit_fields(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let mut fields: [ast::Node] = []
+    skip_nl(p)
+    while !at_op(p, "}") && !at_eof(p) is
+        skip_nl(p)
+        if at_op(p, "}") is break end
+        let fname: string = expect_ident(p)?
+        p_expect_op(p, ":")?
+        let fval: ast::Node = parse_expr(p, 0)?
+        fields.push(nd("Field", fname, [fval]))
+        if at_op(p, ",") is p_adv(p) end
+        skip_nl(p)
+    end
+    p_expect_op(p, "}")?
+    return ok(nd("Fields", "", fields))
+end
+
+fn parse_ident_expr_from(p: Parser, name: string, start: ast::Sp) -> option::Result<ast::Node, error::ParseError> is
+    if at_op(p, "::") is
+        let mut segs: [string] = [name]
+        while at_op(p, "::") is
+            p_adv(p)
+            let seg: string = expect_path_segment(p)?
+            segs.push(seg)
+        end
+        let path_span: ast::Sp = mrg(start, cur_sp(p))
+        if at_op(p, "(") is
+            p_adv(p)
+            let args: ast::Node = parse_call_args(p)?
+            let s: ast::Sp = mrg(start, cur_sp(p))
+            let callee: ast::Node = spn(lf("Path", join_str(segs, "::")), path_span)
+            return ok(spn(nd("Call", "", [callee, args]), s))
+        end
+        if at_op(p, "{") is
+            p_adv(p)
+            let fs: ast::Node = parse_struct_lit_fields(p)?
+            let s2: ast::Sp = mrg(start, cur_sp(p))
+            return ok(spn(nd("StructLit", join_str(segs, "_"), fs.kids), s2))
+        end
+        return ok(spn(lf("Path", join_str(segs, "::")), path_span))
+    end
+    if at_op(p, "{") is
+        p_adv(p)
+        let fs: ast::Node = parse_struct_lit_fields(p)?
+        let s3: ast::Sp = mrg(start, cur_sp(p))
+        return ok(spn(nd("StructLit", name, fs.kids), s3))
+    end
+    if at_op(p, "(") is
+        p_adv(p)
+        let args: ast::Node = parse_call_args(p)?
+        let s4: ast::Sp = mrg(start, cur_sp(p))
+        return ok(spn(nd("Call", "", [spn(lf("Ident", name), start), args]), s4))
+    end
+    return ok(spn(lf("Ident", name), start))
+end
+
+fn parse_ident_expr(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    let name: string = expect_ident(p)?
+    return parse_ident_expr_from(p, name, start)
+end
+
+fn parse_prefix(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    skip_nl(p)
+    let start: ast::Sp = cur_sp(p)
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "kw" && c.text == "await" is
+        let span: ast::Sp = cur_sp(p)
+        p_adv(p)
+        let inner: ast::Node = parse_expr(p, 0)?
+        return ok(spn(nd("Await", "", [inner]), mrg(span, sp_of(inner))))
+    end
+    if c.kind == "op" && c.text == "|" is return parse_closure_expr(p) end
+    if c.kind == "op" && c.text == "||" is return parse_empty_param_closure_expr(p) end
+    if c.kind == "int" is
+        p_adv(p)
+        return ok(spn(lf("Int", int_text(c.text)), start))
+    end
+    if c.kind == "float" is
+        p_adv(p)
+        return ok(spn(lf("Float", floatfmt::float_canon(c.text)), start))
+    end
+    if c.kind == "str" is
+        p_adv(p)
+        return ok(spn(lf("Str", c.text), start))
+    end
+    if c.kind == "interp" is
+        p_adv(p)
+        return ok(parse_interpolated_string(p, c.text, start))
+    end
+    if c.kind == "ident" is return parse_ident_expr(p) end
+    if c.kind == "kw" is
+        let k: string = c.text
+        if k == "true" || k == "false" is
+            p_adv(p)
+            return ok(spn(lf("Bool", k), start))
+        end
+        if k == "nil" is
+            p_adv(p)
+            return ok(spn(lf("Nil", ""), start))
+        end
+        if k == "self" is
+            p_adv(p)
+            return ok(spn(lf("Self", ""), start))
+        end
+        if k == "write" || k == "manual" || k == "arena" is
+            p_adv(p)
+            if at_op(p, "(") is
+                p_adv(p)
+                let args: ast::Node = parse_call_args(p)?
+                let s: ast::Sp = mrg(start, cur_sp(p))
+                return ok(spn(nd("Call", "", [spn(lf("Ident", k), start), args]), s))
+            end
+            return ok(spn(lf("Ident", k), start))
+        end
+        if k == "from" && !is_op_at(p, 1, "::") is
+            p_adv(p)
+            return parse_ident_expr_from(p, "from", start)
+        end
+        if (k == "new" || k == "type" || k == "end" || k == "as" || k == "is" || k == "from" || k == "use" || k == "mod" || k == "async" || k == "await" || k == "in") && is_op_at(p, 1, "::") is
+            let nsp: ast::Sp = cur_sp(p)
+            let name: string = expect_path_segment(p)?
+            return parse_ident_expr_from(p, name, nsp)
+        end
+        if k == "if" is return parse_if(p) end
+        if k == "match" is return parse_match(p) end
+        if k == "while" is return parse_while(p) end
+        if k == "loop" is return parse_loop(p) end
+        if k == "for" is return parse_for(p) end
+        if k == "is" is
+            let body: ast::Node = parse_block(p)?
+            return ok(spn(nd("Do", "", [body]), mrg(start, cur_sp(p))))
+        end
+        if k == "unsafe" is return parse_unsafe_block(p, start) end
+        if k == "return" is
+            p_adv(p)
+            let mut v: ast::Node = nn()
+            let t: lexer::Token = p_cur(p)
+            let stop: bool = t.kind == "nl" || t.kind == "eof" || (t.kind == "kw" && t.text == "end") || (t.kind == "op" && (t.text == "," || t.text == ")"))
+            if !stop is v = parse_expr(p, 0)? end
+            return ok(spn(nd("ReturnE", "", [v]), mrg(start, cur_sp(p))))
+        end
+    end
+    if c.kind == "op" is
+        let o: string = c.text
+        if o == "-" || o == "!" || o == "~" is
+            p_adv(p)
+            let e: ast::Node = parse_expr(p, 29)?
+            let opn: string = if o == "-" is "Neg" elsif o == "!" is "Not" else "BitNot" end
+            return ok(spn(nd("UnOp", opn, [e]), mrg(start, sp_of(e))))
+        end
+        if o == "&" is
+            p_adv(p)
+            let mut m: bool = false
+            if at_kw(p, "mut") is
+                p_adv(p)
+                m = true
+            end
+            let e: ast::Node = parse_prefix(p)?
+            let opn: string = if m is "RefMut" else "Ref" end
+            return ok(spn(nd("UnOp", opn, [e]), mrg(start, sp_of(e))))
+        end
+        if o == "*" is
+            p_adv(p)
+            let e: ast::Node = parse_prefix(p)?
+            return ok(spn(nd("UnOp", "Deref", [e]), mrg(start, sp_of(e))))
+        end
+        if o == "(" is
+            p_adv(p)
+            if at_op(p, ")") is
+                p_adv(p)
+                return ok(spn(nd("TupleLit", "", []), start))
+            end
+            let e: ast::Node = parse_expr(p, 0)?
+            if at_op(p, ",") is
+                let mut elems: [ast::Node] = [e]
+                while at_op(p, ",") is
+                    p_adv(p)
+                    if at_op(p, ")") is break end
+                    elems.push(parse_expr(p, 0)?)
+                end
+                p_expect_op(p, ")")?
+                return ok(spn(nd("TupleLit", "", elems), mrg(start, cur_sp(p))))
+            end
+            p_expect_op(p, ")")?
+            return ok(e)
+        end
+        if o == "[" is
+            p_adv(p)
+            let mut elems: [ast::Node] = []
+            while !at_op(p, "]") && !at_eof(p) is
+                skip_nl(p)
+                if at_op(p, "]") is break end
+                elems.push(parse_expr(p, 0)?)
+                if at_op(p, ",") is p_adv(p) end
+            end
+            p_expect_op(p, "]")?
+            return ok(spn(nd("ArrayLit", "", elems), mrg(start, cur_sp(p))))
+        end
+    end
+    let found: string = c.disp
+    return fail(err_at(p, "UnexpectedToken", cur_sp(p), "unexpected token `{found}`", ["expected an expression"]))
+end
+
+;; ── control flow ──────────────────────────────────────────────────────────────
+;; statements up to (not including) end / else / elsif (or end/EOF only); errors recover
+fn parse_branch_body(p: Parser, stop_at_else: bool) -> ast::Node is
+    let mut stmts: [ast::Node] = []
+    while true is
+        skip_nl(p)
+        if at_eof(p) || at_kw(p, "end") is break end
+        if stop_at_else && (at_kw(p, "else") || at_kw(p, "elsif")) is break end
+        match parse_stmt(p) is
+            option::Result::Ok(sn_) => is
+                for k in sn_.kids is stmts.push(k) end
+            end
+            option::Result::Err(em) => is
+                report(p, em)
+                recover(p)
+            end
+        end
+    end
+    return nd("Block", "", stmts)
+end
+
+fn expr_block(e: ast::Node) -> ast::Node is
+    return nd("Block", "", [expr_stmt(e)])
+end
+
+fn parse_if(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let cond: ast::Node = parse_expr(p, 0)?
+    skip_nl(p)
+    let mut elsifs: [ast::Node] = []
+    let mut else_b: ast::Node = nn()
+    if at_kw(p, "then") is
+        p_adv(p)
+        let te: ast::Node = parse_expr(p, 0)?
+        let then_b: ast::Node = expr_block(te)
+        skip_nl(p)
+        while true is
+            if at_kw(p, "elsif") is
+                p_adv(p)
+                let cnd: ast::Node = parse_expr(p, 0)?
+                skip_nl(p)
+                p_expect_kw(p, "then")?
+                let e: ast::Node = parse_expr(p, 0)?
+                elsifs.push(nd("Elsif", "", [cnd, expr_block(e)]))
+                skip_nl(p)
+                continue
+            end
+            if at_kw(p, "else") is
+                p_adv(p)
+                skip_nl(p)
+                if at_kw(p, "if") is
+                    p_adv(p)
+                    let cnd: ast::Node = parse_expr(p, 0)?
+                    skip_nl(p)
+                    p_expect_kw(p, "then")?
+                    let e: ast::Node = parse_expr(p, 0)?
+                    elsifs.push(nd("Elsif", "", [cnd, expr_block(e)]))
+                    skip_nl(p)
+                    continue
+                end
+                if at_kw(p, "then") is p_adv(p) end
+                let e: ast::Node = parse_expr(p, 0)?
+                else_b = expr_block(e)
+            end
+            break
+        end
+        if at_kw(p, "end") is p_adv(p) end
+        let s: ast::Sp = mrg(start, cur_sp(p))
+        return ok(spn(nd("If", "", [cond, then_b, nd("Elsifs", "", elsifs), else_b]), s))
+    end
+    if !at_kw(p, "is") is
+        return fail(perr(p, "expected `is` after if condition", ["write: if condition is ... end"]))
+    end
+    p_adv(p)
+    skip_nl(p)
+    let then_b: ast::Node = parse_branch_body(p, true)
+    while true is
+        skip_nl(p)
+        if at_kw(p, "elsif") is
+            p_adv(p)
+            let cnd: ast::Node = parse_expr(p, 0)?
+            skip_nl(p)
+            if !at_kw(p, "is") is return fail(perr(p, "expected `is` after elsif condition", [])) end
+            p_adv(p)
+            skip_nl(p)
+            let bb: ast::Node = parse_branch_body(p, true)
+            elsifs.push(nd("Elsif", "", [cnd, bb]))
+            continue
+        end
+        if at_kw(p, "else") is
+            p_adv(p)
+            if at_kw(p, "if") is
+                p_adv(p)
+                let cnd: ast::Node = parse_expr(p, 0)?
+                skip_nl(p)
+                if !at_kw(p, "is") is return fail(perr(p, "expected `is` after else if condition", [])) end
+                p_adv(p)
+                skip_nl(p)
+                let bb: ast::Node = parse_branch_body(p, true)
+                elsifs.push(nd("Elsif", "", [cnd, bb]))
+                continue
+            end
+            if at_kw(p, "is") is p_adv(p) end
+            skip_nl(p)
+            else_b = parse_branch_body(p, false)
+            break
+        end
+        break
+    end
+    p_expect_kw(p, "end")?
+    let s2: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("If", "", [cond, then_b, nd("Elsifs", "", elsifs), else_b]), s2))
+end
+
+fn parse_match(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let subject: ast::Node = parse_expr(p, 0)?
+    skip_nl(p)
+    p_expect_kw(p, "is")?
+    skip_nl(p)
+    let mut arms: [ast::Node] = []
+    while !at_kw(p, "end") && !at_eof(p) is
+        skip_nl(p)
+        if at_kw(p, "end") is break end
+        let arm_span: ast::Sp = cur_sp(p)
+        let pat: ast::Node = parse_pattern_or(p)?
+        let mut guard: ast::Node = nn()
+        if at_kw(p, "if") is
+            p_adv(p)
+            guard = parse_expr(p, 0)?
+        end
+        p_expect_op(p, "=>")?
+        skip_nl(p)
+        let mut body: ast::Node = nd("Block", "", [])
+        if at_kw(p, "is") is
+            body = parse_block(p)?
+        else
+            let e: ast::Node = parse_expr(p, 0)?
+            body = expr_block(e)
+        end
+        arms.push(spn(nd("Arm", "", [pat, guard, body]), arm_span))
+        if at_op(p, ",") is p_adv(p) end
+        skip_nl(p)
+    end
+    p_expect_kw(p, "end")?
+    let s: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("Match", "", [subject, nd("Arms", "", arms)]), s))
+end
+
+fn parse_pattern_or(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let span: ast::Sp = cur_sp(p)
+    let first: ast::Node = parse_pattern(p)?
+    if !at_op(p, "|") is return ok(first) end
+    let mut pats: [ast::Node] = [first]
+    while at_op(p, "|") is
+        p_adv(p)
+        skip_nl(p)
+        pats.push(parse_pattern(p)?)
+    end
+    return ok(spn(nd("POr", "", pats), span))
+end
+
+;; after `(`: patterns until `)` (consumed)
+fn parse_pattern_list(p: Parser, break_on_no_comma: bool) -> option::Result<ast::Node, error::ParseError> is
+    let mut pats: [ast::Node] = []
+    while !at_op(p, ")") && !at_eof(p) is
+        pats.push(parse_pattern(p)?)
+        if at_op(p, ",") is p_adv(p)
+        elsif break_on_no_comma is break end
+    end
+    p_expect_op(p, ")")?
+    return ok(nd("L", "", pats))
+end
+
+fn parse_pattern(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "ident" is
+        if c.text == "_" is
+            p_adv(p)
+            return ok(spn(lf("PWild", ""), start))
+        end
+        p_adv(p)
+        if at_op(p, "::") is
+            let mut qual: string = c.text
+            p_adv(p)
+            let mut variant: string = expect_path_segment(p)?
+            while at_op(p, "::") is
+                p_adv(p)
+                let next: string = expect_path_segment(p)?
+                qual = variant
+                variant = next
+            end
+            let mut inner: [ast::Node] = []
+            if at_op(p, "(") is
+                p_adv(p)
+                let l: ast::Node = parse_pattern_list(p, true)?
+                inner = l.kids
+            end
+            let mut kids: [ast::Node] = [lf("Qual", qual)]
+            for x in inner is kids.push(x) end
+            return ok(spn(nd("PEnum", variant, kids), mrg(start, cur_sp(p))))
+        end
+        if at_op(p, "(") is
+            p_adv(p)
+            let l: ast::Node = parse_pattern_list(p, true)?
+            let mut kids: [ast::Node] = [lf("Qual", "")]
+            for x in l.kids is kids.push(x) end
+            return ok(spn(nd("PEnum", c.text, kids), mrg(start, cur_sp(p))))
+        end
+        return ok(spn(lf("PIdent", c.text), start))
+    end
+    if c.kind == "int" is
+        p_adv(p)
+        return ok(spn(nd("PLit", "", [lf("Int", int_text(c.text))]), start))
+    end
+    if c.kind == "str" || c.kind == "interp" is
+        p_adv(p)
+        return ok(spn(nd("PLit", "", [lf("Str", c.text)]), start))
+    end
+    if c.kind == "kw" && (c.text == "true" || c.text == "false") is
+        p_adv(p)
+        return ok(spn(nd("PLit", "", [lf("Bool", c.text)]), start))
+    end
+    if c.kind == "kw" && c.text == "nil" is
+        p_adv(p)
+        return ok(spn(nd("PLit", "", [lf("Nil", "")]), start))
+    end
+    if c.kind == "op" && c.text == "-" is
+        p_adv(p)
+        if at_kind(p, "int") is
+            let t: string = int_text(p_cur(p).text)
+            p_adv(p)
+            let mut neg: string = "-" + t
+            if t == "0" is neg = "0" end
+            return ok(spn(nd("PLit", "", [lf("Int", neg)]), start))
+        end
+        return fail(perr(p, "expected integer after `-` in pattern", []))
+    end
+    if c.kind == "op" && c.text == "(" is
+        p_adv(p)
+        let l: ast::Node = parse_pattern_list(p, false)?
+        return ok(spn(nd("PTuple", "", l.kids), mrg(start, cur_sp(p))))
+    end
+    if c.kind == "op" && c.text == ".." is
+        p_adv(p)
+        return ok(spn(lf("PWild", ""), start))
+    end
+    let found: string = c.disp
+    return fail(perr(p, "expected pattern, found `{found}`", ["valid patterns: name, literal, Variant(inner), (a, b), or _"]))
+end
+
+fn parse_loop(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    skip_nl(p)
+    let body: ast::Node = parse_block(p)?
+    let s: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("While", "", [spn(lf("Bool", "true"), s), body]), s))
+end
+
+fn parse_while(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let cond: ast::Node = parse_expr(p, 0)?
+    skip_nl(p)
+    let body: ast::Node = parse_block(p)?
+    return ok(spn(nd("While", "", [cond, body]), mrg(start, cur_sp(p))))
+end
+
+fn parse_for(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let start: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let pat: ast::Node = parse_pattern(p)?
+    p_expect_kw(p, "in")?
+    let it: ast::Node = parse_expr(p, 0)?
+    skip_nl(p)
+    let body: ast::Node = parse_block(p)?
+    return ok(spn(nd("For", "", [pat, it, body]), mrg(start, cur_sp(p))))
+end
+
+;; Ok("") for no size, Ok("N") for a size
+fn parse_optional_paren_size(p: Parser) -> option::Result<string, error::ParseError> is
+    if !at_op(p, "(") is return option::Result::Ok("") end
+    p_adv(p)
+    let mut size: string = ""
+    if at_kind(p, "int") is
+        size = int_text(p_cur(p).text)
+        p_adv(p)
+    end
+    p_expect_op(p, ")")?
+    return option::Result::Ok(size)
+end
+
+fn parse_unsafe_block(p: Parser, start: ast::Sp) -> option::Result<ast::Node, error::ParseError> is
+    p_adv(p)
+    let mut mode: string = "raw"
+    if at_kw(p, "arena") is
+        p_adv(p)
+        let mut kind: string = "General"
+        let mut size: string = ""
+        if at_op(p, "(") is
+            p_adv(p)
+            if at_ident_text(p, "general") is
+                p_adv(p)
+                kind = "General"
+            elsif at_ident_text(p, "fixed") is
+                p_adv(p)
+                kind = "Fixed"
+            elsif at_ident_text(p, "pool") is
+                p_adv(p)
+                kind = "Pool"
+            elsif at_ident_text(p, "page") is
+                p_adv(p)
+                kind = "Page"
+            elsif at_ident_text(p, "ring") is
+                p_adv(p)
+                kind = "Ring"
+            elsif at_kind(p, "int") is
+                kind = "Fixed"
+            else
+                kind = "General"
+            end
+            if at_op(p, ",") is p_adv(p) end
+            if at_kind(p, "int") is
+                size = int_text(p_cur(p).text)
+                p_adv(p)
+            end
+            p_expect_op(p, ")")?
+        end
+        mode = "arena:{kind}:{size}"
+    elsif at_ident_text(p, "pool") is
+        p_adv(p)
+        let size: string = parse_optional_paren_size(p)?
+        mode = "arena:Pool:{size}"
+    elsif at_ident_text(p, "page") is
+        p_adv(p)
+        let size: string = parse_optional_paren_size(p)?
+        mode = "arena:Page:{size}"
+    elsif at_ident_text(p, "ring") is
+        p_adv(p)
+        let size: string = parse_optional_paren_size(p)?
+        mode = "arena:Ring:{size}"
+    elsif at_ident_text(p, "classic") is
+        p_adv(p)
+        mode = "manual:Classic"
+    elsif at_kw(p, "manual") is
+        p_adv(p)
+        let mut mk: string = "Modern"
+        if at_op(p, "(") is
+            p_adv(p)
+            if at_ident_text(p, "classic") is
+                p_adv(p)
+                mk = "Classic"
+            end
+            p_expect_op(p, ")")?
+        end
+        mode = "manual:{mk}"
+    end
+    let body: ast::Node = parse_block(p)?
+    let s: ast::Sp = mrg(start, cur_sp(p))
+    return ok(spn(nd("Unsafe", mode, [body]), s))
+end
+
+;; ── closures ──────────────────────────────────────────────────────────────────
+fn closure_tail(p: Parser, span: ast::Sp, params: ast::Node) -> option::Result<ast::Node, error::ParseError> is
+    let mut ret: ast::Node = nn()
+    if at_op(p, "->") is
+        p_adv(p)
+        ret = parse_type(p)?
+    end
+    let mut body: ast::Node = nd("Block", "", [])
+    if at_kw(p, "is") is
+        body = parse_block(p)?
+    else
+        let e: ast::Node = parse_expr(p, 0)?
+        body = nd("Block", "", [spn(nd("Return", "", [e]), sp_of(e))])
+    end
+    let end_sp: ast::Sp = cur_sp(p)
+    return ok(spn(nd("Closure", "", [params, ret, body]), mrg(span, end_sp)))
+end
+
+fn parse_empty_param_closure_expr(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let span: ast::Sp = cur_sp(p)
+    p_adv(p)
+    return closure_tail(p, span, nd("Params", "", []))
+end
+
+fn parse_closure_expr(p: Parser) -> option::Result<ast::Node, error::ParseError> is
+    let span: ast::Sp = cur_sp(p)
+    p_adv(p)
+    let mut params: [ast::Node] = []
+    while !at_op(p, "|") && !at_eof(p) is
+        let p_span: ast::Sp = cur_sp(p)
+        let mut m: bool = false
+        if at_kw(p, "mut") is
+            p_adv(p)
+            m = true
+        end
+        let name: string = expect_ident(p)?
+        let mut ty: ast::Node = lf("Named", "int")
+        if at_op(p, ":") is
+            p_adv(p)
+            ty = parse_type(p)?
+        end
+        params.push(spn(nd("Param", name, [bn(m), ty]), p_span))
+        if at_op(p, ",") is p_adv(p) end
+    end
+    if at_op(p, "|") is p_adv(p) end
+    return closure_tail(p, span, nd("Params", "", params))
+end
+
+;; ── string interpolation ──────────────────────────────────────────────────────
+fn utf8_len_at(s: string, i: int) -> int is
+    let b: int = byte_at(s, i)
+    if b < 128 is return 1 end
+    if b >= 192 && b < 224 is return 2 end
+    if b >= 224 && b < 240 is return 3 end
+    if b >= 240 && b < 248 is return 4 end
+    return 1
+end
+
+fn all_ident_chars(s: string) -> bool is
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        let ok_c: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128
+        if !ok_c is return false end
+        i += 1
+    end
+    return true
+end
+
+;; `crate::parse(&sub, "<interp>")` then pull the returned expression out of `fn __interp__`
+fn first_return_expr(m: ast::Node) -> ast::Node is
+    for it in m.kids[3].kids is
+        if it.tag == "Fn" is
+            for st in it.kids[4].kids is
+                if st.tag == "Return" && st.kids[0].tag != "None" is return st.kids[0] end
+            end
+        end
+    end
+    return nn()
+end
+
+fn parse_interp_expr(src: string, span: ast::Sp) -> ast::Node is
+    let sub: string = "fn __interp__() is\n    return " + src + "\nend"
+    let lx: lexer::Lexed = lexer::lex(sub, "<interp>")
+    if lx.errs.len() == 0 is
+        let sp: Parser = Parser { toks: lx.toks, pos: 0, file: "<interp>", errs: [] }
+        let m: ast::Node = parse_module(sp)
+        if sp.errs.len() == 0 is
+            let mut found: ast::Node = first_return_expr(m)
+            if found.tag == "None" is found = lf("Ident", src) end
+            ast::mark_interp(found)
+            ast::remap_span(found, span)
+            return found
+        end
+    end
+    if all_ident_chars(src) is return spn(lf("Ident", src), span) end
+    return spn(lf("Str", "{" + src + "}"), span)
+end
+
+fn parse_interpolated_string(p: Parser, raw: string, span: ast::Sp) -> ast::Node is
+    let mut parts: [ast::Node] = []
+    let n: int = raw.len()
+    let mut i: int = 0
+    let mut text_start: int = 0
+    while i < n is
+        let b: int = byte_at(raw, i)
+        if i + 1 < n && b == 123 && byte_at(raw, i + 1) == 123 is
+            parts.push(lf("Text", raw[text_start..i] + "{"))
+            i += 2
+            text_start = i
+            continue
+        end
+        if i + 1 < n && b == 125 && byte_at(raw, i + 1) == 125 is
+            parts.push(lf("Text", raw[text_start..i] + "}"))
+            i += 2
+            text_start = i
+            continue
+        end
+        if b == 123 is
+            let text: string = raw[text_start..i]
+            if text.len() > 0 is parts.push(lf("Text", text)) end
+            i += 1
+            let expr_start: int = i
+            let mut depth: int = 1
+            let mut in_str: bool = false
+            let mut escaped: bool = false
+            while i < n is
+                let c: int = byte_at(raw, i)
+                if in_str is
+                    if escaped is escaped = false
+                    elsif c == 92 is escaped = true
+                    elsif c == 34 is in_str = false end
+                    i += 1
+                    continue
+                end
+                if c == 34 is
+                    in_str = true
+                    i += 1
+                elsif c == 123 is
+                    depth += 1
+                    i += 1
+                elsif c == 125 is
+                    depth -= 1
+                    if depth == 0 is break end
+                    i += 1
+                else
+                    i += 1
+                end
+            end
+            if i >= n is
+                parts.push(lf("Text", "{" + raw[expr_start..n]))
+                text_start = n
+                break
+            end
+            let expr_src: string = trim_s(raw[expr_start..i])
+            i += 1
+            text_start = i
+            if expr_src.len() == 0 is
+                parts.push(spn(lf("Str", ""), span))
+            else
+                parts.push(parse_interp_expr(expr_src, span))
+            end
+        else
+            i += utf8_len_at(raw, i)
+        end
+    end
+    let tail: string = raw[text_start..n]
+    if tail.len() > 0 is parts.push(lf("Text", tail)) end
+    if parts.len() == 1 && parts[0].tag == "Text" is return spn(lf("Str", parts[0].text), span) end
+    if parts.len() == 0 is return spn(lf("Str", ""), span) end
+    return spn(nd("Interp", "", parts), span)
+end
+
+;; ── module ────────────────────────────────────────────────────────────────────
+;; Module(Edition[span], FileMem, Imports, Items)
+pub fn parse_module(p: Parser) -> ast::Node is
+    let mut items: [ast::Node] = []
+    let mut imports: [ast::Node] = []
+    let mut edition: string = ""
+    let mut has_edition: bool = false
+    let mut edition_span: ast::Sp = cur_sp(p)
+    let mut using_seen: bool = false
+    let mut item_seen: bool = false
+    let mut file_mem: string = ""
+    skip_nl(p)
+    if at_op(p, "@") && is_op_at(p, 1, ":") is
+        p_adv(p)
+        p_adv(p)
+        let mut name: string = ""
+        let mut name_sp: ast::Sp = cur_sp(p)
+        let mut got: bool = true
+        if at_kw(p, "arena") is
+            name = "arena"
+            p_adv(p)
+        elsif at_kw(p, "manual") is
+            name = "manual"
+            p_adv(p)
+        else
+            name_sp = cur_sp(p)
+            match expect_ident(p) is
+                option::Result::Ok(s) => is name = s end
+                option::Result::Err(em) => is
+                    got = false
+                    report(p, em)
+                end
+            end
+        end
+        if got is
+            let mm: string = mem_mode_name(name)
+            if mm == "" is
+                report(p, err_at(p, "Custom", name_sp, "unknown file-level memory annotation `@: {name}`", ["expected one of: @: default, @: safety, @: arc, @: arena, @: pointers"]))
+            else
+                file_mem = mm
+            end
+        end
+        skip_nl(p)
+    end
+    while !at_eof(p) is
+        skip_nl(p)
+        if at_eof(p) is break end
+        if at_kw(p, "using") is
+            let using_span: ast::Sp = cur_sp(p)
+            p_adv(p)
+            let mut has_payload: bool = false
+            let mut text: string = ""
+            let sp: ast::Sp = cur_sp(p)
+            if at_kind(p, "str") is
+                text = p_cur(p).text
+                has_payload = true
+                p_adv(p)
+            elsif at_kind(p, "int") is
+                text = int_text(p_cur(p).text)
+                has_payload = true
+                p_adv(p)
+            end
+            if !has_payload is
+                report(p, err_at(p, "Custom", using_span, "`using` must be followed by an edition", ["write it as `using \"2026\"`"]))
+            else
+                let full: ast::Sp = mrg(using_span, sp)
+                if using_seen is
+                    report(p, err_at(p, "Custom", full, "`using` edition declared more than once", ["a file has exactly one edition — remove the extra `using`"]))
+                elsif item_seen is
+                    report(p, err_at(p, "Custom", full, "`using` must come before any item", ["move `using \"<edition>\"` to the top of the file, above the first `fn`/`struct`/`enum`"]))
+                else
+                    let r: edition::EditionParse = edition::parse_edition(text)
+                    if r.ok is
+                        edition = "{r.year}"
+                        has_edition = true
+                        edition_span = full
+                    else
+                        report(p, err_at(p, "Custom", sp, edition::edition_error_message(r.err), edition::edition_error_hints(r.err)))
+                    end
+                end
+                using_seen = true
+            end
+            skip_nl(p)
+            continue
+        end
+        if at_use_import(p) is
+            match parse_import(p) is
+                option::Result::Ok(im) => is imports.push(im) end
+                option::Result::Err(em) => is
+                    report(p, em)
+                    recover(p)
+                end
+            end
+            continue
+        end
+        item_seen = true
+        match parse_item(p) is
+            option::Result::Ok(it) => is items.push(it) end
+            option::Result::Err(em) => is
+                report(p, em)
+                recover(p)
+            end
+        end
+    end
+    let mut ed: ast::Node = lf("Edition", edition)
+    if has_edition is ed = spn(ed, edition_span) end
+    return nd("Module", "", [ed, lf("FileMem", file_mem), nd("Imports", "", imports), nd("Items", "", items)])
+end
