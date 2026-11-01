@@ -1,0 +1,107 @@
+use "std -> strings" from "str"
+
+mod rt_conv
+
+;; hsh_civil_from_unix -> [year, month, day, days_since_epoch]
+fn civil_from_unix(ts: int) -> [int] is
+    let mut dd: int = ts / 86400
+    if ts % 86400 < 0 is dd -= 1 end
+    let z: int = dd + 719468
+    let mut base: int = z
+    if z < 0 is base = z - 146096 end
+    let era: int = base / 146097
+    let doe: int = z - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let yy: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let dday: int = doy - (153 * mp + 2) / 5 + 1
+    let mut mm: int = mp - 9
+    if mp < 10 is mm = mp + 3 end
+    let mut year: int = yy
+    if mm <= 2 is year = yy + 1 end
+    return [year, mm, dday, dd]
+end
+
+;; hsh_days_from_civil
+fn days_from_civil(y0: int, m: int, d: int) -> int is
+    let mut y: int = y0
+    if m <= 2 is y -= 1 end
+    let mut base: int = y
+    if y < 0 is base = y - 399 end
+    let era: int = base / 400
+    let yoe: int = y - era * 400
+    let mut mp: int = m + 9
+    if m > 2 is mp = m - 3 end
+    let doy: int = (153 * mp + 2) / 5 + d - 1
+    let doe: int = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+end
+
+pub fn year(ts: int) -> int is return civil_from_unix(ts)[0] end
+pub fn month(ts: int) -> int is return civil_from_unix(ts)[1] end
+pub fn day(ts: int) -> int is return civil_from_unix(ts)[2] end
+
+;; hsh_date_weekday: "Mon".."Sun" (epoch day 0 was a Thursday)
+pub fn weekday(ts: int) -> string is
+    let names: [string] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]
+    let mut i: int = civil_from_unix(ts)[3] % 7
+    if i < 0 is i += 7 end
+    return names[i]
+end
+
+pub fn add_days(ts: int, days: int) -> int is return ts + days * 86400 end
+pub fn add_hours(ts: int, hours: int) -> int is return ts + hours * 3600 end
+pub fn diff_days(a: int, b: int) -> int is return (a - b) / 86400 end
+
+;; hsh_parse_parts: up to `max` integers separated by `sep`; a piece that is not a clean integer is skipped
+fn parse_parts(s: string, sep: int, max: int) -> [int] is
+    let n: int = s.len()
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n && out.len() < max is
+        while i < n && byte_at(s, i) == 32 is i += 1 end
+        let r: [int] = rt_conv::strtoll10(s, i)
+        let mut next: int = r[1]
+        while next < n && byte_at(s, next) != sep is next += 1 end
+        if r[1] != i && (r[1] == n || byte_at(s, r[1]) == sep) && r[2] == 0 is out.push(r[0]) end
+        if next < n is i = next + 1 else i = next end
+    end
+    return out
+end
+
+;; hsh_date_parse: "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS" or "...THH:MM:SS" (UTC) -> unix seconds; 0 when the date is bad.
+;; Like the C version it only looks at the first 127 bytes.
+pub fn parse(s0: string) -> int is
+    let mut s: string = s0
+    if s.len() > 127 is s = s[0..127] end
+    let mut sp: int = -1
+    let mut i: int = 0
+    while i < s.len() && sp < 0 is
+        if byte_at(s, i) == 32 is sp = i end
+        i += 1
+    end
+    if sp < 0 is
+        i = 0
+        while i < s.len() && sp < 0 is
+            if byte_at(s, i) == 84 is sp = i end
+            i += 1
+        end
+    end
+    let mut date_part: string = s
+    let mut time_part: string = "00:00:00"
+    if sp >= 0 is
+        date_part = s[0..sp]
+        time_part = s[sp + 1..s.len()]
+    end
+    let d: [int] = parse_parts(date_part, 45, 3)
+    if d.len() != 3 is return 0 end
+    let t: [int] = parse_parts(time_part, 58, 3)
+    let mut h: int = 0
+    let mut mi: int = 0
+    let mut sec: int = 0
+    if t.len() > 0 is h = t[0] end
+    if t.len() > 1 is mi = t[1] end
+    if t.len() > 2 is sec = t[2] end
+    return days_from_civil(d[0], d[1], d[2]) * 86400 + h * 3600 + mi * 60 + sec
+end
