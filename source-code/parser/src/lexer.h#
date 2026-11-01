@@ -1,0 +1,597 @@
+use "std -> map" from "map"
+use "std -> strbuf" from "strbuf"
+
+mod error
+
+pub struct Token is
+    pub kind: string
+    pub text: string
+    pub disp: string
+    pub line: int
+    ;; byte range in the source, and the Rust-lexer `Span` (1-based line/col, 0-based char offset)
+    pub bs: int
+    pub be: int
+    pub sl: int
+    pub sc: int
+    pub so: int
+    pub el: int
+    pub ec: int
+    pub eo: int
+end
+
+pub struct DocLine is
+    pub text: string
+    pub bs:   int
+    pub be:   int
+    pub sl:   int
+    pub sc:   int
+    pub so:   int
+    pub el:   int
+    pub ec:   int
+    pub eo:   int
+end
+
+;; the full result of lexing (Rust: `tokenize()` -> Ok(tokens) / Err(errors), plus `doc_lines()`)
+pub struct Lexed is
+    pub toks: [Token]
+    pub errs: [error::ParseError]
+    pub docs: [DocLine]
+end
+
+struct RawErr is
+    pub kind: string
+    pub bs:   int
+    pub be:   int
+    pub msg:  string
+    pub hints: [string]
+end
+
+fn mk(kind: string, text: string, line: int) -> Token is
+    return Token { kind: kind, text: text, disp: text, line: line, bs: -1, be: -1, sl: 0, sc: 0, so: 0, el: 0, ec: 0, eo: 0 }
+end
+
+pub fn keyword_set() -> map::Set<string> is
+    let mut s: map::Set<string> = map::Set::new()
+    let words: [string] = ["fn", "let", "const", "mut", "if", "else", "elsif", "while", "loop", "for", "in",
+        "return", "use", "from", "pub", "struct", "enum", "impl", "trait", "match", "is", "end", "then", "type",
+        "as", "self", "new", "break", "continue", "unsafe", "using", "arena", "manual", "extern", "mod", "async",
+        "await", "write", "true", "false", "nil", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16",
+        "u32", "u64", "u128", "f32", "f64", "bool", "string", "bytes", "void", "any"]
+    for w in words is
+        s.add(w)
+    end
+    return s
+end
+
+fn is_hex_digit(c: int) -> bool is
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+end
+
+fn hex_val(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 87 end
+    return c - 55
+end
+
+;; UTF-8 encoding of a code point (the Rust lexer pushes `char`s).
+fn utf8_of(cp: int) -> string is
+    if cp < 128 is return str_from_byte(cp) end
+    if cp < 2048 is
+        return str_from_byte(192 + cp / 64) + str_from_byte(128 + cp % 64)
+    end
+    if cp < 65536 is
+        return str_from_byte(224 + cp / 4096) + str_from_byte(128 + (cp / 64) % 64) + str_from_byte(128 + cp % 64)
+    end
+    return str_from_byte(240 + cp / 262144) + str_from_byte(128 + (cp / 4096) % 64) + str_from_byte(128 + (cp / 64) % 64) + str_from_byte(128 + cp % 64)
+end
+
+;; Mirror of `has_unescaped_interp_marker`: does the (escape-processed) string need interpolation parsing?
+fn has_interp_marker(s: string) -> bool is
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n is
+        let c: int = byte_at(s, i)
+        if c == 123 is
+            if byte_at(s, i + 1) == 123 is return true end
+            let mut depth: int = 1
+            let mut j: int = i + 1
+            while j < n && depth > 0 is
+                let d: int = byte_at(s, j)
+                if d == 123 is depth += 1 end
+                if d == 125 is depth -= 1 end
+                j += 1
+            end
+            if depth == 0 && j > i + 1 is return true end
+        elsif c == 125 && byte_at(s, i + 1) == 125 is
+            return true
+        end
+        i += 1
+    end
+    return false
+end
+
+fn is_punct_escape(c: int) -> bool is
+    ;; the characters the Rust lexer maps to themselves after a backslash
+    if c == 123 || c == 125 is return true end
+    let set: string = "\\\"'[]()$?*+.^|/-<>@&!#%=:;,_`~"
+    return set.contains(str_from_byte(c))
+end
+
+pub fn tokenize(src: string) -> [Token] is
+    return lex(src, "").toks
+end
+
+pub fn lex(src: string, file: string) -> Lexed is
+    let n: int = src.len()
+    let mut raw: [RawErr] = []
+    let mut docs: [DocLine] = []
+    let kws: map::Set<string> = keyword_set()
+    let mut toks: [Token] = []
+    let mut i: int = 0
+    let mut line: int = 1
+    let mut pend_i0: int = 0
+    let mut pend_t0: int = 0
+    while i < n is
+        ;; tokens pushed by the previous iteration span [pend_i0, i)
+        while pend_t0 < toks.len() is
+            toks[pend_t0].bs = pend_i0
+            toks[pend_t0].be = i
+            pend_t0 += 1
+        end
+        pend_i0 = i
+        let c: int = byte_at(src, i)
+        let c1: int = byte_at(src, i + 1)
+        if c == 32 || c == 9 || c == 13 is
+            i += 1
+        elsif c == 10 is
+            toks.push(mk("nl", "\n", line))
+            line += 1
+            i += 1
+        elsif c == 47 && c1 == 47 && byte_at(src, i + 2) == 47 && byte_at(src, i + 3) != 47 is
+            let d0: int = i
+            i += 3
+            if byte_at(src, i) == 32 is i += 1 end
+            let ts: int = i
+            while i < n && byte_at(src, i) != 10 is i += 1 end
+            docs.push(DocLine { text: trim_end_s(src[ts..i]), bs: d0, be: i, sl: 0, sc: 0, so: 0, el: 0, ec: 0, eo: 0 })
+        elsif c == 59 && c1 == 59 is
+            while i < n && byte_at(src, i) != 10 is i += 1 end
+        elsif c == 47 && c1 == 47 is
+            let c0: int = i
+            i += 2
+            let mut closed: bool = false
+            while i < n && !closed is
+                if byte_at(src, i) == 92 && byte_at(src, i + 1) == 92 is
+                    closed = true
+                    i += 2
+                else
+                    if byte_at(src, i) == 10 is line += 1 end
+                    i += 1
+                end
+            end
+            if !closed is
+                raw.push(RawErr { kind: "Custom", bs: c0, be: c0 + 2, msg: "unterminated block comment", hints: ["close it with `\\\\` (two backslashes), or use `;;` for a one-line comment"] })
+            end
+        elsif c == 35 is
+            if c1 == 91 is
+                toks.push(mk("op", "#", line))
+                i += 1
+            else
+                while i < n && byte_at(src, i) != 10 is i += 1 end
+            end
+        elsif c == 114 && c1 == 34 is
+            let r0: int = i
+            i += 2
+            let st: int = i
+            while i < n && byte_at(src, i) != 34 && byte_at(src, i) != 10 is i += 1 end
+            if i >= n is
+                raw.push(RawErr { kind: "UnterminatedString", bs: r0, be: n, msg: "unterminated raw string", hints: ["close with `\"`"] })
+            elsif byte_at(src, i) == 10 is
+                i += 1
+                line += 1
+                raw.push(RawErr { kind: "UnterminatedString", bs: r0, be: i, msg: "unterminated raw string", hints: ["close with `\"`"] })
+            else
+                let mut rt: Token = mk("str", src[st..i], line)
+                rt.disp = "r\"" + src[st..i] + "\""
+                toks.push(rt)
+                i += 1
+            end
+        elsif c == 34 is
+            let q0: int = i
+            i += 1
+            let mut sb = strbuf::new()
+            let mut run: int = i
+            let mut closed: bool = false
+            let mut failed: bool = false
+            while i < n && !closed && !failed is
+                let d: int = byte_at(src, i)
+                if d == 34 is
+                    sb.push(src[run..i])
+                    i += 1
+                    closed = true
+                elsif d == 92 && i + 1 >= n is
+                    raw.push(RawErr { kind: "UnterminatedString", bs: q0, be: n, msg: "unterminated escape sequence", hints: [] })
+                    i = n
+                    failed = true
+                elsif d == 92 is
+                    sb.push(src[run..i])
+                    let e: int = byte_at(src, i + 1)
+                    i += 2
+                    if e == 110 is sb.push("\n")
+                    elsif e == 116 is sb.push("\t")
+                    elsif e == 114 is sb.push("\r")
+                    elsif e == 48 is sb.push(str_from_byte(0))
+                    elsif e == 120 is
+                        let h1: int = byte_at(src, i)
+                        let h2: int = byte_at(src, i + 1)
+                        i += 2
+                        if is_hex_digit(h1) && is_hex_digit(h2) is
+                            sb.push(utf8_of(hex_val(h1) * 16 + hex_val(h2)))
+                        else
+                            sb.push("\\x")
+                            sb.push(str_from_byte(h1))
+                            sb.push(str_from_byte(h2))
+                        end
+                    elsif e == 117 is
+                        let mut cp: int = 0
+                        if byte_at(src, i) == 123 is
+                            i += 1
+                            while is_hex_digit(byte_at(src, i)) is
+                                cp = cp * 16 + hex_val(byte_at(src, i))
+                                i += 1
+                            end
+                            if byte_at(src, i) == 125 is i += 1 end
+                        else
+                            let mut k: int = 0
+                            while k < 4 is
+                                if is_hex_digit(byte_at(src, i)) is
+                                    cp = cp * 16 + hex_val(byte_at(src, i))
+                                    i += 1
+                                end
+                                k += 1
+                            end
+                        end
+                        sb.push(utf8_of(cp))
+                    elsif is_punct_escape(e) is
+                        sb.push(str_from_byte(e))
+                    else
+                        sb.push("\\")
+                        if e >= 0 is sb.push(str_from_byte(e)) end
+                    end
+                    run = i
+                else
+                    if d == 10 is line += 1 end
+                    i += 1
+                end
+            end
+            if !closed && !failed is
+                raw.push(RawErr { kind: "UnterminatedString", bs: q0, be: n, msg: "unterminated string literal", hints: ["close the string with `\"`"] })
+            end
+            if closed is
+                let s: string = sb.build()
+                let mut st: Token = mk("str", s, line)
+                if has_interp_marker(s) is st = mk("interp", s, line) end
+                st.disp = "\"" + s + "\""
+                toks.push(st)
+            end
+        elsif c >= 48 && c <= 57 is
+            let st: int = i
+            let mut is_float: bool = false
+            let mut special: bool = false
+            i += 1
+            if c == 48 && (c1 == 120 || c1 == 88) is
+                special = true
+                i += 1
+                while i < n && (is_hex_digit(byte_at(src, i)) || byte_at(src, i) == 95) is i += 1 end
+            elsif c == 48 && (c1 == 98 || c1 == 66) is
+                special = true
+                i += 1
+                while i < n && (byte_at(src, i) == 48 || byte_at(src, i) == 49 || byte_at(src, i) == 95) is i += 1 end
+            end
+            if !special is
+                while i < n && (is_digit_byte(byte_at(src, i)) || byte_at(src, i) == 95) is i += 1 end
+                if byte_at(src, i) == 46 && is_digit_byte(byte_at(src, i + 1)) is
+                    is_float = true
+                    i += 1
+                    while i < n && (is_digit_byte(byte_at(src, i)) || byte_at(src, i) == 95) is i += 1 end
+                end
+                if byte_at(src, i) == 101 || byte_at(src, i) == 69 is
+                    is_float = true
+                    i += 1
+                    if byte_at(src, i) == 43 || byte_at(src, i) == 45 is i += 1 end
+                    while i < n && is_digit_byte(byte_at(src, i)) is i += 1 end
+                end
+            end
+            if is_float is
+                toks.push(mk("float", src[st..i], line))
+            else
+                toks.push(mk("int", src[st..i], line))
+            end
+        elsif ascii_alpha(c) || (c >= 128 && alpha_cp_at(src, i)) is
+            let st: int = i
+            while i < n is
+                let cb: int = byte_at(src, i)
+                if ascii_alnum(cb) is
+                    i += 1
+                elsif cb >= 128 && alnum_cp_at(src, i) is
+                    i += utf8_len_at(src, i)
+                else
+                    break
+                end
+            end
+            let w: string = src[st..i]
+            if kws.has(w) is
+                toks.push(mk("kw", w, line))
+            else
+                toks.push(mk("ident", w, line))
+            end
+        elsif c >= 128 is
+            i += utf8_len_at(src, i)
+        else
+            let mut op: string = ""
+            if c == 45 is
+                if c1 == 62 is
+                    op = "->"
+                elsif c1 == 61 is
+                    op = "-="
+                else
+                    op = "-"
+                end
+            elsif c == 43 is
+                if c1 == 61 is
+                    op = "+="
+                else
+                    op = "+"
+                end
+            elsif c == 42 is
+                if c1 == 61 is
+                    op = "*="
+                else
+                    op = "*"
+                end
+            elsif c == 47 is
+                if c1 == 61 is
+                    op = "/="
+                else
+                    op = "/"
+                end
+            elsif c == 37 is op = "%"
+            elsif c == 61 is
+                if c1 == 61 is
+                    op = "=="
+                elsif c1 == 62 is
+                    op = "=>"
+                else
+                    op = "="
+                end
+            elsif c == 33 is
+                if c1 == 61 is
+                    op = "!="
+                else
+                    op = "!"
+                end
+            elsif c == 60 is
+                if c1 == 61 is
+                    op = "<="
+                elsif c1 == 60 is
+                    op = "<<"
+                else
+                    op = "<"
+                end
+            elsif c == 62 is
+                if c1 == 61 is
+                    op = ">="
+                elsif c1 == 62 is
+                    op = ">>"
+                else
+                    op = ">"
+                end
+            elsif c == 38 is
+                if c1 == 38 is
+                    op = "&&"
+                else
+                    op = "&"
+                end
+            elsif c == 124 is
+                if c1 == 124 is
+                    op = "||"
+                else
+                    op = "|"
+                end
+            elsif c == 94 is op = "^"
+            elsif c == 126 is op = "~"
+            elsif c == 46 is
+                if c1 == 46 is
+                    if byte_at(src, i + 2) == 61 is
+                        op = "..="
+                    else
+                        op = ".."
+                    end
+                else op = "." end
+            elsif c == 58 is
+                if c1 == 58 is
+                    op = "::"
+                else
+                    op = ":"
+                end
+            elsif c == 59 is op = ";"
+            elsif c == 44 is op = ","
+            elsif c == 63 is op = "?"
+            elsif c == 64 is op = "@"
+            elsif c == 40 is op = "("
+            elsif c == 41 is op = ")"
+            elsif c == 123 is op = "{"
+            elsif c == 125 is op = "}"
+            elsif c == 91 is op = "["
+            elsif c == 93 is op = "]"
+            end
+            if op == "" is
+                raw.push(RawErr { kind: "UnexpectedChar", bs: i, be: i + 1, msg: "unexpected character `" + str_from_byte(c) + "`", hints: ["remove or replace this character"] })
+                i += 1
+            else
+                toks.push(mk("op", op, line))
+                i += op.len()
+            end
+        end
+    end
+    while pend_t0 < toks.len() is
+        toks[pend_t0].bs = pend_i0
+        toks[pend_t0].be = i
+        pend_t0 += 1
+    end
+    let mut eof: Token = mk("eof", "", line)
+    eof.bs = n
+    eof.be = n
+    toks.push(eof)
+    fill_positions(src, toks)
+    let mut errs: [error::ParseError] = []
+    for r in raw is
+        let a: [int] = pos_at(src, r.bs)
+        let b: [int] = pos_at(src, r.be)
+        errs.push(error::new_error(r.kind, file, a[0], a[1], a[2], b[0], b[1], b[2], r.msg, r.hints))
+    end
+    for dl in docs is
+        let a: [int] = pos_at(src, dl.bs)
+        let b: [int] = pos_at(src, dl.be)
+        dl.sl = a[0]
+        dl.sc = a[1]
+        dl.so = a[2]
+        dl.el = b[0]
+        dl.ec = b[1]
+        dl.eo = b[2]
+    end
+    return Lexed { toks: toks, errs: errs, docs: docs }
+end
+
+;; (line, col, char-offset) of a byte index, Rust-lexer style
+pub fn pos_at(src: string, target: int) -> [int] is
+    let mut line: int = 1
+    let mut col: int = 1
+    let mut off: int = 0
+    let mut bp: int = 0
+    let n: int = src.len()
+    while bp < target && bp < n is
+        let c: int = byte_at(src, bp)
+        if c == 10 is
+            line += 1
+            col = 1
+            off += 1
+        elsif c < 128 || c >= 192 is
+            col += 1
+            off += 1
+        end
+        bp += 1
+    end
+    return [line, col, off]
+end
+
+fn trim_end_s(s: string) -> string is
+    let mut b: int = s.len()
+    while b > 0 && (byte_at(s, b - 1) == 32 || byte_at(s, b - 1) == 9 || byte_at(s, b - 1) == 13 || byte_at(s, b - 1) == 10) is b -= 1 end
+    return s[0..b]
+end
+
+fn utf8_len_at(s: string, i: int) -> int is
+    let b: int = byte_at(s, i)
+    if b < 128 is return 1 end
+    if b >= 192 && b < 224 is return 2 end
+    if b >= 224 && b < 240 is return 3 end
+    if b >= 240 && b < 248 is return 4 end
+    return 1
+end
+
+;; code point at byte index i (assumes valid UTF-8)
+fn cp_at(s: string, i: int) -> int is
+    let b: int = byte_at(s, i)
+    if b < 128 is return b end
+    if b >= 192 && b < 224 is return (b - 192) * 64 + (byte_at(s, i + 1) - 128) end
+    if b >= 224 && b < 240 is return (b - 224) * 4096 + (byte_at(s, i + 1) - 128) * 64 + (byte_at(s, i + 2) - 128) end
+    return (b - 240) * 262144 + (byte_at(s, i + 1) - 128) * 4096 + (byte_at(s, i + 2) - 128) * 64 + (byte_at(s, i + 3) - 128)
+end
+
+;; ASCII part of `char::is_alphabetic() || '_'` / `is_alphanumeric() || '_'` (bytes >= 128 are decided by is_alpha_cp)
+fn ascii_alpha(c: int) -> bool is
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+end
+
+fn ascii_alnum(c: int) -> bool is
+    return ascii_alpha(c) || (c >= 48 && c <= 57)
+end
+
+;; approximation of Rust's `char::is_alphabetic` for the scripts that appear in source files
+fn is_alpha_cp(cp: int) -> bool is
+    if cp < 128 is return (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) end
+    if cp == 170 || cp == 181 || cp == 186 is return true end
+    if cp >= 192 && cp <= 214 is return true end
+    if cp >= 216 && cp <= 246 is return true end
+    if cp >= 248 && cp <= 705 is return true end
+    if cp >= 880 && cp <= 1327 is return cp != 894 && cp != 903 && !(cp >= 1154 && cp <= 1161) end
+    if cp >= 1329 && cp <= 1366 is return true end
+    if cp >= 1377 && cp <= 1415 is return true end
+    if cp >= 1488 && cp <= 1514 is return true end
+    if cp >= 1568 && cp <= 1610 is return true end
+    if cp >= 7680 && cp <= 8191 is return !(cp >= 8125 && cp <= 8129) end
+    if cp >= 12353 && cp <= 12438 is return true end
+    if cp >= 12449 && cp <= 12538 is return true end
+    if cp >= 13312 && cp <= 19903 is return true end
+    if cp >= 19968 && cp <= 40959 is return true end
+    if cp >= 44032 && cp <= 55203 is return true end
+    return false
+end
+
+;; `char::is_alphanumeric` = alphabetic or numeric (digits of other scripts are not handled)
+fn is_alnum_cp(cp: int) -> bool is
+    if is_alpha_cp(cp) is return true end
+    if cp >= 1632 && cp <= 1641 is return true end
+    return false
+end
+
+fn alpha_cp_at(s: string, i: int) -> bool is
+    return is_alpha_cp(cp_at(s, i))
+end
+
+fn alnum_cp_at(s: string, i: int) -> bool is
+    return is_alnum_cp(cp_at(s, i))
+end
+
+;; Converts each token's byte range into Rust-lexer positions (chars, not bytes: `col` and
+;; `offset` count Unicode scalar values; a `\n` resets col to 1).
+fn fill_positions(src: string, toks: [Token]) is
+    let n: int = src.len()
+    let mut bp: int = 0
+    let mut line: int = 1
+    let mut col: int = 1
+    let mut off: int = 0
+    for t in toks is
+        while bp < t.bs && bp < n is
+            let c: int = byte_at(src, bp)
+            if c == 10 is
+                line += 1
+                col = 1
+                off += 1
+            elsif c < 128 || c >= 192 is
+                col += 1
+                off += 1
+            end
+            bp += 1
+        end
+        t.sl = line
+        t.sc = col
+        t.so = off
+        while bp < t.be && bp < n is
+            let c: int = byte_at(src, bp)
+            if c == 10 is
+                line += 1
+                col = 1
+                off += 1
+            elsif c < 128 || c >= 192 is
+                col += 1
+                off += 1
+            end
+            bp += 1
+        end
+        t.el = line
+        t.ec = col
+        t.eo = off
+    end
+end
