@@ -1,0 +1,146 @@
+use "workspace -> parser" from "lib -> *"
+
+pub struct HType is
+    pub k:    string
+    pub name: string
+    pub kids: [HType]
+end
+
+pub fn no_kids() -> [HType] is
+    let k: [HType] = []
+    return k
+end
+
+pub fn simple(k: string) -> HType is
+    return HType { k: k, name: "", kids: no_kids() }
+end
+
+pub fn named(n: string) -> HType is
+    return HType { k: "Named", name: n, kids: no_kids() }
+end
+
+pub fn wrap(k: string, inner: HType) -> HType is
+    return HType { k: k, name: "", kids: [inner] }
+end
+
+pub fn is_prim_name(n: string) -> bool is
+    return n == "int" || n == "uint" || n == "i8" || n == "i16" || n == "i32" || n == "i64" || n == "i128" || n == "u8" || n == "u16" || n == "u32" || n == "u64" || n == "u128" || n == "f32" || n == "f64" || n == "bool" || n == "string" || n == "bytes" || n == "any"
+end
+
+;; HType::from_type_expr over the parser's type nodes
+pub fn from_type(t: ast::Node) -> HType is
+    let tag: string = t.tag
+    if tag == "Named" is
+        if is_prim_name(t.text) is return simple(t.text) end
+        return named(t.text)
+    end
+    if tag == "Void" is return simple("void") end
+    if tag == "Generic" is return named(t.text) end
+    if tag == "Optional" is return wrap("Optional", from_type(t.kids[0])) end
+    if tag == "Array" is return wrap("Array", from_type(t.kids[0])) end
+    if tag == "Ref" is return wrap("Ref", from_type(t.kids[0])) end
+    if tag == "RefMut" is return wrap("RefMut", from_type(t.kids[0])) end
+    if tag == "Tuple" is
+        let mut ks: [HType] = []
+        for x in t.kids is ks.push(from_type(x)) end
+        return HType { k: "Tuple", name: "", kids: ks }
+    end
+    if tag == "Fn" is
+        let mut ks: [HType] = []
+        for x in t.kids[0].kids is ks.push(from_type(x)) end
+        ks.push(from_type(t.kids[1]))
+        return HType { k: "Fn", name: "", kids: ks }
+    end
+    return named(tag)
+end
+
+pub fn opt_from_type(t: ast::Node) -> HType is
+    if t.tag == "None" is return simple("void") end
+    return from_type(t)
+end
+
+pub fn is_numeric(t: HType) -> bool is
+    let k: string = t.k
+    return k == "int" || k == "uint" || k == "i8" || k == "i16" || k == "i32" || k == "i64" || k == "i128" || k == "u8" || k == "u16" || k == "u32" || k == "u64" || k == "u128" || k == "f32" || k == "f64"
+end
+
+pub fn eq(a: HType, b: HType) -> bool is
+    if a.k != b.k is return false end
+    if a.k == "Named" is return a.name == b.name end
+    if a.kids.len() != b.kids.len() is return false end
+    let mut i: int = 0
+    while i < a.kids.len() is
+        if !eq(a.kids[i], b.kids[i]) is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn compatible_with(a: HType, b: HType) -> bool is
+    if eq(a, b) is return true end
+    if a.k == "any" || b.k == "any" is return true end
+    if is_numeric(a) && is_numeric(b) is return true end
+    if a.k == "Optional" && b.k == "Optional" is
+        return compatible_with(a.kids[0], b.kids[0])
+    end
+    if b.k == "Optional" is
+        return compatible_with(a, b.kids[0])
+    end
+    if a.k == "Array" && b.k == "Array" is
+        return compatible_with(a.kids[0], b.kids[0])
+    end
+    if a.k == "Tuple" && b.k == "Tuple" is
+        if a.kids.len() != b.kids.len() is return false end
+        let mut i: int = 0
+        while i < a.kids.len() is
+            if !compatible_with(a.kids[i], b.kids[i]) is return false end
+            i += 1
+        end
+        return true
+    end
+    return false
+end
+
+fn display_list(ts: [HType]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < ts.len() is
+        if i > 0 is out += ", " end
+        out += display(ts[i])
+        i += 1
+    end
+    return out
+end
+
+pub fn display(t: HType) -> string is
+    let k: string = t.k
+    if k == "Optional" is return display(t.kids[0]) + "?" end
+    if k == "Array" is return "[" + display(t.kids[0]) + "]" end
+    if k == "Tuple" is return "(" + display_list(t.kids) + ")" end
+    if k == "Named" is return t.name end
+    if k == "Ref" is return "&" + display(t.kids[0]) end
+    if k == "RefMut" is return "&mut " + display(t.kids[0]) end
+    if k == "Fn" is
+        let mut ps: [HType] = []
+        let mut i: int = 0
+        while i < t.kids.len() - 1 is
+            ps.push(t.kids[i])
+            i += 1
+        end
+        return "fn(" + display_list(ps) + ") -> " + display(t.kids[t.kids.len() - 1])
+    end
+    return k
+end
+
+;; the inverse of `display` for the shapes the builtin table uses: T, [T], T?
+pub fn parse_display(s: string) -> HType is
+    let n: int = s.len()
+    if n > 1 && s[n - 1..n] == "?" is
+        return wrap("Optional", parse_display(s[0..n - 1]))
+    end
+    if n > 2 && s[0..1] == "[" && s[n - 1..n] == "]" is
+        return wrap("Array", parse_display(s[1..n - 1]))
+    end
+    if is_prim_name(s) || s == "void" is return simple(s) end
+    return named(s)
+end
