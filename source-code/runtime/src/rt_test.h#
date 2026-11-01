@@ -1,0 +1,137 @@
+use "std -> test" from "test"
+
+mod rt_str
+mod rt_path
+mod rt_codec
+mod rt_conv
+mod rt_date
+
+;; assert_eq takes `any` (pointer compare for strings); typed parameters make `==` a real string comparison
+fn eq_s(actual: string, expected: string) is
+    if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
+end
+
+fn eq_i(actual: int, expected: int) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+fn eq_b(actual: bool, expected: bool) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+#[test]
+fn trim_family() is
+    eq_s(rt_str::trim("  \t a b \r\n"), "a b")
+    eq_s(rt_str::trim("   "), "")
+    eq_s(rt_str::trim(""), "")
+    eq_s(rt_str::trim("x"), "x")
+    eq_s(rt_str::trim_start("\x0b x "), "x ")
+    eq_s(rt_str::trim_end(" x \x0c"), " x")
+end
+
+#[test]
+fn search() is
+    eq_i(rt_str::index_of("hello world", "o w"), 4)
+    eq_i(rt_str::index_of("hello", "z"), -1)
+    eq_i(rt_str::index_of("hello", ""), 0)
+    eq_i(rt_str::index_of("aab", "ab"), 1)
+    eq_b(rt_str::contains("abc", "bc"), true)
+    eq_b(rt_str::contains("abc", "cb"), false)
+end
+
+#[test]
+fn case_and_hex() is
+    eq_s(rt_str::to_upper("aBc-1ż"), "ABC-1ż")
+    eq_s(rt_str::to_lower("AbC-1Ż"), "abc-1Ż")
+    eq_s(rt_str::hex_encode("A\nz"), "410a7a")
+    eq_s(rt_str::hex_encode(""), "")
+end
+
+#[test]
+fn paths() is
+    eq_s(rt_path::join("a", "b"), "a/b")
+    eq_s(rt_path::join("a/", "b"), "a/b")
+    eq_s(rt_path::join("a", "/abs"), "/abs")
+    eq_s(rt_path::join("", "b"), "b")
+    eq_s(rt_path::filename("/usr/lib/libz.so.1"), "libz.so.1")
+    eq_s(rt_path::filename("a/b/"), "b")
+    eq_s(rt_path::filename(".."), "")
+    eq_s(rt_path::stem("a/b.tar.gz"), "b.tar")
+    eq_s(rt_path::stem(".bashrc"), ".bashrc")
+    eq_s(rt_path::extension("a/b.tar.gz"), "gz")
+    eq_s(rt_path::extension("a/.bashrc"), "")
+    eq_s(rt_path::parent("/a/b"), "/a")
+    eq_s(rt_path::parent("/a"), "/")
+    eq_s(rt_path::parent("a"), "")
+    eq_b(rt_path::is_absolute("/x"), true)
+    eq_b(rt_path::is_absolute("x"), false)
+    eq_s(rt_path::normalize("a//b/./c/../d/"), "a/b/d")
+    eq_s(rt_path::normalize("/a/../.."), "")
+    eq_s(rt_path::with_extension("a/b.txt", "rs"), "a/b.rs")
+    eq_s(rt_path::with_extension("a/b.txt", ""), "a/b")
+end
+
+#[test]
+fn codecs() is
+    eq_s(rt_codec::base64_encode("Man"), "TWFu")
+    eq_s(rt_codec::base64_encode("Ma"), "TWE=")
+    eq_s(rt_codec::base64_encode("M"), "TQ==")
+    eq_s(rt_codec::base64_decode("TWFu"), "Man")
+    eq_s(rt_codec::base64_decode("T Q =\n="), "M")
+    eq_s(rt_codec::base64_decode(rt_codec::base64_encode("zażółć")), "zażółć")
+    eq_s(rt_codec::url_encode("a b/ż"), "a%20b%2F%C5%BC")
+    eq_s(rt_codec::url_decode("a%20b+c%C5%BC"), "a b cż")
+    eq_s(rt_codec::url_decode("%zz%4"), "%zz%4")
+end
+
+#[test]
+fn more_strings() is
+    eq_s(rt_str::replace("a-b-c", "-", "+"), "a+b+c")
+    eq_s(rt_str::replace("aaa", "aa", "b"), "ba")
+    eq_s(rt_str::replace("abc", "", "x"), "abc")
+    eq_b(rt_str::starts_with("hello", "he"), true)
+    eq_b(rt_str::ends_with("hello", "llo"), true)
+    eq_b(rt_str::ends_with("lo", "llo"), false)
+    eq_s(rt_str::repeat("ab", 3), "ababab")
+    eq_s(rt_str::pad_right("ab", 5), "ab   ")
+end
+
+#[test]
+fn conversions() is
+    eq_i(rt_conv::to_int("  -17abc"), -17)
+    eq_i(rt_conv::to_int("abc"), 0)
+    eq_i(rt_conv::to_int("9223372036854775808"), 9223372036854775807)
+    eq_i(rt_conv::to_int_from_hex("f"), 15)
+    eq_i(rt_conv::to_int_from_hex("ff"), 15)
+    eq_i(rt_conv::char_code("ż"), 380)
+    eq_i(rt_conv::char_code("😀"), 128512)
+    eq_i(rt_conv::char_code(""), 0)
+end
+
+#[test]
+fn dates() is
+    eq_i(rt_date::year(1709164800), 2024)
+    eq_i(rt_date::month(1709164800), 2)
+    eq_i(rt_date::day(1709164800), 29)
+    eq_s(rt_date::weekday(0), "Thu")
+    eq_s(rt_date::weekday(1709164800), "Thu")
+    eq_i(rt_date::year(-1), 1969)
+    eq_i(rt_date::parse("2024-02-29 12:34:56"), 1709210096)
+    eq_i(rt_date::parse("2024-02"), 0)
+    eq_i(rt_date::diff_days(1709251200, 1709164800), 1)
+    eq_i(rt_date::add_hours(0, 25), 90000)
+end
+
+#[test]
+fn find_slice_split() is
+    eq_i(rt_str::rfind("abcabc", "abc"), 3)
+    eq_i(rt_str::rfind("abc", ""), 3)
+    eq_s(rt_str::at("hello", 1), "e")
+    eq_s(rt_str::at("hello", 9), "")
+    eq_s(rt_str::slice("hello", -2, 3), "hel")
+    eq_s(rt_str::slice("hello", 4, 2), "")
+    eq_i(rt_str::split_count("a,b,c", ","), 3)
+    eq_i(rt_str::split_count("", ""), 1)
+    eq_s(rt_str::split_part("a,b,c", ",", 1), "b")
+    eq_s(rt_str::split_part("a,b,c", ",", 7), "")
+end
