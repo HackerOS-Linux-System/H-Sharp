@@ -39,6 +39,10 @@ fn color_on() -> bool is
     let forced: string = env::get("HSHARP_COLOR")      ;; set by the parent `h#` for its `--phase` children
     if forced == "1" is return true end
     if forced == "0" is return false end
+    ;; explicit override for a child whose stdout is a pipe / log file (bit sets it): same switch nidus honours
+    let nc: string = env::get("NIDUS_COLOR")
+    if nc == "always" || nc == "1" || nc == "true" || nc == "on" is return true end
+    if nc == "never" || nc == "0" || nc == "false" || nc == "off" is return false end
     if env::get("NO_COLOR") != "" is return false end
     if env::get("CLICOLOR_FORCE") != "" || env::get("FORCE_COLOR") != "" is return true end
     if env::get("TERM") == "dumb" is return false end
