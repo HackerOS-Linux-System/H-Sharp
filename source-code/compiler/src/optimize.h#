@@ -1,0 +1,453 @@
+use "std -> strbuf" from "strbuf"
+use "workspace -> parser" from "lib -> *"
+
+pub struct Inl is
+    pub names: [string]
+    pub params: [[string]]
+    pub bodies: [ast::Node]
+end
+
+;; ── node helpers ────────────────────────────────────────────────────────────
+fn deep_clone(n: ast::Node) -> ast::Node is
+    let mut ks: [ast::Node] = []
+    for k in n.kids is ks.push(deep_clone(k)) end
+    return ast::Node { tag: n.tag, text: n.text, kids: ks, sp: n.sp, sl: n.sl, sc: n.sc, so: n.so, el: n.el, ec: n.ec, eo: n.eo, ip: n.ip, fl: n.fl }
+end
+
+fn assign_node(dst: ast::Node, src: ast::Node) is
+    dst.tag = src.tag
+    dst.text = src.text
+    dst.kids = src.kids
+    dst.sp = src.sp
+    dst.sl = src.sl
+    dst.sc = src.sc
+    dst.so = src.so
+    dst.el = src.el
+    dst.ec = src.ec
+    dst.eo = src.eo
+    dst.ip = src.ip
+    dst.fl = src.fl
+end
+
+fn lit_like(tag: string, text: string, at: ast::Node) -> ast::Node is
+    let n: ast::Node = ast::lf(tag, text)
+    n.sp = at.sp
+    n.sl = at.sl
+    n.sc = at.sc
+    n.so = at.so
+    n.el = at.el
+    n.ec = at.ec
+    n.eo = at.eo
+    n.ip = at.ip
+    n.fl = at.fl
+    return n
+end
+
+fn is_none(n: ast::Node) -> bool is return n.tag == "None" end
+
+;; direct children visited by the Rust walk_expr / walk_expr_mut
+fn walk_children(e: ast::Node) -> [ast::Node] is
+    let t: string = e.tag
+    let mut out: [ast::Node] = []
+    if t == "BinOp" || t == "Range" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" is
+        out.push(e.kids[0])
+        out.push(e.kids[1])
+    elsif t == "UnOp" || t == "Cast" || t == "Try" || t == "Await" || t == "FieldAccess" is
+        out.push(e.kids[0])
+    elsif t == "MethodCall" || t == "Call" is
+        out.push(e.kids[0])
+        for a in e.kids[1].kids is out.push(a) end
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for x in e.kids is out.push(x) end
+    elsif t == "StructLit" is
+        for f in e.kids is out.push(f.kids[0]) end
+    elsif t == "ReturnE" is
+        if !is_none(e.kids[0]) is out.push(e.kids[0]) end
+    end
+    return out
+end
+
+fn walk_calls_fn(e: ast::Node, name: string) -> bool is
+    if e.tag == "Call" && e.kids[0].tag == "Ident" && e.kids[0].text == name is return true end
+    for c in walk_children(e) is
+        if walk_calls_fn(c, name) is return true end
+    end
+    return false
+end
+
+fn walk_side_effects(e: ast::Node) -> bool is
+    let t: string = e.tag
+    if t == "Call" || t == "MethodCall" || t == "Assign" || t == "CompoundAssign" || t == "Await" is return true end
+    for c in walk_children(e) is
+        if walk_side_effects(c) is return true end
+    end
+    return false
+end
+
+fn walk_count(e: ast::Node, name: string) -> int is
+    let mut n: int = 0
+    if e.tag == "Ident" && e.text == name is n = 1 end
+    for c in walk_children(e) is n += walk_count(c, name) end
+    return n
+end
+
+fn substitute(e: ast::Node, names: [string], vals: [ast::Node]) is
+    if e.tag == "Ident" is
+        let mut i: int = 0
+        while i < names.len() is
+            if names[i] == e.text is
+                assign_node(e, deep_clone(vals[i]))
+                return
+            end
+            i += 1
+        end
+    end
+    for c in walk_children(e) is substitute(c, names, vals) end
+end
+
+fn retag(e: ast::Node, at: ast::Node) is
+    e.sl = at.sl
+    e.sc = at.sc
+    e.so = at.so
+    e.el = at.el
+    e.ec = at.ec
+    e.eo = at.eo
+    e.ip = at.ip
+    e.fl = at.fl
+    for c in walk_children(e) is retag(c, at) end
+end
+
+;; ── checked i64 arithmetic ──────────────────────────────────────────────────
+fn i64_max() -> int is return 9223372036854775807 end
+fn i64_min() -> int is return 0 - 9223372036854775807 - 1 end
+
+fn add_ok(a: int, b: int) -> bool is
+    if b > 0 is return a <= i64_max() - b end
+    return a >= i64_min() - b
+end
+
+fn sub_ok(a: int, b: int) -> bool is
+    if b > 0 is return a >= i64_min() + b end
+    return a <= i64_max() + b
+end
+
+fn mul_ok(a: int, b: int) -> bool is
+    if a == 0 || b == 0 is return true end
+    if a == 0 - 1 is return b != i64_min() end
+    if b == 0 - 1 is return a != i64_min() end
+    if a > 0 is
+        if b > 0 is return a <= i64_max() / b end
+        return b >= i64_min() / a
+    end
+    if b > 0 is return a >= i64_min() / b end
+    return b >= i64_max() / a
+end
+
+;; "" = no fold
+fn fold_int(a: int, b: int, op: string) -> string is
+    if op == "Add" is
+        if add_ok(a, b) is return to_string(a + b) end
+        return ""
+    end
+    if op == "Sub" is
+        if sub_ok(a, b) is return to_string(a - b) end
+        return ""
+    end
+    if op == "Mul" is
+        if mul_ok(a, b) is return to_string(a * b) end
+        return ""
+    end
+    if op == "Div" is
+        if b != 0 && !(a == i64_min() && b == 0 - 1) is return to_string(a / b) end
+        return ""
+    end
+    if op == "Mod" is
+        if b != 0 && !(a == i64_min() && b == 0 - 1) is return to_string(a % b) end
+        return ""
+    end
+    if op == "BitAnd" is return to_string(a & b) end
+    if op == "BitOr" is return to_string(a | b) end
+    if op == "BitXor" is return to_string(a ^ b) end
+    if op == "Shl" is
+        if b >= 0 && b < 64 is return to_string(a << b) end
+        return ""
+    end
+    if op == "Shr" is
+        if b >= 0 && b < 64 is return to_string(a >> b) end
+        return ""
+    end
+    return ""
+end
+
+fn fold_float(a: f64, b: f64, op: string) -> string is
+    if op == "Add" is return floatfmt::float_to_debug(a + b) end
+    if op == "Sub" is return floatfmt::float_to_debug(a - b) end
+    if op == "Mul" is return floatfmt::float_to_debug(a * b) end
+    if op == "Div" && b != 0.0 is return floatfmt::float_to_debug(a / b) end
+    return ""
+end
+
+;; "" = no fold, else "true"/"false"
+fn fold_bool(a: bool, b: bool, op: string) -> string is
+    if op == "And" is return to_string(a && b) end
+    if op == "Or" is return to_string(a || b) end
+    if op == "Eq" is return to_string(a == b) end
+    if op == "NotEq" is return to_string(a != b) end
+    return ""
+end
+
+fn is_lit(n: ast::Node, tag: string) -> bool is return n.tag == tag end
+
+fn fold_constants(e: ast::Node) is
+    if e.tag == "BinOp" is
+        let l: ast::Node = e.kids[0]
+        let r: ast::Node = e.kids[1]
+        if is_lit(l, "Int") && is_lit(r, "Int") is
+            let v: string = fold_int(to_int(l.text), to_int(r.text), e.text)
+            if v != "" is assign_node(e, lit_like("Int", v, e)) end
+        elsif is_lit(l, "Float") && is_lit(r, "Float") is
+            let v: string = fold_float(to_float(l.text), to_float(r.text), e.text)
+            if v != "" is assign_node(e, lit_like("Float", v, e)) end
+        elsif is_lit(l, "Bool") && is_lit(r, "Bool") is
+            let v: string = fold_bool(l.text == "true", r.text == "true", e.text)
+            if v != "" is assign_node(e, lit_like("Bool", v, e)) end
+        end
+    elsif e.tag == "UnOp" is
+        let x: ast::Node = e.kids[0]
+        if e.text == "Neg" && is_lit(x, "Int") is
+            assign_node(e, lit_like("Int", to_string(0 - to_int(x.text)), e))
+        elsif e.text == "Neg" && is_lit(x, "Float") is
+            let mut t: string = x.text
+            if starts_with(t, "-") is t = t[1..t.len()]
+            elsif t != "NaN" is t = "-" + t end
+            assign_node(e, lit_like("Float", t, e))
+        elsif e.text == "Not" && is_lit(x, "Bool") is
+            assign_node(e, lit_like("Bool", if x.text == "true" is "false" else "true" end, e))
+        end
+    end
+end
+
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn fold_string_concat(e: ast::Node) is
+    if e.tag == "BinOp" && e.text == "Add" is
+        if is_lit(e.kids[0], "Str") && is_lit(e.kids[1], "Str") is
+            assign_node(e, lit_like("Str", e.kids[0].text + e.kids[1].text, e))
+        end
+    end
+end
+
+fn fold_interpolated(e: ast::Node, inl: Inl) is
+    if e.tag != "Interp" is return end
+    for p in e.kids is
+        if p.tag != "Text" is optimize_expr(p, inl) end
+    end
+    let mut out: string = ""
+    for p in e.kids is
+        if p.tag == "Text" || p.tag == "Str" is
+            out = out + p.text
+        elsif p.tag == "Int" is
+            out = out + p.text
+        elsif p.tag == "Float" is
+            out = out + floatfmt::fl_display(floatfmt::fl_parse(p.text))
+        elsif p.tag == "Bool" is
+            out = out + p.text
+        else
+            return
+        end
+    end
+    assign_node(e, lit_like("Str", out, e))
+end
+
+;; returns true when the call was inlined
+fn inline_call(e: ast::Node, inl: Inl) -> bool is
+    if e.tag != "Call" || e.kids[0].tag != "Ident" is return false end
+    let name: string = e.kids[0].text
+    let mut idx: int = 0 - 1
+    let mut i: int = 0
+    while i < inl.names.len() is
+        if inl.names[i] == name is
+            idx = i
+            break
+        end
+        i += 1
+    end
+    if idx < 0 is return false end
+    let params: [string] = inl.params[idx]
+    let args: [ast::Node] = e.kids[1].kids
+    if params.len() != args.len() is return false end
+    let body: ast::Node = inl.bodies[idx]
+    let mut k: int = 0
+    while k < params.len() is
+        if walk_count(body, params[k]) > 1 && walk_side_effects(args[k]) is return false end
+        k += 1
+    end
+    let nb: ast::Node = deep_clone(body)
+    substitute(nb, params, args)
+    retag(nb, e)
+    assign_node(e, nb)
+    return true
+end
+
+fn optimize_expr(e: ast::Node, inl: Inl) is
+    let t: string = e.tag
+    if t == "BinOp" || t == "Assign" || t == "CompoundAssign" || t == "IndexAccess" || t == "Range" is
+        optimize_expr(e.kids[0], inl)
+        optimize_expr(e.kids[1], inl)
+    elsif t == "UnOp" || t == "Cast" || t == "FieldAccess" || t == "Try" || t == "Await" is
+        optimize_expr(e.kids[0], inl)
+    elsif t == "MethodCall" || t == "Call" is
+        optimize_expr(e.kids[0], inl)
+        for a in e.kids[1].kids is optimize_expr(a, inl) end
+    elsif t == "ArrayLit" || t == "TupleLit" is
+        for x in e.kids is optimize_expr(x, inl) end
+    elsif t == "StructLit" is
+        for f in e.kids is optimize_expr(f.kids[0], inl) end
+    elsif t == "ReturnE" is
+        if !is_none(e.kids[0]) is optimize_expr(e.kids[0], inl) end
+    elsif t == "If" is
+        optimize_expr(e.kids[0], inl)
+        optimize_block(e.kids[1], inl)
+        for br in e.kids[2].kids is
+            optimize_expr(br.kids[0], inl)
+            optimize_block(br.kids[1], inl)
+        end
+        if !is_none(e.kids[3]) is optimize_block(e.kids[3], inl) end
+    elsif t == "While" is
+        optimize_expr(e.kids[0], inl)
+        optimize_block(e.kids[1], inl)
+    elsif t == "For" is
+        optimize_expr(e.kids[1], inl)
+        optimize_block(e.kids[2], inl)
+    elsif t == "Do" || t == "Unsafe" is
+        optimize_block(e.kids[0], inl)
+    elsif t == "Match" is
+        optimize_expr(e.kids[0], inl)
+        for arm in e.kids[1].kids is
+            if !is_none(arm.kids[1]) is optimize_expr(arm.kids[1], inl) end
+            optimize_block(arm.kids[2], inl)
+        end
+    elsif t == "Closure" is
+        optimize_block(e.kids[2], inl)
+    end
+    fold_constants(e)
+    fold_string_concat(e)
+    fold_interpolated(e, inl)
+    if inline_call(e, inl) is optimize_expr(e, inl) end
+end
+
+fn optimize_stmt(s: ast::Node, inl: Inl) is
+    let t: string = s.tag
+    if t == "Let" is
+        if !is_none(s.kids[2]) is optimize_expr(s.kids[2], inl) end
+    elsif t == "ExprStmt" is
+        optimize_expr(s.kids[0], inl)
+    elsif t == "Return" || t == "Break" is
+        if !is_none(s.kids[0]) is optimize_expr(s.kids[0], inl) end
+    end
+end
+
+;; Some(stmts) as (found, stmts)
+pub struct Fold is
+    pub found: bool
+    pub stmts: [ast::Node]
+end
+
+fn try_fold_if(ife: ast::Node) -> Fold is
+    let none: [ast::Node] = []
+    let cond: ast::Node = ife.kids[0]
+    if cond.tag != "Bool" is return Fold { found: false, stmts: none } end
+    if cond.text == "true" is return Fold { found: true, stmts: ife.kids[1].kids } end
+    for br in ife.kids[2].kids is
+        let c: ast::Node = br.kids[0]
+        if c.tag == "Bool" && c.text == "true" is return Fold { found: true, stmts: br.kids[1].kids } end
+        if c.tag == "Bool" is continue end
+        return Fold { found: false, stmts: none }
+    end
+    if is_none(ife.kids[3]) is return Fold { found: true, stmts: none } end
+    return Fold { found: true, stmts: ife.kids[3].kids }
+end
+
+fn optimize_block(blk: ast::Node, inl: Inl) is
+    let mut stmts: [ast::Node] = blk.kids
+    for s in stmts is optimize_stmt(s, inl) end
+    let mut i: int = 0
+    while i < stmts.len() is
+        let s: ast::Node = stmts[i]
+        let mut folded: Fold = Fold { found: false, stmts: [] }
+        if s.tag == "ExprStmt" && s.kids[0].tag == "If" is folded = try_fold_if(s.kids[0]) end
+        if folded.found is
+            let mut ns: [ast::Node] = []
+            let mut a: int = 0
+            while a < i is
+                ns.push(stmts[a])
+                a += 1
+            end
+            for x in folded.stmts is ns.push(x) end
+            let mut b: int = i + 1
+            while b < stmts.len() is
+                ns.push(stmts[b])
+                b += 1
+            end
+            stmts = ns
+            blk.kids = ns
+            let mut j: int = i
+            while j < stmts.len() is
+                optimize_stmt(stmts[j], inl)
+                j += 1
+            end
+        else
+            i += 1
+        end
+    end
+end
+
+fn optimize_fn(f: ast::Node, inl: Inl) is
+    optimize_block(f.kids[4], inl)
+end
+
+fn optimize_item(it: ast::Node, inl: Inl) is
+    if it.tag == "Fn" is
+        optimize_fn(it, inl)
+    elsif it.tag == "Impl" is
+        for m in it.kids[1].kids is optimize_fn(m, inl) end
+    elsif it.tag == "ModDecl" && it.kids[1].tag == "Inline" is
+        for x in it.kids[1].kids is optimize_item(x, inl) end
+    end
+end
+
+fn collect_inline_fns(items: [ast::Node]) -> Inl is
+    let inl: Inl = Inl { names: [], params: [], bodies: [] }
+    for it in items is
+        if it.tag != "Fn" is continue end
+        let mut is_inline: bool = false
+        for a in it.kids[0].kids is
+            if a.text == "inline" || a.text == "always_inline" is is_inline = true end
+        end
+        if !is_inline is continue end
+        let body: [ast::Node] = it.kids[4].kids
+        if body.len() != 1 is continue end
+        let s: ast::Node = body[0]
+        let mut expr: ast::Node = ast::nn()
+        if s.tag == "Return" || s.tag == "ExprStmt" is
+            expr = s.kids[0]
+        end
+        if is_none(expr) is continue end
+        if walk_calls_fn(expr, it.text) is continue end
+        let mut ps: [string] = []
+        for p in it.kids[2].kids is ps.push(p.text) end
+        inl.names.push(it.text)
+        inl.params.push(ps)
+        inl.bodies.push(deep_clone(expr))
+    end
+    return inl
+end
+
+pub fn optimize_module(m: ast::Node) -> ast::Node is
+    let items: [ast::Node] = m.kids[3].kids
+    let inl: Inl = collect_inline_fns(items)
+    for it in items is optimize_item(it, inl) end
+    return m
+end
