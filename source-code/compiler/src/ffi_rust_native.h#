@@ -1,0 +1,393 @@
+use "workspace -> parser" from "lib -> *"
+
+;; RsTy.kind: "unit" "bool" "i8" "i16" "i32" "i64" "isize" "u8" "u16" "u32" "u64" "usize" "f32" "f64" "str" "bytes"
+;;            "vec" (inner[0]) "option" (inner[0]) "result" (inner[0]=Ok, inner[1]=Err) "opaque" (name)
+pub struct RsTy is
+    pub kind: string
+    pub name: string
+    pub inner: [RsTy]
+end
+
+fn rs(kind: string) -> RsTy is return RsTy { kind: kind, name: "", inner: [] } end
+fn rs1(kind: string, a: RsTy) -> RsTy is return RsTy { kind: kind, name: "", inner: [a] } end
+fn rs_opaque(n: string) -> RsTy is return RsTy { kind: "opaque", name: n, inner: [] } end
+
+fn named_to_rs(n: string) -> RsTy is
+    if n == "i8" || n == "u8" || n == "i16" || n == "u16" || n == "i32" || n == "u32" || n == "f32" || n == "f64" || n == "bool" || n == "isize" || n == "usize" is return rs(n) end
+    if n == "i64" || n == "int" is return rs("i64") end
+    if n == "u64" || n == "uint" is return rs("u64") end
+    if n == "string" || n == "str" is return rs("str") end
+    if n == "bytes" is return rs("bytes") end
+    if n == "void" is return rs("unit") end
+    return rs_opaque(n)
+end
+
+pub fn hsh_type_to_rust_native(t: ast::Node) -> RsTy is
+    let tag: string = t.tag
+    if tag == "Void" is return rs("unit") end
+    if tag == "Array" || tag == "Slice" is return rs1("vec", hsh_type_to_rust_native(t.kids[0])) end
+    if tag == "Optional" is return rs1("option", hsh_type_to_rust_native(t.kids[0])) end
+    if tag == "Generic" && t.text == "Result" && t.kids.len() == 2 is
+        return RsTy { kind: "result", name: "", inner: [hsh_type_to_rust_native(t.kids[0]), hsh_type_to_rust_native(t.kids[1])] }
+    end
+    if tag == "Generic" && (t.text == "vec" || t.text == "Vec") && t.kids.len() == 1 is return rs1("vec", hsh_type_to_rust_native(t.kids[0])) end
+    if tag == "Named" is return named_to_rs(t.text) end
+    return rs_opaque("()")
+end
+
+;; Rust `{:?}` of an RsTy (used inside one error message)
+pub fn debug(t: RsTy) -> string is
+    let k: string = t.kind
+    if k == "unit" is return "Unit" end
+    if k == "bool" is return "Bool" end
+    if k == "i8" is return "I8" end
+    if k == "i16" is return "I16" end
+    if k == "i32" is return "I32" end
+    if k == "i64" is return "I64" end
+    if k == "isize" is return "Isize" end
+    if k == "u8" is return "U8" end
+    if k == "u16" is return "U16" end
+    if k == "u32" is return "U32" end
+    if k == "u64" is return "U64" end
+    if k == "usize" is return "Usize" end
+    if k == "f32" is return "F32" end
+    if k == "f64" is return "F64" end
+    if k == "str" is return "Str" end
+    if k == "bytes" is return "Bytes" end
+    if k == "vec" is return "Vec(" + debug(t.inner[0]) + ")" end
+    if k == "option" is return "Option(" + debug(t.inner[0]) + ")" end
+    if k == "result" is return "Result(" + debug(t.inner[0]) + ", " + debug(t.inner[1]) + ")" end
+    return "Opaque(\"" + t.name + "\")"
+end
+
+fn c_flat_type(t: RsTy) -> string is
+    let k: string = t.kind
+    if k == "unit" is return "()" end
+    if k == "isize" is return "i64" end
+    if k == "usize" is return "u64" end
+    if k == "bool" || k == "i8" || k == "u8" || k == "i16" || k == "u16" || k == "i32" || k == "u32" || k == "i64" || k == "u64" || k == "f32" || k == "f64" is return k end
+    return "*const u8"
+end
+
+fn is_flat_primitive(t: RsTy) -> bool is
+    let k: string = t.kind
+    return k == "bool" || k == "i8" || k == "u8" || k == "i16" || k == "u16" || k == "i32" || k == "u32" || k == "i64" || k == "u64" || k == "isize" || k == "usize" || k == "f32" || k == "f64"
+end
+
+fn is_sentinel_representable(t: RsTy) -> bool is
+    return is_flat_primitive(t) || t.kind == "str"
+end
+
+fn sentinel_expr(t: RsTy) -> string is
+    if t.kind == "f32" || t.kind == "f64" is return "0.0" end
+    if t.kind == "str" is return "std::ptr::null_mut()" end
+    return "0"
+end
+
+pub struct StructTable is
+    pub names: [string]
+    pub fields: [ast::Node]
+end
+
+pub fn new_struct_table() -> StructTable is
+    return StructTable { names: [], fields: [] }
+end
+
+pub fn add_struct(t: StructTable, name: string, fields: ast::Node) is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == name is
+            t.fields[i] = fields
+            return
+        end
+        i += 1
+    end
+    t.names.push(name)
+    t.fields.push(fields)
+end
+
+fn struct_index(t: StructTable, n: string) -> int is
+    let mut i: int = 0
+    while i < t.names.len() is
+        if t.names[i] == n is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn struct_is_flattenable(fields: ast::Node) -> bool is
+    for f in fields.kids is
+        let r: RsTy = hsh_type_to_rust_native(f.kids[1])
+        if !(is_flat_primitive(r) || r.kind == "str") is return false end
+    end
+    return true
+end
+
+fn flattenable(t: StructTable, name: string) -> bool is
+    let at: int = struct_index(t, name)
+    if at < 0 is return false end
+    return struct_is_flattenable(t.fields[at])
+end
+
+fn emit_struct_field_read(struct_ptr_var: string, idx: int, field: ast::Node, out_var: string) -> string is
+    let r: RsTy = hsh_type_to_rust_native(field.kids[1])
+    let raw: string = "unsafe {{ hsh_struct_get(" + struct_ptr_var + ", " + to_string(idx) + ") }}"
+    let v: string = out_var
+    let k: string = r.kind
+    if k == "f64" is return "        let " + v + " = f64::from_bits((" + raw + ") as u64);\n" end
+    if k == "f32" is return "        let " + v + " = f32::from_bits((" + raw + ") as u32);\n" end
+    if k == "bool" is return "        let " + v + " = (" + raw + ") != 0;\n" end
+    if k == "str" is
+        return "        let " + v + "_ptr = (" + raw + ") as *const std::os::raw::c_char;\n        let " + v + " = unsafe {{ std::ffi::CStr::from_ptr(" + v + "_ptr) }}.to_str().unwrap_or(\"\");\n"
+    end
+    if k == "i8" || k == "u8" || k == "i16" || k == "u16" || k == "i32" || k == "u32" is
+        return "        let " + v + " = (" + raw + ") as " + k + ";\n"
+    end
+    if k == "u64" || k == "usize" is return "        let " + v + " = (" + raw + ") as u64;\n" end
+    return "        let " + v + " = " + raw + ";\n"
+end
+
+fn join_with(xs: [string], sep: string) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is s = s + sep end
+        s = s + xs[i]
+        i += 1
+    end
+    return s
+end
+
+fn index_of_int(xs: [int], v: int) -> int is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == v is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn rstrip_ws(s: string) -> string is
+    let mut e: int = s.len()
+    while e > 0 && (byte_at(s, e - 1) == 32 || byte_at(s, e - 1) == 10 || byte_at(s, e - 1) == 9 || byte_at(s, e - 1) == 13) is e -= 1 end
+    return s[0..e]
+end
+
+fn sanitize_ident(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) is
+            out = out + str_from_byte(c)
+        else
+            out = out + "_"
+        end
+        i += 1
+    end
+    return out
+end
+
+pub struct ShimResult is
+    pub ok: bool
+    pub err: string      ;; message WITHOUT the "extern [rust]: " prefix
+    pub text: string
+end
+
+fn shim_err(m: string) -> ShimResult is return ShimResult { ok: false, err: m, text: "" } end
+
+pub fn error_text(m: string) -> string is return "extern [rust]: " + m end
+
+fn render_success_arm(r: RsTy) -> string is
+    let k: string = r.kind
+    if k == "unit" is return "            return ();\n" end
+    if k == "str" is
+        return "            let __s = __v.to_string();\n" + "            let __c = std::ffi::CString::new(__s).unwrap_or_default();\n" + "            return __c.into_raw(); // H# runtime frees via hsh_rs_free_string\n"
+    end
+    if k == "option" || k == "result" is
+        let is_result: bool = k == "result"
+        let mut present_pat: string = "Some(__x)"
+        let mut absent_pat: string = "None"
+        if is_result is
+            present_pat = "Ok(__x)"
+            absent_pat = "Err(__e)"
+        end
+        let inner: RsTy = r.inner[0]
+        let mut s: string = "            match __v {{\n                " + present_pat + " => {{\n"
+        if inner.kind == "str" is
+            s = s + "                    let __s = __x.to_string();\n"
+            s = s + "                    let __c = std::ffi::CString::new(__s).unwrap_or_default();\n"
+            s = s + "                    return __c.into_raw();\n"
+        else
+            s = s + "                    return __x;\n"
+        end
+        s = s + "                }}\n                " + absent_pat + " => {{\n"
+        if is_result is s = s + "                    eprintln!(\"extern [rust] call returned Err: {{:?}}\", __e);\n" end
+        s = s + "                    return " + sentinel_expr(inner) + ";\n                }}\n            }}\n"
+        return s
+    end
+    return "            return __v;\n"
+end
+
+fn render_panic_arm(r: RsTy) -> string is
+    let k: string = r.kind
+    if k == "unit" is return "            return ();\n" end
+    if k == "str" is return "            return std::ptr::null_mut();\n" end
+    if k == "f32" || k == "f64" is return "            return -1.0 as _;\n" end
+    if k == "option" || k == "result" is return "            return " + sentinel_expr(r.inner[0]) + ";\n" end
+    return "            return Default::default();\n"
+end
+
+pub fn generate_free_fn() -> string is
+    return "#[no_mangle]\npub extern \"C\" fn hsh_rs_free_string(ptr: *mut std::os::raw::c_char) {{\n    if ptr.is_null() {{ return; }}\n    unsafe {{ drop(std::ffi::CString::from_raw(ptr)); }}\n}}\n"
+end
+
+pub fn generate_shim(user_crate: string, f: ast::Node, structs: StructTable) -> ShimResult is
+    let mut ret_rs: RsTy = rs("unit")
+    if f.kids[1].tag != "None" is ret_rs = hsh_type_to_rust_native(f.kids[1]) end
+    let params: [ast::Node] = f.kids[0].kids
+    let mut pr: [RsTy] = []
+    for p in params is pr.push(hsh_type_to_rust_native(p.kids[1])) end
+
+    let mut data_idx: [int] = []
+    let mut data_len: [int] = []
+    let mut consumed: [int] = []
+    let mut i: int = 0
+    while i < params.len() is
+        let is_flat_seq: bool = pr[i].kind == "bytes" || (pr[i].kind == "vec" && is_flat_primitive(pr[i].inner[0]))
+        if is_flat_seq is
+            let want: string = params[i].text + "_len"
+            let mut j: int = -1
+            let mut q: int = 0
+            while q < params.len() is
+                if j < 0 && params[q].text == want is j = q end
+                q += 1
+            end
+            if j >= 0 is
+                let k: string = pr[j].kind
+                if k == "i64" || k == "u64" || k == "isize" || k == "usize" || k == "i32" || k == "u32" is
+                    data_idx.push(i)
+                    data_len.push(j)
+                    consumed.push(j)
+                end
+            end
+        end
+        i += 1
+    end
+
+    i = 0
+    while i < params.len() is
+        let p: ast::Node = params[i]
+        let r: RsTy = pr[i]
+        if r.kind == "opaque" && flattenable(structs, r.name) is
+            ;; accepted
+        elsif r.kind == "opaque" is
+            return shim_err("parameter `" + p.text + "` has type `" + r.name + "`, which has no known stable layout to cross the FFI boundary by value — either pass a `ref`/`ref mut` (opaque pointer) instead, or declare `" + r.name + "` as an H# `struct` with only flat-primitive/`string` fields (see `struct_is_flattenable`) so this shim can flatten it; the real Rust struct on the other side must have the identical name and public fields in the same order — this shim mirrors the layout, it doesn't invent one")
+        elsif (r.kind == "bytes" || r.kind == "vec") && index_of_int(data_idx, i) < 0 is
+            return shim_err("parameter `" + p.text + "` (&[u8]/Vec<T>) has no bundled length at the ABI level this shim can read on its own — H#'s `bytes`/`Array`/`Slice` are bare pointers. Add a paired `" + p.text + "_len: int` parameter right after it in the `extern` signature (and pass the real length at the call site) so this shim can reconstruct a slice; only element types `is_flat_primitive` recognizes (bool/ints/floats — not nested `Vec`/`String`/opaque types) are supported this way")
+        elsif r.kind == "option" && !is_sentinel_representable(r.inner[0]) is
+            return shim_err("parameter `" + p.text + "` is `Option<T>` with a `T` this shim has no unambiguous sentinel for (only flat primitives and `string` are supported — see `is_sentinel_representable`); accept the payload type directly plus a separate `has_value: bool` parameter instead")
+        elsif r.kind == "result" && r.inner[1].kind != "str" is
+            return shim_err("Result<T, E> parameters are not supported (only Result<T, String> return values are) — Results only make sense as outcomes, not inputs")
+        end
+        i += 1
+    end
+    let rk: string = ret_rs.kind
+    if rk == "bytes" || rk == "vec" is
+        return shim_err("&[u8]/Vec<T> return values have no bundled-length convention on the H# side to read them back with — return `string` (null-terminated, fully supported) instead, or add an explicit `out_len: ref mut int` output parameter and marshal it by hand")
+    end
+    if (rk == "option" || rk == "result") && !is_sentinel_representable(ret_rs.inner[0]) is
+        return shim_err("return type wraps a `" + debug(ret_rs.inner[0]) + "` payload, which this shim has no unambiguous sentinel for on return (only flat primitives and `string` are supported — see `is_sentinel_representable`); return the payload type directly and use a sentinel value (e.g. -1) for the error/None case for now")
+    end
+    if rk == "opaque" is
+        return shim_err("return type `" + ret_rs.name + "` would need to cross the FFI boundary by value with no known stable layout on the H# side to receive it into (H#'s codegen only has a single flat `i64` return slot for any `extern` call — see `llvm_types::htype_to_llvm`) — opaque-by-value flattening (see the parameter-side `RsTy::Opaque` handling above) is deliberately only supported for *parameters*, not return values, since a multi-field struct doesn't fit in one flat i64 return slot without new H#-side codegen support this shim generator alone can't add; return a single scalar/`string` field, or write an accessor function per field instead")
+    end
+
+    let mut out: string = "// Auto-generated by hsharp's ffi_rust_native shim generator. Do not edit\n"
+    out = out + "// by hand — regenerated on every `hsharp compile` / `bit build` that sees\n"
+    out = out + "// this `extern [rust]` block. See ffi_rust_native.rs for the generator.\n"
+    out = out + "extern crate " + sanitize_ident(user_crate) + " as __user;\n\n"
+    out = out + "use std::panic::{{catch_unwind, AssertUnwindSafe}};\n\n"
+    let mut uses_struct_get: bool = false
+    for r in pr is
+        if r.kind == "opaque" && flattenable(structs, r.name) is uses_struct_get = true end
+    end
+    if uses_struct_get is out = out + "extern \"C\" {{ fn hsh_struct_get(s: i64, idx: i64) -> i64; }}\n\n" end
+    let shim_name: string = "hsh_rs_shim_" + f.text
+    let mut shim_params: [string] = []
+    let mut prelude: [string] = []
+    let mut call_args: [string] = []
+    i = 0
+    while i < params.len() is
+        let p: ast::Node = params[i]
+        let n: string = p.text
+        let r: RsTy = pr[i]
+        if index_of_int(consumed, i) >= 0 is
+            shim_params.push(n + ": " + c_flat_type(r))
+        elsif r.kind == "str" is
+            shim_params.push(n + "_ptr: *const std::os::raw::c_char")
+            prelude.push("        let " + n + " = unsafe {{ std::ffi::CStr::from_ptr(" + n + "_ptr) }}.to_str().unwrap_or(\"\");")
+            call_args.push(n)
+        elsif r.kind == "bytes" || r.kind == "vec" is
+            let len_name: string = params[data_len[index_of_int(data_idx, i)]].text
+            let mut elem: RsTy = rs("u8")
+            if r.kind == "vec" is elem = r.inner[0] end
+            shim_params.push(n + "_ptr: *const " + c_flat_type(elem))
+            prelude.push("        let " + n + " = unsafe {{ std::slice::from_raw_parts(" + n + "_ptr, " + len_name + " as usize) }};")
+            call_args.push(n)
+        elsif r.kind == "option" is
+            let inner: RsTy = r.inner[0]
+            if inner.kind == "str" is
+                shim_params.push(n + "_ptr: *const std::os::raw::c_char")
+                prelude.push("        let " + n + " = if " + n + "_ptr.is_null() {{ None }} else {{ Some(unsafe {{ std::ffi::CStr::from_ptr(" + n + "_ptr) }}.to_str().unwrap_or(\"\")) }};")
+            else
+                let flat: string = c_flat_type(inner)
+                shim_params.push(n + ": " + flat)
+                let mut check: string = n + " == 0 as " + flat
+                if inner.kind == "bool" is check = "!" + n end
+                prelude.push("        let " + n + " = if " + check + " {{ None }} else {{ Some(" + n + ") }};")
+            end
+            call_args.push(n)
+        elsif r.kind == "opaque" is
+            let fields: ast::Node = structs.fields[struct_index(structs, r.name)]
+            shim_params.push(n + ": i64")
+            let mut fi: int = 0
+            for field in fields.kids is
+                let var: string = n + "_" + field.text
+                prelude.push(rstrip_ws(emit_struct_field_read(n, fi, field, var)))
+                fi += 1
+            end
+            let mut ctor: [string] = []
+            for field in fields.kids is ctor.push(field.text + ": " + n + "_" + field.text) end
+            prelude.push("        let " + n + " = __user::" + r.name + " {{ " + join_with(ctor, ", ") + " }};")
+            call_args.push(n)
+        else
+            shim_params.push(n + ": " + c_flat_type(r))
+            call_args.push(n)
+        end
+        i += 1
+    end
+    let mut flat_ret: string = c_flat_type(ret_rs)
+    if rk == "str" is flat_ret = "*mut std::os::raw::c_char"
+    elsif rk == "option" || rk == "result" is
+        if ret_rs.inner[0].kind == "str" is flat_ret = "*mut std::os::raw::c_char" else flat_ret = c_flat_type(ret_rs.inner[0]) end
+    end
+    out = out + "#[no_mangle]\npub extern \"C\" fn " + shim_name + "(" + join_with(shim_params, ", ") + ") -> " + flat_ret + " {{\n"
+    for line in prelude is out = out + line + "\n" end
+    out = out + "    let __result = catch_unwind(AssertUnwindSafe(|| {{\n"
+    out = out + "        __user::" + f.text + "(" + join_with(call_args, ", ") + ")\n"
+    out = out + "    }}));\n\n"
+    out = out + "    match __result {{\n"
+    out = out + "        Ok(__v) => {{\n"
+    out = out + render_success_arm(ret_rs)
+    out = out + "        }}\n"
+    out = out + "        Err(_panic_payload) => {{\n"
+    out = out + "            // A Rust panic must never unwind across this `extern \"C\"`\n"
+    out = out + "            // frame into H#'s LLVM-generated code — that's undefined\n"
+    out = out + "            // behavior. Convert it into H#'s sentinel failure value.\n"
+    out = out + render_panic_arm(ret_rs)
+    out = out + "        }}\n"
+    out = out + "    }}\n"
+    out = out + "}}\n"
+    return ShimResult { ok: true, err: "", text: out }
+end
