@@ -1,0 +1,121 @@
+pub struct TargetTriple is
+    pub arch: string
+    pub os: string
+    pub abi: string
+    pub llvm_triple: string
+end
+
+fn mk_target(arch: string, os: string, abi: string, triple: string) -> TargetTriple is
+    return TargetTriple { arch: arch, os: os, abi: abi, llvm_triple: triple }
+end
+
+pub fn linux_x86_64_musl() -> TargetTriple is
+    return mk_target("x86_64", "linux", "musl", "x86_64-unknown-linux-musl")
+end
+
+pub fn linux_x86_64_gnu() -> TargetTriple is
+    return mk_target("x86_64", "linux", "gnu", "x86_64-unknown-linux-gnu")
+end
+
+pub fn linux_aarch64() -> TargetTriple is
+    return mk_target("aarch64", "linux", "gnu", "aarch64-unknown-linux-gnu")
+end
+
+pub fn linux_riscv64() -> TargetTriple is
+    return mk_target("riscv64", "linux", "gnu", "riscv64gc-unknown-linux-gnu")
+end
+
+pub fn linux_riscv64_musl() -> TargetTriple is
+    return mk_target("riscv64", "linux", "musl", "riscv64gc-unknown-linux-musl")
+end
+
+pub fn windows_x86_64() -> TargetTriple is
+    return mk_target("x86_64", "windows", "msvc", "x86_64-pc-windows-msvc")
+end
+
+pub fn windows_aarch64() -> TargetTriple is
+    return mk_target("aarch64", "windows", "msvc", "aarch64-pc-windows-msvc")
+end
+
+pub fn macos_x86_64() -> TargetTriple is
+    return mk_target("x86_64", "macos", "none", "x86_64-apple-darwin")
+end
+
+pub fn macos_aarch64() -> TargetTriple is
+    return mk_target("aarch64", "macos", "none", "aarch64-apple-darwin")
+end
+
+;; wasm32-unknown-unknown: no OS, no libc, no filesystem, no processes (pure-computation H# only).
+pub fn wasm32() -> TargetTriple is
+    return mk_target("wasm32", "freestanding", "none", "wasm32-unknown-unknown")
+end
+
+;; the host is linux-x86_64-musl on every platform this self-hosted build supports
+pub fn host() -> TargetTriple is
+    return linux_x86_64_musl()
+end
+
+;; `found` is false when the name is unknown (the Rust version returns Option)
+pub struct TargetLookup is
+    pub found: bool
+    pub target: TargetTriple
+end
+
+pub fn from_str(s: string) -> TargetLookup is
+    let mut t: TargetTriple = linux_x86_64_musl()
+    let mut ok: bool = true
+    if s == "linux-x86_64" || s == "linux" is t = linux_x86_64_musl()
+    elsif s == "linux-x86_64-gnu" is t = linux_x86_64_gnu()
+    elsif s == "linux-aarch64" is t = linux_aarch64()
+    elsif s == "linux-riscv64" is t = linux_riscv64()
+    elsif s == "linux-riscv64-musl" is t = linux_riscv64_musl()
+    elsif s == "windows" || s == "windows-x86_64" is t = windows_x86_64()
+    elsif s == "windows-aarch64" is t = windows_aarch64()
+    elsif s == "macos" || s == "macos-x86_64" is t = macos_x86_64()
+    elsif s == "macos-aarch64" is t = macos_aarch64()
+    elsif s == "wasm32" || s == "wasm" is t = wasm32()
+    else ok = false end
+    return TargetLookup { found: ok, target: t }
+end
+
+pub fn is_wasm(t: TargetTriple) -> bool is
+    return t.arch == "wasm32"
+end
+
+pub fn exe_suffix(t: TargetTriple) -> string is
+    if t.os == "windows" is return ".exe" end
+    if t.os == "freestanding" is return ".wasm" end
+    return ""
+end
+
+;; flat [name, description, name, description, ...] — H# has no tuples
+pub fn all_named() -> [string] is
+    return [
+        "linux-x86_64", "Linux x86_64 (musl, fully static) [default]",
+        "linux-x86_64-gnu", "Linux x86_64 (gnu)",
+        "linux-aarch64", "Linux ARM64",
+        "linux-riscv64", "Linux RISC-V 64-bit (gnu, RV64GC)",
+        "linux-riscv64-musl", "Linux RISC-V 64-bit (musl, RV64GC)",
+        "windows-x86_64", "Windows x86_64",
+        "windows-aarch64", "Windows ARM64",
+        "macos-x86_64", "macOS Intel",
+        "macos-aarch64", "macOS Apple Silicon",
+        "wasm32", "WebAssembly (wasm32-unknown-unknown) — pure-computation H# only, see TargetTriple::wasm32()'s doc comment"
+    ]
+end
+
+;; `h# targets` output
+pub fn targets_text() -> string is
+    let names: [string] = all_named()
+    let mut out: string = "  H# v0.9.0  LLVM backend  (default edition 2026)\n\nAvailable cross-compilation targets:\n\n"
+    let mut i: int = 0
+    while i + 1 < names.len() is
+        let name: string = names[i]
+        let mut pad: string = name
+        while pad.len() < 25 is pad = pad + " " end
+        out = out + "  " + pad + "  " + names[i + 1] + "\n"
+        i += 2
+    end
+    out = out + "\nUsage: h# compile --target linux-aarch64 src/main.h#\n"
+    return out
+end
