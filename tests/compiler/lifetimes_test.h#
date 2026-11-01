@@ -1,0 +1,25 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+#[test]
+fn test_from_str_and_outlives() is
+    assert_eq(lifetimes::from_str("'static"), "static")
+    assert_eq(lifetimes::from_str("_"), "elided")
+    assert_eq(lifetimes::from_str("'a"), "named:a")
+    assert_eq(lifetimes::from_str("b"), "named:b")
+    assert_eq(lifetimes::outlives("static", "named:a"), true)
+    assert_eq(lifetimes::outlives("named:a", "static"), false)
+    assert_eq(lifetimes::outlives("named:a", "named:b"), false)
+    assert_eq(lifetimes::outlives("named:a", "named:a"), true)
+    assert_eq(lifetimes::outlives("anonymous", "named:a"), true)
+end
+
+#[test]
+fn test_check_module_reports_nothing_like_rust() is
+    let src: string = "fn f(a: &int, s: string) -> &int is\n    let x = s\n    if true is\n        let y = x\n    end\n    return a\nend\n"
+    let c: lifetimes::LifetimeChecker = lifetimes::new_checker()
+    let errs: [lifetimes::LifetimeError] = lifetimes::check_module(c, parser::parse_source(src))
+    assert_eq(errs.len(), 0)
+end
