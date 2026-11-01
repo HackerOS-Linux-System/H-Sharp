@@ -6,6 +6,8 @@ mod rt_path
 mod rt_codec
 mod rt_conv
 mod rt_date
+mod rt_num
+mod rt_sys
 
 fn nib(c: int) -> int is
     if c >= 48 && c <= 57 is return c - 48 end
@@ -35,6 +37,40 @@ fn arg(parts: [string], i: int) -> string is
 end
 
 ;; string results are returned as hex, numeric ones as "#<n>"
+fn starts_f(op: string) -> bool is
+    return op.len() > 2 && op[0..2] == "f_"
+end
+
+;; a numeric argument n is the float n / 1000
+fn dd(a: string) -> f64 is
+    return to_int(a) / 1000.0
+end
+
+fn run_float(op: string, x: f64, y: f64) -> string is
+    let f: string = op[2..op.len()]
+    if f == "sin" is return rt_num::fmt6(rt_num::fsin(x)) end
+    if f == "cos" is return rt_num::fmt6(rt_num::fcos(x)) end
+    if f == "tan" is return rt_num::fmt6(rt_num::ftan(x)) end
+    if f == "sqrt" is return rt_num::fmt6(rt_num::fsqrt(x)) end
+    if f == "pow" is return rt_num::fmt6(rt_num::fpow(x, y)) end
+    if f == "floor" is return rt_num::fmt6(rt_num::ffloor(x)) end
+    if f == "ceil" is return rt_num::fmt6(rt_num::fceil(x)) end
+    if f == "round" is return rt_num::fmt6(rt_num::fround(x)) end
+    if f == "abs" is return rt_num::fmt6(rt_num::fabs_f(x)) end
+    if f == "asin" is return rt_num::fmt6(rt_num::fasin(x)) end
+    if f == "acos" is return rt_num::fmt6(rt_num::facos(x)) end
+    if f == "atan" is return rt_num::fmt6(rt_num::fatan(x)) end
+    if f == "atan2" is return rt_num::fmt6(rt_num::fatan2(x, y)) end
+    if f == "exp" is return rt_num::fmt6(rt_num::fexp(x)) end
+    if f == "log" is return rt_num::fmt6(rt_num::flog(x)) end
+    if f == "log2" is return rt_num::fmt6(rt_num::flog2(x)) end
+    if f == "log10" is return rt_num::fmt6(rt_num::flog10(x)) end
+    if f == "trunc" is return rt_num::fmt6(rt_num::ftrunc(x)) end
+    if f == "min" is return rt_num::fmt6(rt_num::min_f(x, y)) end
+    if f == "max" is return rt_num::fmt6(rt_num::max_f(x, y)) end
+    return "?float-op"
+end
+
 fn run_op(op: string, a: string, b: string, c: string) -> string is
     if op == "trim" is return rt_str::hex_encode(rt_str::trim(a)) end
     if op == "trim_start" is return rt_str::hex_encode(rt_str::trim_start(a)) end
@@ -78,6 +114,23 @@ fn run_op(op: string, a: string, b: string, c: string) -> string is
     if op == "trimr" is return rt_str::hex_encode(rt_str::trim_right(a)) end
     if op == "splitc" is return "#" + to_string(rt_str::split_count(a, b)) end
     if op == "splitp" is return rt_str::hex_encode(rt_str::split_part(a, b, to_int(c))) end
+    if op == "absi" is return "#" + to_string(rt_num::abs_i(to_int(a))) end
+    if op == "mini" is return "#" + to_string(rt_num::min_i(to_int(a), to_int(b))) end
+    if op == "maxi" is return "#" + to_string(rt_num::max_i(to_int(a), to_int(b))) end
+    if op == "atoll" is return "#" + to_string(rt_num::atoll(a)) end
+    if op == "f2i" is return "#" + to_string(rt_num::float_to_int(dd(a))) end
+    if op == "f_tofloat" is return "!" + rt_num::fmt6(rt_num::to_float(a)) end
+    if starts_f(op) is return "!" + run_float(op, dd(a), dd(b)) end
+    if op == "uid" is return "#" + to_string(rt_sys::uid()) end
+    if op == "gid" is return "#" + to_string(rt_sys::gid()) end
+    if op == "ppid" is return "#" + to_string(rt_sys::ppid()) end
+    if op == "isroot" is return "#" + bool_n(rt_sys::is_root()) end
+    if op == "pagesize" is return "#" + to_string(rt_sys::page_size()) end
+    if op == "is64" is return "#" + bool_n(rt_sys::is_64bit()) end
+    if op == "le" is return "#" + bool_n(rt_sys::is_little_endian()) end
+    if op == "tty" is return "#" + bool_n(rt_sys::stdout_is_tty()) end
+    if op == "home" is return rt_str::hex_encode(rt_sys::home_dir()) end
+    if op == "tmp" is return rt_str::hex_encode(rt_sys::temp_dir()) end
     return "?unknown-op"
 end
 
@@ -89,7 +142,7 @@ fn main() is
         let parts: [string] = __builtin_str_split(lines[i], "\t")
         if parts.len() > 0 && parts[0].len() > 0 is
             let r: string = run_op(parts[0], arg(parts, 1), arg(parts, 2), arg(parts, 3))
-            if r.len() > 0 && byte_at(r, 0) == 35 is
+            if r.len() > 0 && (byte_at(r, 0) == 35 || byte_at(r, 0) == 33) is
                 write(parts[0] + "\t" + r[1..r.len()])
             else
                 write(parts[0] + "\t" + r)
