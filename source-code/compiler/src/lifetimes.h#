@@ -1,0 +1,192 @@
+use "std -> strbuf" from "strbuf"
+
+use "workspace -> parser" from "lib -> *"
+
+pub fn from_str(s: string) -> string is
+    if s == "'static" || s == "static" is return "static" end
+    if s == "'_" || s == "_" is return "elided" end
+    if s.len() > 0 && byte_at(s, 0) == 39 is return "named:" + s[1..s.len()] end
+    return "named:" + s
+end
+
+fn is_named(lt: string) -> bool is
+    return lt.len() >= 6 && lt[0..6] == "named:"
+end
+
+;; does `a` outlive `b`?
+pub fn outlives(a: string, b: string) -> bool is
+    if a == "static" is return true end
+    if b == "static" is return false end
+    if is_named(a) && is_named(b) is return a == b end
+    return true
+end
+
+pub struct LifetimeError is
+    pub message: string
+    pub line: int
+    pub col: int
+end
+
+pub fn error_text(e: LifetimeError) -> string is
+    return "lifetime error: " + e.message + " at " + to_string(e.line) + ":" + to_string(e.col)
+end
+
+pub struct LifetimeScope is
+    pub lifetimes: [string]
+    pub var_names: [string]
+    pub var_lts: [string]
+end
+
+fn new_scope() -> LifetimeScope is
+    return LifetimeScope { lifetimes: [], var_names: [], var_lts: [] }
+end
+
+fn define_lifetime(s: LifetimeScope, name: string) is
+    for l in s.lifetimes is
+        if l == name is return end
+    end
+    s.lifetimes.push(name)
+end
+
+fn bind_var(s: LifetimeScope, name: string, lt: string) is
+    let mut i: int = 0
+    while i < s.var_names.len() is
+        if s.var_names[i] == name is
+            s.var_lts[i] = lt
+            return
+        end
+        i += 1
+    end
+    s.var_names.push(name)
+    s.var_lts.push(lt)
+end
+
+;; "" when the variable is unknown in this scope
+fn get_lifetime(s: LifetimeScope, name: string) -> string is
+    let mut i: int = 0
+    while i < s.var_names.len() is
+        if s.var_names[i] == name is return s.var_lts[i] end
+        i += 1
+    end
+    return ""
+end
+
+pub struct LifetimeChecker is
+    pub errors: [LifetimeError]
+    pub scopes: [LifetimeScope]
+end
+
+pub fn new_checker() -> LifetimeChecker is
+    return LifetimeChecker { errors: [], scopes: [new_scope()] }
+end
+
+fn cur(c: LifetimeChecker) -> LifetimeScope is
+    return c.scopes[c.scopes.len() - 1]
+end
+
+fn push_scope(c: LifetimeChecker) is c.scopes.push(new_scope()) end
+
+fn pop_scope(c: LifetimeChecker) is
+    let mut rest: [LifetimeScope] = []
+    let mut i: int = 0
+    while i < c.scopes.len() - 1 is
+        rest.push(c.scopes[i])
+        i += 1
+    end
+    c.scopes = rest
+end
+
+;; type node -> lifetime (Ref/RefMut -> anonymous, Named string -> static, everything else anonymous)
+fn extract_lifetime_from_type(ty: ast::Node) -> string is
+    if ty.tag == "Named" && ty.text == "string" is return "static" end
+    return "anonymous"
+end
+
+fn check_return_lifetime(c: LifetimeChecker, f: ast::Node, ret_lt: string) is
+    if !is_named(ret_lt) is return end
+    let name: string = ret_lt[6..ret_lt.len()]
+    let mut found: bool = false
+    for p in f.kids[2].kids is
+        let lt: string = extract_lifetime_from_type(p.kids[1])
+        if is_named(lt) && lt[6..lt.len()] == name is found = true end
+    end
+    if !found && name != "static" is
+        c.errors.push(LifetimeError {
+            message: "lifetime '" + name + "' in return type of `" + f.text + "` doesn't match any parameter lifetime",
+            line: 0, col: 0 })
+    end
+end
+
+fn infer_lifetime(c: LifetimeChecker, e: ast::Node) -> string is
+    if e.tag == "Str" is return "static" end
+    if e.tag == "Ident" is
+        let mut i: int = c.scopes.len() - 1
+        while i >= 0 is
+            let lt: string = get_lifetime(c.scopes[i], e.text)
+            if lt != "" is return lt end
+            i -= 1
+        end
+    end
+    return "anonymous"
+end
+
+fn check_stmts(c: LifetimeChecker, stmts: [ast::Node]) is
+    for s in stmts is check_stmt(c, s) end
+end
+
+fn check_stmt(c: LifetimeChecker, s: ast::Node) is
+    if s.tag == "Let" is
+        let mut lt: string = "anonymous"
+        if s.kids[2].tag != "None" is lt = infer_lifetime(c, s.kids[2]) end
+        bind_var(cur(c), s.text, lt)
+    elsif s.tag == "Return" is
+        if s.kids[0].tag != "None" is
+            ;; check_no_local_ref_return is a no-op in Rust as well
+            let lt: string = infer_lifetime(c, s.kids[0])
+        end
+    elsif s.tag == "ExprStmt" is
+        check_expr(c, s.kids[0])
+    end
+end
+
+fn check_expr(c: LifetimeChecker, e: ast::Node) is
+    if e.tag == "Call" is
+        check_expr(c, e.kids[0])
+        for a in e.kids[1].kids is check_expr(c, a) end
+    elsif e.tag == "BinOp" is
+        check_expr(c, e.kids[0])
+        check_expr(c, e.kids[1])
+    elsif e.tag == "If" is
+        check_expr(c, e.kids[0])
+        push_scope(c)
+        check_stmts(c, e.kids[1].kids)
+        pop_scope(c)
+        if e.kids[3].tag != "None" is
+            push_scope(c)
+            check_stmts(c, e.kids[3].kids)
+            pop_scope(c)
+        end
+    end
+end
+
+pub fn check_fn(c: LifetimeChecker, f: ast::Node) is
+    push_scope(c)
+    for tp in f.kids[1].kids is
+        if tp.text.len() > 0 && byte_at(tp.text, 0) == 39 is define_lifetime(cur(c), tp.text) end
+    end
+    for p in f.kids[2].kids is
+        bind_var(cur(c), p.text, extract_lifetime_from_type(p.kids[1]))
+    end
+    if f.kids[3].tag != "None" is
+        check_return_lifetime(c, f, extract_lifetime_from_type(f.kids[3]))
+    end
+    check_stmts(c, f.kids[4].kids)
+    pop_scope(c)
+end
+
+pub fn check_module(c: LifetimeChecker, m: ast::Node) -> [LifetimeError] is
+    for it in m.kids[3].kids is
+        if it.tag == "Fn" is check_fn(c, it) end
+    end
+    return c.errors
+end
