@@ -1,0 +1,30 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+#[test]
+fn test_find_and_aliases() is
+    let a: int = builtins::find("shell")
+    let b: int = builtins::find("cmd")
+    assert_eq(a >= 0, true)
+    assert_eq(a, b)
+    assert_eq(builtins::spec_c_symbol(a), "hsh_shell")
+    assert_eq(builtins::find("definitely_user_fn"), -1)
+end
+
+#[test]
+fn test_supported_on() is
+    assert_eq(builtins::supported_on("shell", "Cpp"), true)
+    assert_eq(builtins::supported_on("my_own_fn", "Cpp"), true)
+end
+
+#[test]
+fn test_symbols() is
+    assert_eq(builtins::legacy_symbol("trim"), "hsh_trim")
+    assert_eq(builtins::legacy_symbol("hex_encode_nope"), "")
+    assert_eq(builtins::legacy_symbol("ext_hex_encode"), "hsh_hex_encode")
+    assert_eq(builtins::resolve_builtin_dunder_llvm("__builtin_hex_encode"), "ext_hex_encode")
+    assert_eq(builtins::resolve_builtin_dunder_llvm("__builtin_fs_mkdir"), "fs_mkdir_all")
+    assert_eq(builtins::resolve_builtin_dunder_llvm("__builtin_zzz"), "")
+    assert_eq(builtins::resolve_builtin_dunder_llvm("plain"), "")
+end
