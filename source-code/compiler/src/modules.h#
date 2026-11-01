@@ -1,0 +1,912 @@
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "std -> map" from "map"
+use "std -> strbuf" from "strbuf"
+
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+use "workspace -> hlib" from "lib -> *"
+mod hlib_export
+mod target
+
+;; ── result carriers ─────────────────────────────────────────────────────────
+pub struct Expanded is
+    pub ok: bool
+    pub err: string
+    pub items: [ast::Node]
+end
+
+fn ex_ok(items: [ast::Node]) -> Expanded is
+    return Expanded { ok: true, err: "", items: items }
+end
+
+fn ex_err(m: string) -> Expanded is
+    let none: [ast::Node] = []
+    return Expanded { ok: false, err: m, items: none }
+end
+
+;; one parsed `mod X` file (the Rust `Result<(items, imports, path), String>` of `resolve`)
+pub struct Loaded is
+    pub ok: bool
+    pub err: string
+    pub items: [ast::Node]
+    pub imports: [ast::Node]
+    pub path: string
+end
+
+pub struct Resolver is
+    pub search_paths: [string]
+    pub cache_keys: [string]
+    pub cache_vals: [Loaded]
+    pub inlined_files: map::Set<string>
+    pub inlined_std: map::Set<string>
+    pub has_root: bool
+    pub entry_root: string
+    pub rec: edition::EditionRecorder
+    pub st: edition::EditionState
+end
+
+fn edition_fatal() -> string is return "\u{1}edition-fatal\u{1}" end
+
+;; ── small string helpers ────────────────────────────────────────────────────
+fn starts_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[0..p.len()] == p
+end
+
+fn join_strs(xs: [string], sep: string) -> string is
+    let mut sb = strbuf::new()
+    let mut i: int = 0
+    while i < xs.len() is
+        if i > 0 is sb.push(sep) end
+        sb.push(xs[i])
+        i += 1
+    end
+    return sb.build()
+end
+
+fn split_path_segs(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if i + 1 < s.len() && byte_at(s, i) == 58 && byte_at(s, i + 1) == 58 is
+            out.push(cur)
+            cur = ""
+            i += 2
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+            i += 1
+        end
+    end
+    out.push(cur)
+    return out
+end
+
+fn str_to_int(s: string) -> int is
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        v = v * 10 + (byte_at(s, i) - 48)
+        i += 1
+    end
+    return v
+end
+
+pub fn dir_of(path: string) -> string is
+    let par: bit_resolve::Parent = bit_resolve::parent_of(path)
+    if par.has is return par.path end
+    return "."
+end
+
+;; ── construction ────────────────────────────────────────────────────────────
+pub fn new_resolver(source_file: string, extra: [string], rec: edition::EditionRecorder, st: edition::EditionState) -> Resolver is
+    let mut sp: [string] = []
+    let par: bit_resolve::Parent = bit_resolve::parent_of(source_file)
+    if par.has is sp.push(par.path) end
+    for e in extra is sp.push(e) end
+    sp.push(fs::cwd())
+    let mut d: string = "."
+    if par.has && par.path != "" is d = par.path end
+    let cd: string = bit_resolve::canonical(d)
+    let root: string = bit_resolve::manifest_dir_of(cd)
+    return Resolver { search_paths: sp, cache_keys: [], cache_vals: [], inlined_files: map::Set::new(), inlined_std: map::Set::new(),
+        has_root: root != "", entry_root: root, rec: rec, st: st }
+end
+
+fn parse_file(r: Resolver, src: string, path: string, is_std: bool) -> parser::ParseResult is
+    let mut year: int = 0
+    if is_std is
+        year = edition::std_edition()
+    else
+        let e: string = bit_resolve::edition_for_file(path, r.has_root, r.entry_root)
+        if e != "" is year = str_to_int(e) end
+    end
+    return parser::parse_with_default(src, path, year, r.rec, r.st)
+end
+
+;; the imports of a parsed module: Import nodes; the tuple alias is the LAST kid
+fn import_alias(imp: ast::Node) -> string is
+    let a: ast::Node = imp.kids[imp.kids.len() - 1]
+    if a.tag == "None" is return "" end
+    return a.text
+end
+
+fn import_has_alias(imp: ast::Node) -> bool is
+    return imp.kids[imp.kids.len() - 1].tag != "None"
+end
+
+fn opt_text(n: ast::Node) -> string is
+    if n.tag == "None" is return "" end
+    return n.text
+end
+
+fn std_lib_of(imp: ast::Node) -> string is
+    let p: ast::Node = imp.kids[0]
+    if p.kids.len() == 0 is return "" end
+    return p.kids[p.kids.len() - 1].text
+end
+
+fn ns_for(imp: ast::Node, dflt: string) -> string is
+    if import_has_alias(imp) is return import_alias(imp) end
+    return dflt
+end
+
+;; ── the four kinds of import, applied to one import node ────────────────────
+fn resolve_one(r: Resolver, imp: ast::Node, dir: string) -> Expanded is
+    let kind: string = imp.text
+    if kind == "Std" is
+        let lib: string = std_lib_of(imp)
+        if lib == "" is return ex_ok([]) end
+        return resolve_std_import(r, lib, ns_for(imp, lib))
+    elsif kind == "BitRepo" is
+        let name: string = imp.kids[0].text
+        let has_v: bool = imp.kids[1].tag != "None"
+        return resolve_bit_import(r, name, has_v, opt_text(imp.kids[1]), ns_for(imp, name), imp.kids[3].text == "Dynamic", dir)
+    elsif kind == "Hlib" is
+        let name: string = imp.kids[0].text
+        return resolve_hlib_import(r, name, imp.kids[1].tag != "None", opt_text(imp.kids[1]), ns_for(imp, name), dir)
+    elsif kind == "Workspace" is
+        let member: string = imp.kids[0].text
+        return resolve_workspace_import(r, member, imp.kids[1].tag != "None", opt_text(imp.kids[1]), imp.kids[2].tag != "None", opt_text(imp.kids[2]), member, dir)
+    end
+    return ex_ok([])
+end
+
+;; resolve every import of `imports` (in order), appending to `out`; false + err on the first failure
+fn resolve_imports(r: Resolver, imports: [ast::Node], dir: string, out: [ast::Node]) -> string is
+    for imp in imports is
+        let e: Expanded = resolve_one(r, imp, dir)
+        if !e.ok is return e.err end
+        for it in e.items is out.push(it) end
+    end
+    return ""
+end
+
+pub fn std_not_found(lib: string, path: string) -> string is
+    return "std module '" + lib + "' not found at " + path + "\n\nplease install h# utils for HackerOS use:\nlinux:   hacker unpack h#-utils\nwindows: (not available yet — no install path is defined for Windows yet)\n"
+end
+
+pub fn resolve_std_import(r: Resolver, lib: string, alias: string) -> Expanded is
+    let std_root: string = bit_resolve::pjoin(tc_helpers::std_root_dir(), lib + ".h#")
+    let path: string = std_root
+    if !fs::exists(path) is return ex_err(std_not_found(lib, path)) end
+    let key: string = bit_resolve::canonical(path) + "\u{1}" + alias
+    if r.inlined_std.has(key) is return ex_ok([]) end
+    r.inlined_std.add(key)
+    let src: string = fs::read(path)
+    let res: parser::ParseResult = parse_file(r, src, path, true)
+    if parser::has_errors(res) is
+        return ex_err("parse errors in std module '" + lib + "' (" + path + "):\n" + parser::render_errors(res))
+    end
+    let sub: ast::Node = res.module
+    let sub_dir: string = dir_of(path)
+    let mut out: [ast::Node] = []
+    for imp in sub.kids[2].kids is
+        if imp.text == "Std" is
+            let sub_lib: string = std_lib_of(imp)
+            if sub_lib == "" is continue end
+            let e: Expanded = resolve_std_import(r, sub_lib, ns_for(imp, sub_lib))
+            if !e.ok is return e end
+            for it in e.items is out.push(it) end
+        end
+    end
+    let mangled: [ast::Node] = mangle_module_items(sub.kids[3].kids, alias)
+    let ex: Expanded = expand_module(r, mangled, sub_dir)
+    if !ex.ok is return ex end
+    for it in ex.items is out.push(it) end
+    return ex_ok(out)
+end
+
+pub fn dynamic_bit_msg(name: string) -> string is
+    return "dynamic use \"bit -> " + name + "\" cannot be compiled to a native binary yet: the LLVM/AOT backend has no runtime library loader (unlike `extern dynamic [c]` FFI blocks, which do dispatch through libc `dlopen`) — and bit links libraries statically anyway.\n\nfix one of:\n- drop `dynamic`: `use \"bit -> " + name + "\"` links it statically into the binary\n- restructure so the module is reachable at the top level of the entry file\n"
+end
+
+pub fn resolve_bit_import(r: Resolver, name: string, has_version: bool, version: string, alias: string, dynamic_link: bool, start_dir: string) -> Expanded is
+    if dynamic_link is return ex_err(dynamic_bit_msg(name)) end
+    let u: bit_resolve::UseResult = bit_resolve::resolve_bit_use(name, has_version, version, dynamic_link, start_dir)
+    if !u.ok is return ex_err(u.err) end
+    let path: string = u.entry
+    let canon: string = bit_resolve::canonical(path)
+    if r.inlined_files.has(canon) is return ex_ok([]) end
+    r.inlined_files.add(canon)
+    if !fs::exists(path) is return ex_err("cannot read bit library '" + name + "' at " + path + ": No such file or directory (os error 2)") end
+    let src: string = fs::read(path)
+    let res: parser::ParseResult = parse_file(r, src, path, false)
+    if parser::has_errors(res) is
+        return ex_err("parse errors in bit library '" + name + "' (" + path + "):\n" + parser::render_errors(res))
+    end
+    let sub: ast::Node = res.module
+    let sub_dir: string = dir_of(path)
+    let mut out: [ast::Node] = []
+    let e0: string = resolve_imports(r, sub.kids[2].kids, sub_dir, out)
+    if e0 != "" is return ex_err(e0) end
+    let mangled: [ast::Node] = mangle_module_items(sub.kids[3].kids, alias)
+    let ex: Expanded = expand_module(r, mangled, sub_dir)
+    if !ex.ok is return ex end
+    for it in ex.items is out.push(it) end
+    return ex_ok(out)
+end
+
+;; ── hlib ────────────────────────────────────────────────────────────────────
+fn find_hlib_file(name: string, has_version: bool, version: string, start_dir: string) -> string is
+    let project_root: string = bit_resolve::find_bit_project_root(start_dir)
+    let mut dirs: [string] = [bit_resolve::pjoin(start_dir, "hlibs"), start_dir, bit_resolve::pjoin(project_root, "hlibs")]
+    let home: string = env::get("HOME")
+    if home != "" is dirs.push(bit_resolve::pjoin(home, ".hackeros/H#/hlibs")) end
+    if bit_resolve::valid_lib_name(name) is
+        for lib_dir in bit_resolve::bit_lib_candidates(name, start_dir) is
+            dirs.push(bit_resolve::pjoin(lib_dir, ".bit/out"))
+            dirs.push(lib_dir)
+        end
+    end
+    dirs.push("/usr/lib/HackerOS/H#/hlibs")
+    let mut names: [string] = [name + ".hlib"]
+    if has_version is names = [name + "-" + version + ".hlib", name + ".hlib"] end
+    let mut tried: [string] = []
+    for d in dirs is
+        for f in names is
+            let p: string = bit_resolve::pjoin(d, f)
+            if fs::exists(p) is return "OK:" + p end
+            tried.push("  " + p)
+        end
+    end
+    return "ERR:hlib '" + name + "' not found. Tried:\n" + join_strs(tried, "\n") + "\n\nbuild one with `h# lib build <file.h#> -o hlibs/" + name + ".hlib`, or place a prebuilt archive at one of the paths above."
+end
+
+fn abi_to_type(t: string) -> ast::Node is
+    if t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32" || t == "u64" || t == "f32" || t == "f64" || t == "bool" is
+        return ast::lf("Named", t)
+    end
+    if t == "void" is return ast::lf("Void", "") end
+    if t == "ptr" is return ast::lf("Named", "bytes") end
+    if starts_with(t, "opaque:") is return ast::nd("Ref", "", [ast::lf("Named", t[7..t.len()])]) end
+    return ast::lf("Named", t)
+end
+
+fn hlib_cache_dir() -> string is
+    let h: string = env::get("HOME")
+    if h == "" is return "" end
+    return h + "/.hackeros/H#/hlib-cache"
+end
+
+pub fn resolve_hlib_import(r: Resolver, name: string, has_version: bool, version: string, alias: string, start_dir: string) -> Expanded is
+    let found: string = find_hlib_file(name, has_version, version, start_dir)
+    if starts_with(found, "ERR:") is return ex_err(found[4..found.len()]) end
+    let path: string = found[3..found.len()]
+    let canon: string = bit_resolve::canonical(path)
+    if r.inlined_files.has(canon) is return ex_ok([]) end
+    r.inlined_files.add(canon)
+
+    let mut archive: hlib::HlibArchive = hlib::HlibArchive { manifest: hlib::empty_manifest(), entries: [] }
+    match hlib::archive_open(path) is
+        option::Result::Ok(a) => is archive = a end
+        option::Result::Err(e) => is return ex_err("cannot open .hlib '" + name + "' at " + path + ": " + e) end
+    end
+    match hlib::verify_checksums(archive) is
+        option::Result::Ok(_) => is end
+        option::Result::Err(e) => is return ex_err(".hlib '" + name + "' failed its internal integrity check: " + e) end
+    end
+    let m: hlib::Manifest = archive.manifest
+    let same_language: bool = m.language == "hsharp"
+    let sub_dir: string = bit_resolve::parent_of(path).path
+
+    ;; Path 1: same-language `ast` artifact (HLIB_FORMAT §5) — spliced like a source module
+    if same_language is
+        for a in m.artifacts is
+            if a.kind == "ast" is
+                let ei: int = hlib::entry_index(archive, a.path)
+                if ei < 0 is return ex_err(".hlib '" + name + "': ast artifact listed in manifest but missing from the archive") end
+                let dec: hlib_export::AstDecoded = hlib_export::ast_decode(hlib::buf_to_str(archive.entries[ei].data))
+                if !dec.ok is return ex_err(".hlib '" + name + "': cannot parse its ast artifact: " + dec.err) end
+                return expand_module(r, mangle_module_items(dec.items, alias), sub_dir)
+            end
+        end
+    end
+
+    ;; Path 2: synthesize an `extern` block from the header + the host's .so
+    let host: string = target::host().llvm_triple
+    let mut so_path_in: string = ""
+    let mut targets: [string] = []
+    for a in m.artifacts is
+        if a.kind == "shared_object" is
+            targets.push(a.target)
+            if a.target == host && so_path_in == "" is so_path_in = a.path end
+        end
+    end
+    if so_path_in == "" is
+        let mut note: string = ""
+        if !same_language is
+            note = " It was built by " + m.language + ": its `ast` is " + m.language + " source, which H# does not read; across languages only a native `.so` listed in `manifest.exports` (non-generic functions with plain C types) can be called."
+        end
+        return ex_err(".hlib '" + name + "' has neither a usable `ast` artifact nor a `.so` built for this host (" + host + ") — nothing here can be linked. Available native targets: " + join_strs(targets, ", ") + "." + note)
+    end
+    let si: int = hlib::entry_index(archive, so_path_in)
+    if si < 0 is return ex_err(".hlib '" + name + "': shared object listed in manifest but missing from the archive") end
+    let cache_root: string = hlib_cache_dir()
+    if cache_root == "" is return ex_err("cannot locate a cache directory: $HOME is not set") end
+    let cache_dir: string = cache_root + "/" + name + "-" + m.version
+    hlib::make_dirs(cache_dir)
+    let so_path: string = cache_dir + "/lib" + name + ".so"
+    if !fs::exists(so_path) is
+        match hlib::write_file(so_path, archive.entries[si].data) is
+            option::Result::Ok(_) => is end
+            option::Result::Err(e) => is return ex_err("cannot extract .so from '" + name + "': " + e) end
+        end
+    end
+    let mut fns: [ast::Node] = []
+    let mut skipped: [string] = []
+    for e in m.exports is
+        if e.generic is skipped.push(e.name) end
+        if !e.generic && e.kind == "function" is
+            let mut ps: [ast::Node] = []
+            let mut i: int = 0
+            while i < e.params.len() is
+                ps.push(ast::nd("Param", "arg" + to_string(i), [ast::nd("B", "false", []), abi_to_type(e.params[i])]))
+                i += 1
+            end
+            let mut ret: ast::Node = ast::nn()
+            if e.returns != "" is ret = abi_to_type(e.returns) end
+            fns.push(ast::nd("ExternFn", e.name, [ast::nd("Params", "", ps), ret, ast::nd("B", "false", [])]))
+        end
+    end
+    if skipped.len() > 0 is
+        eprint_mod("  note: .hlib '" + name + "' — " + to_string(skipped.len()) + " generic export(s) skipped (no ast artifact to expand them from, only a compiled .so): " + join_strs(skipped, ", ") + "\n")
+    end
+    if fns.len() == 0 is
+        return ex_err(".hlib '" + name + "' has no `ast` artifact and no non-generic function export to bind — nothing to link.")
+    end
+    return ex_ok([ast::nd("Extern", "", [ast::lf("Lang", "Rust"), ast::lf("Link", "Dynamic"), ast::lf("S", so_path), ast::nd("Fns", "", fns)])])
+end
+
+extern static [c] is
+    fn fdopen(fd: int, mode: string) -> int
+    fn fputs(s: string, f: int) -> int
+    fn fflush(f: int) -> int
+end
+
+fn eprint_mod(s: string) is
+    fflush(0)
+    let f: int = fdopen(2, "w")
+    fputs(s, f)
+    fflush(f)
+end
+
+;; ── workspace ───────────────────────────────────────────────────────────────
+fn item_name(it: ast::Node) -> string is
+    let t: string = it.tag
+    if t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "TypeAlias" || t == "ConstDef" is return it.text end
+    return ""
+end
+
+fn is_named_item(it: ast::Node) -> bool is
+    let t: string = it.tag
+    return t == "Fn" || t == "Struct" || t == "Enum" || t == "Trait" || t == "TypeAlias" || t == "ConstDef"
+end
+
+pub fn resolve_workspace_import(r: Resolver, member: string, has_module: bool, module: string, has_item: bool, item: string, alias: string, start_dir: string) -> Expanded is
+    let project_root: string = bit_resolve::find_bit_workspace_root(start_dir)
+    let member_dir: string = bit_resolve::find_workspace_member_dir(project_root, member)
+    if member_dir == "" is
+        return ex_err("workspace member '" + member + "' not found under " + project_root + ".\n\nhint: `use \"workspace -> " + member + "\"` looks for `" + member + "` in the root `Bit.hk`'s `[workspace] -> members => [...]` list (either listed exactly as \"" + member + "\", or as a path ending in \"/" + member + "\", e.g. \"source-code/" + member + "\") — check " + project_root + "/Bit.hk (or bit.hk).\n")
+    end
+    let entry: string = bit_resolve::workspace_member_entry(member_dir)
+    let mut src_dir: string = member_dir
+    let ep: bit_resolve::Parent = bit_resolve::parent_of(entry)
+    if ep.has is src_dir = ep.path end
+    let mut path: string = ""
+    if !has_module is
+        if !fs::exists(entry) is
+            return ex_err("workspace member '" + member + "''s build entry " + entry + " does not exist (checked the entry keys of " + member_dir + "/Bit.hk and `<src>/lib.h#`/`<src>/main.h#`).")
+        end
+        path = entry
+    else
+        let cands: [string] = [module + ".h#", module + "/mod.h#", module + "/main.h#"]
+        for c in cands is
+            let p: string = bit_resolve::pjoin(src_dir, c)
+            if path == "" && fs::is_file(p) is path = p end
+        end
+        if path == "" is
+            return ex_err("workspace member '" + member + "': module '" + module + "' not found (expected " + module + ".h#, " + module + "/mod.h#, or " + module + "/main.h# under " + src_dir + ")")
+        end
+    end
+    let canon: string = bit_resolve::canonical(path)
+    if r.inlined_files.has(canon) is return ex_ok([]) end
+    r.inlined_files.add(canon)
+    let src: string = fs::read(path)
+    let res: parser::ParseResult = parse_file(r, src, path, false)
+    if parser::has_errors(res) is
+        return ex_err("parse errors in workspace member '" + member + "' (" + path + "):\n" + parser::render_errors(res))
+    end
+    let sub: ast::Node = res.module
+    let mut sub_dir: string = src_dir
+    let pp: bit_resolve::Parent = bit_resolve::parent_of(path)
+    if pp.has is sub_dir = pp.path end
+    let mut out: [ast::Node] = []
+    let e0: string = resolve_imports(r, sub.kids[2].kids, sub_dir, out)
+    if e0 != "" is return ex_err(e0) end
+    let mut raw: [ast::Node] = sub.kids[3].kids
+    if has_item && item != "*" is
+        let mut kept: [ast::Node] = []
+        for it in sub.kids[3].kids is
+            if is_named_item(it) && item_name(it) == item is kept.push(it) end
+        end
+        raw = kept
+    end
+    if raw.len() == 0 && has_item && item != "*" is
+        let mut m: string = ""
+        if has_module is m = module end
+        return ex_err("workspace member '" + member + "', module '" + m + "': no item named '" + item + "' found")
+    end
+    let mangled: [ast::Node] = mangle_module_items(raw, alias)
+    let ex: Expanded = expand_module(r, mangled, sub_dir)
+    if !ex.ok is return ex end
+    for it in ex.items is out.push(it) end
+    return ex_ok(out)
+end
+
+;; ── program entry ───────────────────────────────────────────────────────────
+pub fn expand_program(r: Resolver, module: ast::Node, entry_dir: string) -> Expanded is
+    let mut items: [ast::Node] = []
+    let e0: string = resolve_imports(r, module.kids[2].kids, entry_dir, items)
+    if e0 != "" is return ex_err(e0) end
+    let ex: Expanded = expand_module(r, module.kids[3].kids, entry_dir)
+    if !ex.ok is return ex end
+    for it in ex.items is items.push(it) end
+    return ex_ok(items)
+end
+
+;; ── `mod X` ─────────────────────────────────────────────────────────────────
+fn apply_mem_item(it: ast::Node, mode: string) is
+    if it.tag == "Fn" is
+        if it.kids[6].text == "Default" is it.kids[6].text = mode end
+    elsif it.tag == "Impl" is
+        for m in it.kids[1].kids is
+            if m.kids[6].text == "Default" is m.kids[6].text = mode end
+        end
+    elsif it.tag == "ModDecl" && it.kids[1].tag == "Inline" is
+        for s in it.kids[1].kids is apply_mem_item(s, mode) end
+    end
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    for x in xs is
+        if x == s is return true end
+    end
+    return false
+end
+
+fn load(r: Resolver, mod_name: string, from_dir: string) -> Loaded is
+    let cands: [string] = [mod_name + ".h#", mod_name + "/mod.h#", mod_name + "/main.h#"]
+    let mut dirs: [string] = [from_dir]
+    for p in r.search_paths is
+        if !bit_resolve::path_eq(p, from_dir) is dirs.push(p) end
+    end
+    let mut anc: [string] = []
+    let mut cur: bit_resolve::Parent = bit_resolve::parent_of(from_dir)
+    let mut depth: int = 0
+    while cur.has is
+        if depth >= 4 || cur.path == "" is break end
+        anc.push(cur.path)
+        if fs::exists(bit_resolve::pjoin(cur.path, "Bit.hk")) is break end
+        cur = bit_resolve::parent_of(cur.path)
+        depth += 1
+    end
+    for a in anc is
+        let mut seen: bool = false
+        for d in dirs is
+            if bit_resolve::path_eq(d, a) is seen = true end
+        end
+        if !seen is dirs.push(a) end
+    end
+    for d in bit_resolve::dependency_source_dirs(from_dir) is
+        let mut seen: bool = false
+        for x in dirs is
+            if bit_resolve::path_eq(x, d) is seen = true end
+        end
+        if !seen is dirs.push(d) end
+    end
+    for dir in dirs is
+        for c in cands is
+            let path: string = bit_resolve::pjoin(dir, c)
+            if fs::exists(path) is
+                let src: string = fs::read(path)
+                let res: parser::ParseResult = parse_file(r, src, path, false)
+                if parser::has_errors(res) is
+                    let mut fatal: bool = false
+                    for e in res.errors is
+                        if edition::is_edition_diagnostic(e.message) is fatal = true end
+                    end
+                    let mut pre: string = ""
+                    if fatal is pre = edition_fatal() end
+                    return Loaded { ok: false, err: pre + "parse errors in " + path + ": " + parser::render_errors(res), items: [], imports: [], path: "" }
+                end
+                let sub: ast::Node = res.module
+                let fm: string = sub.kids[1].text
+                if fm != "" is
+                    for it in sub.kids[3].kids is apply_mem_item(it, fm) end
+                end
+                return Loaded { ok: true, err: "", items: sub.kids[3].kids, imports: sub.kids[2].kids, path: bit_resolve::canonical(path) }
+            end
+        end
+    end
+    let mut searched: [string] = [from_dir]
+    for p in r.search_paths is searched.push(p) end
+    return Loaded { ok: false, err: "module '" + mod_name + "' not found\n  Searched: " + join_strs(searched, ", ") + "\n  Expected: " + mod_name + ".h#", items: [], imports: [], path: "" }
+end
+
+fn resolve(r: Resolver, mod_name: string, from_dir: string) -> Loaded is
+    let key: string = from_dir + "\u{1}" + mod_name
+    let mut i: int = 0
+    while i < r.cache_keys.len() is
+        if r.cache_keys[i] == key is return r.cache_vals[i] end
+        i += 1
+    end
+    let l: Loaded = load(r, mod_name, from_dir)
+    r.cache_keys.push(key)
+    r.cache_vals.push(l)
+    return l
+end
+
+fn eprint2(s: string) is
+    fflush(0)
+    let f: int = fdopen(2, "w")
+    fputs(s, f)
+    fflush(f)
+end
+
+extern [c] is
+    fn fdopen(fd: int, mode: string) -> int
+    fn fputs(s: string, f: int) -> int
+    fn fflush(f: int) -> int
+end
+
+pub fn expand_module(r: Resolver, items: [ast::Node], current_dir: string) -> Expanded is
+    let mut expanded: [ast::Node] = []
+    for item in items is
+        if item.tag == "ModDecl" && item.kids[1].tag == "Inline" is
+            let mangled: [ast::Node] = mangle_module_items(item.kids[1].kids, item.text)
+            let sub: Expanded = expand_module(r, mangled, current_dir)
+            if !sub.ok is return sub end
+            for s in sub.items is expanded.push(s) end
+        elsif item.tag == "ModDecl" is
+            let name: string = item.text
+            let l: Loaded = resolve(r, name, current_dir)
+            if l.ok is
+                if r.inlined_files.has(l.path) is continue end
+                r.inlined_files.add(l.path)
+                let resolved_dir: string = dir_of(l.path)
+                let mut sub_expanded: [ast::Node] = []
+                let e0: string = resolve_imports(r, l.imports, resolved_dir, sub_expanded)
+                if e0 != "" is return ex_err(e0) end
+                let mangled: [ast::Node] = mangle_module_items(l.items, name)
+                let sub: Expanded = expand_module(r, mangled, resolved_dir)
+                if !sub.ok is return sub end
+                for s in sub.items is sub_expanded.push(s) end
+                for s in sub_expanded is expanded.push(s) end
+            elsif starts_with(l.err, edition_fatal()) is
+                return ex_err(l.err[edition_fatal().len()..l.err.len()])
+            elsif starts_with(l.err, "parse errors in ") is
+                ;; a syntax error inside a `mod` file used to be a warning: the build went on without that file's
+                ;; definitions (exit 0) and failed later with a baffling "undefined fn" — or never.  It is an error now.
+                return ex_err(l.err)
+            else
+                eprint2("warn: " + l.err + "\n")
+            end
+        else
+            expanded.push(item)
+        end
+    end
+    return ex_ok(expanded)
+end
+
+;; ── mangling ────────────────────────────────────────────────────────────────
+fn pre(prefix: string, n: string) -> string is return prefix + "_" + n end
+
+fn rename_type(t: ast::Node, local_types: map::Set<string>, prefix: string) is
+    let g: string = t.tag
+    if g == "Named" is
+        if local_types.has(t.text) is t.text = pre(prefix, t.text) end
+    elsif g == "Generic" is
+        if local_types.has(t.text) is t.text = pre(prefix, t.text) end
+        for a in t.kids is rename_type(a, local_types, prefix) end
+    elsif g == "Array" || g == "Slice" || g == "Optional" || g == "Ref" || g == "RefMut" || g == "Tuple" is
+        for k in t.kids is rename_type(k, local_types, prefix) end
+    elsif g == "Fn" is
+        for p in t.kids[0].kids is rename_type(p, local_types, prefix) end
+        rename_type(t.kids[1], local_types, prefix)
+    end
+end
+
+fn rename_pattern(p: ast::Node, local_types: map::Set<string>, prefix: string) is
+    let g: string = p.tag
+    if g == "PEnum" is
+        let q: ast::Node = p.kids[0]
+        if q.text != "" && local_types.has(q.text) is q.text = pre(prefix, q.text) end
+        let mut i: int = 1
+        while i < p.kids.len() is
+            rename_pattern(p.kids[i], local_types, prefix)
+            i += 1
+        end
+    elsif g == "PStruct" is
+        if local_types.has(p.text) is p.text = pre(prefix, p.text) end
+    elsif g == "PTuple" || g == "POr" || g == "PRange" is
+        for k in p.kids is rename_pattern(k, local_types, prefix) end
+    end
+end
+
+fn rename_stmts(ss: [ast::Node], local_fns: map::Set<string>, local_types: map::Set<string>, prefix: string, shadow: map::Set<string>) is
+    for s in ss is rename_stmt(s, local_fns, local_types, prefix, shadow) end
+end
+
+fn rename_stmt(s: ast::Node, local_fns: map::Set<string>, local_types: map::Set<string>, prefix: string, shadow: map::Set<string>) is
+    let g: string = s.tag
+    if g == "Let" is
+        if s.kids[2].tag != "None" is
+            rename_expr(s.kids[2], local_fns, local_types, prefix, shadow)
+            if s.kids[1].tag != "None" is rename_type(s.kids[1], local_types, prefix) end
+        elsif s.kids[1].tag != "None" is
+            rename_type(s.kids[1], local_types, prefix)
+        end
+    elsif g == "ExprStmt" is
+        rename_expr(s.kids[0], local_fns, local_types, prefix, shadow)
+    elsif g == "Return" || g == "Break" is
+        if s.kids[0].tag != "None" is rename_expr(s.kids[0], local_fns, local_types, prefix, shadow) end
+    elsif g == "Fn" is
+        rename_stmts(s.kids[4].kids, local_fns, local_types, prefix, shadow)
+        for p in s.kids[2].kids is rename_type(p.kids[1], local_types, prefix) end
+        if s.kids[3].tag != "None" is rename_type(s.kids[3], local_types, prefix) end
+    end
+end
+
+fn rename_args(a: ast::Node, local_fns: map::Set<string>, local_types: map::Set<string>, prefix: string, shadow: map::Set<string>) is
+    for x in a.kids is rename_expr(x, local_fns, local_types, prefix, shadow) end
+end
+
+fn rename_expr(e: ast::Node, local_fns: map::Set<string>, local_types: map::Set<string>, prefix: string, shadow: map::Set<string>) is
+    let g: string = e.tag
+    if g == "Call" is
+        let c: ast::Node = e.kids[0]
+        if c.tag == "Ident" && local_fns.has(c.text) && !shadow.has(c.text) is
+            c.text = pre(prefix, c.text)
+        else
+            rename_expr(c, local_fns, local_types, prefix, shadow)
+        end
+        rename_args(e.kids[1], local_fns, local_types, prefix, shadow)
+    elsif g == "MethodCall" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+        rename_args(e.kids[1], local_fns, local_types, prefix, shadow)
+    elsif g == "BinOp" || g == "Range" || g == "Assign" || g == "CompoundAssign" || g == "IndexAccess" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+        rename_expr(e.kids[1], local_fns, local_types, prefix, shadow)
+    elsif g == "UnOp" || g == "Try" || g == "Await" || g == "FieldAccess" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+    elsif g == "Cast" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+        rename_type(e.kids[1], local_types, prefix)
+    elsif g == "ArrayLit" || g == "TupleLit" is
+        for x in e.kids is rename_expr(x, local_fns, local_types, prefix, shadow) end
+    elsif g == "StructLit" is
+        if local_types.has(e.text) is e.text = pre(prefix, e.text) end
+        for f in e.kids is rename_expr(f.kids[0], local_fns, local_types, prefix, shadow) end
+    elsif g == "If" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+        rename_stmts(e.kids[1].kids, local_fns, local_types, prefix, shadow)
+        for br in e.kids[2].kids is
+            rename_expr(br.kids[0], local_fns, local_types, prefix, shadow)
+            rename_stmts(br.kids[1].kids, local_fns, local_types, prefix, shadow)
+        end
+        if e.kids[3].tag != "None" is rename_stmts(e.kids[3].kids, local_fns, local_types, prefix, shadow) end
+    elsif g == "Match" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+        for arm in e.kids[1].kids is
+            rename_pattern(arm.kids[0], local_types, prefix)
+            if arm.kids[1].tag != "None" is rename_expr(arm.kids[1], local_fns, local_types, prefix, shadow) end
+            rename_stmts(arm.kids[2].kids, local_fns, local_types, prefix, shadow)
+        end
+    elsif g == "While" is
+        rename_expr(e.kids[0], local_fns, local_types, prefix, shadow)
+        rename_stmts(e.kids[1].kids, local_fns, local_types, prefix, shadow)
+    elsif g == "For" is
+        rename_expr(e.kids[1], local_fns, local_types, prefix, shadow)
+        rename_stmts(e.kids[2].kids, local_fns, local_types, prefix, shadow)
+    elsif g == "Do" || g == "Unsafe" is
+        rename_stmts(e.kids[0].kids, local_fns, local_types, prefix, shadow)
+    elsif g == "Closure" is
+        rename_stmts(e.kids[2].kids, local_fns, local_types, prefix, shadow)
+    elsif g == "ReturnE" is
+        if e.kids[0].tag != "None" is rename_expr(e.kids[0], local_fns, local_types, prefix, shadow) end
+    elsif g == "Path" is
+        let segs: [string] = split_path_segs(e.text)
+        if segs.len() >= 2 && local_types.has(segs[0]) is
+            segs[0] = pre(prefix, segs[0])
+            e.text = join_strs(segs, "::")
+        end
+    elsif g == "Ident" is
+        if local_fns.has(e.text) && !shadow.has(e.text) is e.text = pre(prefix, e.text) end
+    end
+end
+
+;; names bound inside a function body (params, lets, patterns, closure params, nested fn params)
+fn bound_pattern(p: ast::Node, out: map::Set<string>) is
+    let g: string = p.tag
+    if g == "PIdent" is
+        out.add(p.text)
+    elsif g == "PTuple" || g == "POr" is
+        for q in p.kids is bound_pattern(q, out) end
+    elsif g == "PEnum" is
+        let mut i: int = 1
+        while i < p.kids.len() is
+            bound_pattern(p.kids[i], out)
+            i += 1
+        end
+    elsif g == "PRange" is
+        bound_pattern(p.kids[0], out)
+        bound_pattern(p.kids[1], out)
+    end
+end
+
+fn bound_stmts(ss: [ast::Node], out: map::Set<string>) is
+    for s in ss is
+        let g: string = s.tag
+        if g == "Let" is
+            out.add(s.text)
+            if s.kids[2].tag != "None" is bound_expr(s.kids[2], out) end
+        elsif g == "ExprStmt" is
+            bound_expr(s.kids[0], out)
+        elsif g == "Return" || g == "Break" is
+            if s.kids[0].tag != "None" is bound_expr(s.kids[0], out) end
+        elsif g == "Fn" is
+            for p in s.kids[2].kids is out.add(p.text) end
+            bound_stmts(s.kids[4].kids, out)
+        end
+    end
+end
+
+fn bound_expr(e: ast::Node, out: map::Set<string>) is
+    let g: string = e.tag
+    if g == "Call" || g == "MethodCall" is
+        bound_expr(e.kids[0], out)
+        for a in e.kids[1].kids is bound_expr(a, out) end
+    elsif g == "BinOp" || g == "Range" || g == "Assign" || g == "CompoundAssign" || g == "IndexAccess" is
+        bound_expr(e.kids[0], out)
+        bound_expr(e.kids[1], out)
+    elsif g == "UnOp" || g == "Cast" || g == "Try" || g == "Await" || g == "FieldAccess" is
+        bound_expr(e.kids[0], out)
+    elsif g == "ReturnE" is
+        if e.kids[0].tag != "None" is bound_expr(e.kids[0], out) end
+    elsif g == "ArrayLit" || g == "TupleLit" is
+        for x in e.kids is bound_expr(x, out) end
+    elsif g == "StructLit" is
+        for f in e.kids is bound_expr(f.kids[0], out) end
+    elsif g == "If" is
+        bound_expr(e.kids[0], out)
+        bound_stmts(e.kids[1].kids, out)
+        for br in e.kids[2].kids is
+            bound_expr(br.kids[0], out)
+            bound_stmts(br.kids[1].kids, out)
+        end
+        if e.kids[3].tag != "None" is bound_stmts(e.kids[3].kids, out) end
+    elsif g == "Match" is
+        bound_expr(e.kids[0], out)
+        for a in e.kids[1].kids is
+            bound_pattern(a.kids[0], out)
+            if a.kids[1].tag != "None" is bound_expr(a.kids[1], out) end
+            bound_stmts(a.kids[2].kids, out)
+        end
+    elsif g == "While" is
+        bound_expr(e.kids[0], out)
+        bound_stmts(e.kids[1].kids, out)
+    elsif g == "For" is
+        bound_pattern(e.kids[0], out)
+        bound_expr(e.kids[1], out)
+        bound_stmts(e.kids[2].kids, out)
+    elsif g == "Do" || g == "Unsafe" is
+        bound_stmts(e.kids[0].kids, out)
+    elsif g == "Closure" is
+        for p in e.kids[0].kids is out.add(p.text) end
+        bound_stmts(e.kids[2].kids, out)
+    end
+end
+
+fn rename_fn_body(params: ast::Node, body: ast::Node, local_fns: map::Set<string>, local_types: map::Set<string>, prefix: string) is
+    let bound: map::Set<string> = map::Set::new()
+    for p in params.kids is bound.add(p.text) end
+    bound_stmts(body.kids, bound)
+    rename_stmts(body.kids, local_fns, local_types, prefix, bound)
+end
+
+fn rename_fn_signature(f: ast::Node, local_types: map::Set<string>, prefix: string) is
+    for p in f.kids[2].kids is rename_type(p.kids[1], local_types, prefix) end
+    if f.kids[3].tag != "None" is rename_type(f.kids[3], local_types, prefix) end
+end
+
+fn rename_fields(fields: ast::Node, local_types: map::Set<string>, prefix: string) is
+    for f in fields.kids is rename_type(f.kids[1], local_types, prefix) end
+end
+
+pub fn mangle_module_items(items: [ast::Node], prefix: string) -> [ast::Node] is
+    let local_fns: map::Set<string> = map::Set::new()
+    let local_types: map::Set<string> = map::Set::new()
+    for it in items is
+        if it.tag == "Fn" is local_fns.add(it.text) end
+        if it.tag == "Struct" || it.tag == "Enum" is local_types.add(it.text) end
+    end
+    if local_fns.len() == 0 && local_types.len() == 0 is return items end
+    let mut out: [ast::Node] = []
+    for it in items is
+        let g: string = it.tag
+        if g == "Fn" is
+            rename_fn_body(it.kids[2], it.kids[4], local_fns, local_types, prefix)
+            rename_fn_signature(it, local_types, prefix)
+            it.text = pre(prefix, it.text)
+        elsif g == "Struct" is
+            it.text = pre(prefix, it.text)
+            rename_fields(it.kids[1], local_types, prefix)
+        elsif g == "Enum" is
+            it.text = pre(prefix, it.text)
+            for v in it.kids[1].kids is
+                let vf: ast::Node = v.kids[0]
+                if vf.tag == "Tuple" is
+                    for t in vf.kids is rename_type(t, local_types, prefix) end
+                elsif vf.tag == "StructV" is
+                    rename_fields(vf.kids[0], local_types, prefix)
+                end
+            end
+        elsif g == "Impl" is
+            if local_types.has(it.text) is it.text = pre(prefix, it.text) end
+            for m in it.kids[1].kids is
+                rename_fn_body(m.kids[2], m.kids[4], local_fns, local_types, prefix)
+                rename_fn_signature(m, local_types, prefix)
+            end
+        end
+        out.push(it)
+    end
+    return out
+end
+
+;; ── nested-fn hoisting (used by cppgen) ─────────────────────────────────────
+;; removes `fn` statements from `body` (a Block node) and returns them, renamed `<enclosing>_<name>`
+pub fn hoist_nested_fns(body: ast::Node, enclosing: string) -> [ast::Node] is
+    let mut hoisted: [ast::Node] = []
+    let mut nested: [ast::Node] = []
+    let mut keep: [ast::Node] = []
+    for s in body.kids is
+        if s.tag == "Fn" is nested.push(s) else keep.push(s) end
+    end
+    if nested.len() == 0 is return hoisted end
+    body.kids = keep
+    let local_names: map::Set<string> = map::Set::new()
+    for f in nested is local_names.add(f.text) end
+    let no_types: map::Set<string> = map::Set::new()
+    let no_shadow: map::Set<string> = map::Set::new()
+    rename_stmts(body.kids, local_names, no_types, enclosing, no_shadow)
+    for f in nested is
+        rename_stmts(f.kids[4].kids, local_names, no_types, enclosing, no_shadow)
+        let new_name: string = enclosing + "_" + f.text
+        let deeper: [ast::Node] = hoist_nested_fns(f.kids[4], new_name)
+        f.text = new_name
+        hoisted.push(f)
+        for d in deeper is hoisted.push(d) end
+    end
+    return hoisted
+end
