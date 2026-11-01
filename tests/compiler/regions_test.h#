@@ -1,0 +1,47 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> compiler" from "lib -> *"
+
+#[test]
+fn test_ty_helpers() is
+    assert_eq(regions::ty_from_type_name("string"), "string")
+    assert_eq(regions::ty_from_type_name("u64"), "scalar")
+    assert_eq(regions::ty_from_type_name("Point"), "struct:Point")
+    assert_eq(regions::ty_drop_fn("bytes"), "hsh_bytes_free")
+    assert_eq(regions::ty_drop_fn("array:string"), "hsh_array_free")
+    assert_eq(regions::ty_drop_fn("struct:Point"), "")
+    assert_eq(regions::ty_needs_drop("scalar"), false)
+end
+
+#[test]
+fn test_pop_drops_unmoved_heap_values() is
+    let rs: regions::RegionStack = regions::new_stack()
+    regions::push_scope(rs)
+    regions::declare(rs, "a", "string")
+    regions::declare(rs, "n", "scalar")
+    regions::declare(rs, "b", "bytes")
+    regions::mark_moved(rs, "b")
+    let p: regions::PopResult = regions::pop(rs)
+    assert_eq(p.kind, "scope")
+    assert_eq(p.drops.len(), 1)
+    assert_eq(p.drops[0].name, "a")
+end
+
+#[test]
+fn test_in_unsafe_and_nesting() is
+    let rs: regions::RegionStack = regions::new_stack()
+    regions::push_scope(rs)
+    assert_eq(regions::in_unsafe(rs), false)
+    regions::push_arena(rs, 64)
+    regions::push_scope(rs)
+    assert_eq(regions::in_unsafe(rs), true)
+    regions::declare(rs, "x", "string")
+    regions::mark_moved(rs, "x")
+    let inner: regions::PopResult = regions::pop(rs)
+    assert_eq(inner.drops.len(), 0)
+    let outer: regions::PopResult = regions::pop(rs)
+    assert_eq(outer.kind, "arena")
+    assert_eq(regions::in_unsafe(rs), false)
+    let empty: regions::PopResult = regions::pop(regions::new_stack())
+    assert_eq(empty.kind, "scope")
+end
