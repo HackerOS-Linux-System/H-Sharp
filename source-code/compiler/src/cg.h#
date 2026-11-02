@@ -55,6 +55,13 @@ pub struct Gen is
     pub depth: int
     pub hand: map::Set<string>   ;; HAND_BUILTINS + EXTRA_HAND
     pub tc_ret: map::Map<string, string>
+    ;; caches: the compiler never frees strings/arrays, so per-call lookups that allocate (builtin table scans,
+    ;; `empty_sig()`, scanning every fn for a method name) turned into gigabytes of garbage on large programs
+    pub bknown: map::Map<string, string>     ;; builtin_known(name) -> "1"/"0"
+    pub bres: map::Map<string, string>       ;; resolve_builtin(name)
+    pub esig: FnSig                          ;; shared empty signature (read-only)
+    pub um: map::Set<string>                 ;; names of user-defined methods
+    pub um_ready: bool
 end
 
 pub fn new_gen(module: ast::Node, test_mode: bool) -> Gen is
@@ -70,7 +77,10 @@ pub fn new_gen(module: ast::Node, test_mode: bool) -> Gen is
         variant_owner: map::Map::new(), fns: map::Map::new(), externs: map::Map::new(), extern_py: map::Map::new(),
         used_builtins: map::Set::new(), tparams: [], scopes: [], declared: map::Set::new(), var_tys: [], uniq: 0,
         cur_ret: ast::nn(), cur_mode: "Default", arc_tracked: [], drop_names: [], cur_fn: "", cur_fn_is_std: false, warnings: [],
-        mf_m: [], mf_b: [], err: "", depth: 0, hand: hand, tc_ret: tcr }
+        mf_m: [], mf_b: [], err: "", depth: 0, hand: hand, tc_ret: tcr,
+        bknown: map::Map::new(), bres: map::Map::new(),
+        esig: FnSig { params: [], ret: ast::nn(), generics: [], is_async: false, is_method: false, method_name: "", self_ty: "", owner: "" },
+        um: map::Set::new(), um_ready: false }
 end
 
 ;; ── small string helpers ──────────────────────────────────────────────────────
@@ -324,8 +334,31 @@ pub fn resolve_builtin(n: string) -> string is
 end
 
 pub fn builtin_known(g: Gen, n: string) -> bool is
+    if g.bknown.has(n) is return g.bknown.get(n).unwrap_or("") == "1" end
     let r: string = resolve_builtin(n)
-    return g.hand.has(r) || registry_symbol(r) != "" || builtins::legacy_symbol(r) != ""
+    let known: bool = g.hand.has(r) || registry_symbol(r) != "" || builtins::legacy_symbol(r) != ""
+    if known is g.bknown.put(n, "1") else g.bknown.put(n, "0") end
+    return known
+end
+
+;; cached `resolve_builtin`
+pub fn resolve_builtin_c(g: Gen, n: string) -> string is
+    if g.bres.has(n) is return g.bres.get(n).unwrap_or(n) end
+    let r: string = resolve_builtin(n)
+    g.bres.put(n, r)
+    return r
+end
+
+;; is there a user-defined method called `m`? (set built once, on first use)
+pub fn user_method_exists(g: Gen, m: string) -> bool is
+    if !g.um_ready is
+        for k in g.fns.key_list() is
+            let s: FnSig = g.fns.get(k).unwrap_or(g.esig)
+            if s.is_method is g.um.add(s.method_name) end
+        end
+        g.um_ready = true
+    end
+    return g.um.has(m)
 end
 
 ;; ── errors ────────────────────────────────────────────────────────────────────
@@ -529,10 +562,31 @@ pub fn resolve_enum(g: Gen, q: string) -> string is
     return ""
 end
 
+;; Like `resolve_enum`, but honours the module qualifier of a path (`db::InstallReason`): two modules may each define an
+;; enum with the same name (`pkg/db.h#` and `libhammer/lhdb.h#` both have `InstallReason`), and the last segment alone is
+;; then ambiguous. The whole qualifier, joined with `_`, is matched exactly or as a unique `_` suffix of the mangled name.
+pub fn resolve_enum_qual(g: Gen, qual: string) -> string is
+    let last: string = rsplit_last(qual)
+    if last != qual is
+        let full: string = replace_all(qual, "::", "_")
+        if g.enums.has(full) is return full end
+        let suffix: string = "_" + full
+        let mut found: string = ""
+        let mut count: int = 0
+        for k in g.enums.key_list() is
+            if has_suffix(k, suffix) is
+                count += 1
+                found = k
+            end
+        end
+        if count == 1 is return found end
+    end
+    return resolve_enum(g, last)
+end
+
 pub fn find_variant(g: Gen, qual: string, has_q: bool, variant: string) -> VarRef is
     if has_q is
-        let q: string = rsplit_last(qual)
-        let en: string = resolve_enum(g, q)
+        let en: string = resolve_enum_qual(g, qual)
         if en != "" is
             let i: int = variant_index(g.enums.get(en).unwrap_or(EnumInfo { params: [], variants: [] }), variant)
             if i >= 0 is return VarRef { ok: true, en: en, idx: i } end
