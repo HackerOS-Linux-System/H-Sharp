@@ -358,6 +358,30 @@ pub fn template_hdr(gens: [string]) -> string is
     return "template<" + join_with(ps, ", ") + "> "
 end
 
+;; A type written without its module prefix (`SatResult<int>` inside module `job`, while the enum lives in module
+;; `types` and is registered as `types_SatResult`): `rename_type` only prefixes types local to the module, so
+;; resolve by unique `_Name` suffix, the same way `resolve_enum` does for variants. "" = not found / ambiguous.
+pub fn resolve_type_name(g: Gen, n: string) -> string is
+    if g.structs.has(n) || g.enums.has(n) is return n end
+    let suffix: string = "_" + n
+    let mut found: string = ""
+    let mut count: int = 0
+    for k in g.enums.key_list() is
+        if has_suffix(k, suffix) is
+            count += 1
+            found = k
+        end
+    end
+    for k in g.structs.key_list() is
+        if has_suffix(k, suffix) is
+            count += 1
+            found = k
+        end
+    end
+    if count == 1 is return found end
+    return ""
+end
+
 pub fn ty(g: Gen, t: ast::Node) -> string is
     let tag: string = t.tag
     if tag == "Named" is return named_ty(g, t.text, 0) end
@@ -369,6 +393,12 @@ pub fn ty(g: Gen, t: ast::Node) -> string is
             return tname(n) + "<" + join_with(a, ", ") + ">*"
         end
         if g.aliases.has(n) is return ty(g, g.aliases.get(n).unwrap_or(ast::nn())) end
+        let rn: string = resolve_type_name(g, n)
+        if rn != "" && !tparam_has(g, n) is
+            let mut a2: [string] = []
+            for x in t.kids is a2.push(ty(g, x)) end
+            return tname(rn) + "<" + join_with(a2, ", ") + ">*"
+        end
         return "hs::Any"
     end
     if tag == "Array" is return "hs::Arr<" + ty(g, t.kids[0]) + ">" end
@@ -423,6 +453,10 @@ pub fn named_ty(g: Gen, n: string, depth: int) -> string is
         let mut a: [string] = []
         for x in ei.params is a.push("hs::Any") end
         return tname(n) + "<" + join_with(a, ", ") + ">*"
+    end
+    if depth < 8 && !tparam_has(g, n) is
+        let rn: string = resolve_type_name(g, n)
+        if rn != "" && rn != n is return named_ty(g, rn, depth + 1) end
     end
     return "hs::Any"
 end
