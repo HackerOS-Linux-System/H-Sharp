@@ -120,6 +120,10 @@ fn let_stmt(g: cg::Gen, s: ast::Node) -> string is
     if !cg::is_none(t) && !cg::is_none(value) is
         decl_ty = cg::ty(g, t)
         rhs = expr_h(g, value, t)
+        if t.tag != "Optional" && (value.tag == "Ident" || value.tag == "FieldAccess") is
+            ;; `let b: string = opt_value` (checked non-nil): C++ cannot convert hs::Opt<T> to T implicitly
+            rhs = "hs::unopt({rhs})"
+        end
         has_rhs = true
     elsif !cg::is_none(t) is
         decl_ty = cg::ty(g, t)
@@ -731,9 +735,9 @@ end
 fn path_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
     let segs: [string] = path_segs(e)
     if segs.len() >= 2 is
-        let q: string = segs[segs.len() - 2]
         let v: string = segs[segs.len() - 1]
-        if cg::resolve_enum(g, q) != "" is
+        let q: string = cg::join_with(segs[0..segs.len() - 1], "::")
+        if cg::resolve_enum_qual(g, q) != "" is
             let vr: cg::VarRef = cg::find_variant(g, q, true, v)
             if vr.ok is return variant_ctor(g, vr.en, vr.idx, [], hint) end
         end
@@ -742,7 +746,7 @@ fn path_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
     let last: string = segs[segs.len() - 1]
     for cand in [snake, last] is
         if g.fns.has(cand) is
-            let sig: cg::FnSig = g.fns.get(cand).unwrap_or(empty_sig())
+            let sig: cg::FnSig = g.fns.get(cand).unwrap_or(g.esig)
             if sig.params.len() == 0 is return cg::fname(cand) + "()" end
             return cg::fname(cand)
         end
@@ -1060,9 +1064,9 @@ fn call(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
     if callee.tag == "Path" is
         let segs: [string] = path_segs(callee)
         if segs.len() >= 2 is
-            let q: string = segs[segs.len() - 2]
             let v: string = segs[segs.len() - 1]
-            if cg::resolve_enum(g, q) != "" is
+            let q: string = cg::join_with(segs[0..segs.len() - 1], "::")
+            if cg::resolve_enum_qual(g, q) != "" is
                 let vr: cg::VarRef = cg::find_variant(g, q, true, v)
                 if vr.ok is return enum_call(g, vr.en, vr.idx, args, hint, e) end
             end
@@ -1118,7 +1122,7 @@ end
 fn call_named_h(g: cg::Gen, n: string, args: [ast::Node], hint: ast::Node, at: ast::Node) -> string is
     let std_self_call: bool = g.cur_fn_is_std && n == g.cur_fn && cg::builtin_known(g, n)
     if g.fns.has(n) && !std_self_call is
-        let sig: cg::FnSig = g.fns.get(n).unwrap_or(empty_sig())
+        let sig: cg::FnSig = g.fns.get(n).unwrap_or(g.esig)
         let a: string = args_with_hints(g, args, sig.params, sig.generics)
         let mut targs: string = ""
         if sig.owner != "" && hint.tag == "Generic" is
@@ -1139,7 +1143,7 @@ fn call_named_h(g: cg::Gen, n: string, args: [ast::Node], hint: ast::Node, at: a
         return "{cg::fname(n)}({a})"
     end
     if cg::builtin_known(g, n) is
-        let r: string = cg::resolve_builtin(n)
+        let r: string = cg::resolve_builtin_c(g, n)
         g.used_builtins.add(r)
         let a: string = args_with_hints(g, args, [], [])
         return "hs_b_{r}({a})"
@@ -1170,11 +1174,7 @@ fn method_call(g: cg::Gen, e: ast::Node) -> string is
     let a: string = args_with_hints(g, e.kids[1].kids, [], [])
     let mut comma: string = ", "
     if a == "" is comma = "" end
-    let mut user_has: bool = false
-    for k in g.fns.key_list() is
-        let s: cg::FnSig = g.fns.get(k).unwrap_or(empty_sig())
-        if s.is_method && s.method_name == m is user_has = true end
-    end
+    let user_has: bool = cg::user_method_exists(g, m)
     let mm: string = trim_trailing_us(cg::kw(m))
     let b0: string = cg::method_as_builtin(m)
     if b0 != "" is
