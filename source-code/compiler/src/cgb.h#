@@ -276,10 +276,27 @@ fn for_stmt(g: cg::Gen, e: ast::Node) -> string is
 end
 
 ;; ── match ─────────────────────────────────────────────────────────────────────
+;; True when some arm of the match is the bare `nil` pattern. A later bare binding arm
+;; (`v => ...`) then receives the unwrapped value, not the `hs::Opt<T>` wrapper.
+fn match_has_nil_arm(e: ast::Node) -> bool is
+    for arm in e.kids[1].kids is
+        let p: ast::Node = arm.kids[0]
+        if p.tag == "PLit" && p.kids.len() > 0 && p.kids[0].tag == "Nil" is return true end
+        if p.tag == "PIdent" && p.text == "nil" is return true end
+    end
+    return false
+end
+
+fn bind_expr(p: ast::Node, ex: string, unwrap: bool) -> string is
+    if unwrap && p.tag == "PIdent" is return "hs::unopt({ex})" end
+    return ex
+end
+
 fn match_stmt(g: cg::Gen, e: ast::Node) -> string is
     let m: string = cg::tmp(g, "m")
     let end_l: string = cg::tmp(g, "mend")
     let subj: string = expr(g, e.kids[0])
+    let nilarm: bool = match_has_nil_arm(e)
     let mut o: string = "    {{ auto&& {m} = ({subj});\n"
     for arm in e.kids[1].kids is
         cg::push_scope(g)
@@ -289,7 +306,8 @@ fn match_stmt(g: cg::Gen, e: ast::Node) -> string is
         let mut i: int = 0
         while i < pr.names.len() is
             let cn: string = cg::declare(g, pr.names[i], none())
-            bt = bt + " auto {cn} = {pr.exprs[i]};"
+            let bx: string = bind_expr(arm.kids[0], pr.exprs[i], nilarm)
+            bt = bt + " auto {cn} = {bx};"
             i += 1
         end
         let has_guard: bool = !cg::is_none(arm.kids[1])
@@ -312,6 +330,7 @@ end
 fn match_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
     let m: string = cg::tmp(g, "m")
     let subj: string = expr(g, e.kids[0])
+    let nilarm: bool = match_has_nil_arm(e)
     let mut conds: [string] = []
     let mut bodies: [string] = []
     for arm in e.kids[1].kids is
@@ -321,7 +340,8 @@ fn match_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
         let mut i: int = 0
         while i < pr.names.len() is
             let cn: string = cg::declare(g, pr.names[i], none())
-            bt = bt + " auto {cn} = {pr.exprs[i]};"
+            let bx: string = bind_expr(arm.kids[0], pr.exprs[i], nilarm)
+            bt = bt + " auto {cn} = {bx};"
             i += 1
         end
         let mut cnd: string = ""
@@ -738,7 +758,7 @@ fn variant_ctor(g: cg::Gen, en: string, vi: int, args: [string], hint: ast::Node
     let tn: string = cg::tname(en)
     let aj: string = cg::jc(args)
     if info.params.len() == 0 is return "{tn}::mk_{vname}({aj})" end
-    if hint.tag == "Generic" && hint.text == en is
+    if hint.tag == "Generic" && (hint.text == en || cg::resolve_type_name(g, hint.text) == en) is
         let mut ta: [string] = []
         for x in hint.kids is ta.push(cg::ty(g, x)) end
         return "{tn}<{cg::jc(ta)}>::mk_{vname}({aj})"
