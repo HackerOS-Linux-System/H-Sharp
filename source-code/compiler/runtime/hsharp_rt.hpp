@@ -122,6 +122,12 @@ template<class T> struct Opt {
     explicit operator bool() const { return has; }
 };
 
+// `match opt is nil => .. v => .. end`: a bare binding arm after a `nil` arm sees the unwrapped value.
+// Non-optional subjects pass through unchanged.
+template<class T> inline const T& unopt(const Opt<T>& o) { return o.v; }
+template<class T> inline T& unopt(Opt<T>& o) { return o.v; }
+template<class T> inline T&& unopt(T&& x) { return std::forward<T>(x); }
+
 template<class T> struct Arr {
     HshArray* a;
     Arr() : a(nullptr) {}
