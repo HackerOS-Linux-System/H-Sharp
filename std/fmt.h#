@@ -57,12 +57,12 @@ end
 ;; Word-wrap at `width` columns (breaks on spaces; a single word longer
 ;; than `width` is not itself split).
 pub fn wrap(s: string, width: int) -> string is
-    let words = __builtin_str_split_whitespace(s)
-    let mut out = ""
-    let mut line_len = 0
-    let mut i = 0
+    let words: [string] = __builtin_str_split_whitespace(s)
+    let mut out: string = ""
+    let mut line_len: int = 0
+    let mut i: int = 0
     while i < words.len() is
-        let w = words[i]
+        let w: string = words[i]
         if line_len > 0 && line_len + 1 + w.len() > width is
             out = out + "\n"
             line_len = 0
