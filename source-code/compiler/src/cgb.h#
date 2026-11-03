@@ -280,6 +280,14 @@ fn for_stmt(g: cg::Gen, e: ast::Node) -> string is
 end
 
 ;; ── match ─────────────────────────────────────────────────────────────────────
+fn tern_unsafe(code: string) -> bool is
+    let words: [string] = ["return ", "break;", "continue;", "co_await", "co_yield", "goto "]
+    for w in words is
+        if string_find(code, w) >= 0 is return true end
+    end
+    return false
+end
+
 ;; True when some arm of the match is the bare `nil` pattern. A later bare binding arm
 ;; (`v => ...`) then receives the unwrapped value, not the `hs::Opt<T>` wrapper.
 fn match_has_nil_arm(e: ast::Node) -> bool is
@@ -633,9 +641,25 @@ pub fn expr_h(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
             cs.push(cond(g, el.kids[0]))
             bs.push(block_value(g, el.kids[1].kids, "", hint))
         end
+        ;; with an `else`, branches go through hs::tern (common result type, lazy lambdas); a branch that contains
+        ;; control flow (`return`, `break`, `co_await`, ...) cannot live inside a lambda, so that keeps the plain `?:`
+        let has_else: bool = !cg::is_none(e.kids[3])
+        let mut lam_ok: bool = has_else
+        if has_else is
+            let mut k: int = 0
+            while k < bs.len() is
+                if tern_unsafe(bs[k]) is lam_ok = false end
+                k += 1
+            end
+            if tern_unsafe(chain) is lam_ok = false end
+        end
         let mut j: int = cs.len() - 1
         while j >= 0 is
-            chain = "({cs[j]} ? {bs[j]} : {chain})"
+            if lam_ok is
+                chain = "hs::tern({cs[j]}, [&]() {{ return {bs[j]}; }}, [&]() {{ return {chain}; }})"
+            else
+                chain = "({cs[j]} ? {bs[j]} : {chain})"
+            end
             j -= 1
         end
         return chain
