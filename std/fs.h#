@@ -13,8 +13,8 @@ pub fn read_lines(path: string) -> [string] is
 end
 
 ;; Write string to file (creates or overwrites).
-pub fn write(path: string, content: string) is
-    __builtin_fs_write(path, content)
+pub fn write(path: string, content: string) -> bool is
+    return __builtin_fs_write(path, content)
 end
 
 ;; Write bytes to file.
@@ -23,8 +23,8 @@ pub fn write_bytes(path: string, data: bytes) is
 end
 
 ;; Append string to file.
-pub fn append(path: string, content: string) is
-    __builtin_fs_append(path, content)
+pub fn append(path: string, content: string) -> bool is
+    return __builtin_fs_append(path, content)
 end
 
 ;; Check if path exists.
