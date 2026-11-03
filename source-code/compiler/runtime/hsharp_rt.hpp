@@ -120,7 +120,31 @@ template<class T> struct Opt {
     template<class U, class = std::enable_if_t<std::is_convertible_v<U, T> && !is_opt<std::decay_t<U>>::value && !std::is_same_v<std::decay_t<U>, Nil>>>
     Opt(const U& x) : has(true), v((T)x) {}
     explicit operator bool() const { return has; }
+    // H# narrows `T?` to `T` after a nil check (`if x != nil then x ..`, `let y: T = x`, `f(x)`, `a = x`);
+    // the backend has no static types, so the narrowing happens here.
+    operator const T&() const { return v; }
 };
+
+// `if c then a else b`: the two branches may have different C++ types (`Str` vs `Any`, `T` vs `Opt<T>`), which makes a
+// plain `?:` ambiguous or ill-formed. Branches are lazy (lambdas); the result gets a common type.
+template<class T> struct tern_tag { using type = T; };
+template<class A, class B> constexpr auto tern_pick() {
+    using a = std::decay_t<A>; using b = std::decay_t<B>;
+    if constexpr (std::is_same_v<a, b>) return tern_tag<a>{};
+    else if constexpr (std::is_same_v<a, Any>) return tern_tag<b>{};
+    else if constexpr (std::is_same_v<b, Any>) return tern_tag<a>{};
+    else if constexpr (is_opt<a>::value && !is_opt<b>::value && std::is_convertible_v<b, a>) return tern_tag<a>{};
+    else if constexpr (is_opt<b>::value && !is_opt<a>::value && std::is_convertible_v<a, b>) return tern_tag<b>{};
+    else return tern_tag<decltype(true ? std::declval<A>() : std::declval<B>())>{};
+}
+template<class F, class G> inline auto tern(bool c, F&& f, G&& g) {
+    using A = decltype(f()); using B = decltype(g());
+    if constexpr (std::is_void_v<A> && std::is_void_v<B>) { if (c) f(); else g(); }
+    else {
+        using R = typename decltype(tern_pick<A, B>())::type;
+        if (c) return R(f()); else return R(g());
+    }
+}
 
 // `match opt is nil => .. v => .. end`: a bare binding arm after a `nil` arm sees the unwrapped value.
 // Non-optional subjects pass through unchanged.
