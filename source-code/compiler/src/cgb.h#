@@ -776,6 +776,12 @@ fn path_value(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
         end
         if g.externs.has(cand) is return cg::fname(cand) end
     end
+    ;; `module::CONST` — consts are lowered to global zero-arg fns `__hsh_const_NAME` (modules are flattened), so a
+    ;; qualified path to a const resolves by its last segment
+    if segs.len() >= 2 is
+        let tail: string = "__hsh_const_" + segs[segs.len() - 1]
+        if g.fns.has(tail) is return cg::fname(tail) + "()" end
+    end
     cg::fail_at(g, e, "undefined path `{cg::jcc(segs)}`")
     return ""
 end
@@ -1097,6 +1103,13 @@ fn call(g: cg::Gen, e: ast::Node, hint: ast::Node) -> string is
         end
         let snake: string = cg::join_with(segs, "_")
         if g.fns.has(snake) || g.externs.has(snake) || cg::builtin_known(g, snake) is return call_named_h(g, snake, args, hint, e) end
+        ;; `outer::inner::f(..)`: nested modules register `inner_f`, so drop leading segments one at a time
+        let mut drop: int = 1
+        while drop < segs.len() - 1 is
+            let cand: string = cg::join_with(segs[drop..segs.len()], "_")
+            if g.fns.has(cand) || g.externs.has(cand) is return call_named_h(g, cand, args, hint, e) end
+            drop += 1
+        end
         let last: string = segs[segs.len() - 1]
         let saved_err: string = g.err
         g.err = ""
