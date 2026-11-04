@@ -684,7 +684,7 @@ inline Bytes hs_b_string_to_bytes(Str s) {
     return r;
 }
 template<class T> inline void hs_b_array_remove(Arr<T>& a, int64_t i) { hs_m_remove(a, i); }
-inline void hs_b_assert(bool c, Str msg) { if (!c) hsh_panic(msg.p); }
+inline void hs_b_assert(bool c, Str msg = Str("assertion failed")) { if (!c) hsh_panic(msg.p); }
 inline double hs_b_math_pi() { return 3.14159265358979323846; }
 inline double hs_b_math_e() { return 2.71828182845904523536; }
 inline double hs_b_math_tau() { return 6.28318530717958647692; }
