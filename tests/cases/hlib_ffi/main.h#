@@ -1,0 +1,16 @@
+use "hlib -> demo" from "demo"
+
+fn main() is
+    write("add: " + to_string(demo::add(40, 2)))
+    write("half: " + to_string(demo::half(5.0)))
+    let a: string = demo::greet("one")
+    let b: string = demo::greet("two")
+    write(a)
+    write(b)
+    let c: Counter = demo::Counter_new("clicks")
+    demo::Counter_set_n(c, 7)
+    demo::Counter_items_push(c, 10)
+    demo::Counter_items_push(c, 20)
+    write(demo::Counter_get_name(c) + " n=" + to_string(demo::Counter_get_n(c)) + " len=" + to_string(demo::Counter_items_len(c)) + " [1]=" + to_string(demo::Counter_items_get(c, 1)))
+    demo::Counter_free(c)
+end
