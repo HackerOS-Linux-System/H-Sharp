@@ -1,0 +1,606 @@
+use "std -> map" from "map"
+use "std -> strbuf" from "strbuf"
+use "workspace -> hlib" from "lib -> *"
+mod cg
+
+pub struct FacadeOut is
+    pub cpp: string
+    pub exports: [hlib::Export]
+    pub skipped: [string]
+end
+
+;; one classified type: k = i | f | b | s | h | v | x
+pub struct TyK is
+    pub k: string
+    pub abi: string
+    pub cpp: string        ;; C++ type of the value
+    pub hn: string         ;; handle type name (k == h)
+    pub node: ast::Node    ;; the (substituted) type
+end
+
+pub struct Ctx is
+    pub g: cg::Gen
+    pub lib: string
+    pub out: strbuf::StringBuilder
+    pub exports: [hlib::Export]
+    pub skipped: [string]
+    pub done: map::Map<string, bool>
+    pub names: map::Map<string, bool>
+    pub queue: [TyK]
+end
+
+fn sym(c: Ctx, name: string) -> string is return "hksh_" + c.lib + "_" + name end
+
+fn is_int_name(n: string) -> bool is
+    return n == "int" || n == "i8" || n == "i16" || n == "i32" || n == "i64" || n == "i128" || n == "uint" || n == "u8" || n == "u16" || n == "u32" || n == "u64" || n == "u128"
+end
+
+fn none_ty() -> TyK is
+    return TyK { k: "x", abi: "", cpp: "", hn: "", node: ast::nn() }
+end
+
+;; readable, identifier-safe name of a type: int, string, Pt, Arr_int, Opt_Pt, Pair_int_string
+fn tn(c: Ctx, t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" is
+        if c.g.aliases.has(t.text) is
+            let al: ast::Node = c.g.aliases.get(t.text).unwrap_or(ast::nn())
+            if al.tag != "None" is return tn(c, al) end
+        end
+        if t.text == "bytes" is return "Arr_int" end
+        return t.text
+    end
+    if tag == "Array" is return "Arr_" + tn(c, t.kids[0]) end
+    if tag == "Optional" is return "Opt_" + tn(c, t.kids[0]) end
+    if tag == "Ref" || tag == "RefMut" is return tn(c, t.kids[0]) end
+    if tag == "Generic" is
+        let mut s: string = t.text
+        for k in t.kids is s = s + "_" + tn(c, k) end
+        return s
+    end
+    return "x"
+end
+
+fn classify(c: Ctx, t0: ast::Node) -> TyK is
+    let mut t: ast::Node = t0
+    if t.tag == "Ref" || t.tag == "RefMut" is t = t.kids[0] end
+    let tag: string = t.tag
+    if tag == "Void" is return TyK { k: "v", abi: "void", cpp: "void", hn: "", node: t } end
+    if tag == "Named" is
+        let n: string = t.text
+        if c.g.aliases.has(n) is
+            let al: ast::Node = c.g.aliases.get(n).unwrap_or(ast::nn())
+            if al.tag != "None" is return classify(c, al) end
+        end
+        if is_int_name(n) is return TyK { k: "i", abi: "i64", cpp: cg::ty(c.g, t), hn: "", node: t } end
+        if n == "f64" || n == "f32" || n == "float" is return TyK { k: "f", abi: "f64", cpp: cg::ty(c.g, t), hn: "", node: t } end
+        if n == "bool" is return TyK { k: "b", abi: "bool", cpp: "bool", hn: "", node: t } end
+        if n == "string" is return TyK { k: "s", abi: "cstr", cpp: "hs::Str", hn: "", node: t } end
+        if n == "bytes" is
+            let at: ast::Node = ast::nd("Array", "", [ast::lf("Named", "int")])
+            return classify(c, at)
+        end
+        if c.g.structs.has(n) is
+            if c.g.structs.get(n).unwrap_or(cg::StructInfo { params: [], fields: [] }).params.len() > 0 is return none_ty() end
+            return TyK { k: "h", abi: "opaque:" + n, cpp: cg::ty(c.g, t), hn: n, node: t }
+        end
+        if c.g.enums.has(n) is
+            if c.g.enums.get(n).unwrap_or(cg::EnumInfo { params: [], variants: [] }).params.len() > 0 is return none_ty() end
+            return TyK { k: "h", abi: "opaque:" + n, cpp: cg::ty(c.g, t), hn: n, node: t }
+        end
+        return none_ty()
+    end
+    if tag == "Array" is
+        let e: TyK = classify(c, t.kids[0])
+        if e.k == "x" || e.k == "v" is return none_ty() end
+        let h: string = "Arr_" + tn(c, t.kids[0])
+        return TyK { k: "h", abi: "opaque:" + h, cpp: cg::ty(c.g, t), hn: h, node: t }
+    end
+    if tag == "Optional" is
+        let e: TyK = classify(c, t.kids[0])
+        if e.k == "x" || e.k == "v" is return none_ty() end
+        let h: string = "Opt_" + tn(c, t.kids[0])
+        return TyK { k: "h", abi: "opaque:" + h, cpp: cg::ty(c.g, t), hn: h, node: t }
+    end
+    if tag == "Generic" is
+        let n: string = t.text
+        if c.g.structs.has(n) || c.g.enums.has(n) is
+            for k in t.kids is
+                let kk: TyK = classify(c, k)
+                if kk.k == "x" || kk.k == "v" is return none_ty() end
+            end
+            let h: string = tn(c, t)
+            return TyK { k: "h", abi: "opaque:" + h, cpp: cg::ty(c.g, t), hn: h, node: t }
+        end
+        return none_ty()
+    end
+    return none_ty()
+end
+
+;; value of H# type `k` -> C ABI value (an expression string)
+fn to_abi(k: TyK, e: string) -> string is
+    if k.k == "i" is return "(int64_t)(" + e + ")" end
+    if k.k == "f" is return "(double)(" + e + ")" end
+    if k.k == "b" is return "(bool)(" + e + ")" end
+    if k.k == "s" is return "(" + e + ").p" end
+    return "hs::pack<" + k.cpp + ">(" + e + ")"
+end
+
+;; C ABI value -> H# value
+fn from_abi(k: TyK, e: string) -> string is
+    if k.k == "i" || k.k == "f" || k.k == "b" is return "(" + k.cpp + ")(" + e + ")" end
+    if k.k == "s" is return "hs::Str(strdup((" + e + ") ? (" + e + ") : \"\"))" end
+    return "hs::unpack<" + k.cpp + ">(" + e + ")"
+end
+
+fn abi_c(k: TyK) -> string is
+    if k.k == "i" is return "int64_t" end
+    if k.k == "f" is return "double" end
+    if k.k == "b" is return "bool" end
+    if k.k == "s" is return "const char*" end
+    if k.k == "v" is return "void" end
+    return "int64_t"
+end
+
+fn type_src(t: ast::Node) -> string is
+    let tag: string = t.tag
+    if tag == "Named" is return t.text end
+    if tag == "Void" is return "void" end
+    if tag == "Array" is return "[" + type_src(t.kids[0]) + "]" end
+    if tag == "Optional" is return type_src(t.kids[0]) + "?" end
+    if tag == "Ref" is return "&" + type_src(t.kids[0]) end
+    if tag == "RefMut" is return "&mut " + type_src(t.kids[0]) end
+    if tag == "Generic" is
+        let mut xs: [string] = []
+        for k in t.kids is xs.push(type_src(k)) end
+        return t.text + "<" + cg::jc(xs) + ">"
+    end
+    return tag
+end
+
+;; ── emitting one wrapper ──────────────────────────────────────────────────────
+pub struct Par is
+    pub name: string
+    pub k: TyK
+end
+
+;; `body` is the C++ expression of the call result (already an H# value), `ret` its type
+fn emit_fn(c: Ctx, name: string, owner: string, ps: [Par], ret: TyK, call: string, sig: string) is
+    if c.names.has(name) is
+        c.skipped.push(name + " (name already exported)")
+        return
+    end
+    c.names.put(name, true)
+    let api: string = sym(c, name)
+    let mut decl: [string] = []
+    let mut abis: [string] = []
+    let mut i: int = 0
+    for p in ps is
+        decl.push(abi_c(p.k) + " a" + to_string(i))
+        abis.push(p.k.abi)
+        i += 1
+    end
+    let mut ret_abi: string = ""
+    if ret.k != "v" is ret_abi = ret.abi end
+    let mut line: string = "extern \"C\" __attribute__((visibility(\"default\"))) " + abi_c(ret) + " " + api + "(" + cg::jc(decl) + ") \{ "
+    if ret.k == "v" is line = line + call + "; " else line = line + "return " + to_abi(ret, call) + "; " end
+    line = line + "}\n"
+    c.out.push(line)
+    c.exports.push(hlib::Export { name: name, kind: "function", signature: sig, params: abis, returns: ret_abi, generic: false, is_macro: false, api: api, owner: owner })
+end
+
+fn args_from(ps: [Par]) -> string is
+    let mut xs: [string] = []
+    let mut i: int = 0
+    for p in ps is
+        xs.push(from_abi(p.k, "a" + to_string(i)))
+        i += 1
+    end
+    return cg::jc(xs)
+end
+
+;; ── helper ops for handle types ───────────────────────────────────────────────
+fn want(c: Ctx, k: TyK) is
+    if k.k != "h" is return end
+    if c.done.has(k.hn) is return end
+    c.done.put(k.hn, true)
+    c.queue.push(k)
+end
+
+fn par(c: Ctx, name: string, t: ast::Node) -> Par is
+    let k: TyK = classify(c, t)
+    want(c, k)
+    return Par { name: name, k: k }
+end
+
+fn gen_array(c: Ctx, k: TyK) is
+    let et: ast::Node = k.node.kids[0]
+    let e: TyK = classify(c, et)
+    want(c, e)
+    let h: string = k.hn
+    let ep: Par = Par { name: "v", k: e }
+    let hp: Par = Par { name: "h", k: k }
+    let ip: Par = Par { name: "i", k: TyK { k: "i", abi: "i64", cpp: "int64_t", hn: "", node: ast::lf("Named", "int") } }
+    let arr: string = "hs::unpack<" + k.cpp + ">(a0)"
+    let ev: string = from_abi(e, "a2")
+    emit_fn(c, h + "_new", h, [], k, "hs::Arr<" + cg::ty(c.g, et) + ">(hsh_array_new())", "fn " + h + "_new() -> " + h)
+    emit_fn(c, h + "_len", h, [hp], ip.k, arr + ".len()", "fn " + h + "_len(a: " + h + ") -> int")
+    emit_fn(c, h + "_get", h, [hp, ip], e, "hs::unpack<" + e.cpp + ">(hsh_array_get(" + arr + ".a, a1))", "fn " + h + "_get(a: " + h + ", i: int)")
+    ;; set / push take the element as their last parameter
+    let e2: Par = Par { name: "v", k: e }
+    let ev2: string = from_abi(e, "a2")
+    let ev1: string = from_abi(e, "a1")
+    let voidk: TyK = TyK { k: "v", abi: "void", cpp: "void", hn: "", node: ast::lf("Void", "") }
+    emit_fn(c, h + "_set", h, [hp, ip, e2], voidk, "hsh_array_set(" + arr + ".a, a1, hs::pack<" + e.cpp + ">(" + ev2 + "))", "fn " + h + "_set(a: " + h + ", i: int, v)")
+    emit_fn(c, h + "_push", h, [hp, e2], voidk, "hsh_array_push(" + arr + ".a, hs::pack<" + e.cpp + ">(" + ev1 + "))", "fn " + h + "_push(a: " + h + ", v)")
+end
+
+fn gen_opt(c: Ctx, k: TyK) is
+    let et: ast::Node = k.node.kids[0]
+    let e: TyK = classify(c, et)
+    want(c, e)
+    let h: string = k.hn
+    let hp: Par = Par { name: "h", k: k }
+    let ep: Par = Par { name: "v", k: e }
+    let bk: TyK = TyK { k: "b", abi: "bool", cpp: "bool", hn: "", node: ast::lf("Named", "bool") }
+    let obj: string = "hs::unpack<" + k.cpp + ">(a0)"
+    emit_fn(c, h + "_none", h, [], k, k.cpp + "()", "fn " + h + "_none() -> " + h)
+    emit_fn(c, h + "_some", h, [ep], k, k.cpp + "(" + from_abi(e, "a0") + ")", "fn " + h + "_some(v) -> " + h)
+    emit_fn(c, h + "_is_some", h, [hp], bk, obj + ".has", "fn " + h + "_is_some(o: " + h + ") -> bool")
+    emit_fn(c, h + "_get", h, [hp], e, obj + ".v", "fn " + h + "_get(o: " + h + ")")
+end
+
+;; struct / generic instance: bind = type-parameter substitution
+fn gen_struct(c: Ctx, k: TyK, name: string, params: [string], args: [ast::Node], fields: [ast::Node]) is
+    let h: string = k.hn
+    let cs: string = k.cpp
+    let mut ps: [Par] = []
+    let mut sets: [string] = []
+    let mut ok: bool = true
+    let mut i: int = 0
+    for f in fields is
+        let ft: ast::Node = cg::subst_params(f.kids[1], params, args)
+        let fk: TyK = classify(c, ft)
+        if fk.k == "x" || fk.k == "v" is
+            c.skipped.push(h + "." + f.text + " (unsupported field type " + type_src(ft) + ")")
+            ok = false
+        else
+            want(c, fk)
+            ps.push(Par { name: f.text, k: fk })
+            sets.push("r->" + cg::kw(f.text) + " = " + from_abi(fk, "a" + to_string(i)) + ";")
+            i += 1
+        end
+    end
+    if !ok is return end
+    let hp: Par = Par { name: "h", k: k }
+    let voidk: TyK = TyK { k: "v", abi: "void", cpp: "void", hn: "", node: ast::lf("Void", "") }
+    let base: string = cs[0..cs.len() - 1]
+    let mut mk: string = "(\{ " + cs + " r = hs::mk<" + base + ">(); " + cg::jsp(sets) + " r; })"
+    emit_fn(c, h + "_new", h, ps, k, mk, "fn " + h + "_new(...) -> " + h)
+    let obj: string = "hs::unpack<" + cs + ">(a0)"
+    for p in ps is
+        let fld: string = cg::kw(p.name)
+        emit_fn(c, h + "_get_" + p.name, h, [hp], p.k, obj + "->" + fld, "fn " + h + "_get_" + p.name + "(s: " + h + ")")
+        let np: Par = Par { name: "v", k: p.k }
+        emit_fn(c, h + "_set_" + p.name, h, [hp, np], voidk, obj + "->" + fld + " = " + from_abi(p.k, "a1"), "fn " + h + "_set_" + p.name + "(s: " + h + ", v)")
+    end
+end
+
+fn gen_enum(c: Ctx, k: TyK, name: string, params: [string], args: [ast::Node], variants: [ast::Node]) is
+    let h: string = k.hn
+    let cs: string = k.cpp
+    let base: string = cs[0..cs.len() - 1]
+    let hp: Par = Par { name: "h", k: k }
+    let ik: TyK = TyK { k: "i", abi: "i64", cpp: "int64_t", hn: "", node: ast::lf("Named", "int") }
+    let obj: string = "hs::unpack<" + cs + ">(a0)"
+    emit_fn(c, h + "_tag", h, [hp], ik, obj + "->tag", "fn " + h + "_tag(e: " + h + ") -> int")
+    let mut vi: int = 0
+    for v in variants is
+        let mut pts: [ast::Node] = []
+        let fk: ast::Node = v.kids[0]
+        if fk.tag == "Tuple" is
+            for t in fk.kids is pts.push(t) end
+        elsif fk.tag == "StructV" is
+            for f in fk.kids[0].kids is pts.push(f.kids[1]) end
+        end
+        let mut ps: [Par] = []
+        let mut ok: bool = true
+        let mut j: int = 0
+        for t in pts is
+            let tt: ast::Node = cg::subst_params(t, params, args)
+            let pk: TyK = classify(c, tt)
+            if pk.k == "x" || pk.k == "v" is
+                c.skipped.push(h + "::" + v.text + " (unsupported payload " + type_src(tt) + ")")
+                ok = false
+            else
+                want(c, pk)
+                ps.push(Par { name: "f" + to_string(j), k: pk })
+            end
+            j += 1
+        end
+        if ok is
+            emit_fn(c, h + "_" + v.text, h, ps, k, base + "::mk_" + v.text + "(" + args_from(ps) + ")", "fn " + h + "_" + v.text + "(...) -> " + h)
+            let mut q: int = 0
+            for p in ps is
+                emit_fn(c, h + "_" + v.text + "_get_" + to_string(q), h, [hp], p.k, obj + "->f" + to_string(vi) + "_" + to_string(q), "fn " + h + "_" + v.text + "_get_" + to_string(q) + "(e: " + h + ")")
+                q += 1
+            end
+        end
+        vi += 1
+    end
+end
+
+fn drain(c: Ctx) is
+    let mut i: int = 0
+    while i < c.queue.len() is
+        let k: TyK = c.queue[i]
+        i += 1
+        let n: ast::Node = k.node
+        if n.tag == "Array" is gen_array(c, k)
+        elsif n.tag == "Optional" is gen_opt(c, k)
+        elsif n.tag == "Named" is
+            if c.g.structs.has(n.text) is
+                let si: cg::StructInfo = c.g.structs.get(n.text).unwrap_or(cg::StructInfo { params: [], fields: [] })
+                gen_struct(c, k, n.text, [], [], si.fields)
+            elsif c.g.enums.has(n.text) is
+                let ei: cg::EnumInfo = c.g.enums.get(n.text).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+                gen_enum(c, k, n.text, [], [], ei.variants)
+            end
+        elsif n.tag == "Generic" is
+            if c.g.structs.has(n.text) is
+                let si2: cg::StructInfo = c.g.structs.get(n.text).unwrap_or(cg::StructInfo { params: [], fields: [] })
+                gen_struct(c, k, n.text, si2.params, n.kids, si2.fields)
+            elsif c.g.enums.has(n.text) is
+                let ei2: cg::EnumInfo = c.g.enums.get(n.text).unwrap_or(cg::EnumInfo { params: [], variants: [] })
+                gen_enum(c, k, n.text, ei2.params, n.kids, ei2.variants)
+            end
+        end
+    end
+    c.queue = []
+end
+
+;; ── instance list "ident<int>,Pair<int,string>" ───────────────────────────────
+pub struct Inst is
+    pub name: string
+    pub args: [ast::Node]
+end
+
+fn parse_ty(s: string) -> ast::Node is
+    let t: string = trim_s(s)
+    if t.len() > 2 && t[0..1] == "[" && t[t.len() - 1..t.len()] == "]" is
+        return ast::nd("Array", "", [parse_ty(t[1..t.len() - 1])])
+    end
+    if t.len() > 1 && t[t.len() - 1..t.len()] == "?" is
+        return ast::nd("Optional", "", [parse_ty(t[0..t.len() - 1])])
+    end
+    let lt: int = index_of(t, "<")
+    if lt > 0 && t[t.len() - 1..t.len()] == ">" is
+        let mut ks: [ast::Node] = []
+        for a in split_top(t[lt + 1..t.len() - 1]) is ks.push(parse_ty(a)) end
+        return ast::nd("Generic", t[0..lt], ks)
+    end
+    return ast::lf("Named", t)
+end
+
+fn index_of(s: string, p: string) -> int is
+    let mut i: int = 0
+    while i + p.len() <= s.len() is
+        if s[i..i + p.len()] == p is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn split_top(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut depth: int = 0
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let ch: string = s[i..i + 1]
+        if ch == "<" || ch == "[" is depth += 1 end
+        if ch == ">" || ch == "]" is depth -= 1 end
+        if ch == "," && depth == 0 is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + ch
+        end
+        i += 1
+    end
+    if trim_s(cur) != "" is out.push(cur) end
+    return out
+end
+
+pub fn parse_insts(s: string) -> [Inst] is
+    let mut out: [Inst] = []
+    for part in split_top(s) is
+        let n: ast::Node = parse_ty(part)
+        if n.tag == "Generic" is out.push(Inst { name: n.text, args: n.kids }) end
+    end
+    return out
+end
+
+;; ── driver ────────────────────────────────────────────────────────────────────
+fn is_pub(f: ast::Node) -> bool is
+    return cg::has_sub("," + f.kids[5].text + ",", ",pub,")
+end
+
+fn is_async(f: ast::Node) -> bool is
+    return cg::has_sub("," + f.kids[5].text + ",", ",async,")
+end
+
+fn tparams(f: ast::Node) -> [string] is
+    let mut out: [string] = []
+    for t in f.kids[1].kids is out.push(t.text) end
+    return out
+end
+
+fn sig_of(name: string, ps: [Par], ret: TyK, f: ast::Node) -> string is
+    let mut xs: [string] = []
+    for p in f.kids[2].kids is xs.push(p.text + ": " + type_src(p.kids[1])) end
+    let mut s: string = "fn " + name + "(" + cg::jc(xs) + ")"
+    if !cg::is_none(f.kids[3]) is s = s + " -> " + type_src(f.kids[3]) end
+    return s
+end
+
+;; export one function (free fn, or impl method flattened to `Owner_method`) under `export_name`;
+;; `targs` = explicit C++ template arguments (generic instances), `params`/`args` = their substitution
+fn export_fn(c: Ctx, f: ast::Node, cname: string, export_name: string, owner: string, params: [string], args: [ast::Node], targs: [string]) is
+    if is_async(f) is
+        c.skipped.push(export_name + " (async)")
+        return
+    end
+    let mut ps: [Par] = []
+    for p in f.kids[2].kids is
+        let pt: ast::Node = cg::subst_params(p.kids[1], params, args)
+        let pk: TyK = classify(c, pt)
+        if pk.k == "x" || pk.k == "v" is
+            c.skipped.push(export_name + " (unsupported parameter `" + p.text + ": " + type_src(pt) + "`)")
+            return
+        end
+        want(c, pk)
+        ps.push(Par { name: p.text, k: pk })
+    end
+    let mut rk: TyK = TyK { k: "v", abi: "void", cpp: "void", hn: "", node: ast::lf("Void", "") }
+    if !cg::is_none(f.kids[3]) && f.kids[3].tag != "Void" is
+        let rt: ast::Node = cg::subst_params(f.kids[3], params, args)
+        rk = classify(c, rt)
+        if rk.k == "x" is
+            c.skipped.push(export_name + " (unsupported return type " + type_src(rt) + ")")
+            return
+        end
+        want(c, rk)
+    end
+    let mut callee: string = cname
+    if targs.len() > 0 is callee = cname + "<" + cg::jc(targs) + ">" end
+    emit_fn(c, export_name, owner, ps, rk, callee + "(" + args_from(ps) + ")", sig_of(export_name, ps, rk, f))
+end
+
+fn inst_targs(c: Ctx, args: [ast::Node]) -> [string] is
+    let mut out: [string] = []
+    for a in args is out.push(cg::ty(c.g, a)) end
+    return out
+end
+
+fn inst_suffix(c: Ctx, args: [ast::Node]) -> string is
+    let mut s: string = ""
+    for a in args is s = s + "_" + tn(c, a) end
+    return s
+end
+
+fn walk(c: Ctx, items: [ast::Node], insts: [Inst]) is
+    for it in items is
+        let t: string = it.tag
+        if t == "Fn" && is_pub(it) is
+            let gens: [string] = tparams(it)
+            if gens.len() == 0 is
+                export_fn(c, it, cg::fname(it.text), it.text, "", [], [], [])
+            else
+                let mut found: bool = false
+                for ins in insts is
+                    if ins.name == it.text is
+                        found = true
+                        if ins.args.len() != gens.len() is
+                            c.skipped.push(it.text + " (instance has " + to_string(ins.args.len()) + " type arguments, the function has " + to_string(gens.len()) + ")")
+                        else
+                            export_fn(c, it, cg::fname(it.text), it.text + inst_suffix(c, ins.args), "", gens, ins.args, inst_targs(c, ins.args))
+                        end
+                    end
+                end
+                if !found is c.skipped.push(it.text + " (generic — name an instance with --ffi-inst \"" + it.text + "<...>\")") end
+            end
+        elsif t == "Struct" && it.kids[2].text == "true" is
+            if it.kids[0].kids.len() == 0 is
+                want(c, classify(c, ast::lf("Named", it.text)))
+            else
+                let mut found2: bool = false
+                for ins in insts is
+                    if ins.name == it.text is
+                        found2 = true
+                        let gt: ast::Node = ast::nd("Generic", it.text, ins.args)
+                        want(c, classify(c, gt))
+                    end
+                end
+                if !found2 is c.skipped.push(it.text + " (generic struct — name an instance with --ffi-inst)") end
+            end
+        elsif t == "Enum" && it.kids[2].text == "true" is
+            if it.kids[0].kids.len() == 0 is
+                want(c, classify(c, ast::lf("Named", it.text)))
+            else
+                let mut found3: bool = false
+                for ins in insts is
+                    if ins.name == it.text is
+                        found3 = true
+                        want(c, classify(c, ast::nd("Generic", it.text, ins.args)))
+                    end
+                end
+                if !found3 is c.skipped.push(it.text + " (generic enum — name an instance with --ffi-inst)") end
+            end
+        elsif t == "Impl" is
+            walk_impl(c, it, insts)
+        elsif t == "ModDecl" && it.kids[0].text == "true" && it.kids[1].tag == "Inline" is
+            walk(c, it.kids[1].kids, insts)
+        end
+    end
+end
+
+fn walk_impl(c: Ctx, it: ast::Node, insts: [Inst]) is
+    let owner: string = it.text
+    let mut sparams: [string] = []
+    if c.g.structs.has(owner) is sparams = c.g.structs.get(owner).unwrap_or(cg::StructInfo { params: [], fields: [] }).params
+    elsif c.g.enums.has(owner) is sparams = c.g.enums.get(owner).unwrap_or(cg::EnumInfo { params: [], variants: [] }).params
+    else return end
+    ;; only impls of exported (pub) types — a private type has no handle contract
+    let mut is_pub_ty: bool = false
+    for x in c.g.module.kids[3].kids is
+        if (x.tag == "Struct" || x.tag == "Enum") && x.text == owner && x.kids[2].text == "true" is is_pub_ty = true end
+    end
+    if !is_pub_ty is return end
+    for m in it.kids[1].kids is
+        if !is_pub(m) is continue end
+        if tparams(m).len() > 0 is
+            c.skipped.push(owner + "_" + m.text + " (method with its own type parameters)")
+            continue
+        end
+        let cname: string = cg::fname(owner + "_" + m.text)
+        if sparams.len() == 0 is
+            let selfty: ast::Node = ast::lf("Named", owner)
+            let m2: ast::Node = cg::deep_clone(m)
+            for p in m2.kids[2].kids is p.kids[1] = cg::subst_self(p.kids[1], selfty) end
+            if !cg::is_none(m2.kids[3]) is m2.kids[3] = cg::subst_self(m2.kids[3], selfty) end
+            export_fn(c, m2, cname, owner + "_" + m.text, owner, [], [], [])
+        else
+            let mut found: bool = false
+            for ins in insts is
+                if ins.name == owner && ins.args.len() == sparams.len() is
+                    found = true
+                    let selfty2: ast::Node = ast::nd("Generic", owner, ins.args)
+                    let m3: ast::Node = cg::deep_clone(m)
+                    for p in m3.kids[2].kids is p.kids[1] = cg::subst_self(p.kids[1], selfty2) end
+                    if !cg::is_none(m3.kids[3]) is m3.kids[3] = cg::subst_self(m3.kids[3], selfty2) end
+                    export_fn(c, m3, cname, owner + inst_suffix(c, ins.args) + "_" + m.text, owner + inst_suffix(c, ins.args), sparams, ins.args, inst_targs(c, ins.args))
+                end
+            end
+            if !found is c.skipped.push(owner + "_" + m.text + " (method of a generic type — name an instance with --ffi-inst)") end
+        end
+    end
+end
+
+pub fn build(g: cg::Gen, lib: string, inst_text: string) -> FacadeOut is
+    let c: Ctx = Ctx { g: g, lib: lib, out: strbuf::new(), exports: [], skipped: [], done: map::Map::new(), names: map::Map::new(), queue: [] }
+    let insts: [Inst] = parse_insts(inst_text)
+    walk(c, g.module.kids[3].kids, insts)
+    drain(c)
+    let mut cpp: string = "\n// ── C-ABI facade (h# lib build --ffi) ─────────────────────────────────────────\n"
+    cpp = cpp + c.out.build()
+    return FacadeOut { cpp: cpp, exports: c.exports, skipped: c.skipped }
+end
+
+fn trim_s(s: string) -> string is
+    let mut a: int = 0
+    let mut b: int = s.len()
+    while a < b && (byte_at(s, a) == 32 || byte_at(s, a) == 9 || byte_at(s, a) == 10) is a += 1 end
+    while b > a && (byte_at(s, b - 1) == 32 || byte_at(s, b - 1) == 9 || byte_at(s, b - 1) == 10) is b -= 1 end
+    return s[a..b]
+end
