@@ -326,11 +326,11 @@ fn walk_items(items: [ast::Node], out: ExportSummary) is
             for p in it.kids[2].kids is params.push(lower_param(p.kids[1])) end
             let mut ret: string = ""
             if !cg::is_none(it.kids[3]) is ret = lower_type(it.kids[3]) end
-            out.symbols.push(hlib::Export { name: it.text, kind: "function", signature: render_fn_signature(it), params: params,
+            out.symbols.push(hlib::Export { api: "", owner: "", name: it.text, kind: "function", signature: render_fn_signature(it), params: params,
                 returns: ret, generic: it.kids[1].kids.len() > 0, is_macro: false })
             out.pub_items.push(it)
         elsif t == "Struct" && it.kids[2].text == "true" is
-            out.symbols.push(hlib::Export { name: it.text, kind: "struct", signature: "struct " + it.text, params: [], returns: "",
+            out.symbols.push(hlib::Export { api: "", owner: "", name: it.text, kind: "struct", signature: "struct " + it.text, params: [], returns: "",
                 generic: it.kids[0].kids.len() > 0, is_macro: false })
             out.pub_items.push(it)
         elsif t == "Enum" && it.kids[2].text == "true" is
@@ -340,21 +340,21 @@ fn walk_items(items: [ast::Node], out: ExportSummary) is
                 names.push(v.text)
                 if v.kids[0].tag != "Unit" is payload = true end
             end
-            out.symbols.push(hlib::Export { name: it.text, kind: "enum", signature: "enum " + it.text + " { " + cg::jc(names) + " }", params: [],
+            out.symbols.push(hlib::Export { api: "", owner: "", name: it.text, kind: "enum", signature: "enum " + it.text + " { " + cg::jc(names) + " }", params: [],
                 returns: "", generic: it.kids[0].kids.len() > 0 || payload, is_macro: false })
             out.pub_items.push(it)
         elsif t == "Trait" && it.kids[2].text == "true" is
-            out.symbols.push(hlib::Export { name: it.text, kind: "trait", signature: "trait " + it.text, params: [], returns: "",
+            out.symbols.push(hlib::Export { api: "", owner: "", name: it.text, kind: "trait", signature: "trait " + it.text, params: [], returns: "",
                 generic: true, is_macro: false })
             out.pub_items.push(it)
         elsif t == "ConstDef" && it.kids[0].text == "true" is
             let mut ret: string = ""
             if !cg::is_none(it.kids[1]) is ret = lower_type(it.kids[1]) end
-            out.symbols.push(hlib::Export { name: it.text, kind: "const", signature: "const " + it.text, params: [], returns: ret,
+            out.symbols.push(hlib::Export { api: "", owner: "", name: it.text, kind: "const", signature: "const " + it.text, params: [], returns: ret,
                 generic: ret == "", is_macro: false })
             out.pub_items.push(it)
         elsif t == "TypeAlias" && it.kids[0].text == "true" is
-            out.symbols.push(hlib::Export { name: it.text, kind: "type_alias", signature: "type " + it.text, params: [], returns: "",
+            out.symbols.push(hlib::Export { api: "", owner: "", name: it.text, kind: "type_alias", signature: "type " + it.text, params: [], returns: "",
                 generic: false, is_macro: false })
             out.pub_items.push(it)
         elsif t == "ModDecl" && it.kids[0].text == "true" && it.kids[1].tag == "Inline" is
