@@ -1,3 +1,4 @@
+use "bit -> lsp"
 use "std -> option" from "option"
 use "std -> fs" from "fs"
 use "std -> strbuf" from "strbuf"
@@ -576,23 +577,23 @@ end
 
 ;; ── manifest parsing (via the lsp library's JSON reader) ──────────────────────
 fn str_or(raw: string, path: string, dflt: string) -> string is
-    if lsp_json::get(raw, path) == "" is return dflt end
-    return lsp_json::get_str(raw, path)
+    if lsp::json::get(raw, path) == "" is return dflt end
+    return lsp::json::get_str(raw, path)
 end
 
 fn int_or(raw: string, path: string, dflt: int) -> int is
-    if lsp_json::get(raw, path) == "" is return dflt end
-    return lsp_json::get_int(raw, path)
+    if lsp::json::get(raw, path) == "" is return dflt end
+    return lsp::json::get_int(raw, path)
 end
 
 pub fn manifest_parse(raw: string) -> option::Result<Manifest, string> is
-    if lsp_json::get(raw, "name") == "" || lsp_json::get(raw, "version") == "" is
+    if lsp::json::get(raw, "name") == "" || lsp::json::get(raw, "version") == "" is
         return option::Result::Err("manifest (de)serialization failed: missing field `name` or `version`")
     end
-    if lsp_json::get(raw, "artifacts") == "" is
+    if lsp::json::get(raw, "artifacts") == "" is
         return option::Result::Err("manifest (de)serialization failed: missing field `artifacts`")
     end
-    let lang: string = lsp_json::get_str(raw, "language")
+    let lang: string = lsp::json::get_str(raw, "language")
     let mut language: string = ""
     match language_from_str(lang) is
         option::Result::Ok(l) => is language = l end
@@ -601,86 +602,86 @@ pub fn manifest_parse(raw: string) -> option::Result<Manifest, string> is
         end
     end
     let mut authors: [string] = []
-    let na: int = lsp_json::array_length(lsp_json::get(raw, "authors"))
+    let na: int = lsp::json::array_length(lsp::json::get(raw, "authors"))
     let mut i: int = 0
     while i < na is
-        authors.push(lsp_json::get_str(raw, "authors." + to_string(i)))
+        authors.push(lsp::json::get_str(raw, "authors." + to_string(i)))
         i += 1
     end
     let mut deps: [Dependency] = []
-    let nd: int = lsp_json::array_length(lsp_json::get(raw, "dependencies"))
+    let nd: int = lsp::json::array_length(lsp::json::get(raw, "dependencies"))
     i = 0
     while i < nd is
         let b: string = "dependencies." + to_string(i)
-        deps.push(Dependency { name: lsp_json::get_str(raw, b + ".name"), version_req: lsp_json::get_str(raw, b + ".version_req") })
+        deps.push(Dependency { name: lsp::json::get_str(raw, b + ".name"), version_req: lsp::json::get_str(raw, b + ".version_req") })
         i += 1
     end
     let mut arts: [Artifact] = []
-    let nr: int = lsp_json::array_length(lsp_json::get(raw, "artifacts"))
+    let nr: int = lsp::json::array_length(lsp::json::get(raw, "artifacts"))
     i = 0
     while i < nr is
         let b: string = "artifacts." + to_string(i)
         let mut ll: [string] = []
-        let nl: int = lsp_json::array_length(lsp_json::get(raw, b + ".link_libs"))
+        let nl: int = lsp::json::array_length(lsp::json::get(raw, b + ".link_libs"))
         let mut k: int = 0
         while k < nl is
-            ll.push(lsp_json::get_str(raw, b + ".link_libs." + to_string(k)))
+            ll.push(lsp::json::get_str(raw, b + ".link_libs." + to_string(k)))
             k += 1
         end
         arts.push(Artifact {
             link_libs: ll,
-            path: lsp_json::get_str(raw, b + ".path"),
-            kind: lsp_json::get_str(raw, b + ".kind"),
+            path: lsp::json::get_str(raw, b + ".path"),
+            kind: lsp::json::get_str(raw, b + ".kind"),
             target: str_or(raw, b + ".target", ""),
-            sha256: lsp_json::get_str(raw, b + ".sha256"),
-            size: lsp_json::get_int(raw, b + ".size")
+            sha256: lsp::json::get_str(raw, b + ".sha256"),
+            size: lsp::json::get_int(raw, b + ".size")
         })
         i += 1
     end
     let mut exps: [Export] = []
-    let ne: int = lsp_json::array_length(lsp_json::get(raw, "exports"))
+    let ne: int = lsp::json::array_length(lsp::json::get(raw, "exports"))
     i = 0
     while i < ne is
         let b: string = "exports." + to_string(i)
         let mut ps: [string] = []
-        let np: int = lsp_json::array_length(lsp_json::get(raw, b + ".params"))
+        let np: int = lsp::json::array_length(lsp::json::get(raw, b + ".params"))
         let mut j: int = 0
         while j < np is
             let pb: string = b + ".params." + to_string(j)
-            let t: string = lsp_json::get_str(raw, pb + ".type")
-            if t == "opaque" is ps.push("opaque:" + lsp_json::get_str(raw, pb + ".struct_name")) else ps.push(t) end
+            let t: string = lsp::json::get_str(raw, pb + ".type")
+            if t == "opaque" is ps.push("opaque:" + lsp::json::get_str(raw, pb + ".struct_name")) else ps.push(t) end
             j += 1
         end
         let mut ret: string = ""
-        if lsp_json::get(raw, b + ".returns") != "" is
-            ret = lsp_json::get_str(raw, b + ".returns.type")
-            if ret == "opaque" is ret = "opaque:" + lsp_json::get_str(raw, b + ".returns.struct_name") end
+        if lsp::json::get(raw, b + ".returns") != "" is
+            ret = lsp::json::get_str(raw, b + ".returns.type")
+            if ret == "opaque" is ret = "opaque:" + lsp::json::get_str(raw, b + ".returns.struct_name") end
         end
         exps.push(Export {
-            name: lsp_json::get_str(raw, b + ".name"),
-            kind: lsp_json::get_str(raw, b + ".kind"),
-            signature: lsp_json::get_str(raw, b + ".signature"),
+            name: lsp::json::get_str(raw, b + ".name"),
+            kind: lsp::json::get_str(raw, b + ".kind"),
+            signature: lsp::json::get_str(raw, b + ".signature"),
             params: ps,
             returns: ret,
-            generic: lsp_json::get_bool(raw, b + ".generic"),
-            is_macro: lsp_json::get_bool(raw, b + ".is_macro"),
+            generic: lsp::json::get_bool(raw, b + ".generic"),
+            is_macro: lsp::json::get_bool(raw, b + ".is_macro"),
             api: str_or(raw, b + ".api", ""),
             owner: str_or(raw, b + ".owner", "")
         })
         i += 1
     end
-    let has_sig: bool = lsp_json::get(raw, "signature") != ""
+    let has_sig: bool = lsp::json::get(raw, "signature") != ""
     let m: Manifest = Manifest {
-        spec_version: lsp_json::get_int(raw, "hlib_spec_version"),
-        name: lsp_json::get_str(raw, "name"),
-        version: lsp_json::get_str(raw, "version"),
+        spec_version: lsp::json::get_int(raw, "hlib_spec_version"),
+        name: lsp::json::get_str(raw, "name"),
+        version: lsp::json::get_str(raw, "version"),
         language: language,
         language_version: str_or(raw, "language_version", ""),
         edition: str_or(raw, "edition", default_edition()),
         abi_version: int_or(raw, "abi_version", 1),
         description: str_or(raw, "description", ""),
         authors: authors,
-        created_at: lsp_json::get_str(raw, "created_at"),
+        created_at: lsp::json::get_str(raw, "created_at"),
         dependencies: deps,
         artifacts: arts,
         exports: exps,
