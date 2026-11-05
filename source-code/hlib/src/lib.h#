@@ -362,6 +362,7 @@ pub struct Artifact is
     pub target: string        ;; "" = none
     pub sha256: string
     pub size: int
+    pub link_libs: [string]   ;; system libs a static_lib needs (pthread, dl, m ...)
 end
 
 ;; AbiType is kept as text: "i64", "ptr", "void", … or "opaque:<StructName>"
@@ -373,6 +374,8 @@ pub struct Export is
     pub returns: string       ;; "" = none
     pub generic: bool
     pub is_macro: bool
+    pub api: string           ;; C symbol of the facade fn ("" = same as `name`)
+    pub owner: string         ;; facade: the H# type this fn belongs to (constructor/getter/method/array op), "" = free fn
 end
 
 pub struct Dependency is
@@ -497,6 +500,8 @@ pub fn export_json(e: Export, lv: int) -> string is
     if e.returns.len() > 0 is f.push(pad(lv + 1) + "\"returns\": " + abi_json(e.returns, lv + 1)) end
     f.push(pad(lv + 1) + "\"generic\": " + (if e.generic is "true" else "false" end))
     f.push(pad(lv + 1) + "\"is_macro\": " + (if e.is_macro is "true" else "false" end))
+    if e.api.len() > 0 is f.push(pad(lv + 1) + "\"api\": " + jstr(e.api)) end
+    if e.owner.len() > 0 is f.push(pad(lv + 1) + "\"owner\": " + jstr(e.owner)) end
     return "\{\n" + hlib_join(f, ",\n") + "\n" + pad(lv) + "}"
 end
 
@@ -514,6 +519,11 @@ fn artifact_json(a: Artifact, lv: int) -> string is
     if a.target.len() > 0 is f.push(pad(lv + 1) + "\"target\": " + jstr(a.target)) end
     f.push(pad(lv + 1) + "\"sha256\": " + jstr(a.sha256))
     f.push(pad(lv + 1) + "\"size\": " + to_string(a.size))
+    if a.link_libs.len() > 0 is
+        let mut q: [string] = []
+        for l in a.link_libs is q.push(jstr(l)) end
+        f.push(pad(lv + 1) + "\"link_libs\": [" + hlib_join(q, ", ") + "]")
+    end
     return "\{\n" + hlib_join(f, ",\n") + "\n" + pad(lv) + "}"
 end
 
@@ -610,7 +620,15 @@ pub fn manifest_parse(raw: string) -> option::Result<Manifest, string> is
     i = 0
     while i < nr is
         let b: string = "artifacts." + to_string(i)
+        let mut ll: [string] = []
+        let nl: int = lsp_json::array_length(lsp_json::get(raw, b + ".link_libs"))
+        let mut k: int = 0
+        while k < nl is
+            ll.push(lsp_json::get_str(raw, b + ".link_libs." + to_string(k)))
+            k += 1
+        end
         arts.push(Artifact {
+            link_libs: ll,
             path: lsp_json::get_str(raw, b + ".path"),
             kind: lsp_json::get_str(raw, b + ".kind"),
             target: str_or(raw, b + ".target", ""),
@@ -645,7 +663,9 @@ pub fn manifest_parse(raw: string) -> option::Result<Manifest, string> is
             params: ps,
             returns: ret,
             generic: lsp_json::get_bool(raw, b + ".generic"),
-            is_macro: lsp_json::get_bool(raw, b + ".is_macro")
+            is_macro: lsp_json::get_bool(raw, b + ".is_macro"),
+            api: str_or(raw, b + ".api", ""),
+            owner: str_or(raw, b + ".owner", "")
         })
         i += 1
     end
@@ -878,13 +898,24 @@ pub fn add_entry(b: HlibBuilder, rel_path: string, kind: string, target: string,
     for e in b.entries is
         if e.path == rel_path is return option::Result::Err("duplicate archive entry path `" + rel_path + "`") end
     end
-    b.artifacts.push(Artifact { path: rel_path, kind: kind, target: target, sha256: sha256_hex(data), size: data.n })
+    b.artifacts.push(Artifact { path: rel_path, kind: kind, target: target, sha256: sha256_hex(data), size: data.n, link_libs: [] })
     b.entries.push(Entry { path: rel_path, data: data })
     return option::Result::Ok(true)
 end
 
 pub fn add_shared_object(b: HlibBuilder, target: string, data: Buf) -> option::Result<bool, string> is
     return add_entry(b, "native/" + target + "/" + b.name + ".so", "shared_object", target, data)
+end
+
+;; prebuilt C-ABI static archive (facade of a cross-language lib); `link_libs` = system libs it needs
+pub fn add_static_lib(b: HlibBuilder, target: string, data: Buf, link_libs: [string]) -> option::Result<bool, string> is
+    let rel: string = "native/" + target + "/lib" + b.name + ".a"
+    match add_entry(b, rel, "static_lib", target, data) is
+        option::Result::Err(e) => is return option::Result::Err(e) end
+        option::Result::Ok(_) => is end
+    end
+    b.artifacts[b.artifacts.len() - 1].link_libs = link_libs
+    return option::Result::Ok(true)
 end
 
 pub fn add_bytecode(b: HlibBuilder, data: Buf) -> option::Result<bool, string> is
@@ -991,9 +1022,13 @@ pub fn builder_finish(b: HlibBuilder, output_path: string, signing_key_hex: stri
     end
     b.entries.push(Entry { path: checksums_entry(), data: checksums })
 
+    let mut abi_v: int = 1
+    for ar in b.artifacts is
+        if ar.kind == "static_lib" is abi_v = 2 end
+    end
     let m: Manifest = Manifest {
         spec_version: spec_version(), name: b.name, version: b.version, language: b.language,
-        language_version: b.language_version, edition: b.edition, abi_version: 1,
+        language_version: b.language_version, edition: b.edition, abi_version: abi_v,
         description: b.description, authors: b.authors, created_at: rfc3339(time::now_unix()),
         dependencies: b.dependencies, artifacts: b.artifacts, exports: b.exports,
         signed: signed, sig_algorithm: "ed25519", sig_public_key: public_key, sig_entry: checksums_entry()
@@ -1007,6 +1042,13 @@ pub fn builder_finish(b: HlibBuilder, output_path: string, signing_key_hex: stri
 end
 
 ;; plain `join` (hlib used to borrow the one of the lsp library)
+pub fn push_str(xs: [string], x: string) -> [string] is
+    let mut out: [string] = []
+    for y in xs is out.push(y) end
+    out.push(x)
+    return out
+end
+
 pub fn hlib_join(parts: [string], sep: string) -> string is
     let mut out: string = ""
     let mut i: int = 0
