@@ -63,7 +63,7 @@ fn str_count_fn() -> ast::Node is
 end
 
 fn iter_join_fn() -> ast::Node is
-    return item_from("pub fn iter_join(arr: [string], sep: string) -> string is\n    let __n: i64 = arr.len()\n    let mut __result: string = \"\"\n    let mut __i: i64 = 0\n    while __i < __n is\n        if __i > 0 is\n            __result = __result + sep\n        end\n        __result = __result + arr[__i]\n        __i = __i + 1\n    end\n    return __result\nend\n")
+    return item_from("pub fn iter_join(arr: [string], sep: string) -> string is\n    let __n: i64 = arr.len()\n    if __n == 0 is return \"\" end\n    let mut __cur: [string] = []\n    let mut __i: i64 = 0\n    while __i < __n is\n        __cur.push(arr[__i])\n        __i = __i + 1\n    end\n    while __cur.len() > 1 is\n        let mut __next: [string] = []\n        let mut __k: i64 = 0\n        let __m: i64 = __cur.len()\n        while __k + 1 < __m is\n            __next.push(__cur[__k] + sep + __cur[__k + 1])\n            __k = __k + 2\n        end\n        if __k < __m is __next.push(__cur[__k]) end\n        __cur = __next\n    end\n    return __cur[0]\nend\n")
 end
 
 fn json_empty_object_fn() -> ast::Node is
