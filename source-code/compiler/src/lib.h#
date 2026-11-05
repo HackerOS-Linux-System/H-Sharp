@@ -15,6 +15,7 @@ mod ffi
 mod ffi_rust_native
 mod ffi_cpp
 mod ffi_linker
+mod ffi_export
 mod hlib_export
 mod cpp_build
 mod stdlib_shims
