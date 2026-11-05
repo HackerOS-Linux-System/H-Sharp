@@ -640,6 +640,17 @@ fn banner(info: EditionInfo) is
 end
 
 ;; ── lib build (hlib_cmd.rs::cmd_build) — native ──────────────────────────────
+fn ffi_ident(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 is out = out + str_from_byte(c) else out = out + "_" end
+        i += 1
+    end
+    return out
+end
+
 fn cmd_lib_build(rest: [string], year: int) -> int is
     let mut file: string = ""
     let mut output: string = ""
@@ -647,6 +658,8 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
     let mut target_s: string = ""
     let mut sign: string = ""
     let mut release: bool = false
+    let mut ffi: bool = false
+    let mut ffi_inst: string = ""
     let mut i: int = 0
     while i < rest.len() is
         let a: string = rest[i]
@@ -663,6 +676,10 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
             sign = opt_value(rest, i, "--sign", "")
             if a == "--sign" is i += 1 end
         elsif a == "--release" is release = true
+        elsif a == "--ffi" is ffi = true
+        elsif is_opt(a, "--ffi-inst", "") is
+            ffi_inst = opt_value(rest, i, "--ffi-inst", "")
+            if a == "--ffi-inst" is i += 1 end
         elsif starts_with(a, "-") is return unexpected(a, "Usage: h# lib build [OPTIONS] <FILE>")
         else file = a end
         i += 1
@@ -693,6 +710,13 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
         eprint(parser::render_errors(r) + "\n")
         return die_ret("parsing failed.")
     end
+    env::set("HSHARP_TARGET_TRIPLE", triple.llvm_triple)
+    let ffi_exports_path: string = out_parent + "/.hlib-" + stem + ".ffi.json"
+    if ffi is
+        env::set("HSHARP_FFI_LIB", ffi_ident(stem))
+        env::set("HSHARP_FFI_INST", ffi_inst)
+        env::set("HSHARP_FFI_EXPORTS_OUT", ffi_exports_path)
+    end
     let res: modules::Resolver = modules::new_resolver(file, [], rec, st)
     let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(file))
     if !e.ok is return die_ret(e.err) end
@@ -712,6 +736,30 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
     if !cr.ok is
         if cr.diag is return die_ret("compilation failed (type errors above).") end
         return die_ret(cr.err)
+    end
+    let mut a_bytes: hlib::Buf = hlib::buf_new(0)
+    let mut ffi_syms: [hlib::Export] = []
+    if ffi is
+        ;; second build of the same module as a static archive (what a fully static consumer links)
+        let sopts: options::CompileOptions = options::CompileOptions { target: triple, optimize: release, static_link: true, debug_info: false,
+            output: tmp_stem + "-static", output_kind: "StaticLib", default_mem_mode: "", strict_memory: false, save_cpp: false, test_mode: false, verbose: false }
+        let sr: pipeline::CompileResult = pipeline::compile(module, source, file, sopts)
+        if !sr.ok is return die_ret(sr.err) end
+        match hlib::read_file(tmp_stem + "-static.a") is
+            option::Result::Ok(b2) => is a_bytes = b2 end
+            option::Result::Err(er) => is return die_ret("static archive vanished: " + er) end
+        end
+        fs::remove(tmp_stem + "-static.a")
+        if !fs::exists(ffi_exports_path) is return die_ret("--ffi: the facade generator produced no export list") end
+        let wrapped: string = "\{\"name\":\"x\",\"version\":\"1\",\"language\":\"hsharp\",\"artifacts\":[],\"exports\":" + fs::read(ffi_exports_path) + "}"
+        match hlib::manifest_parse(wrapped) is
+            option::Result::Ok(m) => is ffi_syms = m.exports end
+            option::Result::Err(er) => is return die_ret("--ffi: bad export list: " + er) end
+        end
+        let sk: string = trim_s(fs::read(ffi_exports_path + ".skipped"))
+        fs::remove(ffi_exports_path)
+        fs::remove(ffi_exports_path + ".skipped")
+        if sk != "" is eprint(yellow("  --ffi skipped (not expressible through a C ABI):\n    " + sk) + "\n") end
     end
     let so_path: string = tmp_stem + options::file_suffix("SharedLib", triple)
     let mut so_bytes: hlib::Buf = hlib::buf_new(0)
@@ -747,6 +795,19 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
         end
     end
     b.exports = summary.symbols
+    if ffi is
+        ;; keep type/const/generic entries, drop the (non-C-ABI) plain function entries, add the facade
+        let mut kept: [hlib::Export] = []
+        for sy in summary.symbols is
+            if sy.kind != "function" || sy.generic is kept.push(sy) end
+        end
+        for fx in ffi_syms is kept.push(fx) end
+        b.exports = kept
+        match hlib::add_static_lib(b, triple.llvm_triple, a_bytes, ["stdc++", "m", "pthread", "dl"]) is
+            option::Result::Ok(_) => is end
+            option::Result::Err(er) => is return die_ret(er) end
+        end
+    end
     let mut key_hex: string = ""
     if sign != "" is
         if !fs::exists(sign) is return die_ret("cannot read signing key `" + sign + "`: No such file or directory (os error 2)") end
@@ -762,6 +823,115 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
     if mf.signed is sg = ", signed" end
     out_line(green_b("✓") + " " + file + " → " + bold(out_hlib) + " (" + to_string(mf.artifacts.len()) + " artifact(s)" + sg + ")")
     return 0
+end
+
+;; ── lib pack-static: wrap a prebuilt C-ABI facade (`.a`) into an .hlib ───────────────────────
+;; Used by `bit`/`hackerc hlib build --ffi`-style flows: the facade archive becomes a `static_lib` artifact that
+;; H# links in whole (fully static executables), `exports.json` lists the C-ABI functions (+ their `api` symbols).
+fn split_csv(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 44 is
+            if cur.len() > 0 is out.push(cur) end
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    if cur.len() > 0 is out.push(cur) end
+    return out
+end
+
+fn cmd_lib_pack_static(rest: [string]) -> int is
+    let usage: string = "Usage: h# lib pack-static --name N --lib-version V --lib FILE.a --exports exports.json -o OUT.hlib [--language L] [--target T] [--link-libs a,b] [--sign KEY]"
+    let mut name: string = ""
+    let mut ver: string = "0.1.0"
+    let mut lang: string = "hackerscript"
+    let mut lib_file: string = ""
+    let mut exports_file: string = ""
+    let mut out_hlib: string = ""
+    let mut target_s: string = ""
+    let mut link_libs: string = ""
+    let mut sign: string = ""
+    let mut i: int = 0
+    while i < rest.len() is
+        let a: string = rest[i]
+        if a == "--name" is
+            name = opt_value(rest, i, "--name", "")
+            i += 1
+        elsif a == "--lib-version" is
+            ver = opt_value(rest, i, "--lib-version", "")
+            i += 1
+        elsif a == "--language" is
+            lang = opt_value(rest, i, "--language", "")
+            i += 1
+        elsif a == "--lib" is
+            lib_file = opt_value(rest, i, "--lib", "")
+            i += 1
+        elsif a == "--exports" is
+            exports_file = opt_value(rest, i, "--exports", "")
+            i += 1
+        elsif a == "--target" is
+            target_s = opt_value(rest, i, "--target", "")
+            i += 1
+        elsif a == "--link-libs" is
+            link_libs = opt_value(rest, i, "--link-libs", "")
+            i += 1
+        elsif a == "--sign" is
+            sign = opt_value(rest, i, "--sign", "")
+            i += 1
+        elsif a == "-o" || a == "--output" is
+            out_hlib = opt_value(rest, i, a, "")
+            i += 1
+        else return unexpected(a, usage) end
+        i += 1
+    end
+    if name == "" || lib_file == "" || exports_file == "" || out_hlib == "" is
+        eprint("error: --name, --lib, --exports and -o are required\n\n" + usage + "\n")
+        return 2
+    end
+    if !fs::exists(lib_file) is return die_ret("cannot read `" + lib_file + "`: No such file or directory (os error 2)") end
+    if !fs::exists(exports_file) is return die_ret("cannot read `" + exports_file + "`: No such file or directory (os error 2)") end
+    let mut triple: target::TargetTriple = target::host()
+    if target_s != "" is
+        let tl: target::TargetLookup = target::from_str(target_s)
+        if !tl.found is return die_ret("unknown target `" + target_s + "`. Run `h# targets` to list them.") end
+        triple = tl.target
+    end
+    let wrapped: string = "\{\"name\":\"x\",\"version\":\"1\",\"language\":\"hsharp\",\"artifacts\":[],\"exports\":" + fs::read(exports_file) + "}"
+    let b: hlib::HlibBuilder = hlib::builder_new(name, ver, lang)
+    match hlib::manifest_parse(wrapped) is
+        option::Result::Ok(m) => is b.exports = m.exports end
+        option::Result::Err(er) => is return die_ret("`" + exports_file + "` is not a valid exports array: " + er) end
+    end
+    match hlib::read_file(lib_file) is
+        option::Result::Ok(data) => is
+            match hlib::add_static_lib(b, triple.llvm_triple, data, split_csv(link_libs)) is
+                option::Result::Ok(_) => is end
+                option::Result::Err(er) => is return die_ret(er) end
+            end
+        end
+        option::Result::Err(er) => is return die_ret(er) end
+    end
+    let mut key_hex: string = ""
+    if sign != "" is
+        if !fs::exists(sign) is return die_ret("cannot read signing key `" + sign + "`: No such file or directory (os error 2)") end
+        key_hex = trim_s(fs::read(sign))
+    end
+    let mut parent: string = parent_dir(out_hlib)
+    if parent == "" is parent = "." end
+    mkdir_p(parent)
+    match hlib::builder_finish(b, out_hlib, key_hex) is
+        option::Result::Ok(m) => is
+            out_line(green_b("✓") + " " + bold(out_hlib) + " (static_lib for " + triple.llvm_triple + ", " + to_string(m.exports.len()) + " export(s))")
+            return 0
+        end
+        option::Result::Err(er) => is return die_ret(er) end
+    end
+    return 1
 end
 
 fn die_ret(msg: string) -> int is
@@ -787,6 +957,7 @@ fn run_lib(args: [string], edition_flag: string, info: EditionInfo) -> int is
         if info.edition != "" is y = str_to_int_cli(info.edition) end
         return cmd_lib_build(rest, y)
     end
+    if sub == "pack-static" is return cmd_lib_pack_static(rest) end
     if sub == "inspect" is
         banner(info)
         if rest.len() != 1 is die("usage: h# lib inspect <file.hlib>") end
@@ -1326,6 +1497,8 @@ fn frontend_phase(a: CompileArgs, opts: options::CompileOptions, year: int, src_
         eprint(red_b("✗") + " parsing failed.\n")
         return 1
     end
+    ;; native hlib artifacts are chosen for the TARGET being compiled, not for the machine running h#
+    env::set("HSHARP_TARGET_TRIPLE", opts.target.llvm_triple)
     let res: modules::Resolver = modules::new_resolver(src_path, [], rec, st)
     let e: modules::Expanded = modules::expand_program(res, r.module, modules::dir_of(src_path))
     if !e.ok is
