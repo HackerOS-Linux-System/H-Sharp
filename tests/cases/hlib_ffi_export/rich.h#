@@ -1,0 +1,59 @@
+pub struct Pt is
+    pub x: int
+    pub y: int
+    pub name: string
+    pub tags: [string]
+    pub next: Pt?
+end
+pub enum Shape is
+    Circle(int)
+    Rect(int, int)
+    Empty
+end
+pub struct Pair<A, B> is
+    pub a: A
+    pub b: B
+end
+impl Pt is
+    pub fn dist2(self, o: Pt) -> int is
+        let dx: int = self.x - o.x
+        let dy: int = self.y - o.y
+        return dx * dx + dy * dy
+    end
+end
+pub fn add(a: int, b: int) -> int is return a + b end
+pub fn half(a: f64) -> f64 is return a / 2.0 end
+pub fn flip(b: bool) -> bool is return !b end
+pub fn greet(n: string) -> string is return "hi " + n end
+pub fn mk(x: int, y: int) -> Pt is
+    return Pt { x: x, y: y, name: "p", tags: [], next: nil }
+end
+pub fn sum(xs: [int]) -> int is
+    let mut s: int = 0
+    for v in xs is s += v end
+    return s
+end
+pub fn evens(n: int) -> [int] is
+    let mut r: [int] = []
+    let mut i: int = 0
+    while i < n is
+        r.push(i * 2)
+        i += 1
+    end
+    return r
+end
+pub fn area(s: Shape) -> int is
+    match s is
+        Shape::Circle(r) => is return 3 * r * r end
+        Shape::Rect(w, h) => is return w * h end
+        Shape::Empty => is return 0 end
+    end
+end
+pub fn find(xs: [int], v: int) -> int? is
+    for x in xs is
+        if x == v is return x end
+    end
+    return nil
+end
+pub fn ident<T>(x: T) -> T is return x end
+pub fn async_one() -> int is return 1 end
