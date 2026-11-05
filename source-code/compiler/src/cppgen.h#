@@ -4,6 +4,8 @@ use "workspace -> parser" from "lib -> *"
 use "workspace -> typecheck" from "lib -> *"
 mod cg
 mod cgb
+mod ffi_export
+use "workspace -> hlib" from "lib -> *"
 mod modules
 mod builtins
 mod builtin_syms_table
@@ -383,7 +385,9 @@ fn gen_extern(g: cg::Gen, name: string) -> string is
     end
     let mut vd: string = ""
     if variadic is vd = ", ..." end
-    let mut out: string = "extern \"C\" {cret} hx_{name}({cg::jc(cps)}{vd}) __asm__(\"{name}\");\n"
+    let mut sym: string = name
+    if f.kids.len() > 3 is sym = f.kids[3].text end
+    let mut out: string = "extern \"C\" {cret} hx_{name}({cg::jc(cps)}{vd}) __asm__(\"{sym}\");\n"
     let mut args: [string] = []
     i = 0
     while i < params.len() is
@@ -394,6 +398,9 @@ fn gen_extern(g: cg::Gen, name: string) -> string is
     let call: string = "hx_{name}({cg::jc(args)})"
     let mut body: string = ""
     if hret == "void" is body = call + ";"
+    ;; a returned `const char*` is borrowed from the callee (static / thread-local buffer): copy it right away, otherwise the
+    ;; next call into the library silently rewrites an earlier result
+    elsif cret == "const char*" is body = "return [&]{{ const char* r = {call}; return hs::Str(std::string(r ? r : \"\")); }}();"
     elsif cret == "int64_t" is body = "return hs::unpack<{hret}>({call});"
     else body = "return hs::cv<{hret}>({call});" end
     out = out + "inline {hret} {cg::fname(name)}({cg::jc(hps)}) {{ {body} }}\n"
@@ -588,6 +595,21 @@ pub fn generate(module: ast::Node, test_mode: bool) -> GenOut is
         tail = "int main(int argc, char** argv) {{\n    _hsh_argc = argc; _hsh_argv = argv;\n    {call}\n}}\n"
     end
 
+    ;; C-ABI facade (`h# lib build --ffi`): extern "C" wrappers appended to the same translation unit
+    let ffi_lib: string = env::get_or("HSHARP_FFI_LIB", "")
+    let mut facade: string = ""
+    if ffi_lib != "" is
+        let fo: ffi_export::FacadeOut = ffi_export::build(g, ffi_lib, env::get_or("HSHARP_FFI_INST", ""))
+        facade = fo.cpp
+        let outp: string = env::get_or("HSHARP_FFI_EXPORTS_OUT", "")
+        if outp != "" is
+            let mut rep: string = hlib::exports_json(fo.exports)
+            fs::write(outp, rep)
+            let mut sk: string = ""
+            for x in fo.skipped is sk = sk + x + "\n" end
+            fs::write(outp + ".skipped", sk)
+        end
+    end
     ;; generated builtin wrappers (registry-backed)
     let wrappers: string = gen_builtin_wrappers(g)
     let mut out = strbuf::new()
@@ -604,6 +626,7 @@ pub fn generate(module: ast::Node, test_mode: bool) -> GenOut is
     out.push("\n")
     out.push(defs_sb.build())
     out.push("\n")
+    out.push(facade)
     out.push(tail)
     return GenOut { ok: true, err: "", cpp: out.build(), has_main: has_main, warnings: g.warnings }
 end
