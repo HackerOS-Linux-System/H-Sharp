@@ -1,0 +1,5 @@
+add: 42
+half: 2.5
+hello, one!
+hello, two!
+clicks n=7 len=2 [1]=20
