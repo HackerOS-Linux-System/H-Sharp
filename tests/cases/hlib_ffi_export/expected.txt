@@ -1,0 +1,18 @@
+42
+2.5
+false
+hi bob
+3 p
+10
+temp
+1 a
+false
+true 13
+dist2 25
+5 6 20
+18 true
+false
+15 1 5 12
+0
+77
+bee
