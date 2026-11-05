@@ -279,7 +279,10 @@ fn abi_to_type(t: string) -> ast::Node is
     end
     if t == "void" is return ast::lf("Void", "") end
     if t == "ptr" is return ast::lf("Named", "bytes") end
-    if starts_with(t, "opaque:") is return ast::nd("Ref", "", [ast::lf("Named", t[7..t.len()])]) end
+    ;; facade strings: NUL-terminated `const char*`, a returned one is valid until the next call into the lib
+    if t == "cstr" is return ast::lf("Named", "string") end
+    ;; opaque facade handle: an i64 at the C boundary; H# sees it under the struct's name (TypeAlias to int)
+    if starts_with(t, "opaque:") is return ast::lf("Named", t[7..t.len()]) end
     return ast::lf("Named", t)
 end
 
@@ -323,37 +326,63 @@ pub fn resolve_hlib_import(r: Resolver, name: string, has_version: bool, version
         end
     end
 
-    ;; Path 2: synthesize an `extern` block from the header + the host's .so
-    let host: string = target::host().llvm_triple
-    let mut so_path_in: string = ""
+    ;; Path 2: synthesize an `extern` block from the manifest exports + the host's native artifact
+    ;; (a `static_lib` C-ABI facade is preferred: it links into fully static musl executables)
+    let host: string = env::get_or("HSHARP_TARGET_TRIPLE", target::host().llvm_triple)
+    let mut lib_path_in: string = ""
+    let mut lib_kind: string = ""
+    let mut lib_sha: string = ""
+    let mut sys_libs: [string] = []
     let mut targets: [string] = []
+    for a in m.artifacts is
+        if a.kind == "static_lib" is
+            targets.push(a.target + " (static)")
+            if a.target == host && lib_kind != "static_lib" is
+                lib_path_in = a.path
+                lib_kind = "static_lib"
+                lib_sha = a.sha256
+                sys_libs = a.link_libs
+            end
+        end
+    end
     for a in m.artifacts is
         if a.kind == "shared_object" is
             targets.push(a.target)
-            if a.target == host && so_path_in == "" is so_path_in = a.path end
+            if a.target == host && lib_kind == "" is
+                lib_path_in = a.path
+                lib_kind = "shared_object"
+                lib_sha = a.sha256
+            end
         end
     end
-    if so_path_in == "" is
+    if lib_kind == "" is
         let mut note: string = ""
         if !same_language is
-            note = " It was built by " + m.language + ": its `ast` is " + m.language + " source, which H# does not read; across languages only a native `.so` listed in `manifest.exports` (non-generic functions with plain C types) can be called."
+            note = " It was built by " + m.language + ": its `ast` is " + m.language + " source, which H# does not read; across languages only a native `static_lib` / `.so` listed in `manifest.exports` (non-generic functions with plain C types) can be called — build the library with `--ffi`."
         end
-        return ex_err(".hlib '" + name + "' has neither a usable `ast` artifact nor a `.so` built for this host (" + host + ") — nothing here can be linked. Available native targets: " + join_strs(targets, ", ") + "." + note)
+        return ex_err(".hlib '" + name + "' has neither a usable `ast` artifact nor a native library built for this host (" + host + ") — nothing here can be linked. Available native targets: " + join_strs(targets, ", ") + "." + note)
     end
-    let si: int = hlib::entry_index(archive, so_path_in)
-    if si < 0 is return ex_err(".hlib '" + name + "': shared object listed in manifest but missing from the archive") end
+    let si: int = hlib::entry_index(archive, lib_path_in)
+    if si < 0 is return ex_err(".hlib '" + name + "': native library listed in manifest but missing from the archive") end
     let cache_root: string = hlib_cache_dir()
     if cache_root == "" is return ex_err("cannot locate a cache directory: $HOME is not set") end
-    let cache_dir: string = cache_root + "/" + name + "-" + m.version
+    ;; keyed by content hash: a rebuilt lib with the same version never links a stale file
+    let mut tag: string = lib_sha
+    if tag.len() > 12 is tag = tag[0..12] end
+    let cache_dir: string = cache_root + "/" + name + "-" + m.version + "-" + tag
     hlib::make_dirs(cache_dir)
-    let so_path: string = cache_dir + "/lib" + name + ".so"
-    if !fs::exists(so_path) is
-        match hlib::write_file(so_path, archive.entries[si].data) is
+    let mut ext: string = ".so"
+    if lib_kind == "static_lib" is ext = ".a" end
+    let lib_file: string = cache_dir + "/lib" + name + ext
+    if !fs::exists(lib_file) is
+        match hlib::write_file(lib_file, archive.entries[si].data) is
             option::Result::Ok(_) => is end
-            option::Result::Err(e) => is return ex_err("cannot extract .so from '" + name + "': " + e) end
+            option::Result::Err(e) => is return ex_err("cannot extract native library from '" + name + "': " + e) end
         end
     end
     let mut fns: [ast::Node] = []
+    let mut aliases: [ast::Node] = []
+    let mut alias_seen: [string] = []
     let mut skipped: [string] = []
     for e in m.exports is
         if e.generic is skipped.push(e.name) end
@@ -366,16 +395,34 @@ pub fn resolve_hlib_import(r: Resolver, name: string, has_version: bool, version
             end
             let mut ret: ast::Node = ast::nn()
             if e.returns != "" is ret = abi_to_type(e.returns) end
-            fns.push(ast::nd("ExternFn", e.name, [ast::nd("Params", "", ps), ret, ast::nd("B", "false", [])]))
+            let mut kids: [ast::Node] = [ast::nd("Params", "", ps), ret, ast::nd("B", "false", [])]
+            if e.api != "" is kids.push(ast::lf("S", e.api)) end
+            fns.push(ast::nd("ExternFn", e.name, kids))
+            let mut all_t: [string] = e.params
+            if e.returns != "" is all_t = hlib::push_str(all_t, e.returns) end
+            for t in all_t is
+                if starts_with(t, "opaque:") && !contains_str(alias_seen, t[7..t.len()]) is
+                    alias_seen.push(t[7..t.len()])
+                    aliases.push(ast::nd("TypeAlias", t[7..t.len()], [ast::nd("B", "true", []), ast::lf("Named", "int")]))
+                end
+            end
         end
     end
     if skipped.len() > 0 is
-        eprint_mod("  note: .hlib '" + name + "' — " + to_string(skipped.len()) + " generic export(s) skipped (no ast artifact to expand them from, only a compiled .so): " + join_strs(skipped, ", ") + "\n")
+        eprint_mod("  note: .hlib '" + name + "' — " + to_string(skipped.len()) + " generic export(s) skipped (no ast artifact to expand them from, only a compiled library): " + join_strs(skipped, ", ") + "\n")
     end
     if fns.len() == 0 is
         return ex_err(".hlib '" + name + "' has no `ast` artifact and no non-generic function export to bind — nothing to link.")
     end
-    return ex_ok([ast::nd("Extern", "", [ast::lf("Lang", "Rust"), ast::lf("Link", "Dynamic"), ast::lf("S", so_path), ast::nd("Fns", "", fns)])])
+    let mut link: string = "Dynamic"
+    if lib_kind == "static_lib" is link = "Static" end
+    let mut out: [ast::Node] = []
+    for al in aliases is out.push(al) end
+    out.push(ast::nd("Extern", "", [ast::lf("Lang", "Rust"), ast::lf("Link", link), ast::lf("S", lib_file), ast::nd("Fns", "", fns)]))
+    for sl in sys_libs is
+        out.push(ast::nd("Extern", "", [ast::lf("Lang", "Sys"), ast::lf("Link", "Dynamic"), ast::lf("S", sl), ast::nd("Fns", "", [])]))
+    end
+    return ex_ok(out)
 end
 
 extern static [c] is
