@@ -29,6 +29,7 @@ fn repack(a: [string]) is
             option::Result::Ok(_) => is end
             option::Result::Err(e) => is die(e) end
         end
+        b.artifacts[b.artifacts.len() - 1].link_libs = art.link_libs
     end
     let mut key: string = ""
     if a.len() > 4 is key = fs::read(a[4]) end
@@ -38,8 +39,58 @@ fn repack(a: [string]) is
     end
 end
 
+fn split_commas(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 44 is
+            if cur.len() > 0 is out.push(cur) end
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    if cur.len() > 0 is out.push(cur) end
+    return out
+end
+
+;; pack-static <out.hlib> <name> <version> <language> <target> <lib.a> <exports.json> [link_libs,comma,sep] [signing.key]
+;; packs a prebuilt C-ABI facade archive (`static_lib` artifact) — the same layout `hackerc hlib build --ffi` writes
+fn pack_static(a: [string]) is
+    let name: string = a[3]
+    let b: hlib::HlibBuilder = hlib::builder_new(name, a[4], a[5])
+    let raw: string = "\{\"name\":\"x\",\"version\":\"1\",\"language\":\"hsharp\",\"artifacts\":[],\"exports\":" + fs::read(a[8]) + "}"
+    match hlib::manifest_parse(raw) is
+        option::Result::Ok(m) => is b.exports = m.exports end
+        option::Result::Err(e) => is die(e) end
+    end
+    let mut libs: [string] = []
+    if a.len() > 9 is libs = split_commas(a[9]) end
+    match hlib::read_file(a[7]) is
+        option::Result::Ok(data) => is
+            match hlib::add_static_lib(b, a[6], data, libs) is
+                option::Result::Ok(_) => is end
+                option::Result::Err(e) => is die(e) end
+            end
+        end
+        option::Result::Err(e) => is die(e) end
+    end
+    let mut key: string = ""
+    if a.len() > 10 is key = fs::read(a[10]) end
+    match hlib::builder_finish(b, a[2], key) is
+        option::Result::Ok(mm) => is write("packed " + mm.name + " " + mm.version + ": " + to_string(mm.exports.len()) + " export(s)") end
+        option::Result::Err(e) => is die(e) end
+    end
+end
+
 fn main() is
     let a: [string] = env_args()
+    if a[1] == "pack-static" is
+        pack_static(a)
+        return
+    end
     if a[1] == "repack" is
         repack(a)
         return
