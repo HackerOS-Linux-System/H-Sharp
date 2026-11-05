@@ -10,3 +10,6 @@
 
 [layout]
 -> src => src
+
+[dependencies]
+-> colors => newest
