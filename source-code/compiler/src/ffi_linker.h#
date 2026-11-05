@@ -8,6 +8,7 @@ pub struct LinkFlags is
     pub static_libs: [string]
     pub dynamic_libs: [string]
     pub rust_whole_archive_libs: [string]
+    pub post_libs: [string]
     pub pkg_config_args: [string]
     pub rpath_hints: [string]
     pub python_notes: [string]
@@ -15,7 +16,7 @@ pub struct LinkFlags is
 end
 
 pub fn new_flags() -> LinkFlags is
-    return LinkFlags { static_libs: [], dynamic_libs: [], rust_whole_archive_libs: [], pkg_config_args: [],
+    return LinkFlags { static_libs: [], dynamic_libs: [], rust_whole_archive_libs: [], post_libs: [], pkg_config_args: [],
                        rpath_hints: [], python_notes: [], diagnostics: [] }
 end
 
@@ -65,6 +66,7 @@ pub fn dedup(f: LinkFlags) is
     f.static_libs = dedup_vec(f.static_libs)
     f.dynamic_libs = dedup_vec(f.dynamic_libs)
     f.rust_whole_archive_libs = dedup_vec(f.rust_whole_archive_libs)
+    f.post_libs = dedup_vec(f.post_libs)
     f.pkg_config_args = dedup_vec(f.pkg_config_args)
     f.rpath_hints = dedup_vec(f.rpath_hints)
 end
@@ -108,6 +110,20 @@ fn process_c_like(link: string, lib: string, has_lib: bool, flags: LinkFlags, ne
     if need_stdcpp is flags.dynamic_libs = with(flags.dynamic_libs, "stdc++") end
 end
 
+fn last_slash(s: string) -> int is
+    let mut i: int = s.len() - 1
+    while i >= 0 is
+        if byte_at(s, i) == 47 is return i end
+        i -= 1
+    end
+    return 0
+end
+
+;; "-lpthread" / "libpthread.so" / "pthread" -> "pthread"
+fn sanitize_sys(lib: string) -> string is
+    return sanitize(trim_start_matches(lib, "-l"))
+end
+
 ;; Extern(Lang, Link, S lib | None, Fns)
 fn process_extern_block(ext: ast::Node, flags: LinkFlags) is
     let lang: string = ext.kids[0].text
@@ -120,9 +136,24 @@ fn process_extern_block(ext: ast::Node, flags: LinkFlags) is
         else
             flags.python_notes = with(flags.python_notes, "python — bridge, no link flag")
         end
+    elsif lang == "Sys" is
+        ;; system library needed by a prebuilt archive (pthread, dl, m, ...): placed after the archives
+        if has_lib is flags.post_libs = with(flags.post_libs, sanitize_sys(lib)) end
     elsif lang == "Rust" is
+        let is_path: bool = has_lib && starts_with(lib, "/")
         if has_lib && link == "Static" is
-            flags.rust_whole_archive_libs = with(flags.rust_whole_archive_libs, sanitize(lib))
+            ;; absolute path (hlib cache) is passed to cc as-is, a bare name via -l
+            if is_path is
+                flags.rust_whole_archive_libs = with(flags.rust_whole_archive_libs, lib)
+            else
+                flags.rust_whole_archive_libs = with(flags.rust_whole_archive_libs, sanitize(lib))
+            end
+        elsif is_path is
+            let cut: int = last_slash(lib)
+            let dir: string = lib[0..cut]
+            flags.pkg_config_args = with(flags.pkg_config_args, "-L" + dir)
+            flags.dynamic_libs = with(flags.dynamic_libs, sanitize(lib[cut + 1..lib.len()]))
+            flags.rpath_hints = with(flags.rpath_hints, "-Wl,-rpath," + dir)
         elsif has_lib is
             flags.dynamic_libs = with(flags.dynamic_libs, sanitize(lib))
             flags.rpath_hints = with(flags.rpath_hints, "-Wl,-rpath,$ORIGIN")
@@ -163,9 +194,12 @@ pub fn to_cc_args_ex(f: LinkFlags, fully_static: bool) -> [string] is
     for lib in f.dynamic_libs is args.push("-l" + lib) end
     if f.rust_whole_archive_libs.len() > 0 is
         args.push("-Wl,--whole-archive")
-        for lib in f.rust_whole_archive_libs is args.push("-l" + lib) end
+        for lib in f.rust_whole_archive_libs is
+            if starts_with(lib, "/") is args.push(lib) else args.push("-l" + lib) end
+        end
         args.push("-Wl,--no-whole-archive")
     end
+    for lib in f.post_libs is args.push("-l" + lib) end
     for a in f.rpath_hints is args.push(a) end
     return args
 end
@@ -273,7 +307,7 @@ pub fn resolve_missing_static_libs(f: LinkFlags) -> [string] is
 end
 
 pub fn is_empty(f: LinkFlags) -> bool is
-    return f.static_libs.len() == 0 && f.dynamic_libs.len() == 0 && f.rust_whole_archive_libs.len() == 0 && f.pkg_config_args.len() == 0
+    return f.static_libs.len() == 0 && f.dynamic_libs.len() == 0 && f.rust_whole_archive_libs.len() == 0 && f.post_libs.len() == 0 && f.pkg_config_args.len() == 0
 end
 
 pub fn has_warnings(f: LinkFlags) -> bool is
