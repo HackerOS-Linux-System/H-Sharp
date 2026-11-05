@@ -10,3 +10,6 @@
 
 [layout]
 -> src => src
+
+[dependencies]
+-> nidus => newest
