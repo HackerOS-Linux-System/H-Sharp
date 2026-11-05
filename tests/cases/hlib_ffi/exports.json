@@ -1,0 +1,13 @@
+[
+ {"name":"add","kind":"function","signature":"fun add(a: Int, b: Int) -> Int","params":[{"type":"i64"},{"type":"i64"}],"returns":{"type":"i64"},"generic":false,"is_macro":false,"api":"hksffi_demo_add"},
+ {"name":"half","kind":"function","signature":"fun half(a: Float) -> Float","params":[{"type":"f64"}],"returns":{"type":"f64"},"generic":false,"is_macro":false,"api":"hksffi_demo_half"},
+ {"name":"greet","kind":"function","signature":"fun greet(who: Str) -> Str","params":[{"type":"cstr"}],"returns":{"type":"cstr"},"generic":false,"is_macro":false,"api":"hksffi_demo_greet"},
+ {"name":"Counter_new","kind":"function","signature":"new","params":[{"type":"cstr"}],"returns":{"type":"opaque","struct_name":"Counter"},"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_new"},
+ {"name":"Counter_free","kind":"function","signature":"free","params":[{"type":"opaque","struct_name":"Counter"}],"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_free"},
+ {"name":"Counter_get_n","kind":"function","signature":"get","params":[{"type":"opaque","struct_name":"Counter"}],"returns":{"type":"i64"},"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_get_n"},
+ {"name":"Counter_set_n","kind":"function","signature":"set","params":[{"type":"opaque","struct_name":"Counter"},{"type":"i64"}],"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_set_n"},
+ {"name":"Counter_get_name","kind":"function","signature":"name","params":[{"type":"opaque","struct_name":"Counter"}],"returns":{"type":"cstr"},"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_get_name"},
+ {"name":"Counter_items_push","kind":"function","signature":"push","params":[{"type":"opaque","struct_name":"Counter"},{"type":"i64"}],"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_items_push"},
+ {"name":"Counter_items_len","kind":"function","signature":"len","params":[{"type":"opaque","struct_name":"Counter"}],"returns":{"type":"i64"},"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_items_len"},
+ {"name":"Counter_items_get","kind":"function","signature":"get","params":[{"type":"opaque","struct_name":"Counter"},{"type":"i64"}],"returns":{"type":"i64"},"generic":false,"is_macro":false,"api":"hksffi_demo_Counter_items_get"}
+]
