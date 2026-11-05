@@ -10,3 +10,6 @@
 
 [layout]
 -> src => src
+
+[dependencies]
+! future migration to library hlib -> hlib => newest
