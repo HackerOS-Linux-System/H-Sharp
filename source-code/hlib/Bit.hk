@@ -13,3 +13,4 @@
 
 [dependencies]
 ! future migration to library hlib -> hlib => newest
+-> lsp => newest
