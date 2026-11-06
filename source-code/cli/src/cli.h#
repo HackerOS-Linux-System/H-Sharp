@@ -439,8 +439,11 @@ fn cmd_new(name: string, template: string) is
     if is_lib is bit += "-> hsharp-lib-entry => src/main.h#\n" end
     bit += "\n[build]\n-> link => static\n"
     if is_lib is bit += "\n[lib]\n-> output => hlib\n" end
-    bit += "\n! what a bare `bit` / `bit build` does\n[default-build]\n-> profile => release\n-> emit    => " + (if is_lib is "hlib" else "bin" end) + "\n\n"
+    let mut wasm_line: string = ""
+    if template == "wasm" is wasm_line = "-> target  => wasm\n" end
+    bit += "\n! what a bare `bit` / `bit build` does\n[default-build]\n-> profile => release\n-> emit    => " + (if is_lib is "hlib" else "bin" end) + "\n" + wasm_line + "\n"
     bit += "! libraries: `bit add <name>` installs one and records it here;\n! use it in code with:  use \"bit -> <name>\"\n[dependencies]\n"
+    if template == "wasm" is bit += "-> wasm => newest\n" end
     fs::write(name + "/Bit.hk", bit)
 
     let mut main_src: string = cli_templates::template_app()
@@ -730,7 +733,7 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
 
     let tmp_stem: string = out_parent + "/.hlib-" + stem
     let opts: options::CompileOptions = options::CompileOptions { target: triple, optimize: release, static_link: true, debug_info: false,
-        output: tmp_stem, output_kind: "SharedLib", default_mem_mode: "", strict_memory: false, save_cpp: false, test_mode: false, verbose: false }
+        output: tmp_stem, output_kind: "SharedLib", default_mem_mode: "", strict_memory: false, save_cpp: false, test_mode: false, verbose: false, wasm_flavor: "js" }
     out_line("  " + green_b("Compiling:") + " " + file + " (target: " + triple.llvm_triple + ")")
     let cr: pipeline::CompileResult = pipeline::compile(module, source, file, opts)
     if !cr.ok is
@@ -742,7 +745,7 @@ fn cmd_lib_build(rest: [string], year: int) -> int is
     if ffi is
         ;; second build of the same module as a static archive (what a fully static consumer links)
         let sopts: options::CompileOptions = options::CompileOptions { target: triple, optimize: release, static_link: true, debug_info: false,
-            output: tmp_stem + "-static", output_kind: "StaticLib", default_mem_mode: "", strict_memory: false, save_cpp: false, test_mode: false, verbose: false }
+            output: tmp_stem + "-static", output_kind: "StaticLib", default_mem_mode: "", strict_memory: false, save_cpp: false, test_mode: false, verbose: false, wasm_flavor: "js" }
         let sr: pipeline::CompileResult = pipeline::compile(module, source, file, sopts)
         if !sr.ok is return die_ret(sr.err) end
         match hlib::read_file(tmp_stem + "-static.a") is
@@ -1340,7 +1343,6 @@ fn compile_file(a: CompileArgs, year: int) -> int is
         mkdir_p("build")
         out_path = "build/" + stem
     end
-    mkdir_p(parent_dir(out_path))
 
     let mut triple: target::TargetTriple = target::host()
     if a.target != "" is
@@ -1351,6 +1353,14 @@ fn compile_file(a: CompileArgs, year: int) -> int is
         end
         triple = tl.target
     end
+
+    ;; WebAssembly: `-o app.js` / `-o app.html` / `-o app.wasm` choose what emcc writes; the stem is the build's name
+    let mut wasm_flavor: string = "js"
+    if target::is_wasm(triple) is
+        wasm_flavor = options::wasm_flavor_of(out_path)
+        out_path = options::strip_wasm_ext(out_path)
+    end
+    mkdir_p(parent_dir(out_path))
 
     let mut kind: string = "Binary"
     if a.emit_cpp is
@@ -1383,12 +1393,18 @@ fn compile_file(a: CompileArgs, year: int) -> int is
     let opts: options::CompileOptions = options::CompileOptions { target: triple, optimize: optimize, static_link: !a.dynamic,
         debug_info: a.debug, output: out_path, output_kind: kind, default_mem_mode: mm,
         strict_memory: a.strict_memory || env::get("HSHARP_STRICT_MEMORY") == "1", save_cpp: a.save_cpp,
-        test_mode: a.test_mode, verbose: a.verbose }
+        test_mode: a.test_mode, verbose: a.verbose, wasm_flavor: wasm_flavor }
 
     if a.verbose && a.handoff == "" is
         let mut mode: string = "g++ -O0 (debug)"
         if optimize is mode = "g++ -O2 + gc-sections + strip" end
-        out_line("  " + green_b("Compiling:") + " " + src_path + " → " + out_path + target::exe_suffix(triple) + "  [" + mode + "]")
+        if target::is_wasm(triple) is
+            mode = "emcc -O0 (debug)"
+            if optimize is mode = "emcc -O2" end
+            out_line("  " + green_b("Compiling:") + " " + src_path + " → " + emscripten::artifacts_text(out_path, wasm_flavor) + "  [" + mode + "]")
+        else
+            out_line("  " + green_b("Compiling:") + " " + src_path + " → " + out_path + target::exe_suffix(triple) + "  [" + mode + "]")
+        end
         out_line("")
     end
 
@@ -1614,6 +1630,7 @@ fn report(opts: options::CompileOptions, t0: int, out_path: string, kind: string
     let mut label: string = "Binary:"
     if kind == "Binary" is
         artifact_suffix = target::exe_suffix(triple)
+        if target::is_wasm(triple) is artifact_suffix = emscripten::output_ext(opts.wasm_flavor) end
     elsif kind == "Object" is
         artifact_suffix = ".o"
         label = "Object:"
@@ -1627,7 +1644,8 @@ fn report(opts: options::CompileOptions, t0: int, out_path: string, kind: string
         artifact_suffix = ".cpp"
         label = "C++ source:"
     end
-    let bin: string = out_path + artifact_suffix
+    let mut bin: string = out_path + artifact_suffix
+    if target::is_wasm(triple) && kind == "Binary" is bin = emscripten::artifacts_text(out_path, opts.wasm_flavor) end
     let elapsed: int = time::now_ms() - t0
     let mut bar: string = ""
     let mut k: int = 0
@@ -1639,7 +1657,11 @@ fn report(opts: options::CompileOptions, t0: int, out_path: string, kind: string
     out_line(dim(bar))
     out_line("  " + bold(pad_right(label, 10)) + " " + cyan(bin))
     out_line("  " + bold(pad_right("Target:", 10)) + " " + triple.llvm_triple)
-    out_line("  " + bold(pad_right("Backend:", 10)) + " " + green("C++ (g++)"))
+    if target::is_wasm(triple) is
+        out_line("  " + bold(pad_right("Backend:", 10)) + " " + green("C++ (emcc)"))
+    else
+        out_line("  " + bold(pad_right("Backend:", 10)) + " " + green("C++ (g++)"))
+    end
     if optimize is
         out_line("  " + bold(pad_right("Mode:", 10)) + " " + yellow("release (-O2)"))
     else
@@ -1681,6 +1703,10 @@ fn cmd_compile_native(cmd: string, rest: [string], info: EditionInfo) -> int is
     let mut year: int = 0
     if info.edition != "" is year = str_to_int_cli(info.edition) end
     if cmd == "run" is
+        if rest.len() > 0 && (rest[0] == "-h" || rest[0] == "--help") is
+            print(cli_style::help(cli_help2::help_run()))
+            return 0
+        end
         let mut quiet: bool = false
         let mut file: string = ""
         let mut prog: [string] = []
@@ -1706,11 +1732,19 @@ fn cmd_compile_native(cmd: string, rest: [string], info: EditionInfo) -> int is
         return build_and_run(file, prog, false, quiet, year)
     end
     if cmd == "test" is
+        if has_help(rest) is
+            print(cli_style::help(cli_help2::help_test()))
+            return 0
+        end
         if rest.len() != 1 || starts_with(rest[0], "-") is
             eprint("error: the following required arguments were not provided:\n  <FILE>\n\nUsage: h# test <FILE>\n\nFor more information, try '--help'.\n")
             return 2
         end
         return build_and_run(rest[0], [], true, false, year)
+    end
+    if has_help(rest) is
+        print(cli_style::help(cli_help2::help_compile()))
+        return 0
     end
     let mut ca: CompileArgs = new_compile_args("")
     let mut i: int = 0
