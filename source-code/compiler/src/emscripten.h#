@@ -1,0 +1,256 @@
+use "std -> fs" from "fs"
+use "std -> env" from "env"
+use "std -> strings" from "str"
+
+mod options
+
+;; ── Emscripten for `--target wasm32` ──────────────────────────────────────────────────────────────────
+;;
+;; H# transpiles to C++, so WebAssembly output goes through `emcc` / `em++` (Emscripten).  Nothing here
+;; touches the user's shell setup (.bashrc, .profile, emsdk_env.sh …): the compiler finds an installed
+;; emsdk and hands it to emcc through the environment of THIS PROCESS (and its children) only.
+;;
+;; Where an emsdk is looked for, first match wins:
+;;   1. HSHARP_EMCC            path of an `emcc` executable (em++ is taken from the same directory)
+;;   2. HSHARP_EMSDK           an emsdk directory (the one that holds `emsdk` and `upstream/`)
+;;   3. <project>/cache/env/emsdk      the per-project copy `bit` clones and activates
+;;   4. $EMSDK                 an emsdk the user activated himself
+;;   5. ~/.hackeros/env/emsdk  a per-user copy
+;;   6. `emcc` + `em++` on PATH (a distro package)
+;; `bit` creates (3) when a build asks for the wasm target: git clone emsdk, `./emsdk install latest`,
+;; `./emsdk activate latest`.
+
+pub struct Emcc is
+    pub ok: bool
+    pub err: string
+    pub emcc: string       ;; emcc to run (absolute path, or the bare name when found on PATH)
+    pub empp: string       ;; em++
+    pub emsdk: string      ;; emsdk root; "" when emcc did not come from an emsdk directory
+    pub config: string     ;; <emsdk>/.emscripten; "" when there is none
+end
+
+fn no_emcc(msg: string) -> Emcc is
+    return Emcc { ok: false, err: msg, emcc: "", empp: "", emsdk: "", config: "" }
+end
+
+;; ── small helpers (this module must not depend on cpp_build) ──────────────────────────────────────────
+fn contains(s: string, pat: string) -> bool is
+    let n: int = s.len()
+    let m: int = pat.len()
+    let mut i: int = 0
+    while i + m <= n is
+        if s[i..i + m] == pat is return true end
+        i += 1
+    end
+    return false
+end
+
+fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+fn split_colon(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 58 is
+            out.push(cur)
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    out.push(cur)
+    return out
+end
+
+pub fn on_path(name: string) -> bool is
+    for d in split_colon(env::get_or("PATH", "")) is
+        if d != "" && fs::is_file(d + "/" + name) is return true end
+    end
+    return false
+end
+
+fn parent_of(path: string) -> string is
+    let mut i: int = path.len() - 1
+    while i >= 0 is
+        if byte_at(path, i) == 47 is
+            if i == 0 is return "/" end
+            return path[0..i]
+        end
+        i -= 1
+    end
+    return ""
+end
+
+fn home_dir() -> string is
+    return env::get_or("HOME", "")
+end
+
+;; ── locating emcc ─────────────────────────────────────────────────────────────────────────────────────
+;; "" when `root` is not an installed emsdk (`./emsdk install` has not run there)
+fn emcc_in_sdk(root: string) -> string is
+    if root == "" is return "" end
+    let c: string = root + "/upstream/emscripten/emcc"
+    if fs::is_file(c) is return c end
+    return ""
+end
+
+;; the emsdk `bit` keeps in <project>/cache/env/emsdk — searched from the working directory upwards
+fn project_emsdk() -> string is
+    let mut dir: string = fs::cwd()
+    let mut depth: int = 0
+    while depth < 8 is
+        let cand: string = dir + "/cache/env/emsdk"
+        if emcc_in_sdk(cand) != "" is return cand end
+        let up: string = parent_of(dir)
+        if up == "" || up == dir is return "" end
+        dir = up
+        depth += 1
+    end
+    return ""
+end
+
+pub fn home_emsdk() -> string is
+    let h: string = home_dir()
+    if h == "" is return "" end
+    return h + "/.hackeros/env/emsdk"
+end
+
+;; another tool of the same Emscripten install: sibling("/x/emcc", "emar") = "/x/emar"; a bare `emcc` gives the bare name
+pub fn sibling(emcc: string, tool: string) -> string is
+    if ends_with(emcc, "emcc") is return emcc[0..emcc.len() - 4] + tool end
+    return tool
+end
+
+fn sibling_empp(emcc: string) -> string is
+    return sibling(emcc, "em++")
+end
+
+fn from_sdk(root: string) -> Emcc is
+    let c: string = emcc_in_sdk(root)
+    let mut cfg: string = root + "/.emscripten"
+    if !fs::is_file(cfg) is cfg = "" end
+    return Emcc { ok: true, err: "", emcc: c, empp: sibling_empp(c), emsdk: root, config: cfg }
+end
+
+pub fn install_hint() -> string is
+    return "target wasm32 needs Emscripten (emcc). Easiest: let `bit` set it up — `bit --target wasm` clones emsdk into cache/env/emsdk and runs `./emsdk install latest` + `./emsdk activate latest` there.\nBy hand:  git clone https://github.com/emscripten-core/emsdk.git cache/env/emsdk && cd cache/env/emsdk && ./emsdk install latest && ./emsdk activate latest\nOr point H# at an existing install: HSHARP_EMSDK=/path/to/emsdk  (or HSHARP_EMCC=/path/to/emcc)"
+end
+
+pub fn locate() -> Emcc is
+    let direct: string = env::get_or("HSHARP_EMCC", "")
+    if direct != "" is
+        if !fs::is_file(direct) && !on_path(direct) is
+            return no_emcc("HSHARP_EMCC is set to `" + direct + "`, which is not an executable file")
+        end
+        return Emcc { ok: true, err: "", emcc: direct, empp: sibling_empp(direct), emsdk: "", config: "" }
+    end
+    let mut roots: [string] = []
+    for r in [env::get_or("HSHARP_EMSDK", ""), project_emsdk(), env::get_or("EMSDK", ""), home_emsdk()] is
+        if r != "" is roots.push(r) end
+    end
+    for r in roots is
+        if emcc_in_sdk(r) != "" is return from_sdk(r) end
+    end
+    if on_path("emcc") && on_path("em++") is
+        return Emcc { ok: true, err: "", emcc: "emcc", empp: "em++", emsdk: "", config: "" }
+    end
+    return no_emcc(install_hint())
+end
+
+;; first <dir>/<entry>/<rel> that is a file, for the python / node emsdk downloads (<emsdk>/python/3.9.2-1_64bit/bin/python3)
+fn first_in(dir: string, rel: string) -> string is
+    if !fs::is_dir(dir) is return "" end
+    for n in fs::list_dir(dir) is
+        let cand: string = dir + "/" + n + "/" + rel
+        if fs::is_file(cand) is return cand end
+    end
+    return ""
+end
+
+;; The environment emcc needs, set for this process and its children ONLY — no shell profile is edited.
+pub fn apply_env(e: Emcc) is
+    if e.emsdk == "" is return end
+    env::set("EMSDK", e.emsdk)
+    if env::get_or("EM_CONFIG", "") == "" && e.config != "" is env::set("EM_CONFIG", e.config) end
+    if env::get_or("EMSDK_PYTHON", "") == "" is
+        let py: string = first_in(e.emsdk + "/python", "bin/python3")
+        if py != "" is env::set("EMSDK_PYTHON", py) end
+    end
+end
+
+;; ── the wasm library (bit.io `wasm`) ──────────────────────────────────────────────────────────────────
+;; Browser bindings for H# (console, DOM, events, timers, storage, fetch, canvas, …).  Its `emscripten/`
+;; directory carries web_bridge.cpp (the C side of every `extern static [rust]` it declares) and
+;; hsharp-web.js (an emcc --js-library with the JS side).  Both are used whenever a program calls into it.
+fn has_bridge(dir: string) -> bool is
+    if dir == "" is return false end
+    return fs::is_file(dir + "/emscripten/web_bridge.cpp") && fs::is_file(dir + "/emscripten/hsharp-web.js")
+end
+
+;; "" when the library is not installed.  HSHARP_WASM_LIB wins; then the places `bit` installs libraries to.
+pub fn wasm_lib_dir() -> string is
+    let explicit: string = env::get_or("HSHARP_WASM_LIB", "")
+    if has_bridge(explicit) is return explicit end
+    let mut bases: [string] = []
+    for b in [env::get_or("HLIB_PATH", ""), env::get_or("BIT_LIBS", ""), env::get_or("BIT_HOME", ""), home_dir() + "/.hackeros/libs", fs::cwd() + "/cache/libs"] is
+        if b != "" && b != "/.hackeros/libs" is bases.push(b) end
+    end
+    for b in bases is
+        if has_bridge(b + "/wasm/current") is return b + "/wasm/current" end
+        if has_bridge(b + "/wasm") is return b + "/wasm" end
+    end
+    return ""
+end
+
+;; true when the generated C++ calls into the wasm library (every extern of it is named hweb_*)
+pub fn uses_web_bridge(cpp: string) -> bool is
+    return contains(cpp, "hx_hweb_")
+end
+
+pub fn missing_lib_message() -> string is
+    return "the program calls the `wasm` library (browser bindings) but its emscripten/ files were not found.\nInstall it:  bit install wasm   (or add `-> wasm => newest` to [dependencies] in Bit.hk), or set HSHARP_WASM_LIB to its directory"
+end
+
+;; ── command lines ─────────────────────────────────────────────────────────────────────────────────────
+pub fn exported_functions() -> string is
+    return "-sEXPORTED_FUNCTIONS=_main,_hsharp_web_retbuf,_hsharp_web_alloc,_hsharp_web_free,_hsharp_web_event"
+end
+
+;; the link line of a wasm program (objects and -o are added by the caller).  `web` = the program uses the
+;; wasm library: the JS bridge is linked in and the runtime stays alive after main() returns so that timers,
+;; DOM events and fetch callbacks can still reach `wasm_on_event`.
+pub fn link_flags(o: options::CompileOptions, web: bool, libdir: string) -> [string] is
+    let mut f: [string] = ["-sALLOW_MEMORY_GROWTH=1"]
+    if o.optimize is f.push("-O2") else f.push("-O0") f.push("-sASSERTIONS=1") end
+    if o.debug_info is f.push("-g") end
+    if web is
+        f.push("--js-library")
+        f.push(libdir + "/emscripten/hsharp-web.js")
+        f.push(exported_functions())
+        f.push("-sEXPORTED_RUNTIME_METHODS=UTF8ToString,lengthBytesUTF8,stringToUTF8")
+    else
+        ;; a command-line program: flush stdio and end the process when main() returns
+        f.push("-sEXIT_RUNTIME=1")
+    end
+    if o.wasm_flavor == "wasm" is f.push("-sSTANDALONE_WASM=1") end
+    for w in str::split_whitespace(env::get_or("HSHARP_EMCC_FLAGS", "")) is f.push(w) end
+    return f
+end
+
+;; what emcc writes for `-o <stem><ext>`
+pub fn output_ext(flavor: string) -> string is
+    if flavor == "html" is return ".html" end
+    if flavor == "wasm" is return ".wasm" end
+    return ".js"
+end
+
+;; what the build leaves behind, for the final report
+pub fn artifacts_text(stem: string, flavor: string) -> string is
+    if flavor == "html" is return stem + ".html + " + stem + ".js + " + stem + ".wasm" end
+    if flavor == "wasm" is return stem + ".wasm" end
+    return stem + ".js + " + stem + ".wasm"
+end
