@@ -17,6 +17,7 @@ mod ffi_cpp
 mod ffi_linker
 mod ffi_export
 mod hlib_export
+mod emscripten
 mod cpp_build
 mod stdlib_shims
 mod traits
