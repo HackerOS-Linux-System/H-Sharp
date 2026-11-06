@@ -8,6 +8,7 @@ mod target
 mod options
 mod ffi_linker
 mod runtime_embed
+mod emscripten
 
 ;; ── runtime sources ────────────────────────────────────────────────────────
 pub fn runtime_dir() -> string is
@@ -167,6 +168,13 @@ fn same_target(a: target::TargetTriple, b: target::TargetTriple) -> bool is
 end
 
 pub fn toolchain(t: target::TargetTriple) -> Toolchain is
+    if target::is_wasm(t) is
+        ;; WebAssembly: Emscripten (emcc / em++) found in an emsdk or on PATH — see emscripten.h#
+        let e: emscripten::Emcc = emscripten::locate()
+        if !e.ok is return tc_err(e.err) end
+        emscripten::apply_env(e)
+        return Toolchain { ok: true, err: "", cc: e.emcc, cxx: e.empp, extra: [] }
+    end
     if same_target(t, target::host()) is
         let mut cc: string = env::get_or("CC", "")
         if cc == "" is
@@ -293,7 +301,8 @@ fn runtime_objects(cc: string, extra: [string], o: options::CompileOptions) -> O
             let tmp: string = dir + "/" + name + ".tmp"
             let mut args: [string] = []
             for e in extra is args.push(e) end
-            for f in [opt_flag(o), "-fPIC", "-fwrapv", "-ffunction-sections", "-fdata-sections", "-w", "-c", c, "-o", tmp] is args.push(f) end
+            if !target::is_wasm(o.target) is args.push("-fPIC") end
+            for f in [opt_flag(o), "-fwrapv", "-ffunction-sections", "-fdata-sections", "-w", "-c", c, "-o", tmp] is args.push(f) end
             let e: string = run(cc, args, "compiling runtime/" + name + ".c")
             if e != "" is return ObjResult { err: e, objs: [] } end
             fs::rename(tmp, ob)
@@ -351,6 +360,37 @@ fn starts_with(s: string, p: string) -> bool is
     return s.len() >= p.len() && s[0..p.len()] == p
 end
 
+;; ── target wasm32: link with em++ ───────────────────────────────────────────────────────────────────────
+;; `main_o` + the runtime objects (+ the `wasm` library's bridge when the program calls into it) -> <output>.js + .wasm.
+;; "" on success, else the error text.
+fn link_wasm(inp: BuildInput, o: options::CompileOptions, tc: Toolchain, main_o: string, rt_objs: [string], work: string) -> string is
+    let web: bool = emscripten::uses_web_bridge(inp.cpp)
+    let mut libdir: string = ""
+    let mut objs: [string] = [main_o]
+    for ob in rt_objs is objs.push(ob) end
+    if web is
+        libdir = emscripten::wasm_lib_dir()
+        if libdir == "" is return emscripten::missing_lib_message() end
+        if o.wasm_flavor == "wasm" is
+            return "the `wasm` library needs JavaScript glue: build with `-o <name>.js` or `-o <name>.html`, not `.wasm`"
+        end
+        let bridge_o: string = work + "/web_bridge.o"
+        let mut bargs: [string] = []
+        for e in tc.extra is bargs.push(e) end
+        for f in ["-std=gnu++17", "-I" + work, opt_flag(o), "-w", "-fwrapv", "-c", libdir + "/emscripten/web_bridge.cpp", "-o", bridge_o] is bargs.push(f) end
+        let be: string = run(tc.cxx, bargs, "compiling the wasm library bridge")
+        if be != "" is return be end
+        objs.push(bridge_o)
+    end
+    let out: string = o.output + emscripten::output_ext(o.wasm_flavor)
+    let mut l: [string] = []
+    for ob in objs is l.push(ob) end
+    l.push("-o")
+    l.push(out)
+    for f in emscripten::link_flags(o, web, libdir) is l.push(f) end
+    return run(tc.cxx, l, "linking with emcc")
+end
+
 ;; returns "" on success, otherwise the error text (Toolchain error in the Rust version)
 pub fn build(inp: BuildInput, o: options::CompileOptions) -> string is
     let rp: string = runtime_problem()
@@ -386,7 +426,9 @@ pub fn build(inp: BuildInput, o: options::CompileOptions) -> string is
     let main_o: string = work + "/program.o"
     let mut cargs: [string] = []
     for e in tc.extra is cargs.push(e) end
-    for f in ["-std=gnu++17", "-I" + work, opt_flag(o), "-fPIC", "-w", "-fwrapv", "-fno-strict-aliasing", "-ffunction-sections", "-fdata-sections", "-c"] is cargs.push(f) end
+    let wasm: bool = target::is_wasm(o.target)
+    if !wasm is cargs.push("-fPIC") end
+    for f in ["-std=gnu++17", "-I" + work, opt_flag(o), "-w", "-fwrapv", "-fno-strict-aliasing", "-ffunction-sections", "-fdata-sections", "-c"] is cargs.push(f) end
     if o.debug_info is cargs.push("-g") end
     if inp.strict_memory is cargs.push("-DHSH_STRICT_MEMORY") end
     cargs.push(cpp_path)
@@ -404,16 +446,23 @@ pub fn build(inp: BuildInput, o: options::CompileOptions) -> string is
     if on_linux is linux_libs = ["-lm", "-lpthread", "-ldl"]
     elsif o.target.os == "macos" is linux_libs = ["-lm"] end
     let lf: ffi_linker::LinkFlags = inp.link
-    if !o.static_link is ffi_linker::resolve_missing_static_libs(lf) end
+    if !o.static_link && !wasm is ffi_linker::resolve_missing_static_libs(lf) end
     let ext_args: [string] = ffi_linker::to_cc_args_ex(lf, o.static_link)
     let mut result: string = ""
-    if o.output_kind == "Object" is
+    if wasm && o.output_kind == "Binary" && inp.has_main is
+        ;; x.js + x.wasm (or x.html / a standalone x.wasm), linked by em++
+        let we: string = link_wasm(inp, o, tc, main_o, ro.objs, work)
+        if we != "" is return we end
+    elsif o.output_kind == "Object" is
         fs::copy(main_o, o.output + ".o")
     elsif o.output_kind == "StaticLib" is
         let out: string = o.output + ".a"
         let mut ar: [string] = ["rcs", out, main_o]
         for ob in ro.objs is ar.push(ob) end
-        result = run("ar", ar, "ar")
+        ;; GNU ar cannot index WebAssembly objects; emar (llvm-ar) can
+        let mut archiver: string = "ar"
+        if wasm is archiver = emscripten::sibling(tc.cc, "emar") end
+        result = run(archiver, ar, "ar")
     elsif o.output_kind == "SharedLib" is
         let out: string = o.output + options::file_suffix(o.output_kind, o.target)
         let mut l: [string] = []
