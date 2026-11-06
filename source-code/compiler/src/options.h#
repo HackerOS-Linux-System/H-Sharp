@@ -12,12 +12,13 @@ pub struct CompileOptions is
     pub save_cpp: bool
     pub test_mode: bool
     pub verbose: bool
+    pub wasm_flavor: string        ;; target wasm32 only: "js" (x.js + x.wasm, default) | "html" | "wasm" (standalone x.wasm)
 end
 
 pub fn default_options(strict_env: bool) -> CompileOptions is
     return CompileOptions { target: target::host(), optimize: true, static_link: true, debug_info: false,
         output: "output", output_kind: "Binary", default_mem_mode: "", strict_memory: strict_env,
-        save_cpp: false, test_mode: false, verbose: false }
+        save_cpp: false, test_mode: false, verbose: false, wasm_flavor: "js" }
 end
 
 fn contains(s: string, pat: string) -> bool is
@@ -57,12 +58,32 @@ pub fn kind_from_str(s: string) -> KindLookup is
     return KindLookup { found: false, kind: "Binary" }
 end
 
-;; the `wasm32` guard at the top of `compile()`; "" when fine
+;; the `wasm32` guard at the top of `compile()`; "" when fine.  A wasm build goes through emcc: an executable
+;; (.js + .wasm), a static archive, an object and the C++ source all work; a shared library does not exist there.
 pub fn wasm_guard(o: CompileOptions) -> string is
-    if target::is_wasm(o.target) && o.output_kind != "Cpp" is
-        return "target wasm32 only supports `--emit cpp` (compile the emitted source with emscripten / wasi-sdk yourself)"
+    if target::is_wasm(o.target) && o.output_kind == "SharedLib" is
+        return "target wasm32 cannot build shared libraries (`--emit so`); use `--emit bin` (.js + .wasm), `--emit lib` (.a), `--emit obj` or `--emit cpp`"
     end
     return ""
+end
+
+fn ends_with(s: string, p: string) -> bool is
+    return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
+end
+
+;; what `-o <path>` asks of a wasm build: x.html -> "html", x.wasm -> "wasm" (standalone module), anything else -> "js"
+pub fn wasm_flavor_of(path: string) -> string is
+    if ends_with(path, ".html") is return "html" end
+    if ends_with(path, ".wasm") is return "wasm" end
+    return "js"
+end
+
+;; `-o build/app.js` and `-o build/app` name the same build: the extension only chose the flavor
+pub fn strip_wasm_ext(path: string) -> string is
+    for ext in [".html", ".wasm", ".js"] is
+        if ends_with(path, ext) && path.len() > ext.len() is return path[0..path.len() - ext.len()] end
+    end
+    return path
 end
 
 ;; CompileError display texts
