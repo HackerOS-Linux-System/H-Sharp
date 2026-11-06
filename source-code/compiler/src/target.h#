@@ -45,9 +45,12 @@ pub fn macos_aarch64() -> TargetTriple is
     return mk_target("aarch64", "macos", "none", "aarch64-apple-darwin")
 end
 
-;; wasm32-unknown-unknown: no OS, no libc, no filesystem, no processes (pure-computation H# only).
+;; wasm32-unknown-emscripten: WebAssembly built by emcc (Emscripten / emsdk) from the generated C++.  The H# runtime
+;; builds against Emscripten's libc, so ordinary programs run in node as they are; in a browser the `wasm` library
+;; (bit.io) supplies the DOM / events / timers / storage / fetch / canvas bindings.  `-o x.js` -> x.js + x.wasm,
+;; `-o x.html` adds a page, `-o x.wasm` is a standalone module (see emscripten.h#).
 pub fn wasm32() -> TargetTriple is
-    return mk_target("wasm32", "freestanding", "none", "wasm32-unknown-unknown")
+    return mk_target("wasm32", "emscripten", "none", "wasm32-unknown-emscripten")
 end
 
 ;; the host is linux-x86_64-musl on every platform this self-hosted build supports
@@ -73,7 +76,7 @@ pub fn from_str(s: string) -> TargetLookup is
     elsif s == "windows-aarch64" is t = windows_aarch64()
     elsif s == "macos" || s == "macos-x86_64" is t = macos_x86_64()
     elsif s == "macos-aarch64" is t = macos_aarch64()
-    elsif s == "wasm32" || s == "wasm" is t = wasm32()
+    elsif s == "wasm32" || s == "wasm" || s == "wasm32-emscripten" || s == "wasm32-unknown-emscripten" || s == "emscripten" is t = wasm32()
     else ok = false end
     return TargetLookup { found: ok, target: t }
 end
@@ -84,6 +87,7 @@ end
 
 pub fn exe_suffix(t: TargetTriple) -> string is
     if t.os == "windows" is return ".exe" end
+    if t.os == "emscripten" is return ".js" end
     if t.os == "freestanding" is return ".wasm" end
     return ""
 end
@@ -100,7 +104,7 @@ pub fn all_named() -> [string] is
         "windows-aarch64", "Windows ARM64",
         "macos-x86_64", "macOS Intel",
         "macos-aarch64", "macOS Apple Silicon",
-        "wasm32", "WebAssembly (wasm32-unknown-unknown) — pure-computation H# only, see TargetTriple::wasm32()'s doc comment"
+        "wasm32", "WebAssembly (wasm32-unknown-emscripten, built with emcc from emsdk) [alias: wasm]"
     ]
 end
 
