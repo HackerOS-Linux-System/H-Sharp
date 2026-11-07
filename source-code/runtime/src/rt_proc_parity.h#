@@ -1,0 +1,104 @@
+use "std -> env" from "env"
+
+mod rt_io
+mod rt_str
+mod rt_ptr
+mod rt_sys
+
+fn pn(tag: string, v: int) is
+    rt_io::print_s(tag + "=" + to_string(v) + "\n")
+end
+
+fn main() is
+    let args: [string] = env::args()
+    let sc: string = args[1]
+    if sc == "print" is
+        rt_io::print_s("a")
+        rt_io::print_s("b\n")
+        rt_io::print_s("")
+        rt_io::print_s("no newline at end")
+    elsif sc == "order" is
+        rt_io::print_s("x")
+        println("y")
+        rt_io::print_s("z\n")
+    elsif sc == "assert_ok" is
+        rt_io::assert_s(true, "fine")
+        rt_io::print_s("after")
+    elsif sc == "assert_fail" is
+        rt_io::print_s("before\n")
+        rt_io::assert_s(false, "boom")
+        rt_io::print_s("after")
+    elsif sc == "panic" is
+        rt_io::print_s("before")
+        rt_io::panic_s("kaboom")
+    elsif sc == "test_fail" is
+        rt_io::print_s("pending")
+        rt_io::test_fail("nope")
+        rt_io::print_s("unreachable")
+    elsif sc == "test_skip" is
+        let r: int = rt_io::test_skip("why")
+        rt_io::print_s("r=" + to_string(r) + "\n")
+    elsif sc == "readline" is
+        let mut i: int = 0
+        while i < 6 is
+            rt_io::print_s("[" + rt_io::readline() + "]\n")
+            i += 1
+        end
+    elsif sc == "env_read_line" is
+        let mut i: int = 0
+        while i < 6 is
+            rt_io::print_s("[" + rt_io::env_read_line() + "]\n")
+            i += 1
+        end
+    elsif sc == "read_char" is
+        let mut i: int = 0
+        while i < 8 is
+            rt_io::print_s("<" + rt_io::io_read_char() + ">")
+            i += 1
+        end
+        rt_io::print_s("\n")
+        elsif sc == "env_args" is
+        let a: [string] = rt_sys::env_args()
+        rt_io::print_s("n=" + to_string(a.len()) + "\n")
+        let mut i: int = 1
+        while i < a.len() is
+            rt_io::print_s("[" + a[i] + "]\n")
+            i += 1
+        end
+    elsif rt_str::starts_with(sc, "chk_") is
+        let p: int = rt_ptr::rc_alloc(16)
+        rt_io::ptr_write_checked(p, 0, 8, -2)
+        rt_io::ptr_write_checked(p, 8, 4, 16909060)
+        rt_io::ptr_write_checked(p, 12, 2, -3)
+        rt_io::ptr_write_checked(p, 14, 1, 200)
+        if sc == "chk_ok" is
+            pn("r8", rt_io::ptr_read_checked(p, 0, 8))
+            pn("r4", rt_io::ptr_read_checked(p, 8, 4))
+            pn("r2", rt_io::ptr_read_checked(p, 12, 2))
+            pn("r1", rt_io::ptr_read_checked(p, 14, 1))
+            pn("r1b", rt_io::ptr_read_checked(p, 15, 1))
+        elsif sc == "chk_null_read" is
+            rt_io::print_s("a\n")
+            pn("r", rt_io::ptr_read_checked(0, 0, 1))
+            rt_io::print_s("after\n")
+        elsif sc == "chk_oob_read" is
+            pn("r", rt_io::ptr_read_checked(p, 12, 8))
+        elsif sc == "chk_neg_read" is
+            pn("r", rt_io::ptr_read_checked(p, -1, 1))
+        elsif sc == "chk_width_read" is
+            pn("r", rt_io::ptr_read_checked(p, 0, 3))
+        elsif sc == "chk_zero_width" is
+            pn("r", rt_io::ptr_read_checked(p, 0, 0))
+        elsif sc == "chk_null_write" is
+            rt_io::ptr_write_checked(0, 0, 1, 1)
+        elsif sc == "chk_oob_write" is
+            rt_io::ptr_write_checked(p, 9, 8, 1)
+        elsif sc == "chk_width_write" is
+            rt_io::ptr_write_checked(p, 0, 5, 1)
+        elsif sc == "chk_edge" is
+            rt_io::ptr_write_checked(p, 8, 8, 77)
+            pn("r", rt_io::ptr_read_checked(p, 8, 8))
+            pn("r2", rt_io::ptr_read_checked(p, 0, 8))
+        end
+    end
+end
