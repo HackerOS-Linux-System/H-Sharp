@@ -394,7 +394,9 @@ fn block_value(g: cg::Gen, body: [ast::Node], prefix: string, hint: ast::Node) -
         let last: ast::Node = body[body.len() - 1]
         if last.tag == "ExprStmt" && !cg::is_stmt_expr(last.kids[0]) is
             let v: string = expr_h(g, last.kids[0], hint)
-            o = o + "    " + v + ";\n"
+            ;; parenthesised: `T(x);` as the last statement would be parsed as a (function) declaration
+            ;; (vexing parse) and the statement-expression would silently become `void`
+            o = o + "    (" + v + ");\n"
         else
             o = o + stmt(g, last)
             let diverges: bool = last.tag == "Return" || last.tag == "Break" || last.tag == "Continue" || (last.tag == "ExprStmt" && last.kids[0].tag == "ReturnE")
