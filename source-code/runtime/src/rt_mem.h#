@@ -1,0 +1,628 @@
+mod rt_ptr
+mod rt_state
+mod rt_io
+mod rt_rand
+mod rt_conv
+
+extern static [c] is
+    fn malloc(n: int) -> int
+    fn calloc(n: int, m: int) -> int
+    fn free(p: int) -> int
+    fn memmove(dst: int, src: int, n: int) -> int
+    fn memset(p: int, c: int, n: int) -> int
+    fn strlen(p: int) -> int
+    fn strdup(p: int) -> string
+    fn memcpy(dst: int, src: string, n: int) -> int
+    fn pthread_mutex_lock(m: int) -> int
+    fn pthread_mutex_unlock(m: int) -> int
+end
+
+fn rd(p: int, off: int) -> int is return rt_ptr::ptr_read_i64(p, off) end
+fn wr(p: int, off: int, v: int) is rt_ptr::ptr_write_i64(p, off, v) end
+
+;; ───────────────────────────── arenas ─────────────────────────────
+;; arena stack block: top:i32 @0, entries @8 (64 of them)
+fn astack() -> int is return rt_state::tls_block(520) end
+
+fn arena_current() -> int is
+    let st: int = astack()
+    let top: int = rt_ptr::ptr_read_i32(st, 0)
+    if top > 0 is return rd(st, 8 + (top - 1) * 8) end
+    return 0
+end
+
+;; core.c hsh_arena_push_current / hsh_arena_pop_current (at most 64 levels; pop on an empty stack gives NULL)
+pub fn arena_push_current(a: int) is
+    let st: int = astack()
+    let top: int = rt_ptr::ptr_read_i32(st, 0)
+    if top < 64 is
+        wr(st, 8 + top * 8, a)
+        rt_ptr::ptr_write_i32(st, 0, top + 1)
+    end
+end
+pub fn arena_pop_current() -> int is
+    let st: int = astack()
+    let top: int = rt_ptr::ptr_read_i32(st, 0)
+    if top > 0 is
+        rt_ptr::ptr_write_i32(st, 0, top - 1)
+        return rd(st, 8 + (top - 1) * 8)
+    end
+    return 0
+end
+
+;; core.c hsh_arena_new_kind (kinds: 0 general, 1 fixed, 2 pool, 3 page, 4 ring) / hsh_arena_new
+pub fn arena_new_kind(cap: int, kind: int) -> int is
+    let a: int = malloc(40)
+    if a == 0 is return 0 end
+    wr(a, 0, malloc(cap))
+    wr(a, 8, cap)
+    wr(a, 16, 0)
+    wr(a, 24, kind)
+    wr(a, 32, 0)
+    return a
+end
+pub fn arena_new(cap: int) -> int is return arena_new_kind(cap, 0) end
+
+;; core.c hsh_arena_alloc: bump allocation, alignment 8 (pool 64, page 4096); a full fixed arena panics, a full ring wraps,
+;; the others chain a fresh block (the exhausted one is kept on `prev`); NULL arena = plain malloc
+pub fn arena_alloc(a: int, n: int) -> int is
+    if a == 0 is return malloc(n) end
+    let kind: int = rd(a, 24)
+    let mut align: int = 8
+    if kind == 2 is
+        align = 64
+    elsif kind == 3 is
+        align = 4096
+    end
+    let aligned: int = (n + (align - 1)) & (~(align - 1))
+    let cap: int = rd(a, 8)
+    if rd(a, 16) + aligned > cap is
+        if kind == 1 is
+            rt_io::panic_s("arena(fixed) capacity exceeded — allocation would overflow the fixed-size arena")
+        end
+        if kind == 4 && aligned <= cap is
+            wr(a, 16, 0)
+        else
+            let mut ncap: int = cap
+            if aligned > cap is ncap = aligned end
+            let nb: int = malloc(ncap)
+            let old: int = malloc(40)
+            if nb == 0 || old == 0 is
+                free(nb)
+                free(old)
+                return malloc(n)
+            end
+            wr(old, 0, rd(a, 0))
+            wr(old, 8, rd(a, 8))
+            wr(old, 16, rd(a, 16))
+            wr(old, 24, rd(a, 24))
+            wr(old, 32, rd(a, 32))
+            wr(a, 32, old)
+            wr(a, 0, nb)
+            wr(a, 8, ncap)
+            wr(a, 16, 0)
+        end
+    end
+    let p: int = rd(a, 0) + rd(a, 16)
+    wr(a, 16, rd(a, 16) + aligned)
+    return p
+end
+
+;; core.c hsh_arena_free: every chained block, then the arena
+pub fn arena_free(a: int) is
+    if a == 0 is return end
+    let mut b: int = rd(a, 32)
+    while b != 0 is
+        let nx: int = rd(b, 32)
+        free(rd(b, 0))
+        free(b)
+        b = nx
+    end
+    free(rd(a, 0))
+    free(a)
+end
+
+;; core.c hsh_arena_checkpoint / rewind / used / capacity — all on the CURRENT arena (0 without one)
+pub fn arena_checkpoint() -> int is
+    let a: int = arena_current()
+    if a == 0 is return 0 end
+    return rd(a, 16)
+end
+pub fn arena_rewind(mark: int) is
+    let a: int = arena_current()
+    if a == 0 || mark < 0 || mark > rd(a, 8) is return end
+    wr(a, 16, mark)
+end
+pub fn arena_used() -> int is
+    let a: int = arena_current()
+    if a == 0 is return 0 end
+    return rd(a, 16)
+end
+pub fn arena_capacity() -> int is
+    let a: int = arena_current()
+    if a == 0 is return 0 end
+    return rd(a, 8)
+end
+
+;; core.c hsh_alloc (arena-aware malloc), hsh_alloc_ex (the exported alias) and hsh_struct_new (zeroed n 8-byte slots)
+pub fn alloc(n: int) -> int is
+    let a: int = arena_current()
+    if a != 0 is return arena_alloc(a, n) end
+    return malloc(n)
+end
+pub fn alloc_ex(n: int) -> int is return alloc(n) end
+pub fn struct_new(n: int) -> int is
+    let s: int = alloc(n * 8)
+    if s != 0 is memset(s, 0, n * 8) end
+    return s
+end
+
+;; ───────────────────────────── arrays ─────────────────────────────
+;; hsh_arr_alloc: header + inline elements (at least 4)
+pub fn arr_alloc(cap0: int) -> int is
+    let mut cap: int = cap0
+    if cap < 4 is cap = 4 end
+    let a: int = alloc(32 + 8 * cap)
+    if a == 0 is return 0 end
+    wr(a, 0, 0)
+    wr(a, 8, cap)
+    wr(a, 16, a + 32)
+    wr(a, 24, 0)
+    return a
+end
+
+pub fn array_new() -> int is return arr_alloc(4) end
+
+;; core.c hsh_array_push: grows IN PLACE (the header never moves); NULL array -> a new one
+pub fn array_push(a0: int, val: int) -> int is
+    let mut a: int = a0
+    if a == 0 is a = array_new() end
+    let len: int = rd(a, 0)
+    let cap: int = rd(a, 8)
+    if len >= cap is
+        let new_cap: int = cap * 2
+        let nd: int = malloc(8 * new_cap)
+        if nd == 0 is return a end
+        memmove(nd, rd(a, 16), len * 8)
+        if rd(a, 24) != 0 is free(rd(a, 16)) end
+        wr(a, 16, nd)
+        wr(a, 24, 1)
+        wr(a, 8, new_cap)
+    end
+    wr(rd(a, 16), len * 8, val)
+    wr(a, 0, len + 1)
+    return a
+end
+
+pub fn array_push_str(a: int, s: int) -> int is return array_push(a, s) end
+
+pub fn array_len(a: int) -> int is
+    if a == 0 is return 0 end
+    return rd(a, 0)
+end
+
+pub fn array_get(a: int, idx: int) -> int is
+    if a == 0 || idx < 0 || idx >= rd(a, 0) is return 0 end
+    return rd(rd(a, 16), idx * 8)
+end
+
+pub fn array_set(a: int, idx: int, val: int) -> int is
+    if a == 0 || idx < 0 || idx >= rd(a, 0) is return a end
+    wr(rd(a, 16), idx * 8, val)
+    return a
+end
+
+;; core.c hsh_array_concat: a fresh array; a NULL side returns the other (both NULL -> a new empty array)
+pub fn array_concat(a: int, b: int) -> int is
+    if a == 0 is
+        if b != 0 is return b end
+        return array_new()
+    end
+    if b == 0 is return a end
+    let la: int = rd(a, 0)
+    let lb: int = rd(b, 0)
+    let r: int = arr_alloc(la + lb)
+    wr(r, 0, la + lb)
+    memmove(rd(r, 16), rd(a, 16), la * 8)
+    memmove(rd(r, 16) + la * 8, rd(b, 16), lb * 8)
+    return r
+end
+
+;; core.c hsh_array_contains: 1 / 0 (the C returns the pointers 1 and 0)
+pub fn array_contains(a: int, val: int) -> int is
+    if a == 0 is return 0 end
+    let mut i: int = 0
+    while i < rd(a, 0) is
+        if rd(rd(a, 16), i * 8) == val is return 1 end
+        i += 1
+    end
+    return 0
+end
+
+;; core.c hsh_array_remove: shifts the tail left; 1 on success, 0 for a bad index
+pub fn array_remove(a: int, idx: int) -> int is
+    if a == 0 || idx < 0 || idx >= rd(a, 0) is return 0 end
+    let len: int = rd(a, 0)
+    memmove(rd(a, 16) + idx * 8, rd(a, 16) + (idx + 1) * 8, (len - idx - 1) * 8)
+    wr(a, 0, len - 1)
+    return 1
+end
+
+;; core.c hsh_array_slice: elements [start, end) of a (clamped) in a new array
+pub fn array_slice(a: int, start0: int, end0: int) -> int is
+    let mut r: int = array_new()
+    if a == 0 is return r end
+    let mut start: int = start0
+    let mut e: int = end0
+    if start < 0 is start = 0 end
+    if e > rd(a, 0) is e = rd(a, 0) end
+    let mut i: int = start
+    while i < e is
+        r = array_push(r, rd(rd(a, 16), i * 8))
+        i += 1
+    end
+    return r
+end
+
+;; core.c hsh_array_free: the grown buffer (if owned) and the header
+pub fn array_free(arr: int) is
+    if arr == 0 is return end
+    if rd(arr, 24) != 0 is free(rd(arr, 16)) end
+    free(arr)
+end
+
+;; core.c hsh_array_drop: release the buffer, empty the array; the header itself is freed only outside an arena
+pub fn array_drop(arr: int) is
+    if arr == 0 is return end
+    if rd(arr, 24) != 0 is
+        free(rd(arr, 16))
+        wr(arr, 24, 0)
+        wr(arr, 16, arr + 32)
+    end
+    wr(arr, 0, 0)
+    if arena_current() != 0 is return end
+    free(arr)
+end
+
+;; ───────────────────────────── maps ─────────────────────────────
+fn lsr64(x: int, n: int) -> int is return (x >> n) & ((1 << (64 - n)) - 1) end
+
+;; a copy of the H# string made with the arena-aware allocator (hsh_alloc), NUL terminated; its address
+pub fn alloc_string(s: string) -> int is
+    let b: int = alloc(s.len() + 1)
+    memcpy(b, s, s.len())
+    rt_ptr::ptr_write_i8(b, s.len(), 0)
+    return b
+end
+
+;; a malloc'd NUL-terminated copy of the H# string; its address (helper for callers and tests)
+pub fn c_string(s: string) -> int is
+    let b: int = calloc(s.len() + 1, 1)
+    memcpy(b, s, s.len())
+    return b
+end
+
+;; text of the C string at address p ("" for NULL)
+pub fn text_at(p: int) -> string is
+    if p == 0 is return "" end
+    return strdup(p)
+end
+
+;; hsh_fnv1a of the C string at p: 64-bit FNV-1a with the offset basis of core.c (1469598103934665603, one digit short of the textbook value — kept)
+fn fnv1a(p: int) -> int is
+    let s: string = text_at(p)
+    let mut h: int = 1469598103934665603
+    let mut i: int = 0
+    while i < s.len() is
+        h = h ^ byte_at(s, i)
+        h = h * 1099511628211
+        i += 1
+    end
+    return h
+end
+
+fn map_hash(m: int, key: int) -> int is
+    if rt_ptr::ptr_read_i32(m, 16) != 0 is return fnv1a(key) end
+    let mut k: int = key
+    k = k ^ lsr64(k, 33)
+    k = k * -49064778989728563
+    k = k ^ lsr64(k, 33)
+    return k
+end
+
+;; h % cap with h read as unsigned
+fn umod(h: int, cap: int) -> int is
+    if h >= 0 is return h % cap end
+    return rt_rand::umod64(h, cap)
+end
+
+fn keys_eq(m: int, a: int, b: int) -> bool is
+    if rt_ptr::ptr_read_i32(m, 16) != 0 is
+        if a == 0 || b == 0 is return a == b end
+        return text_at(a) == text_at(b)
+    end
+    return a == b
+end
+
+;; address of entry idx of m
+fn entry(m: int, idx: int) -> int is return rd(m, 24) + idx * 24 end
+fn occupied(e: int) -> bool is return rt_ptr::ptr_read_i8(e, 16) != 0 end
+fn deleted(e: int) -> bool is return rt_ptr::ptr_read_i8(e, 17) != 0 end
+
+fn map_probe(m: int, key: int) -> int is
+    let cap: int = rd(m, 8)
+    let mut idx: int = umod(map_hash(m, key), cap)
+    let mut first_free: int = -1
+    let mut i: int = 0
+    while i < cap is
+        let e: int = entry(m, idx)
+        if !occupied(e) is
+            if first_free >= 0 is return first_free end
+            return idx
+        end
+        if deleted(e) is
+            if first_free < 0 is first_free = idx end
+        elsif keys_eq(m, rd(e, 0), key) is
+            return idx
+        end
+        idx = (idx + 1) % cap
+        i += 1
+    end
+    return first_free
+end
+
+;; the value for `key` is written to out[0..] when found: returns 1/0 and the value via the second result
+fn map_find(m: int, key: int) -> [int] is
+    if m == 0 || rd(m, 0) == 0 is return [0, 0] end
+    let idx: int = map_probe(m, key)
+    let e: int = entry(m, idx)
+    if occupied(e) && !deleted(e) is return [1, rd(e, 8)] end
+    return [0, 0]
+end
+
+fn map_grow(m: int) is
+    let old_cap: int = rd(m, 8)
+    let old_entries: int = rd(m, 24)
+    let ncap: int = old_cap * 2
+    wr(m, 8, ncap)
+    wr(m, 24, calloc(ncap, 24))
+    wr(m, 0, 0)
+    let mut i: int = 0
+    while i < old_cap is
+        let oe: int = old_entries + i * 24
+        if occupied(oe) && !deleted(oe) is
+            let mut idx: int = umod(map_hash(m, rd(oe, 0)), ncap)
+            while occupied(entry(m, idx)) is idx = (idx + 1) % ncap end
+            memmove(entry(m, idx), oe, 24)
+            wr(m, 0, rd(m, 0) + 1)
+        end
+        i += 1
+    end
+    free(old_entries)
+end
+
+;; a malloc'd copy of the C string at p ("" for NULL), like strdup
+fn c_strdup(p: int) -> int is
+    if p == 0 is return calloc(1, 1) end
+    let n: int = strlen(p)
+    let b: int = malloc(n + 1)
+    memmove(b, p, n + 1)
+    return b
+end
+
+;; core.c hsh_map_new(string_keys): 16 slots, load factor 0.5, string keys are copied
+pub fn map_new(string_keys: int) -> int is
+    let m: int = malloc(32)
+    if m == 0 is return 0 end
+    wr(m, 0, 0)
+    wr(m, 8, 16)
+    if string_keys != 0 is rt_ptr::ptr_write_i32(m, 16, 1) else rt_ptr::ptr_write_i32(m, 16, 0) end
+    wr(m, 24, calloc(16, 24))
+    return m
+end
+
+pub fn map_set(m: int, key: int, value: int) is
+    if m == 0 is return end
+    if rd(m, 0) * 2 >= rd(m, 8) is map_grow(m) end
+    let idx: int = map_probe(m, key)
+    let e: int = entry(m, idx)
+    let is_new: bool = !(occupied(e) && !deleted(e))
+    if rt_ptr::ptr_read_i32(m, 16) != 0 is
+        if !is_new is free(rd(e, 0)) end
+        wr(e, 0, c_strdup(key))
+    else
+        wr(e, 0, key)
+    end
+    wr(e, 8, value)
+    rt_ptr::ptr_write_i8(e, 16, 1)
+    rt_ptr::ptr_write_i8(e, 17, 0)
+    if is_new is wr(m, 0, rd(m, 0) + 1) end
+end
+
+;; core.c hsh_map_get (0 on a miss) / hsh_map_has / hsh_map_len
+pub fn map_get(m: int, key: int) -> int is return map_find(m, key)[1] end
+pub fn map_has(m: int, key: int) -> int is return map_find(m, key)[0] end
+pub fn map_len(m: int) -> int is
+    if m == 0 is return 0 end
+    return rd(m, 0)
+end
+
+;; core.c hsh_map_remove: leaves a tombstone, frees an owned string key; 1 / 0
+pub fn map_remove(m: int, key: int) -> int is
+    if m == 0 || rd(m, 0) == 0 is return 0 end
+    let idx: int = map_probe(m, key)
+    let e: int = entry(m, idx)
+    if !(occupied(e) && !deleted(e)) is return 0 end
+    if rt_ptr::ptr_read_i32(m, 16) != 0 is free(rd(e, 0)) end
+    rt_ptr::ptr_write_i8(e, 17, 1)
+    wr(m, 0, rd(m, 0) - 1)
+    return 1
+end
+
+;; core.c hsh_map_clear: frees string keys, zeroes every slot, count = 0 (capacity stays)
+pub fn map_clear(m: int) is
+    if m == 0 is return end
+    if rt_ptr::ptr_read_i32(m, 16) != 0 is
+        let mut i: int = 0
+        while i < rd(m, 8) is
+            let e: int = entry(m, i)
+            if occupied(e) && !deleted(e) is free(rd(e, 0)) end
+            i += 1
+        end
+    end
+    memset(rd(m, 24), 0, rd(m, 8) * 24)
+    wr(m, 0, 0)
+end
+
+;; core.c hsh_map_keys / hsh_map_values: live entries in table order
+fn map_collect(m: int, off: int) -> int is
+    let mut want: int = 1
+    if m != 0 && rd(m, 0) > 0 is want = rd(m, 0) end
+    let mut a: int = arr_alloc(want)
+    if m == 0 is return a end
+    let mut i: int = 0
+    while i < rd(m, 8) is
+        let e: int = entry(m, i)
+        if occupied(e) && !deleted(e) is a = array_push(a, rd(e, off)) end
+        i += 1
+    end
+    return a
+end
+pub fn map_keys(m: int) -> int is return map_collect(m, 0) end
+pub fn map_values(m: int) -> int is return map_collect(m, 8) end
+
+;; ───────────────────── reference counts (guarded by one mutex) ─────────────────────
+fn rc_lock() -> int is
+    let mu: int = rt_state::global_slot("_HSH_RT_RCMUTEX", 64)
+    pthread_mutex_lock(mu)
+    return mu
+end
+
+;; core.c hsh_rc_retain / rc_count / rc_release (the block is freed when the last strong ref goes and no weak ref is left)
+pub fn rc_retain(p: int) is
+    if p == 0 is return end
+    let mu: int = rc_lock()
+    wr(p - 24, 0, rd(p - 24, 0) + 1)
+    pthread_mutex_unlock(mu)
+end
+pub fn rc_count(p: int) -> int is
+    if p == 0 is return 0 end
+    let mu: int = rc_lock()
+    let c: int = rd(p - 24, 0)
+    pthread_mutex_unlock(mu)
+    return c
+end
+pub fn rc_release(p: int) is
+    if p == 0 is return end
+    let mu: int = rc_lock()
+    let old: int = rd(p - 24, 0)
+    wr(p - 24, 0, old - 1)
+    let mut dead: bool = false
+    if old == 1 && rd(p - 24, 8) == 0 is dead = true end
+    pthread_mutex_unlock(mu)
+    if dead is free(p - 24) end
+end
+
+;; core.c hsh_arc_downgrade (weak + 1, returns p) / arc_upgrade (strong + 1 unless it already reached 0, else NULL)
+;; / arc_weak_count / arc_weak_release (frees when the last weak ref goes and no strong ref is left)
+pub fn arc_downgrade(p: int) -> int is
+    if p == 0 is return 0 end
+    let mu: int = rc_lock()
+    wr(p - 24, 8, rd(p - 24, 8) + 1)
+    pthread_mutex_unlock(mu)
+    return p
+end
+pub fn arc_upgrade(p: int) -> int is
+    if p == 0 is return 0 end
+    let mu: int = rc_lock()
+    let cur: int = rd(p - 24, 0)
+    let mut out: int = 0
+    if cur > 0 is
+        wr(p - 24, 0, cur + 1)
+        out = p
+    end
+    pthread_mutex_unlock(mu)
+    return out
+end
+pub fn arc_weak_count(p: int) -> int is
+    if p == 0 is return 0 end
+    let mu: int = rc_lock()
+    let w: int = rd(p - 24, 8)
+    pthread_mutex_unlock(mu)
+    return w
+end
+pub fn arc_weak_release(p: int) is
+    if p == 0 is return end
+    let mu: int = rc_lock()
+    let old: int = rd(p - 24, 8)
+    wr(p - 24, 8, old - 1)
+    let mut dead: bool = false
+    if old == 1 && rd(p - 24, 0) == 0 is dead = true end
+    pthread_mutex_unlock(mu)
+    if dead is free(p - 24) end
+end
+
+;; ───────────────────────────── small helpers ─────────────────────────────
+;; core.c hsh_args_alloc / free / get / set: n int64 slots for task argument blocks
+pub fn args_alloc(n: int) -> int is
+    if n <= 0 is return 0 end
+    return calloc(n, 8)
+end
+pub fn args_free(args: int) is
+    if args != 0 is free(args) end
+end
+pub fn args_get(args: int, i: int) -> int is
+    if args == 0 || i < 0 is return 0 end
+    return rd(args, i * 8)
+end
+pub fn args_set(args: int, i: int, v: int) is
+    if args == 0 || i < 0 is return end
+    wr(args, i * 8, v)
+end
+
+;; core.c hsh_closure_create: { fn_ptr, n_caps, caps[8] } with the first min(n_caps, 8) captures stored
+pub fn closure_create(fn_ptr: int, n_caps: int, c0: int, c1: int, c2: int, c3: int, c4: int, c5: int, c6: int, c7: int) -> int is
+    let c: int = malloc(80)
+    if c == 0 is return 0 end
+    wr(c, 0, fn_ptr)
+    wr(c, 8, n_caps)
+    let caps: [int] = [c0, c1, c2, c3, c4, c5, c6, c7]
+    let mut i: int = 0
+    while i < n_caps && i < 8 is
+        wr(c, 16 + i * 8, caps[i])
+        i += 1
+    end
+    return c
+end
+
+;; core.c hsh_closure_call1 / hsh_closure_call2: call the function at c->fn_ptr with the arguments, then the captures (n_caps 0, 1 or 2; any
+;; other count calls it with the bare arguments); a NULL closure gives 0.  Needs the compiler builtin `call_ptr` (an indirect call through an
+;; address: SysV passes the arguments in registers, a callee that takes fewer ignores the rest).
+pub fn closure_call1(c: int, a0: int) -> int is
+    if c == 0 is return 0 end
+    let f: int = rd(c, 0)
+    let n: int = rd(c, 8)
+    if n == 1 is return call_ptr(f, a0, rd(c, 16), 0, 0) end
+    if n == 2 is return call_ptr(f, a0, rd(c, 16), rd(c, 24), 0) end
+    return call_ptr(f, a0, 0, 0, 0)
+end
+
+pub fn closure_call2(c: int, a0: int, a1: int) -> int is
+    if c == 0 is return 0 end
+    let f: int = rd(c, 0)
+    let n: int = rd(c, 8)
+    if n == 1 is return call_ptr(f, a0, a1, rd(c, 16), 0) end
+    if n == 2 is return call_ptr(f, a0, a1, rd(c, 16), rd(c, 24)) end
+    return call_ptr(f, a0, a1, 0, 0)
+end
+
+;; core.c hsh_val_to_str: 0 -> "0"; an int that looks like a pointer (65536 < v < 0x7fffffffffff) whose first byte is NUL or
+;; printable ASCII is treated as a C string and returned; anything else is printed as a decimal
+pub fn val_to_str(v: int) -> string is
+    if v == 0 is return "0" end
+    if v > 65536 && v < 140737488355327 is
+        let first: int = rt_ptr::peek_byte(v)
+        if first == 0 || (first >= 32 && first < 128) is return strdup(v) end
+    end
+    return rt_conv::int_to_str(v)
+end
