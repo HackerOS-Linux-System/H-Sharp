@@ -1043,11 +1043,13 @@ fn run_op(op: string, a: string, b: string, c: string) -> string is
             return rt_str::hex_encode(to_string(rt_mem::closure_call1(0, a0)) + "," + to_string(rt_mem::closure_call2(0, a0, a1)))
         end
         let fs: [string] = a.split(",")
+        if !have_fn_addr() is return "?needs-fn_addr" end
         let c: int = rt_mem::closure_create(fn_addr_of(fs[0]), to_int(fs[1]), to_int(ps[2]), to_int(ps[3]), 0, 0, 0, 0, 0, 0)
         if to_int(fs[2]) == 1 is return rt_str::hex_encode(to_string(rt_mem::closure_call1(c, a0))) end
         return rt_str::hex_encode(to_string(rt_mem::closure_call2(c, a0, a1)))
     end
     if op == "spawnfn" is
+        if !have_fn_addr() is return "?needs-fn_addr" end
         return "#" + to_string(rt_task::task_wait(rt_task::task_spawn(fn_addr_of(a), to_int(b))))
     end
     if op == "beq" is return "#" + bool_n(rt_crypto::bytes_eq(ints(a), ints(b))) end
@@ -1177,13 +1179,14 @@ fn pf_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 +
 fn pf_sub2(a: int, b: int) -> int is return a - b end
 fn pf_neg(x: int) -> int is return -x end
 fn pf_sq(x: int) -> int is return x * x end
+;; The named-function vectors ("closure" with a non-null closure, "spawnfn") need the compiler builtin `fn_addr` (the address of a named fn as an
+;; int), which h# 0.9.0 does not have.  Until it does, those two ops answer "?needs-fn_addr" (the null-closure vector and everything else still run),
+;; and fn_addr_of is the one place to switch back on:
+;;     if name == "dbl" is return fn_addr(pf_dbl) end   ... one line per pf_* function above, `return fn_addr(pf_sub2)` last
+;; with have_fn_addr() returning true.
+fn have_fn_addr() -> bool is return false end
 fn fn_addr_of(name: string) -> int is
-    if name == "dbl" is return fn_addr(pf_dbl) end
-    if name == "add3" is return fn_addr(pf_add3) end
-    if name == "add4" is return fn_addr(pf_add4) end
-    if name == "neg" is return fn_addr(pf_neg) end
-    if name == "sq" is return fn_addr(pf_sq) end
-    return fn_addr(pf_sub2)
+    return 0
 end
 fn c_str(p: int) -> string is
     if p == 0 is return "" end
