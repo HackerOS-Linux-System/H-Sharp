@@ -36,6 +36,7 @@ pub struct Gen is
     pub fns: map::Map<string, FnSig>
     pub externs: map::Map<string, ast::Node>
     pub extern_py: map::Map<string, string>
+    pub extern_min: map::Map<string, int>
     pub used_builtins: map::Set<string>
     pub tparams: [string]
     pub scopes: [map::Map<string, string>]
@@ -74,7 +75,7 @@ pub fn new_gen(module: ast::Node, test_mode: bool) -> Gen is
         if parts.len() == 3 is tcr.put(parts[0], parts[2]) end
     end
     return Gen { module: module, test_mode: test_mode, structs: map::Map::new(), enums: map::Map::new(), aliases: map::Map::new(),
-        variant_owner: map::Map::new(), fns: map::Map::new(), externs: map::Map::new(), extern_py: map::Map::new(),
+        variant_owner: map::Map::new(), fns: map::Map::new(), externs: map::Map::new(), extern_py: map::Map::new(), extern_min: map::Map::new(),
         used_builtins: map::Set::new(), tparams: [], scopes: [], declared: map::Set::new(), var_tys: [], uniq: 0,
         cur_ret: ast::nn(), cur_mode: "Default", arc_tracked: [], drop_names: [], cur_fn: "", cur_fn_is_std: false, warnings: [],
         mf_m: [], mf_b: [], err: "", depth: 0, hand: hand, tc_ret: tcr,
@@ -291,7 +292,7 @@ end
 
 pub fn extra_hand() -> [string] is
     return ["math_sqrt","math_floor","math_ceil","math_sin","math_cos","math_tan","math_pow","math_abs","math_min","math_max",
-        "array_pop","env_home","exec","db_query_bind","sort_by","sort_by_key","sort_ints","str_join","parse_int",
+        "array_pop","env_home","exec","db_query_bind","sort_by","sort_by_key","__builtin_sort_by","__builtin_sort_by_key","sort_ints","str_join","parse_int",
         "to_int_from_hex","string_upper","string_lower","string_chars","string_replace_all","string_replace","string_trim_start",
         "__builtin_tcp_connect","__builtin_tcp_send","__builtin_tcp_recv","__builtin_tcp_close","__builtin_atomic_add","__builtin_atomic_load","__builtin_atomic_store",
         "__builtin_base64url_encode","__builtin_base64url_decode","__builtin_hmac_sha256_b64url","__builtin_str_replace_all","__builtin_str_reverse","__builtin_str_is_numeric","__builtin_str_trim_start","__builtin_str_trim_end",
