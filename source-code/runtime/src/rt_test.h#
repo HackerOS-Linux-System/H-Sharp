@@ -7,6 +7,22 @@ mod rt_conv
 mod rt_date
 mod rt_num
 mod rt_sys
+mod rt_bytes
+mod rt_text
+mod rt_sort
+mod rt_crypto
+mod rt_ptr
+mod rt_os
+mod rt_rand
+mod rt_io
+mod rt_proc
+mod rt_net
+mod rt_mem
+mod rt_fmt
+mod rt_env
+mod rt_db
+mod rt_argon2
+mod rt_task
 
 ;; assert_eq takes `any` (pointer compare for strings); typed parameters make `==` a real string comparison
 fn eq_s(actual: string, expected: string) is
@@ -159,10 +175,570 @@ fn numbers() is
 end
 
 #[test]
-fn system() is
+fn sys_basics() is
     eq_b(rt_sys::pid() > 0, true)
     eq_b(rt_sys::page_size() >= 4096, true)
     eq_b(rt_sys::is_64bit(), true)
     eq_b(rt_sys::temp_dir().len() > 0, true)
     eq_b(rt_sys::now_unix() > 1700000000, true)
+end
+
+#[test]
+fn hex_decode_and_xor() is
+    eq_s(rt_bytes::hex_decode("48656c6c6f"), "Hello")
+    eq_s(rt_bytes::hex_decode("zz41"), "A")
+    eq_s(rt_bytes::hex_decode("414"), "A")
+    eq_s(rt_bytes::hex_decode("00"), "")
+    eq_s(rt_bytes::hex_decode("4100" + "42"), "A")
+    eq_s(rt_bytes::hex_decode("c3a9"), "é")
+    ;; invalid UTF-8 -> U+FFFD (maximal subpart): a lone lead byte, a stray continuation, a truncated 4-byte sequence
+    eq_s(rt_bytes::hex_decode("ff"), "\u{FFFD}")
+    eq_s(rt_bytes::hex_decode("80"), "\u{FFFD}")
+    eq_s(rt_bytes::hex_decode("f09f98"), "\u{FFFD}")
+    eq_s(rt_bytes::hex_decode("e282ac"), "€")
+    eq_s(rt_bytes::hex_xor("ff00", "0f"), "f00f")
+    eq_s(rt_bytes::hex_xor("4142", "20"), "6162")
+    eq_s(rt_bytes::hex_xor("ff", ""), "")
+    eq_s(rt_bytes::hex_xor("0102030405", "ff00"), "fe02fc04fa")
+end
+
+#[test]
+fn bytes_helpers() is
+    eq_s(rt_bytes::hex_encode_bytes([0, 1, 255, 256, -1]), "0001ff00ff")
+    eq_i(rt_bytes::bytes_len([1, 2, 3]), 3)
+    eq_i(rt_bytes::bytes_from_ints([300, -1])[0], 44)
+    eq_i(rt_bytes::bytes_from_ints([300, -1])[1], 255)
+    eq_i(rt_bytes::bytes_concat([1, 2], [257])[2], 1)
+    eq_i(rt_bytes::bytes_concat([1, 2], [257]).len(), 3)
+    eq_s(rt_bytes::bytes_to_str_lossy([72, 105]), "Hi")
+    eq_s(rt_bytes::bytes_to_str_lossy([72, 0, 105]), "H")
+end
+
+#[test]
+fn string_aliases() is
+    eq_i(rt_str::string_len("żó"), 4)
+    eq_i(rt_str::strlen(""), 0)
+    eq_s(rt_str::strcat("ab", "cd"), "abcd")
+    eq_s(rt_str::substr("hello", 1, 3), "el")
+    eq_s(rt_str::substr("hello", -2, 3), "hel")
+    eq_s(rt_str::substr("hello", 2, -7), "llo")
+    eq_s(rt_str::substr("hello", 3, 3), "")
+    eq_s(rt_str::string_upper("aBc"), "ABC")
+    eq_s(rt_str::string_trim("  x "), "x")
+    eq_b(rt_str::string_contains("abc", "bc"), true)
+    let ws: [string] = rt_str::split_whitespace("  a \t b\n\nc  ")
+    eq_i(ws.len(), 3)
+    eq_s(ws[0], "a")
+    eq_s(ws[2], "c")
+    eq_i(rt_str::split_whitespace("   ").len(), 0)
+end
+
+#[test]
+fn int_and_char_conversions() is
+    eq_s(rt_conv::int_to_str(0), "0")
+    eq_s(rt_conv::int_to_str(-7), "-7")
+    eq_s(rt_conv::int_to_str(-15), "-15")
+    eq_s(rt_conv::int_to_str(1234567890123), "1234567890123")
+    eq_s(rt_conv::int_to_str(9223372036854775807), "9223372036854775807")
+    eq_s(rt_conv::int_to_str(-9223372036854775807 - 1), "-9223372036854775808")
+    eq_s(rt_conv::int_to_hex(0), "0")
+    eq_s(rt_conv::int_to_hex(255), "ff")
+    eq_s(rt_conv::int_to_hex(-1), "ffffffffffffffff")
+    eq_s(rt_conv::int_to_hex(-9223372036854775807 - 1), "8000000000000000")
+    eq_s(rt_conv::char_code_to_str(65), "A")
+    eq_s(rt_conv::char_code_to_str(233), "é")
+    eq_s(rt_conv::char_code_to_str(8364), "€")
+    eq_s(rt_conv::char_code_to_str(128512), "😀")
+    eq_s(rt_conv::char_code_to_str(0), "")
+    eq_s(rt_conv::char_code_to_str(-3), "")
+end
+
+#[test]
+fn text_helpers() is
+    eq_b(rt_text::uuid_is_valid("123e4567-e89b-12d3-a456-426614174000"), true)
+    eq_b(rt_text::uuid_is_valid("123E4567-E89B-12D3-A456-426614174000"), true)
+    eq_b(rt_text::uuid_is_valid("123e4567e89b12d3a456426614174000"), false)
+    eq_b(rt_text::uuid_is_valid(""), false)
+    eq_s(rt_text::shell_escape("it's"), "'it'\\''s'")
+    eq_s(rt_text::shell_escape(""), "''")
+    eq_s(rt_text::json_get("{\"a\":\"b\",\"c\":12}", "a"), "b")
+    eq_s(rt_text::json_get("{\"a\":\"b\",\"c\":12}", "c"), "12")
+    eq_s(rt_text::json_get("{\"a\": \"b\"}", "a"), "b")
+    eq_s(rt_text::json_get("{\"a\":\"b\"}", "zz"), "")
+    eq_s(rt_text::json_get("{\"k\":\"open", "k"), "")
+end
+
+#[test]
+fn parse_opt_and_sort() is
+    eq_i(rt_conv::parse_int_opt("42"), 42)
+    eq_i(rt_conv::parse_int_opt("-42"), -42)
+    eq_i(rt_conv::parse_int_opt(" 42"), 0)
+    eq_i(rt_conv::parse_int_opt("4 2"), 0)
+    eq_i(rt_conv::parse_int_opt("9223372036854775808"), 0)
+    eq_i(rt_conv::parse_int_opt("-9223372036854775808"), -9223372036854775807 - 1)
+    let mut xs: [int] = [5, 3, 9, 1, 3]
+    rt_sort::sort_ints(xs)
+    eq_i(xs[0], 1)
+    eq_i(xs[1], 3)
+    eq_i(xs[2], 3)
+    eq_i(xs[4], 9)
+    let mut ss: [string] = ["b", "a", "ab", "B", ""]
+    let r: [string] = rt_sort::sort_strings(ss)
+    eq_s(ss[0], "")
+    eq_s(ss[1], "B")
+    eq_s(ss[2], "a")
+    eq_s(ss[3], "ab")
+    eq_s(r[4], "b")
+end
+
+#[test]
+fn crypto_known_answers() is
+    eq_s(rt_crypto::sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    eq_s(rt_crypto::sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    eq_s(rt_crypto::sha1("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    eq_s(rt_crypto::md5("abc"), "900150983cd24fb0d6963f7d28e17f72")
+    eq_s(rt_crypto::sha512("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    eq_s(rt_crypto::blake3(""), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+    eq_s(rt_crypto::hmac_sha256("key", "The quick brown fox jumps over the lazy dog"), "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+    eq_s(rt_bytes::hex_encode_bytes(rt_crypto::pbkdf2("password", [115, 97, 108, 116], 1, 32)), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    eq_i(rt_crypto::pbkdf2("pw", [1], 0, 32).len(), 0)
+    eq_s(rt_crypto::sha256_bytes([97, 98, 99]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    eq_b(rt_crypto::bytes_eq([1, 2, 3], [1, 2, 3]), true)
+    eq_b(rt_crypto::bytes_eq([1, 2, 3], [1, 2]), false)
+    eq_i(rt_crypto::xor_bytes([255, 1], [15, 1])[0], 240)
+    eq_i(rt_crypto::xor_bytes([1], [1, 2]).len(), 0)
+end
+
+#[test]
+fn raw_pointers() is
+    let p: int = rt_ptr::buf_new(32)
+    rt_ptr::ptr_write_i32(p, 0, -2)
+    eq_i(rt_ptr::ptr_read_i32(p, 0), -2)
+    eq_i(rt_ptr::ptr_read_i8(p, 0), -2)
+    eq_i(rt_ptr::ptr_read_i16(p, 2), -1)
+    rt_ptr::ptr_write_i64(p, 8, 81985529216486895)
+    eq_i(rt_ptr::ptr_read_i64(p, 8), 81985529216486895)
+    eq_i(rt_ptr::ptr_read_i8(p, 8), -17)
+    rt_ptr::ptr_fill(p, 7, 4)
+    eq_i(rt_ptr::ptr_read_i32(p, 0), 117901063)
+    rt_ptr::ptr_zero(p, 4)
+    eq_i(rt_ptr::ptr_read_i32(p, 0), 0)
+    rt_ptr::ptr_copy(p + 16, p + 8, 8)
+    eq_i(rt_ptr::ptr_compare(p + 16, p + 8, 8), 0)
+    rt_ptr::ptr_write_i8(p + 16, 0, 1)
+    eq_b(rt_ptr::ptr_compare(p + 16, p + 8, 8) != 0, true)
+    eq_i(rt_ptr::ptr_read_i64(0, 0), 0)
+    eq_b(rt_ptr::ptr_is_null(0), true)
+    eq_i(rt_ptr::ptr_add(0, 9), 0)
+    eq_i(rt_ptr::ptr_add(p, 9) - p, 9)
+    rt_ptr::buf_free(p)
+end
+
+#[test]
+fn files_and_env() is
+    let d: string = "/tmp/hs_rt_test_" + to_string(rt_sys::pid())
+    eq_b(rt_os::mkdir_all(d + "/a/b"), true)
+    eq_b(rt_os::is_dir(d + "/a/b"), true)
+    eq_b(rt_os::is_file(d + "/a/b"), false)
+    eq_b(rt_os::write_file(d + "/a/b/f.txt", "hello"), true)
+    eq_s(rt_os::read_file(d + "/a/b/f.txt"), "hello")
+    eq_i(rt_os::file_size(d + "/a/b/f.txt"), 5)
+    eq_b(rt_os::append_file(d + "/a/b/f.txt", " world"), true)
+    eq_s(rt_os::read_file(d + "/a/b/f.txt"), "hello world")
+    eq_b(rt_os::rename_file(d + "/a/b/f.txt", d + "/a/b/g.txt"), true)
+    eq_b(rt_os::file_exists(d + "/a/b/f.txt"), false)
+    eq_b(rt_os::is_file(d + "/a/b/g.txt"), true)
+    eq_i(rt_os::file_size(d + "/nope"), -1)
+    eq_s(rt_os::read_file(d + "/nope"), "")
+    eq_b(rt_os::fs_rmdir(d + "/a/b"), false)
+    eq_b(rt_os::file_delete(d + "/a/b/g.txt"), true)
+    eq_b(rt_os::fs_rmdir(d + "/a/b"), true)
+    eq_b(rt_os::fs_rmdir(d + "/a"), true)
+    eq_b(rt_os::fs_rmdir(d), true)
+    eq_b(rt_os::setenv_s("HSH_RT_TEST_VAR", "abc"), true)
+    eq_s(rt_os::getenv_s("HSH_RT_TEST_VAR"), "abc")
+    eq_s(rt_os::env_get("HSH_RT_TEST_VAR"), "abc")
+    eq_b(rt_os::env_remove("HSH_RT_TEST_VAR"), true)
+    eq_s(rt_os::getenv_s("HSH_RT_TEST_VAR"), "")
+    eq_s(rt_os::platform(), "linux")
+end
+
+#[test]
+fn chars_split_join_json_set() is
+    let cs: [string] = rt_str::string_chars("aż😀")
+    eq_i(cs.len(), 3)
+    eq_s(cs[1], "ż")
+    eq_s(cs[2], "😀")
+    let ps: [string] = rt_str::string_split("a,,b,", ",")
+    eq_i(ps.len(), 4)
+    eq_s(ps[3], "")
+    eq_i(rt_str::string_split("abc", "").len(), 1)
+    eq_s(rt_str::array_join(["x", "y", "z"], "-"), "x-y-z")
+    eq_i(rt_bytes::string_to_bytes("Hi")[1], 105)
+    eq_s(rt_bytes::bytes_to_string([72, 105, 33], 2), "Hi")
+    eq_s(rt_text::json_set_str("", "a", "b"), "{\"a\":\"b\"}")
+    eq_s(rt_text::json_set_str("{\"a\":\"1\"}", "b", "2"), "{\"a\":\"1\",\"b\":\"2\"}")
+    eq_s(rt_text::json_set_str("{\"a\":\"1\",\"b\":\"2\"}", "a", "X"), "{\"a\":\"X\",\"b\":\"2\"}")
+end
+
+#[test]
+fn system_information_and_misc() is
+    eq_s(rt_sys::sysname(), "Linux")
+    eq_b(rt_sys::cpu_count() >= 1, true)
+    eq_b(rt_sys::memory_total() > 0, true)
+    eq_b(rt_sys::uptime() > 0, true)
+    eq_b(rt_sys::getcwd_s().len() > 0, true)
+    eq_b(rt_sys::term_width() > 0 && rt_sys::term_height() > 0, true)
+    eq_b(rt_sys::env_args().len() >= 1, true)
+    eq_s(rt_text::bold("x"), "\u{1b}[1mx\u{1b}[0m")
+    eq_s(rt_text::red_text("a"), "\u{1b}[31ma\u{1b}[0m")
+    eq_s(rt_os::date_format(1700000000, "%Y"), "2023")
+    eq_i(rt_codec::base64_decode_bytes("QUJD").len(), 3)
+    eq_i(rt_codec::base64_decode_bytes("QUJD")[2], 67)
+    eq_i(rt_codec::base64_decode_bytes("QU*D").len(), 0)
+end
+
+#[test]
+fn randomness() is
+    eq_i(rt_rand::random_hex(8).len(), 16)
+    eq_i(rt_rand::random_string(10).len(), 10)
+    eq_i(rt_rand::uuid_v4().len(), 36)
+    eq_b(rt_rand::random_int(5, 6) == 5, true)
+    eq_b(rt_rand::random_int(10, 0) == 10, true)
+    eq_i(rt_rand::crypto_random_bytes(7).len(), 7)
+    ;; unsigned remainder of 64-bit values (the top bit counts as 2^63)
+    eq_i(rt_rand::umod64(-1, 10), 5)
+    eq_i(rt_rand::umod64(-1, 3), 0)
+    eq_i(rt_rand::umod64(-1, 9223372036854775807), 1)
+    eq_i(rt_rand::umod64(100, 7), 2)
+end
+
+#[test]
+fn processes_and_regex() is
+    eq_s(rt_proc::exec2("echo", "hi"), "hi\n")
+    eq_s(rt_proc::exec1("nonexistent-cmd-xyz"), "")
+    eq_s(rt_proc::shell("echo x"), "x\n")
+    eq_b(rt_proc::process_which("sh").len() > 0, true)
+    eq_s(rt_proc::process_which("nonexistent-xyz"), "")
+    eq_b(rt_proc::regex_match("\\d+", "abc123"), true)
+    eq_b(rt_proc::regex_match("^\\d+$", "abc"), false)
+    eq_s(rt_proc::regex_find("\\d+", "abc 123 def 45"), "123")
+    eq_i(rt_proc::regex_find_all("\\d+", "a1b22c333").len(), 3)
+    eq_s(rt_proc::regex_replace("[0-9]+", "N", "a1b22"), "aNbN")
+    ;; sed -E has no \d: the pattern matches nothing and the text comes back as it was (the C does the same)
+    eq_s(rt_proc::regex_replace("\\d+", "N", "a1b22"), "a1b22")
+    eq_i(rt_proc::regex_split("a b  c", "\\s+").len(), 3)
+    let cap: [string] = rt_proc::regex_captures("([a-z]+)@([a-z]+)", "mail bob@example now")
+    eq_i(cap.len(), 3)
+    eq_s(cap[1], "bob")
+    eq_s(cap[2], "example")
+    eq_i(rt_proc::regex_captures_all("[0-9]+", "a1b22c333").len(), 3)
+    let pid: int = rt_proc::process_spawn("sleep 30")
+    eq_b(pid > 0, true)
+    eq_b(rt_proc::process_kill(pid), true)
+end
+
+#[test]
+fn floats_through_bits() is
+    eq_i(rt_ptr::f64_bits(1.5), 4609434218613702656)
+    eq_i(rt_ptr::f64_bits(3.14), 4614253070214989087)
+    eq_i(rt_ptr::f32_bits(0.1), 1036831949)
+    eq_i(rt_ptr::f32_bits(1.0), 1065353216)
+    eq_i(rt_ptr::f64_bits(-0.0), -9223372036854775807 - 1)
+    eq_b(rt_ptr::bits_f64(4614253070214989087) == 3.14, true)
+    eq_b(rt_ptr::bits_f32(1065353216) == 1.0, true)
+    let p: int = rt_ptr::buf_new(16)
+    rt_ptr::ptr_write_f64(p, 0, 2.5)
+    eq_b(rt_ptr::ptr_read_f64(p, 0) == 2.5, true)
+    rt_ptr::ptr_write_f32(p, 8, 0.5)
+    eq_b(rt_ptr::ptr_read_f32(p, 8) == 0.5, true)
+    rt_ptr::buf_free(p)
+    let blk: int = rt_ptr::rc_alloc(24)
+    eq_i(rt_ptr::ptr_alloc_size(blk), 24)
+    eq_i(rt_ptr::struct_set(blk, 1, 99) - blk, 0)
+    eq_i(rt_ptr::struct_get(blk, 1), 99)
+end
+
+#[test]
+fn more_files() is
+    let d: string = "/tmp/hs_rt_test2_" + to_string(rt_sys::pid())
+    eq_b(rt_os::mkdir_all(d + "/sub"), true)
+    eq_b(rt_os::fs_write_bytes(d + "/b.bin", [0, 255, 10, 13, 65]), true)
+    eq_i(rt_os::fs_read_bytes(d + "/b.bin").len(), 5)
+    eq_i(rt_os::fs_read_bytes(d + "/b.bin")[1], 255)
+    eq_b(rt_os::write_file(d + "/l.txt", "a\r\nb\n\nc"), true)
+    let ls: [string] = rt_os::fs_read_lines(d + "/l.txt")
+    eq_i(ls.len(), 4)
+    eq_s(ls[0], "a")
+    eq_s(ls[2], "")
+    eq_b(rt_os::fs_copy(d + "/l.txt", d + "/sub/copy.txt"), true)
+    eq_s(rt_os::read_file(d + "/sub/copy.txt"), rt_os::read_file(d + "/l.txt"))
+    eq_i(rt_sort::sort_strings(rt_os::fs_walk(d)).len(), 3)
+    eq_i(rt_os::fs_list_dir(d).len(), 3)
+    eq_b(rt_os::fs_modified_time(d + "/l.txt") > 1600000000, true)
+    let t: string = rt_os::fs_temp_file("hs_")
+    eq_b(rt_os::file_exists(t), true)
+    eq_b(rt_os::file_delete(t), true)
+    eq_b(rt_os::remove_dir_recursive(d), true)
+    eq_b(rt_os::file_exists(d), false)
+end
+
+#[test]
+fn network_helpers() is
+    eq_s(rt_net::dns_resolve("127.0.0.1"), "127.0.0.1")
+    eq_s(rt_net::dns_resolve("nonexistent.invalid"), "")
+    eq_b(rt_net::scan_port_net("127.0.0.1", 1, 50), false)
+end
+
+#[test]
+fn arrays_maps_arenas() is
+    let mut a: int = rt_mem::array_new()
+    let mut i: int = 0
+    while i < 10 is
+        a = rt_mem::array_push(a, i * i)
+        i += 1
+    end
+    eq_i(rt_mem::array_len(a), 10)
+    eq_i(rt_mem::array_get(a, 9), 81)
+    eq_i(rt_mem::array_remove(a, 0), 1)
+    eq_i(rt_mem::array_get(a, 0), 1)
+    eq_i(rt_mem::array_len(rt_mem::array_slice(a, 2, 5)), 3)
+    let m: int = rt_mem::map_new(1)
+    rt_mem::map_set(m, rt_mem::c_string("k"), 7)
+    eq_i(rt_mem::map_get(m, rt_mem::c_string("k")), 7)
+    eq_i(rt_mem::map_has(m, rt_mem::c_string("zz")), 0)
+    let n: int = rt_mem::map_new(0)
+    let mut j: int = 0
+    while j < 40 is
+        rt_mem::map_set(n, j, j * 2)
+        j += 1
+    end
+    eq_i(rt_mem::map_len(n), 40)
+    eq_i(rt_mem::map_get(n, 39), 78)
+    eq_i(rt_mem::map_remove(n, 5), 1)
+    eq_i(rt_mem::map_len(n), 39)
+    let ar: int = rt_mem::arena_new(256)
+    rt_mem::arena_push_current(ar)
+    let before: int = rt_mem::arena_used()
+    rt_mem::alloc_ex(10)
+    eq_i(rt_mem::arena_used() - before, 16)
+    rt_mem::arena_pop_current()
+    rt_mem::arena_free(ar)
+    let blk: int = rt_ptr::rc_alloc(8)
+    rt_mem::rc_retain(blk)
+    eq_i(rt_mem::rc_count(blk), 2)
+    rt_mem::rc_release(blk)
+    eq_i(rt_mem::rc_count(blk), 1)
+end
+
+#[test]
+fn number_text() is
+    eq_s(rt_fmt::float_to_string(0.1), "0.1")
+    eq_s(rt_fmt::float_to_string(1.0), "1")
+    eq_s(rt_fmt::float_to_string(-2.5), "-2.5")
+    eq_s(rt_fmt::float_to_string(rt_num::to_float("1e21")), "1e+21")
+    eq_s(rt_fmt::float_to_string(rt_num::to_float("0.30000000000000004")), "0.30000000000000004")
+    eq_s(rt_fmt::float_to_string(rt_num::to_float("5e-324")), "5e-324")
+    eq_s(rt_fmt::py_repr("it's"), "'it\\'s'")
+end
+
+#[test]
+fn sqlite_linked_statically() is
+    let d: string = "/tmp/hs_rt_db_" + to_string(rt_sys::pid())
+    rt_os::mkdir_all(d)
+    let h: string = rt_db::sqlite_open(d + "/t.db")
+    eq_i(rt_db::sqlite_ping(h), 1)
+    eq_i(rt_db::sqlite_exec(h, "CREATE TABLE t(a, b)"), 0)
+    eq_i(rt_db::sqlite_exec(h, "INSERT INTO t VALUES(1,'x'),(2,'y')"), 2)
+    eq_i(rt_db::sqlite_exec(h, "SELEC nonsense"), -1)
+    let rows: int = rt_db::sqlite_query(h, "SELECT a, b FROM t ORDER BY a")
+    eq_i(rt_mem::array_len(rows), 2)
+    let r0: int = rt_mem::array_get(rows, 0)
+    eq_s(rt_db::db_col_str(r0, "b"), "x")
+    eq_i(rt_db::db_col_int(r0, "a"), 1)
+    eq_i(rt_db::db_col_is_null(r0, "a"), 0)
+    let tx: string = rt_mem::text_at(rt_db::sqlite_begin(h))
+    eq_i(rt_db::sqlite_exec(tx, "INSERT INTO t VALUES(3,'z')"), 0)
+    eq_i(rt_mem::array_len(rt_db::sqlite_query(h, "SELECT * FROM t")), 2)
+    eq_i(rt_mem::array_len(rt_db::sqlite_query(tx, "SELECT * FROM t")), 3)
+    eq_i(rt_db::sqlite_commit(tx), 1)
+    eq_i(rt_mem::array_len(rt_db::sqlite_query(h, "SELECT * FROM t")), 3)
+    eq_s(rt_db::sqlite_query_bind1(d + "/t.db", "SELECT b FROM t WHERE a = CAST(? AS INTEGER)", "2"), "y\n")
+    eq_b(rt_str::starts_with(rt_db::sqlite_query_bind1(d + "/t.db", "SELEC 1", ""), "Error: in prepare, near \"SELEC\": syntax error"), true)
+    eq_b(rt_os::remove_dir_recursive(d), true)
+end
+
+;; ── Argon2id / BLAKE2b (rt_argon2): known answers from Python hashlib.blake2b and argon2-cffi (hash_secret_raw, Type.ID, v=19) ──
+fn hex_of_bytes(b: [int]) -> string is return rt_bytes::hex_encode_bytes(b) end
+
+fn bytes_of(s: string) -> [int] is
+    let mut o: [int] = []
+    let mut i: int = 0
+    while i < s.len() is
+        o.push(byte_at(s, i))
+        i += 1
+    end
+    return o
+end
+
+#[test]
+fn blake2b_known_answers() is
+    eq_s(rt_str::slice(hex_of_bytes(rt_argon2::blake2b(bytes_of("abc"), 64)), 0, 32), "ba80a53f981c4d0d6a2797b69f12f6e9")
+    eq_s(hex_of_bytes(rt_argon2::blake2b(bytes_of("abc"), 16)), "cf4ab791c62b8d2b2109c90275287816")
+    eq_i(rt_argon2::blake2b([], 64).len(), 64)
+end
+
+#[test]
+fn argon2id_raw_known_answers() is
+    eq_s(hex_of_bytes(rt_argon2::argon2id_raw(bytes_of("password"), bytes_of("somesalt"), 2, 64, 1, 32)), "16a1a498734609dd01456da406de9f3d9da93e6c86c300a12fc1465214ce4922")
+    eq_s(hex_of_bytes(rt_argon2::argon2id_raw(bytes_of("password"), bytes_of("somesalt"), 1, 32, 2, 16)), "f0c19e33caafd1555e5e1e13261682a1")
+    eq_s(hex_of_bytes(rt_argon2::argon2id_raw(bytes_of(""), bytes_of("saltsalt"), 2, 40, 4, 100)),
+         "e4cb51af1e5d059e1d9f532d02cd4f41511b5f9fb8968ecf906ffaa841d354f84aa6d6ecd0d73f2b45b71e465bd5eef1ddf987703b56b407756c82d04399567684b24af0878b417b92d840cd2ecacab93cd485bca5f023e8bbfbcb8afd7dfd86385b33f8")
+    eq_i(rt_argon2::argon2id_raw(bytes_of("x"), bytes_of("saltsalt"), 0, 64, 1, 32).len(), 0)
+    eq_i(rt_argon2::argon2id_raw(bytes_of("x"), bytes_of("saltsalt"), 1, 7, 1, 32).len(), 0)
+end
+
+#[test]
+fn argon2id_default_params_known_answer() is
+    ;; m = 19456 KiB (the default size), t = 3: the full-size memory path
+    eq_s(hex_of_bytes(rt_argon2::argon2id_raw(bytes_of("pw"), bytes_of("0123456789abcdef"), 3, 19456, 1, 32)), "85368b2fa3fd89b0b85966cc7f1de882a48e239c45ff3019a5ebc52f5c968608")
+end
+
+#[test]
+fn argon2_hash_verify_roundtrip() is
+    let h: string = rt_argon2::hash("correct horse")
+    eq_b(rt_str::starts_with(h, "$argon2id$v=19$m=19456,t=2,p=1$"), true)
+    eq_i(rt_argon2::verify("correct horse", h), 1)
+    eq_i(rt_argon2::verify("wrong horse", h), 0)
+    eq_b(rt_argon2::hash("a") != rt_argon2::hash("a"), true)
+end
+
+#[test]
+fn argon2_verify_rejects_malformed() is
+    eq_i(rt_argon2::verify("a", ""), 0)
+    eq_i(rt_argon2::verify("a", "$argon2id$v=19$m=64,t=1,p=1$c29tZXNhbHQ"), 0)
+    eq_i(rt_argon2::verify("a", "$argon2id$v=18$m=64,t=1,p=1$c29tZXNhbHQ$AAAAAAAAAAA"), 0)
+    eq_i(rt_argon2::verify("a", "$argon2id$v=19$m=64,t=1,p=0$c29tZXNhbHQ$AAAAAAAAAAA"), 0)
+    eq_i(rt_argon2::verify("a", "$argon2id$v=19$m=64,t=1,p=1$c29tZXNhbHQ$AA="), 0)
+    eq_i(rt_argon2::verify("a", "$argon2id$v=19$m=99999999,t=1,p=1$c29tZXNhbHQ$AAAAAAAAAAA"), 0)
+    ;; a hash made elsewhere (argon2-cffi: password / somesalt / m=64 t=2 p=1) verifies
+    eq_i(rt_argon2::verify("password", "$argon2id$v=19$m=64,t=2,p=1$c29tZXNhbHQ$FqGkmHNGCd0BRW2kBt6fPZ2pPmyGwwChL8FGUhTOSSI"), 1)
+    eq_i(rt_argon2::verify("passwore", "$argon2id$v=19$m=64,t=2,p=1$c29tZXNhbHQ$FqGkmHNGCd0BRW2kBt6fPZ2pPmyGwwChL8FGUhTOSSI"), 0)
+end
+
+;; ── tasks (rt_task): handles made by the C hsh_task_spawn_shell, waited for by the H# port ──
+extern static [c] is
+    fn hsh_task_spawn_shell(cmd: string) -> int
+    fn strdup(p: int) -> string
+end
+
+#[test]
+fn task_wait_and_timeout() is
+    let h: int = hsh_task_spawn_shell("printf hello")
+    eq_s(strdup(rt_task::task_wait(h)), "hello")
+    eq_i(rt_task::task_wait(0), 0)
+    eq_i(rt_task::task_wait(5), 5)
+    eq_i(rt_task::task_wait(65535), 65535)
+    let s: int = hsh_task_spawn_shell("sleep 1; printf late")
+    eq_i(rt_task::task_wait_timeout(s, 20), 0)
+    eq_i(rt_task::task_wait_timeout(s, 5000), 1)
+    eq_i(rt_task::task_wait_timeout(s, 0), 1)
+    eq_s(strdup(rt_task::task_wait(s)), "late")
+    eq_i(rt_task::task_wait_timeout(0, 10), 1)
+    eq_i(rt_task::task_wait_timeout(7, 10), 1)
+    ;; a heap block that is not a task comes back unchanged
+    let blk: int = rt_ptr::buf_new(64)
+    eq_i(rt_task::task_wait(blk), blk)
+    eq_i(rt_task::task_wait_timeout(blk, 1), 1)
+end
+
+#[test]
+fn task_join_all_in_order() is
+    let hs: int = rt_ptr::buf_new(24)
+    rt_ptr::ptr_write_i64(hs, 0, hsh_task_spawn_shell("sleep 1; printf one"))
+    rt_ptr::ptr_write_i64(hs, 8, hsh_task_spawn_shell("printf two"))
+    rt_ptr::ptr_write_i64(hs, 16, 42)
+    let r: int = rt_task::task_join_all(hs, 3)
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 0)), "one")
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 8)), "two")
+    eq_i(rt_ptr::ptr_read_i64(r, 16), 42)
+    eq_i(rt_task::task_join_all(hs, -1), 0)
+end
+
+;; ── sort_by (rt_sort): stable, cmp(a, b) > 0 puts a after b ──
+fn cmp_asc(a: int, b: int) -> int is
+    if a > b is return 1 end
+    if a < b is return -1 end
+    return 0
+end
+fn cmp_mod3(a: int, b: int) -> int is return (a % 3) - (b % 3) end
+
+fn join_ints(a: [int]) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is s = s + "," end
+        s = s + to_string(a[i])
+        i += 1
+    end
+    return s
+end
+
+#[test]
+fn sort_by_is_stable_and_in_place() is
+    let a: [int] = [5, 3, 9, 1, 3, 7, 0, -4]
+    let r: [int] = rt_sort::sort_by(a, cmp_asc)
+    eq_s(join_ints(r), "-4,0,1,3,3,5,7,9")
+    eq_s(join_ints(a), "-4,0,1,3,3,5,7,9")
+    ;; stability: equal keys (x % 3) keep their input order
+    eq_s(join_ints(rt_sort::sort_by([3, 4, 6, 1, 9, 7, 2, 5], cmp_mod3)), "3,6,9,4,1,7,2,5")
+    ;; a closure with a captured value, descending
+    let sign: int = -1
+    let down = |x: int, y: int| -> int is sign * cmp_asc(x, y) end
+    eq_s(join_ints(rt_sort::sort_by([2, 8, 1, 9, 4], down)), "9,8,4,2,1")
+    eq_s(join_ints(rt_sort::sort_by([], cmp_asc)), "")
+    eq_s(join_ints(rt_sort::sort_by([7], cmp_asc)), "7")
+end
+
+;; ── function pointers through the compiler builtins fn_addr / call_ptr: closures and spawned tasks ──
+fn f_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
+fn f_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
+fn f_dbl(x: int) -> int is return x * 2 end
+
+#[test]
+fn closure_call_appends_captures() is
+    ;; fn(x) with 0 captures, fn(x, c0) with 1, fn(x, c0, c1) with 2, more than 2 is ignored
+    let c0: int = rt_mem::closure_create(fn_addr(f_dbl), 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_mem::closure_call1(c0, 21), 42)
+    let c1: int = rt_mem::closure_create(fn_addr(f_add3), 1, 5, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_mem::closure_call2(c1, 1, 2), 125)
+    let c2: int = rt_mem::closure_create(fn_addr(f_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_mem::closure_call2(c2, 1, 2), 1234)
+    let c3: int = rt_mem::closure_create(fn_addr(f_add3), 1, 9, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_mem::closure_call1(c3, 7), 790)
+    let c4: int = rt_mem::closure_create(fn_addr(f_dbl), 5, 1, 2, 3, 4, 5, 0, 0, 0)
+    eq_i(rt_mem::closure_call1(c4, 8), 16)
+    eq_i(rt_mem::closure_call1(0, 8), 0)
+    eq_i(rt_mem::closure_call2(0, 8, 9), 0)
+end
+
+#[test]
+fn task_spawn_runs_h_functions_on_threads() is
+    let t: int = rt_task::task_spawn(fn_addr(f_dbl), 21)
+    eq_i(rt_task::task_wait(t), 42)
+    let hs: int = rt_ptr::buf_new(40)
+    let mut i: int = 0
+    while i < 5 is
+        rt_ptr::ptr_write_i64(hs, i * 8, rt_task::task_spawn(fn_addr(f_dbl), i + 1))
+        i += 1
+    end
+    let r: int = rt_task::task_join_all(hs, 5)
+    eq_i(rt_ptr::ptr_read_i64(r, 0), 2)
+    eq_i(rt_ptr::ptr_read_i64(r, 16), 6)
+    eq_i(rt_ptr::ptr_read_i64(r, 32), 10)
+    let s: int = rt_task::task_spawn_shell("printf spawned")
+    eq_s(strdup(rt_task::task_wait(s)), "spawned")
+    let q: int = rt_task::task_spawn_shell("sleep 1; printf slow")
+    eq_i(rt_task::task_wait_timeout(q, 20), 0)
+    eq_s(strdup(rt_task::task_wait(q)), "slow")
 end
