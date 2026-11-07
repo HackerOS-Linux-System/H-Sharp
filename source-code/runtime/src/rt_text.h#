@@ -1,0 +1,118 @@
+mod rt_str
+
+fn hexval(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 97 + 10 end
+    if c >= 65 && c <= 70 is return c - 65 + 10 end
+    return -1
+end
+
+;; core.c hsh_uuid_is_valid: exactly 36 bytes, '-' at 8/13/18/23, hex digits (either case) elsewhere. No version/variant check.
+pub fn uuid_is_valid(s: string) -> bool is
+    if s.len() != 36 is return false end
+    let mut i: int = 0
+    while i < 36 is
+        let c: int = byte_at(s, i)
+        if i == 8 || i == 13 || i == 18 || i == 23 is
+            if c != 45 is return false end
+        elsif hexval(c) < 0 is
+            return false
+        end
+        i += 1
+    end
+    return true
+end
+
+;; core.c hsh_shell_escape: single-quote the string, every ' becomes '\''
+pub fn shell_escape(s: string) -> string is
+    let mut out: string = "'"
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 39 is out += "'\\''" else out += s[i..i + 1] end
+        i += 1
+    end
+    return out + "'"
+end
+
+;; core.c hsh_json_get: NOT a JSON parser.  Finds the first `"key":` (no space before the colon), skips spaces/tabs, then
+;;   * a value starting with '"' is returned up to the next '"' (escapes are not interpreted; no closing quote -> "")
+;;   * anything else up to the first , } ] or newline (not trimmed)
+pub fn json_get(json: string, key: string) -> string is
+    let pat: string = "\"" + key + "\":"
+    let at_: int = rt_str::index_of(json, pat)
+    if at_ < 0 is return "" end
+    let mut p: int = at_ + pat.len()
+    let n: int = json.len()
+    while p < n && (byte_at(json, p) == 32 || byte_at(json, p) == 9) is p += 1 end
+    if p < n && byte_at(json, p) == 34 is
+        p += 1
+        let mut e: int = p
+        while e < n && byte_at(json, e) != 34 is e += 1 end
+        if e >= n is return "" end
+        return json[p..e]
+    end
+    let mut e2: int = p
+    while e2 < n is
+        let c: int = byte_at(json, e2)
+        if c == 44 || c == 125 || c == 93 || c == 10 is return json[p..e2] end
+        e2 += 1
+    end
+    return json[p..e2]
+end
+
+;; core.c hsh_json_set_str: set / add a flat string field.  Same "not a parser" rules as json_get:
+;;   * json "" counts as "{}"
+;;   * an existing `"key":` (first hit, no space before the colon) is replaced by `"key":"val"`; its old value ends at the closing
+;;     quote (a string value; unterminated -> runs to the end), or at the first , or } (anything else)
+;;   * otherwise the entry is inserted before the LAST '}' (a comma first unless the body is blank); whatever follows that '}' is
+;;     dropped; with no '}' at all the whole text is kept and a '}' is appended
+pub fn json_set_str(json0: string, key: string, val: string) -> string is
+    let mut json: string = json0
+    if json.len() == 0 is json = "{{}}" end
+    let entry: string = "\"" + key + "\":\"" + val + "\""
+    let pat: string = "\"" + key + "\":"
+    let hit: int = rt_str::index_of(json, pat)
+    let n: int = json.len()
+    if hit >= 0 is
+        let mut p: int = hit + pat.len()
+        while p < n && (byte_at(json, p) == 32 || byte_at(json, p) == 9) is p += 1 end
+        let mut value_end: int = p
+        if p < n && byte_at(json, p) == 34 is
+            let mut q: int = p + 1
+            while q < n && byte_at(json, q) != 34 is q += 1 end
+            if q < n is value_end = q + 1 else value_end = n end
+        else
+            while value_end < n && byte_at(json, value_end) != 44 && byte_at(json, value_end) != 125 is value_end += 1 end
+        end
+        return json[0..hit] + entry + json[value_end..n]
+    end
+    let mut close: int = -1
+    let mut i: int = n - 1
+    while i >= 0 && close < 0 is
+        if byte_at(json, i) == 125 is close = i end
+        i -= 1
+    end
+    let mut body_len: int = n
+    if close >= 0 is body_len = close end
+    let mut is_empty: bool = true
+    let mut k: int = 1
+    while k < body_len && is_empty is
+        let c: int = byte_at(json, k)
+        if c != 32 && c != 9 && c != 10 is is_empty = false end
+        k += 1
+    end
+    let mut out: string = json[0..body_len]
+    if !is_empty is out += "," end
+    return out + entry + "}"
+end
+
+;; core.c ANSI_FMT: hsh_bold / green_text / red_text / yellow_text / dim_text / cyan_text = ESC[<code>m + s + ESC[0m
+fn ansi(code: string, s: string) -> string is
+    return "\u{1b}[" + code + "m" + s + "\u{1b}[0m"
+end
+pub fn bold(s: string) -> string is return ansi("1", s) end
+pub fn green_text(s: string) -> string is return ansi("32", s) end
+pub fn red_text(s: string) -> string is return ansi("31", s) end
+pub fn yellow_text(s: string) -> string is return ansi("33", s) end
+pub fn dim_text(s: string) -> string is return ansi("2", s) end
+pub fn cyan_text(s: string) -> string is return ansi("36", s) end
