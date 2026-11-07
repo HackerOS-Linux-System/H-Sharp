@@ -1,0 +1,294 @@
+mod rt_ptr
+mod rt_num
+mod rt_conv
+
+;; little-endian base-1e9 limbs
+fn big_from(m: int) -> [int] is
+    let mut out: [int] = []
+    let mut v: int = m
+    if v == 0 is
+        out.push(0)
+        return out
+    end
+    while v > 0 is
+        out.push(v % 1000000000)
+        v = v / 1000000000
+    end
+    return out
+end
+
+;; limbs *= f  (f < 2^31, limbs < 1e9: the product fits an int)
+fn big_mul(a: [int], f: int) is
+    let mut carry: int = 0
+    let mut i: int = 0
+    while i < a.len() is
+        let cur: int = a[i] * f + carry
+        a[i] = cur % 1000000000
+        carry = cur / 1000000000
+        i += 1
+    end
+    while carry > 0 is
+        a.push(carry % 1000000000)
+        carry = carry / 1000000000
+    end
+end
+
+;; decimal digits of the limbs, no leading zeros ("0" for zero)
+fn big_text(a: [int]) -> string is
+    let mut i: int = a.len() - 1
+    while i > 0 && a[i] == 0 is i -= 1 end
+    let mut out: string = rt_conv::int_to_str(a[i])
+    i -= 1
+    while i >= 0 is
+        let t: string = rt_conv::int_to_str(a[i])
+        let mut pad: string = ""
+        let mut z: int = t.len()
+        while z < 9 is
+            pad += "0"
+            z += 1
+        end
+        out += pad + t
+        i -= 1
+    end
+    return out
+end
+
+;; [digits D, k]: |x| = D / 10^k exactly (x finite)
+fn expand(x: f64) -> [string] is
+    let bits: int = rt_ptr::f64_bits(x)
+    let ex: int = (bits >> 52) & 2047
+    let frac: int = bits & 4503599627370495
+    let mut m: int = frac
+    let mut e: int = -1074
+    if ex != 0 is
+        m = frac + 4503599627370496
+        e = ex - 1075
+    end
+    let limbs: [int] = big_from(m)
+    let mut k: int = 0
+    if e >= 0 is
+        let mut left: int = e
+        while left >= 30 is
+            big_mul(limbs, 1073741824)
+            left -= 30
+        end
+        if left > 0 is big_mul(limbs, 1 << left) end
+    else
+        k = -e
+        let mut left: int = k
+        while left >= 13 is
+            big_mul(limbs, 1220703125)
+            left -= 13
+        end
+        if left > 0 is
+            let mut p5: int = 1
+            let mut j: int = 0
+            while j < left is
+                p5 = p5 * 5
+                j += 1
+            end
+            big_mul(limbs, p5)
+        end
+    end
+    return [big_text(limbs), to_string(k)]
+end
+
+fn zeros(n: int) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < n is
+        s += "0"
+        i += 1
+    end
+    return s
+end
+
+;; digits + 1 on the decimal string (may grow by a digit)
+fn inc_text(d: string) -> string is
+    let mut out: [int] = []
+    let mut carry: int = 1
+    let mut i: int = d.len() - 1
+    while i >= 0 is
+        let mut v: int = byte_at(d, i) - 48 + carry
+        carry = 0
+        if v == 10 is
+            v = 0
+            carry = 1
+        end
+        out.push(v)
+        i -= 1
+    end
+    let mut s: string = ""
+    if carry == 1 is s = "1" end
+    let mut j: int = out.len() - 1
+    while j >= 0 is
+        s += rt_conv::int_to_str(out[j])
+        j -= 1
+    end
+    return s
+end
+
+;; round the digit string `keep` (kept digits) given the dropped digits `rest`: half-even on the exact tail
+fn round_digits(keep: string, rest: string) -> string is
+    if rest.len() == 0 is return keep end
+    let first: int = byte_at(rest, 0) - 48
+    let mut up: bool = false
+    if first > 5 is
+        up = true
+    elsif first == 5 is
+        let mut nonzero: bool = false
+        let mut i: int = 1
+        while i < rest.len() is
+            if byte_at(rest, i) != 48 is nonzero = true end
+            i += 1
+        end
+        if nonzero is
+            up = true
+        else
+            let last: int = byte_at(keep, keep.len() - 1) - 48
+            if keep.len() > 0 && last % 2 == 1 is up = true end
+        end
+    end
+    if up is return inc_text(keep) end
+    return keep
+end
+
+fn is_neg(x: f64) -> bool is return (rt_ptr::f64_bits(x) >> 63) & 1 == 1 end
+
+;; printf("%.<d>f", x) for finite x
+pub fn fmt_f(x: f64, d: int) -> string is
+    let ex: [string] = expand(x)
+    let mut digs: string = ex[0]
+    let k: int = to_int(ex[1])
+    if digs.len() <= k is digs = zeros(k + 1 - digs.len()) + digs end
+    ;; value = digs / 10^k ; integer part = digs[0 .. len-k)
+    let ilen: int = digs.len() - k
+    let mut text: string = ""
+    if d >= k is
+        text = digs + zeros(d - k)
+        ;; digits are int part + d fractional digits
+    else
+        let keep: string = digs[0..ilen + d]
+        let rest: string = digs[ilen + d..digs.len()]
+        text = round_digits(keep, rest)
+    end
+    ;; text = int part (>= ilen digits, maybe one more after a carry) followed by exactly d fractional digits
+    let tl: int = text.len()
+    let intpart: string = text[0..tl - d]
+    let fracpart: string = text[tl - d..tl]
+    let mut out: string = intpart
+    if d > 0 is out += "." + fracpart end
+    if is_neg(x) is return "-" + out end
+    return out
+end
+
+;; printf("%.<p>g", x) for finite x (p >= 1)
+pub fn fmt_g(x: f64, p0: int) -> string is
+    let mut p: int = p0
+    if p < 1 is p = 1 end
+    let neg: bool = is_neg(x)
+    let mut sign: string = ""
+    if neg is sign = "-" end
+    let ex: [string] = expand(x)
+    let digs0: string = ex[0]
+    let k: int = to_int(ex[1])
+    if digs0 == "0" is
+        ;; zero: %g prints "0" (or "-0")
+        return sign + "0"
+    end
+    let mut xexp: int = digs0.len() - k - 1
+    let mut sig: string = ""
+    if digs0.len() <= p is
+        sig = digs0 + zeros(p - digs0.len())
+    else
+        let rounded: string = round_digits(digs0[0..p], digs0[p..digs0.len()])
+        if rounded.len() > p is
+            sig = rounded[0..p]
+            xexp += 1
+        else
+            sig = rounded
+        end
+    end
+    let mut body: string = ""
+    if xexp < -4 || xexp >= p is
+        ;; scientific: d.ddd e+XX
+        let mut mant: string = sig[0..1]
+        let mut tail: string = sig[1..p]
+        while tail.len() > 0 && byte_at(tail, tail.len() - 1) == 48 is tail = tail[0..tail.len() - 1] end
+        if tail.len() > 0 is mant += "." + tail end
+        let ax: int = if_abs(xexp)
+        let mut es: string = rt_conv::int_to_str(ax)
+        if es.len() < 2 is es = "0" + es end
+        let mut esign: string = "+"
+        if xexp < 0 is esign = "-" end
+        body = mant + "e" + esign + es
+    else
+        if xexp >= 0 is
+            let ip: string = sig[0..xexp + 1]
+            let mut fp: string = sig[xexp + 1..p]
+            while fp.len() > 0 && byte_at(fp, fp.len() - 1) == 48 is fp = fp[0..fp.len() - 1] end
+            body = ip
+            if fp.len() > 0 is body += "." + fp end
+        else
+            let mut fp: string = zeros(-xexp - 1) + sig
+            while fp.len() > 0 && byte_at(fp, fp.len() - 1) == 48 is fp = fp[0..fp.len() - 1] end
+            body = "0." + fp
+        end
+    end
+    return sign + body
+end
+
+fn if_abs(v: int) -> int is
+    if v < 0 is return -v end
+    return v
+end
+
+;; core.c hsh_float_to_string: NaN / inf / -inf; otherwise the SHORTEST text that parses back to the same double:
+;; %.<d>f for d = 0..20 when 1e-5 <= |x| < 1e16 (or x == 0), %.<p>g for p = 1..17 otherwise
+pub fn float_to_string(n: f64) -> string is
+    if n != n is return "NaN" end
+    let big: f64 = rt_num::to_float("1.7976931348623157e308")
+    if n > big is return "inf" end
+    if n < -big is return "-inf" end
+    let mut a: f64 = n
+    if n < 0.0 is a = -n end
+    let mut s: string = ""
+    if a == 0.0 || (a >= rt_num::to_float("1e-5") && a < rt_num::to_float("1e16")) is
+        let mut d: int = 0
+        while d <= 20 is
+            s = fmt_f(n, d)
+            if rt_num::to_float(s) == n is return s end
+            d += 1
+        end
+        return s
+    end
+    let mut p: int = 1
+    while p <= 17 is
+        s = fmt_g(n, p)
+        if rt_num::to_float(s) == n is return s end
+        p += 1
+    end
+    return s
+end
+
+;; core.c hsh_py_repr: a Python-style single-quoted literal: ' \ newline and return are escaped, everything else is kept
+pub fn py_repr(s: string) -> string is
+    let mut out: string = "'"
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 39 is
+            out += "\\'"
+        elsif c == 92 is
+            out += "\\\\"
+        elsif c == 10 is
+            out += "\\n"
+        elsif c == 13 is
+            out += "\\r"
+        else
+            out += s[i..i + 1]
+        end
+        i += 1
+    end
+    return out + "'"
+end
