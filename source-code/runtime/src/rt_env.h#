@@ -1,0 +1,21 @@
+mod rt_state
+mod rt_mem
+
+extern static [c] is
+    fn getenv(name: string) -> int
+    fn strdup(p: int) -> string
+end
+
+pub fn env_vars() -> int is
+    let mut r: int = rt_mem::array_new()
+    let names: [string] = rt_state::env_names()
+    let mut i: int = 0
+    while i < names.len() is
+        let p: int = getenv(names[i])
+        if p != 0 is
+            r = rt_mem::array_push(r, rt_mem::alloc_string(names[i] + "=" + strdup(p)))
+        end
+        i += 1
+    end
+    return r
+end
