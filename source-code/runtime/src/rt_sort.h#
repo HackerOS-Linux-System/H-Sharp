@@ -1,0 +1,166 @@
+fn cmp_s(a: string, b: string) -> int is
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut i: int = 0
+    while i < n && i < m is
+        let x: int = byte_at(a, i)
+        let y: int = byte_at(b, i)
+        if x != y is
+            if x < y is return -1 end
+            return 1
+        end
+        i += 1
+    end
+    if n == m is return 0 end
+    if n < m is return -1 end
+    return 1
+end
+
+pub fn sort_ints(a: [int]) -> [int] is
+    let n: int = a.len()
+    ;; bottom-up merge sort through a scratch array, copied back into `a`
+    let mut width: int = 1
+    let mut src: [int] = []
+    let mut c0: int = 0
+    while c0 < n is
+        src.push(a[c0])
+        c0 += 1
+    end
+    while width < n is
+        let mut dst: [int] = []
+        let mut lo: int = 0
+        while lo < n is
+            let mid: int = lo + width
+            let hi: int = lo + 2 * width
+            let mut i: int = lo
+            let mut j: int = mid
+            while i < mid && i < n && j < hi && j < n is
+                if src[j] < src[i] is
+                    dst.push(src[j])
+                    j += 1
+                else
+                    dst.push(src[i])
+                    i += 1
+                end
+            end
+            while i < mid && i < n is
+                dst.push(src[i])
+                i += 1
+            end
+            while j < hi && j < n is
+                dst.push(src[j])
+                j += 1
+            end
+            lo += 2 * width
+        end
+        src = dst
+        width *= 2
+    end
+    let mut k: int = 0
+    while k < n is
+        a[k] = src[k]
+        k += 1
+    end
+    return a
+end
+
+pub fn sort_strings(a: [string]) -> [string] is
+    let n: int = a.len()
+    let mut width: int = 1
+    let mut src: [string] = []
+    let mut c0: int = 0
+    while c0 < n is
+        src.push(a[c0])
+        c0 += 1
+    end
+    while width < n is
+        let mut dst: [string] = []
+        let mut lo: int = 0
+        while lo < n is
+            let mid: int = lo + width
+            let hi: int = lo + 2 * width
+            let mut i: int = lo
+            let mut j: int = mid
+            while i < mid && i < n && j < hi && j < n is
+                if cmp_s(src[j], src[i]) < 0 is
+                    dst.push(src[j])
+                    j += 1
+                else
+                    dst.push(src[i])
+                    i += 1
+                end
+            end
+            while i < mid && i < n is
+                dst.push(src[i])
+                i += 1
+            end
+            while j < hi && j < n is
+                dst.push(src[j])
+                j += 1
+            end
+            lo += 2 * width
+        end
+        src = dst
+        width *= 2
+    end
+    let mut k: int = 0
+    while k < n is
+        a[k] = src[k]
+        k += 1
+    end
+    return a
+end
+
+;; ── hsh_sort_by(arr, cmp) ──
+;; C: `cmp` is a raw function pointer `int64 (*)(int64, int64)`; `cmp(a, b) > 0` puts a AFTER b; STABLE top-down merge sort, sorted in
+;; place, the same array returned (arrays of fewer than 2 elements untouched).  Same algorithm and the same sequence of comparator calls
+;; as the C `hsh_msort`: `f(d[i], d[j]) > 0 ? d[j++] : d[i++]`.  In H# the comparator is a first-class `fn(int, int) -> int` value instead of
+;; a raw address (like `[int]` for HshArray*): a named function or a closure.  The C entry point that takes a raw pointer
+;; (`hs::cmp_tramp`, used by hsharp_rt.hpp) stays in C until H# can take the address of a function.
+fn msort(d: [int], tmp: [int], off: int, n: int, f: fn(int, int) -> int) is
+    if n < 2 is return end
+    let m: int = n / 2
+    msort(d, tmp, off, m, f)
+    msort(d, tmp, off + m, n - m, f)
+    let mut i: int = 0
+    let mut j: int = m
+    let mut k: int = 0
+    while i < m && j < n is
+        if f(d[off + i], d[off + j]) > 0 is
+            tmp[k] = d[off + j]
+            j += 1
+        else
+            tmp[k] = d[off + i]
+            i += 1
+        end
+        k += 1
+    end
+    while i < m is
+        tmp[k] = d[off + i]
+        i += 1
+        k += 1
+    end
+    while j < n is
+        tmp[k] = d[off + j]
+        j += 1
+        k += 1
+    end
+    let mut c: int = 0
+    while c < n is
+        d[off + c] = tmp[c]
+        c += 1
+    end
+end
+
+pub fn sort_by(a: [int], cmp: fn(int, int) -> int) -> [int] is
+    let n: int = a.len()
+    if n < 2 is return a end
+    let mut tmp: [int] = []
+    let mut i: int = 0
+    while i < n is
+        tmp.push(0)
+        i += 1
+    end
+    msort(a, tmp, 0, n, cmp)
+    return a
+end
