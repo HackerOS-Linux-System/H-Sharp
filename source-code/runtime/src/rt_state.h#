@@ -1,0 +1,132 @@
+mod rt_ptr
+
+extern static [c] is
+    fn getenv(name: string) -> int
+    fn putenv(s: int) -> int
+    fn memcpy(dst: int, src: string, n: int) -> int
+    fn pthread_key_create(key: int, destructor: int) -> int
+    fn pthread_getspecific(key: int) -> int
+    fn pthread_setspecific(key: int, val: int) -> int
+    fn fopen(path: string, mode: string) -> int
+    fn fclose(f: int) -> int
+    fn fread(buf: int, size: int, n: int, f: int) -> int
+    fn strdup(p: int) -> string
+end
+
+pub fn global_slot(name: string, size: int) -> int is
+    let p: int = getenv(name)
+    if p != 0 is return p end
+    let buf: int = rt_ptr::buf_new(name.len() + 1 + size + 1)
+    memcpy(buf, name, name.len())
+    rt_ptr::ptr_write_i8(buf, name.len(), 61)
+    putenv(buf)
+    return buf + name.len() + 1
+end
+
+pub fn tls_block(size: int) -> int is
+    let g: int = global_slot("_HSH_RT_TLSKEY", 16)
+    if rt_ptr::ptr_read_i32(g, 8) == 0 is
+        pthread_key_create(g, 0)
+        rt_ptr::ptr_write_i32(g, 8, 1)
+    end
+    let key: int = rt_ptr::ptr_read_i32(g, 0)
+    let mut p: int = pthread_getspecific(key)
+    if p == 0 is
+        p = rt_ptr::buf_new(size)
+        pthread_setspecific(key, p)
+    end
+    return p
+end
+
+;; ── order of the environment ──
+;; H# cannot see `environ`, so the list of variable NAMES in environ order is kept here: it starts as the names in
+;; /proc/self/environ (the environment at process start, same order) and follows every setenv / unsetenv that goes through
+;; rt_os (a new name is appended, an existing one keeps its place, a removed one leaves and re-enters at the end — what glibc does).
+;; The list is one '\n'-separated C string whose address sits in the global slot _HSH_RT_ENVORD.
+fn env_initial_text() -> string is
+    let mut out: string = ""
+    let f: int = fopen("/proc/self/environ", "rb")
+    if f == 0 is return out end
+    let buf: int = rt_ptr::buf_new(4097)
+    let mut cur: string = ""
+    let mut name_done: bool = false
+    let mut n: int = fread(buf, 1, 4096, f)
+    while n > 0 is
+        let mut i: int = 0
+        while i < n is
+            let c: int = rt_ptr::peek_byte(buf + i)
+            if c == 0 is
+                if cur.len() > 0 || name_done is out += cur + "\n" end
+                cur = ""
+                name_done = false
+            elsif c == 61 is
+                name_done = true
+            elsif !name_done is
+                let one: int = rt_ptr::buf_new(2)
+                rt_ptr::ptr_write_i8(one, 0, c)
+                cur += strdup(one)
+                rt_ptr::buf_free(one)
+            end
+            i += 1
+        end
+        n = fread(buf, 1, 4096, f)
+    end
+    fclose(f)
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+fn env_order_store(s: string) is
+    let slot: int = global_slot("_HSH_RT_ENVORD", 16)
+    let b: int = rt_ptr::buf_new(s.len() + 1)
+    memcpy(b, s, s.len())
+    rt_ptr::ptr_write_ptr(slot, 0, b)
+    rt_ptr::ptr_write_i32(slot, 8, 1)
+end
+
+pub fn env_order_text() -> string is
+    let slot: int = global_slot("_HSH_RT_ENVORD", 16)
+    if rt_ptr::ptr_read_i32(slot, 8) == 0 is env_order_store(env_initial_text()) end
+    return strdup(rt_ptr::ptr_read_ptr(slot, 0))
+end
+
+fn env_has(text: string, name: string) -> bool is
+    let parts: [string] = __builtin_str_split(text, "\n")
+    let mut i: int = 0
+    while i < parts.len() is
+        if parts[i] == name is return true end
+        i += 1
+    end
+    return false
+end
+
+;; every setenv / unsetenv calls one of these (before it changes the environment)
+pub fn env_note_set(name: string) is
+    let t: string = env_order_text()
+    if !env_has(t, name) is env_order_store(t + name + "\n") end
+end
+pub fn env_note_unset(name: string) is
+    let t: string = env_order_text()
+    if env_has(t, name) is
+        let parts: [string] = __builtin_str_split(t, "\n")
+        let mut out: string = ""
+        let mut i: int = 0
+        while i < parts.len() is
+            if parts[i].len() > 0 && parts[i] != name is out += parts[i] + "\n" end
+            i += 1
+        end
+        env_order_store(out)
+    end
+end
+
+;; names currently in the environment, in environ order (the runtime's own _HSH_RT_ slots are left out)
+pub fn env_names() -> [string] is
+    let parts: [string] = __builtin_str_split(env_order_text(), "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < parts.len() is
+        if parts[i].len() > 0 && !(parts[i].len() >= 8 && parts[i][0..8] == "_HSH_RT_") && getenv(parts[i]) != 0 is out.push(parts[i]) end
+        i += 1
+    end
+    return out
+end
