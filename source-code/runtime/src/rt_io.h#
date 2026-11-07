@@ -1,0 +1,152 @@
+mod rt_ptr
+
+extern static [c] is
+    fn putchar(c: int) -> int
+    fn getchar() -> int
+    fn dprintf(fd: int, fmt: string, s: string) -> int
+    fn exit(code: int) -> int
+    fn fflush(f: int) -> int
+    fn strdup(p: int) -> string
+end
+
+;; core.c hsh_print: printf("%s", s)
+pub fn print_s(s: string) is
+    let mut i: int = 0
+    while i < s.len() is
+        putchar(byte_at(s, i))
+        i += 1
+    end
+end
+
+;; getchar() returns a C `int`: only the low 32 bits of the register count, sign-extended (EOF = -1)
+fn getc0() -> int is
+    let c: int = getchar() & 4294967295
+    if c >= 2147483648 is return c - 4294967296 end
+    return c
+end
+
+fn err(msg: string) is
+    dprintf(2, "%s", msg)
+end
+
+;; text on stderr, no newline added (helper for the other modules)
+pub fn eprint_s(msg: string) is
+    dprintf(2, "%s", msg)
+end
+
+;; core.c hsh_assert: "assertion failed: <msg>" on stderr and exit(1) when the condition is false
+pub fn assert_s(cond: bool, msg: string) is
+    if !cond is
+        err("assertion failed: " + msg + "\n")
+        exit(1)
+    end
+end
+
+;; core.c hsh_panic
+pub fn panic_s(msg: string) is
+    err("panic: " + msg + "\n")
+    exit(1)
+end
+
+;; core.c hsh_test_fail: flush stdout first, "test failed: <msg>" on stderr, exit(1)
+pub fn test_fail(msg: string) -> int is
+    fflush(0)
+    err("test failed: " + msg + "\n")
+    exit(1)
+    return 0
+end
+
+;; core.c hsh_test_skip: "test skipped: <reason>" on stderr, returns 1
+pub fn test_skip(reason: string) -> int is
+    err("test skipped: " + reason + "\n")
+    return 1
+end
+
+;; up to max-1 bytes of stdin, stopping after a '\n' (fgets(buf, max, stdin)); NUL ends the C string; "" at EOF
+fn fgets_like(max: int) -> string is
+    let buf: int = rt_ptr::buf_new(max)
+    let mut n: int = 0
+    let mut done: bool = false
+    while n < max - 1 && !done is
+        let c: int = getc0()
+        if c < 0 is
+            done = true
+        else
+            rt_ptr::ptr_write_i8(buf, n, c)
+            n += 1
+            if c == 10 is done = true end
+        end
+    end
+    let out: string = strdup(buf)
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_readline: one line (4095 bytes at most per call), ONE trailing '\n' removed, "" at EOF
+pub fn readline() -> string is
+    let s: string = fgets_like(4096)
+    if s.len() > 0 && byte_at(s, s.len() - 1) == 10 is return s[0..s.len() - 1] end
+    return s
+end
+
+;; core.c hsh_env_read_line: like readline but every trailing '\r' / '\n' is removed
+pub fn env_read_line() -> string is
+    let s: string = fgets_like(4096)
+    let mut n: int = s.len()
+    while n > 0 && (byte_at(s, n - 1) == 10 || byte_at(s, n - 1) == 13) is n -= 1 end
+    return s[0..n]
+end
+
+;; core.c hsh_io_read_char: getchar(); the byte as a one-byte string, "" at EOF (and for a 0 byte)
+pub fn io_read_char() -> string is
+    let c: int = getc0()
+    if c < 0 is return "" end
+    let buf: int = rt_ptr::buf_new(2)
+    rt_ptr::ptr_write_i8(buf, 0, c)
+    let out: string = strdup(buf)
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_ptr_read_checked / hsh_ptr_write_checked: bounds-checked access into an rc_alloc block (width 1, 2, 4 or 8);
+;; every violation is a panic (message on stderr, exit 1) like the C
+pub fn ptr_read_checked(p: int, offset: int, width: int) -> int is
+    if p == 0 is
+        panic_s("ptr_read_checked: null pointer")
+        return 0
+    end
+    let size: int = rt_ptr::ptr_alloc_size(p)
+    if offset < 0 || width <= 0 || offset + width > size is
+        panic_s("ptr_read_checked: access out of bounds of the arc_alloc allocation")
+        return 0
+    end
+    if width == 1 is return rt_ptr::ptr_read_i8(p, offset) end
+    if width == 2 is return rt_ptr::ptr_read_i16(p, offset) end
+    if width == 4 is return rt_ptr::ptr_read_i32(p, offset) end
+    if width == 8 is return rt_ptr::ptr_read_i64(p, offset) end
+    panic_s("ptr_read_checked: width must be 1, 2, 4, or 8 bytes")
+    return 0
+end
+
+pub fn ptr_write_checked(p: int, offset: int, width: int, val: int) is
+    if p == 0 is
+        panic_s("ptr_write_checked: null pointer")
+        return
+    end
+    let size: int = rt_ptr::ptr_alloc_size(p)
+    if offset < 0 || width <= 0 || offset + width > size is
+        panic_s("ptr_write_checked: access out of bounds of the arc_alloc allocation")
+        return
+    end
+    if width == 1 is
+        rt_ptr::ptr_write_i8(p, offset, val)
+    elsif width == 2 is
+        rt_ptr::ptr_write_i16(p, offset, val)
+    elsif width == 4 is
+        rt_ptr::ptr_write_i32(p, offset, val)
+    elsif width == 8 is
+        rt_ptr::ptr_write_i64(p, offset, val)
+    else
+        panic_s("ptr_write_checked: width must be 1, 2, 4, or 8 bytes")
+    end
+end
