@@ -11,27 +11,8 @@ extern static [c] is
     fn pthread_cond_destroy(c: int) -> int
     fn pthread_join(t: int, ret: int) -> int
     fn clock_gettime(clk: int, ts: int) -> int
-    fn pthread_mutex_init(m: int, attr: int) -> int
-    fn pthread_cond_init(c: int, attr: int) -> int
-    fn pthread_cond_broadcast(c: int) -> int
-    fn pthread_attr_init(a: int) -> int
-    fn pthread_attr_setdetachstate(a: int, st: int) -> int
-    fn pthread_attr_destroy(a: int) -> int
-    fn pthread_create(t: int, attr: int, start: int, arg: int) -> int
-    fn pthread_once(ctl: int, init: int) -> int
-    fn sem_init(s: int, shared: int, value: int) -> int
-    fn sem_wait(s: int) -> int
-    fn sem_post(s: int) -> int
-    fn getenv(name: string) -> int
-    fn atol(p: int) -> int
-    fn sysconf(name: int) -> int
-    fn popen(cmd: string, mode: string) -> int
-    fn strdup(p: int) -> string
-    fn pclose(f: int) -> int
-    fn fread(buf: int, size: int, n: int, f: int) -> int
-    fn memmove(dst: int, src: int, n: int) -> int
-    fn strncpy(dst: int, src: string, n: int) -> int
-    fn free(p: int) -> int
+    fn hsh_task_spawn(fn_ptr: int, args: int) -> int
+    fn hsh_task_spawn_shell(cmd: string) -> int
 end
 
 fn magic() -> int is return 79522532966739 end
@@ -113,91 +94,19 @@ end
 
 
 ;; ── spawning (core.c / async_rt.c hsh_task_spawn, hsh_task_spawn_shell) ──
-;; The bounded-concurrency semaphore (HSH_MAX_TASKS, else 64 per core clamped to 64..4096) is a global slot: sem_t at 0, pthread_once_t at 48.
-;; Like every global slot it must be created by one thread first — the first spawn of a program comes from main in practice.
-fn sem_slot() -> int is return rt_state::global_slot("_HSH_RT_TASKSEM", 64) end
-
-fn sem_init_once() -> int is
-    let mut cap: int = 0
-    let env: int = getenv("HSH_MAX_TASKS")
-    if env != 0 && rt_ptr::peek_byte(env) != 0 is cap = atol(env) end
-    if cap <= 0 is
-        let mut cores: int = sysconf(84)
-        if cores < 1 is cores = 1 end
-        cap = cores * 64
-    end
-    if cap < 64 is cap = 64 end
-    if cap > 4096 is cap = 4096 end
-    sem_init(sem_slot(), 0, cap)
-    return 0
-end
-
-;; the pthread entry point: run fn_ptr(args), publish the result under the mutex, wake the waiters, free the concurrency slot
-fn task_trampoline(arg: int) -> int is
-    let r: int = call_ptr(rt_ptr::ptr_read_i64(arg, 16), rt_ptr::ptr_read_i64(arg, 24), 0, 0, 0)
-    pthread_mutex_lock(arg + 48)
-    rt_ptr::ptr_write_i64(arg, 32, r)
-    rt_ptr::ptr_write_i32(arg, 40, 1)
-    pthread_cond_broadcast(arg + 88)
-    pthread_mutex_unlock(arg + 48)
-    sem_post(sem_slot())
-    return 0
-end
+;; Starting a thread needs two things H# cannot express without compiler builtins that h# 0.9.0 does not have (`fn_addr` to hand pthread_create the
+;; address of an H# function, `call_ptr` to call it indirectly): a C-callable thread entry point and an indirect call.  Both live in the C runtime
+;; (compiler/runtime/async_rt.c), which is linked into every program, so spawning is a forward to it.  That also keeps the bounded-concurrency
+;; semaphore (HSH_MAX_TASKS, else 64 per core clamped to 64..4096) in one place.  The task descriptor it returns is the block that task_wait,
+;; task_wait_timeout and task_join_all above read field by field (magic @0, pthread_t @8, fn @16, args @24, result @32, done @40, mutex @48, cond @88).
 
 ;; core.c hsh_task_spawn(fn_ptr, args): a joinable thread running fn_ptr(args); blocks while HSH_MAX_TASKS tasks are in flight; 0 on failure
 pub fn task_spawn(fn_ptr: int, args: int) -> int is
-    let slot: int = sem_slot()
-    pthread_once(slot + 48, fn_addr(sem_init_once))
-    sem_wait(slot)
-    let t: int = rt_ptr::buf_new(136)
-    if t == 0 is
-        sem_post(slot)
-        return 0
-    end
-    rt_ptr::ptr_write_i64(t, 0, magic())
-    rt_ptr::ptr_write_i64(t, 16, fn_ptr)
-    rt_ptr::ptr_write_i64(t, 24, args)
-    rt_ptr::ptr_write_i32(t, 40, 0)
-    pthread_mutex_init(t + 48, 0)
-    pthread_cond_init(t + 88, 0)
-    let attr: int = rt_ptr::buf_new(64)
-    pthread_attr_init(attr)
-    pthread_attr_setdetachstate(attr, 0)
-    let rc: int = cint(pthread_create(t + 8, attr, fn_addr(task_trampoline), t))
-    pthread_attr_destroy(attr)
-    rt_ptr::buf_free(attr)
-    if rc != 0 is
-        rt_io::eprint_s("hsh_task_spawn: pthread_create failed (errno=" + to_string(rc) + ")\n")
-        pthread_mutex_destroy(t + 48)
-        pthread_cond_destroy(t + 88)
-        rt_ptr::buf_free(t)
-        sem_post(slot)
-        return 0
-    end
-    return t
+    return hsh_task_spawn(fn_ptr, args)
 end
 
-;; the task body of task_spawn_shell: popen(cmd, "r"), read up to 65535 bytes, pclose; the result is a malloc'd copy of the output (the caller frees
-;; it), -1 when popen fails; frees the 4096-byte command block
-fn shell_task_fn(sa: int) -> int is
-    let fp: int = popen(strdup(sa), "r")
-    if fp == 0 is
-        free(sa)
-        return -1
-    end
-    let buf: int = rt_ptr::buf_new(65536)
-    let n: int = fread(buf, 1, 65535, fp)
-    pclose(fp)
-    let out: int = rt_ptr::buf_new(n + 1)
-    memmove(out, buf, n)
-    rt_ptr::buf_free(buf)
-    free(sa)
-    return out
-end
-
-;; core.c hsh_task_spawn_shell(cmd): the command is copied (truncated to 4095 bytes) and run on a task thread
+;; core.c hsh_task_spawn_shell(cmd): the command is copied (truncated to 4095 bytes) and run on a task thread; the task result is a malloc'd copy
+;; of the output (the caller frees it), -1 when popen fails
 pub fn task_spawn_shell(cmd: string) -> int is
-    let sa: int = rt_ptr::buf_new(4096)
-    strncpy(sa, cmd, 4095)
-    return task_spawn(fn_addr(shell_task_fn), sa)
+    return hsh_task_spawn_shell(cmd)
 end
