@@ -1,0 +1,272 @@
+mod rt_num
+mod rt_conv
+
+extern static [c] is
+    fn frexp(x: f64, e: int) -> f64
+    fn ldexp(x: f64, e: int) -> f64
+    fn copysign(x: f64, y: f64) -> f64
+    fn rint(x: f64) -> f64
+    fn calloc(n: int, m: int) -> int
+    fn free(p: int) -> int
+    fn strdup(p: int) -> string
+    fn strndup(p: int, n: int) -> string
+    fn memset(p: int, c: int, n: int) -> int
+    fn memmove(dst: int, src: int, n: int) -> int
+    fn memcmp(a: int, b: int, n: int) -> int
+end
+
+;; helpers for the other modules / tests (not hsh_* symbols)
+pub fn buf_new(n: int) -> int is return calloc(n, 1) end
+pub fn buf_free(p: int) is free(p) end
+
+;; the byte (0..255) at address p
+pub fn peek_byte(p: int) -> int is
+    let s: string = strndup(p, 1)
+    if s.len() == 0 is return 0 end
+    return byte_at(s, 0)
+end
+
+;; `width` bytes at p, little-endian, as an unsigned number (wraps into the sign bit for width 8)
+fn peek_le(p: int, width: int) -> int is
+    let mut v: int = 0
+    let mut k: int = width - 1
+    while k >= 0 is
+        v = (v << 8) | peek_byte(p + k)
+        k -= 1
+    end
+    return v
+end
+
+fn poke_le(p: int, width: int, val: int) is
+    let mut k: int = 0
+    while k < width is
+        memset(p + k, (val >> (8 * k)) & 255, 1)
+        k += 1
+    end
+end
+
+;; core.c hsh_ptr_is_null / hsh_ptr_add (NULL stays NULL)
+pub fn ptr_is_null(p: int) -> bool is return p == 0 end
+pub fn ptr_add(p: int, off: int) -> int is
+    if p == 0 is return 0 end
+    return p + off
+end
+
+;; core.c hsh_ptr_copy (memmove: overlap-safe), hsh_ptr_fill (low byte of val), hsh_ptr_zero; no-ops for NULL or n <= 0
+pub fn ptr_copy(dst: int, src: int, n: int) is
+    if dst == 0 || src == 0 || n <= 0 is return end
+    memmove(dst, src, n)
+end
+pub fn ptr_fill(p: int, val: int, n: int) is
+    if p == 0 || n <= 0 is return end
+    memset(p, val & 255, n)
+end
+pub fn ptr_zero(p: int, n: int) is
+    if p == 0 || n <= 0 is return end
+    memset(p, 0, n)
+end
+
+;; core.c hsh_ptr_compare: 0 when a == b, NULL sorts first (a ? 1 : b ? -1 : 0), else memcmp's sign (the magnitude is libc's)
+pub fn ptr_compare(a: int, b: int, n: int) -> int is
+    if a == b is return 0 end
+    if a == 0 || b == 0 || n <= 0 is
+        if a != 0 is return 1 end
+        if b != 0 is return -1 end
+        return 0
+    end
+    ;; memcmp returns a C `int` (32 bits): take the low half of the register and sign-extend it
+    let r: int = memcmp(a, b, n) & 4294967295
+    if r >= 2147483648 is return r - 4294967296 end
+    return r
+end
+
+;; core.c hsh_ptr_read_i8/i16/i32/i64/ptr: sign-extended, 0 for NULL
+pub fn ptr_read_i8(p: int, off: int) -> int is
+    if p == 0 is return 0 end
+    let v: int = peek_le(p + off, 1)
+    if v >= 128 is return v - 256 end
+    return v
+end
+pub fn ptr_read_i16(p: int, off: int) -> int is
+    if p == 0 is return 0 end
+    let v: int = peek_le(p + off, 2)
+    if v >= 32768 is return v - 65536 end
+    return v
+end
+pub fn ptr_read_i32(p: int, off: int) -> int is
+    if p == 0 is return 0 end
+    let v: int = peek_le(p + off, 4)
+    if v >= 2147483648 is return v - 4294967296 end
+    return v
+end
+pub fn ptr_read_i64(p: int, off: int) -> int is
+    if p == 0 is return 0 end
+    return peek_le(p + off, 8)
+end
+pub fn ptr_read_ptr(p: int, off: int) -> int is
+    if p == 0 is return 0 end
+    return peek_le(p + off, 8)
+end
+
+;; core.c hsh_ptr_write_i8/i16/i32/i64/ptr: the low width bytes of val, no-op for NULL
+pub fn ptr_write_i8(p: int, off: int, val: int) is
+    if p == 0 is return end
+    poke_le(p + off, 1, val)
+end
+pub fn ptr_write_i16(p: int, off: int, val: int) is
+    if p == 0 is return end
+    poke_le(p + off, 2, val)
+end
+pub fn ptr_write_i32(p: int, off: int, val: int) is
+    if p == 0 is return end
+    poke_le(p + off, 4, val)
+end
+pub fn ptr_write_i64(p: int, off: int, val: int) is
+    if p == 0 is return end
+    poke_le(p + off, 8, val)
+end
+pub fn ptr_write_ptr(p: int, off: int, val: int) is
+    if p == 0 is return end
+    poke_le(p + off, 8, val)
+end
+
+;; ── blocks from arc_alloc / rc_alloc: header { count: i64, weak: i64, size: u64 } = 24 bytes right before the pointer ──
+;; core.c hsh_rc_alloc(n): count = 1, weak = 0, size = n; the block itself is zeroed here (the C leaves it uninitialised)
+pub fn rc_alloc(n: int) -> int is
+    let h: int = calloc(1, 24 + n)
+    if h == 0 is return 0 end
+    poke_le(h, 8, 1)
+    poke_le(h + 16, 8, n)
+    return h + 24
+end
+
+;; core.c hsh_ptr_alloc_size: the recorded size of an rc_alloc block (0 for NULL)
+pub fn ptr_alloc_size(p: int) -> int is
+    if p == 0 is return 0 end
+    return peek_le(p - 8, 8)
+end
+
+;; ── struct helpers and plain frees ──
+;; core.c hsh_struct_get / hsh_struct_set: slot idx (8 bytes each); NULL reads 0 / is left alone; set returns the struct
+pub fn struct_get(s: int, idx: int) -> int is
+    if s == 0 is return 0 end
+    return peek_le(s + idx * 8, 8)
+end
+pub fn struct_set(s: int, idx: int, val: int) -> int is
+    if s != 0 is poke_le(s + idx * 8, 8, val) end
+    return s
+end
+;; core.c hsh_struct_free / hsh_bytes_free: free() unless NULL; hsh_string_free does nothing
+pub fn struct_free(p: int) is
+    if p != 0 is free(p) end
+end
+pub fn bytes_free(p: int) is
+    if p != 0 is free(p) end
+end
+pub fn string_free(s: string) is
+    return
+end
+
+;; ── floats through their IEEE-754 bit patterns ──
+fn f2i(x: f64) -> int is return rt_num::float_to_int(x) end
+fn i2f(n: int) -> f64 is return rt_num::to_float(rt_conv::int_to_str(n)) end
+
+;; the 64 bits of a double.  NaN comes out as the canonical quiet NaN with the sign of the input (other payloads are not kept).
+pub fn f64_bits(x: f64) -> int is
+    let mut sign: int = 0
+    if copysign(1.0, x) < 0.0 is sign = 1 end
+    let signbit: int = sign << 63
+    let a: f64 = copysign(x, 1.0)
+    if a != a is return signbit | 9221120237041090560 end
+    if a - a != 0.0 is return signbit | 9218868437227405312 end
+    if a == 0.0 is return signbit end
+    let e: int = calloc(1, 8)
+    let m: f64 = frexp(a, e)
+    let ex: int = ptr_read_i32(e, 0) - 1
+    free(e)
+    let biased: int = ex + 1023
+    if biased >= 1 is
+        let frac: int = f2i((m * 2.0 - 1.0) * 4503599627370496.0)
+        return signbit | (biased << 52) | frac
+    end
+    return signbit | f2i(ldexp(a, 1074))
+end
+
+;; the double with these 64 bits (a NaN comes back as the canonical quiet NaN carrying the sign bit)
+pub fn bits_f64(b: int) -> f64 is
+    let sign: int = (b >> 63) & 1
+    let ex: int = (b >> 52) & 2047
+    let frac: int = b & 4503599627370495
+    let mut v: f64 = 0.0
+    if ex == 2047 is
+        let inf: f64 = ldexp(1.0, 4000)
+        if frac == 0 is v = inf else v = inf - inf end
+    elsif ex == 0 is
+        v = ldexp(i2f(frac), -1074)
+    else
+        v = ldexp(1.0 + i2f(frac) / 4503599627370496.0, ex - 1023)
+    end
+    if sign == 1 is return copysign(v, -1.0) end
+    return copysign(v, 1.0)
+end
+
+;; the 32 bits of (float)x: round to nearest even, overflow -> inf, tiny -> subnormal / 0
+pub fn f32_bits(x: f64) -> int is
+    let mut sign: int = 0
+    if copysign(1.0, x) < 0.0 is sign = 1 end
+    let signbit: int = sign << 31
+    let a: f64 = copysign(x, 1.0)
+    if a != a is return signbit | 2143289344 end
+    if a - a != 0.0 is return signbit | 2139095040 end
+    if a == 0.0 is return signbit end
+    let e: int = calloc(1, 8)
+    let m: f64 = frexp(a, e)
+    let ex: int = ptr_read_i32(e, 0) - 1
+    free(e)
+    if ex >= -126 is
+        let mut frac: int = f2i(rint((m * 2.0 - 1.0) * 8388608.0))
+        let mut ex2: int = ex
+        if frac == 8388608 is
+            frac = 0
+            ex2 = ex + 1
+        end
+        if ex2 > 127 is return signbit | 2139095040 end
+        return signbit | ((ex2 + 127) << 23) | frac
+    end
+    return signbit | f2i(rint(ldexp(a, 149)))
+end
+
+pub fn bits_f32(b: int) -> f64 is
+    let sign: int = (b >> 31) & 1
+    let ex: int = (b >> 23) & 255
+    let frac: int = b & 8388607
+    let mut v: f64 = 0.0
+    if ex == 255 is
+        let inf: f64 = ldexp(1.0, 4000)
+        if frac == 0 is v = inf else v = inf - inf end
+    elsif ex == 0 is
+        v = ldexp(i2f(frac), -149)
+    else
+        v = ldexp(1.0 + i2f(frac) / 8388608.0, ex - 127)
+    end
+    if sign == 1 is return copysign(v, -1.0) end
+    return copysign(v, 1.0)
+end
+
+;; core.c hsh_ptr_read_f64 / write_f64 / read_f32 / write_f32 (f32 values are read and written as doubles; the write rounds to float)
+pub fn ptr_read_f64(p: int, off: int) -> f64 is
+    if p == 0 is return 0.0 end
+    return bits_f64(peek_le(p + off, 8))
+end
+pub fn ptr_write_f64(p: int, off: int, val: f64) is
+    if p == 0 is return end
+    poke_le(p + off, 8, f64_bits(val))
+end
+pub fn ptr_read_f32(p: int, off: int) -> f64 is
+    if p == 0 is return 0.0 end
+    return bits_f32(peek_le(p + off, 4))
+end
+pub fn ptr_write_f32(p: int, off: int, val: f64) is
+    if p == 0 is return end
+    poke_le(p + off, 4, f32_bits(val))
+end
