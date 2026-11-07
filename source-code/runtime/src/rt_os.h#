@@ -1,0 +1,421 @@
+mod rt_ptr
+mod rt_text
+mod rt_state
+
+extern static [c] is
+    fn stat(path: string, buf: int) -> int
+    fn remove(path: string) -> int
+    fn rename(src_path: string, dst_path: string) -> int
+    fn chdir(path: string) -> int
+    fn mkdir(path: string, mode: int) -> int
+    fn rmdir(path: string) -> int
+    fn getenv(name: string) -> int
+    fn setenv(name: string, value: string, overwrite: int) -> int
+    fn unsetenv(name: string) -> int
+    fn usleep(us: int) -> int
+    fn fopen(path: string, mode: string) -> int
+    fn fclose(f: int) -> int
+    fn fputs(s: string, f: int) -> int
+    fn fseek(f: int, off: int, whence: int) -> int
+    fn ftell(f: int) -> int
+    fn fread(buf: int, size: int, n: int, f: int) -> int
+    fn strdup(p: int) -> string
+    fn puts(s: string) -> int
+    fn fflush(f: int) -> int
+    fn localtime_r(t: int, tm: int) -> int
+    fn strftime(buf: int, max: int, fmt: string, tm: int) -> int
+    fn opendir(path: string) -> int
+    fn readdir(d: int) -> int
+    fn closedir(d: int) -> int
+    fn lstat(path: string, buf: int) -> int
+    fn mkstemp(tmpl: int) -> int
+    fn close(fd: int) -> int
+    fn system(cmd: string) -> int
+    fn fwrite(buf: int, size: int, n: int, f: int) -> int
+    fn memcpy(dst: int, src: string, n: int) -> int
+end
+
+;; stat(path): [rc, st_mode, st_size]
+fn stat3(path: string) -> [int] is
+    let buf: int = rt_ptr::buf_new(144)
+    let rc: int = stat(path, buf)
+    let mut out: [int] = [rc, 0, 0]
+    if rc == 0 is
+        out[1] = rt_ptr::ptr_read_i32(buf, 24)
+        out[2] = rt_ptr::ptr_read_i64(buf, 48)
+    end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; S_IFMT = 0o170000, S_IFREG = 0o100000, S_IFDIR = 0o040000
+fn mode_is(mode: int, kind: int) -> bool is return (mode & 61440) == kind end
+
+;; core.c hsh_file_exists: stat() == 0
+pub fn file_exists(path: string) -> bool is return stat3(path)[0] == 0 end
+
+;; core.c hsh_file_size: st_size, -1 when stat fails
+pub fn file_size(path: string) -> int is
+    let st: [int] = stat3(path)
+    if st[0] != 0 is return -1 end
+    return st[2]
+end
+
+;; core.c hsh_is_file / hsh_is_dir / hsh_dir_exists
+pub fn is_file(path: string) -> bool is
+    let st: [int] = stat3(path)
+    return st[0] == 0 && mode_is(st[1], 32768)
+end
+pub fn is_dir(path: string) -> bool is
+    let st: [int] = stat3(path)
+    return st[0] == 0 && mode_is(st[1], 16384)
+end
+pub fn dir_exists(path: string) -> bool is return is_dir(path) end
+
+;; core.c hsh_file_delete / hsh_remove_file: remove(path) == 0 (works on files and empty dirs)
+pub fn file_delete(path: string) -> bool is return remove(path) == 0 end
+pub fn remove_file(path: string) -> bool is return remove(path) == 0 end
+;; core.c hsh_rename / hsh_chdir / hsh_fs_rmdir / hsh_dir_create (mode 0755)
+pub fn rename_file(src_path: string, dst_path: string) -> bool is return rename(src_path, dst_path) == 0 end
+pub fn change_dir(path: string) -> bool is return chdir(path) == 0 end
+pub fn fs_rmdir(path: string) -> bool is return rmdir(path) == 0 end
+pub fn dir_create(path: string) -> bool is return mkdir(path, 493) == 0 end
+
+;; core.c hsh_mkdir_all: mkdir(0755) for every prefix that ends before a '/' (not the leading one), then the whole path; always true.
+;; (the C copies the path into a 4096-byte buffer, so a longer path is cut there)
+pub fn mkdir_all(path0: string) -> bool is
+    let mut path: string = path0
+    if path.len() > 4095 is path = path[0..4095] end
+    let mut i: int = 1
+    while i < path.len() is
+        if byte_at(path, i) == 47 is mkdir(path[0..i], 493) end
+        i += 1
+    end
+    mkdir(path, 493)
+    return true
+end
+
+;; core.c hsh_getenv / hsh_env_get: "" when unset
+pub fn getenv_s(name: string) -> string is
+    let p: int = getenv(name)
+    if p == 0 is return "" end
+    return strdup(p)
+end
+pub fn env_get(name: string) -> string is return getenv_s(name) end
+;; core.c hsh_setenv: overwrite = 1
+pub fn setenv_s(name: string, value: string) -> bool is
+    if name.len() > 0 is rt_state::env_note_set(name) end
+    return setenv(name, value, 1) == 0
+end
+;; core.c hsh_env_remove: unset when the name is not empty; always 1
+pub fn env_remove(name: string) -> bool is
+    if name.len() > 0 is
+        rt_state::env_note_unset(name)
+        unsetenv(name)
+    end
+    return true
+end
+
+;; core.c hsh_platform
+pub fn platform() -> string is return "linux" end
+
+;; core.c hsh_sleep_ms: nanosleep(ms) -> usleep in slices below one second (usleep rejects >= 1_000_000 on some systems)
+pub fn sleep_ms(ms: int) is
+    let mut left: int = ms
+    while left > 0 is
+        let step: int = if_min(left, 500)
+        usleep(step * 1000)
+        left -= step
+    end
+end
+
+fn if_min(a: int, b: int) -> int is
+    if a < b is return a end
+    return b
+end
+
+;; core.c hsh_write_file / hsh_append_file: fopen "wb"/"ab", fputs (stops at a NUL), fclose; false when fopen fails
+pub fn write_file(path: string, content: string) -> bool is
+    let f: int = fopen(path, "wb")
+    if f == 0 is return false end
+    fputs(content, f)
+    fclose(f)
+    return true
+end
+pub fn append_file(path: string, content: string) -> bool is
+    let f: int = fopen(path, "ab")
+    if f == 0 is return false end
+    fputs(content, f)
+    fclose(f)
+    return true
+end
+
+;; core.c hsh_read_file: whole file as a C string ("" when it cannot be opened)
+pub fn read_file(path: string) -> string is
+    let f: int = fopen(path, "rb")
+    if f == 0 is return "" end
+    fseek(f, 0, 2)
+    let sz: int = ftell(f)
+    fseek(f, 0, 0)
+    if sz < 0 is
+        fclose(f)
+        return ""
+    end
+    let buf: int = rt_ptr::buf_new(sz + 1)
+    if buf == 0 is
+        fclose(f)
+        return ""
+    end
+    fread(buf, 1, sz, f)
+    fclose(f)
+    let s: string = strdup(buf)
+    rt_ptr::buf_free(buf)
+    return s
+end
+
+;; core.c hsh_println (one puts on the shared stdout buffer) / hsh_flush
+pub fn println_s(s: string) is puts(s) end
+pub fn flush_stdout() is fflush(0) end
+
+;; whole file by reading chunks until fread gives 0 — for files whose size is not known up front (/proc/*, devices, pipes).
+;; NUL bytes end a chunk, like the C fgets loops these helpers stand in for.
+pub fn read_stream(path: string) -> string is
+    let f: int = fopen(path, "rb")
+    if f == 0 is return "" end
+    let buf: int = rt_ptr::buf_new(4097)
+    let mut out: string = ""
+    let mut n: int = fread(buf, 1, 4096, f)
+    while n > 0 is
+        rt_ptr::ptr_write_i8(buf, n, 0)
+        out += strdup(buf)
+        n = fread(buf, 1, 4096, f)
+    end
+    fclose(f)
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; n bytes from /dev/urandom as 0..255 ([] when it cannot be opened; the C leaves such a buffer zeroed, see the callers)
+pub fn urandom(n: int) -> [int] is
+    let mut out: [int] = []
+    if n <= 0 is return out end
+    let f: int = fopen("/dev/urandom", "rb")
+    let buf: int = rt_ptr::buf_new(n)
+    let mut got: int = 0
+    if f != 0 is
+        got = fread(buf, 1, n, f)
+        fclose(f)
+    end
+    let mut i: int = 0
+    while i < n is
+        out.push(rt_ptr::peek_byte(buf + i))
+        i += 1
+    end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_date_format: strftime(localtime_r(ts)); an empty format means "%Y-%m-%d %H:%M:%S"; "" if the result does not fit
+;; the C's 256-byte buffer (strftime returns 0)
+pub fn date_format(ts: int, fmt: string) -> string is
+    let t: int = rt_ptr::buf_new(8)
+    let tm: int = rt_ptr::buf_new(64)
+    let out: int = rt_ptr::buf_new(256)
+    rt_ptr::ptr_write_i64(t, 0, ts)
+    localtime_r(t, tm)
+    let mut f: string = fmt
+    if f.len() == 0 is f = "%Y-%m-%d %H:%M:%S" end
+    let n: int = strftime(out, 256, f, tm)
+    let mut res: string = ""
+    if n > 0 is res = strdup(out) end
+    rt_ptr::buf_free(t)
+    rt_ptr::buf_free(tm)
+    rt_ptr::buf_free(out)
+    return res
+end
+
+;; ── more of the fs_* group ──
+;; core.c hsh_fs_copy: fopen "rb" src, fopen "wb" dst, copy in 8 KiB blocks; false when either open fails or a write comes up short
+pub fn fs_copy(src_path: string, dst_path: string) -> bool is
+    let fin: int = fopen(src_path, "rb")
+    if fin == 0 is return false end
+    let fout: int = fopen(dst_path, "wb")
+    if fout == 0 is
+        fclose(fin)
+        return false
+    end
+    let buf: int = rt_ptr::buf_new(8192)
+    let mut ok: bool = true
+    let mut n: int = fread(buf, 1, 8192, fin)
+    while n > 0 && ok is
+        if fwrite(buf, 1, n, fout) != n is ok = false end
+        if ok is n = fread(buf, 1, 8192, fin) end
+    end
+    fclose(fin)
+    fclose(fout)
+    rt_ptr::buf_free(buf)
+    return ok
+end
+
+;; the names in an open DIR* in readdir order, without "." and ".." (dirent: d_name at offset 19 on x86-64 Linux)
+fn dir_names(d: int) -> [string] is
+    let mut out: [string] = []
+    let mut ent: int = readdir(d)
+    while ent != 0 is
+        let name: string = strdup(ent + 19)
+        if name != "." && name != ".." is out.push(name) end
+        ent = readdir(d)
+    end
+    return out
+end
+
+;; core.c hsh_fs_list_dir: entry names in readdir order ([] when it cannot be opened)
+pub fn fs_list_dir(path: string) -> [string] is
+    let mut out: [string] = []
+    let d: int = opendir(path)
+    if d == 0 is return out end
+    out = dir_names(d)
+    closedir(d)
+    return out
+end
+
+;; core.c hsh_fs_modified_time: st_mtime (seconds, offset 88 of struct stat on x86-64 Linux), -1 when stat fails
+pub fn fs_modified_time(path: string) -> int is
+    let buf: int = rt_ptr::buf_new(144)
+    let mut out: int = -1
+    if stat(path, buf) == 0 is out = rt_ptr::ptr_read_i64(buf, 88) end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_fs_read_bytes: every byte of the file as 0..255 ([] for a missing or empty file)
+pub fn fs_read_bytes(path: string) -> [int] is
+    let mut out: [int] = []
+    let f: int = fopen(path, "rb")
+    if f == 0 is return out end
+    fseek(f, 0, 2)
+    let sz: int = ftell(f)
+    fseek(f, 0, 0)
+    if sz <= 0 is
+        fclose(f)
+        return out
+    end
+    let buf: int = rt_ptr::buf_new(sz)
+    let got: int = fread(buf, 1, sz, f)
+    fclose(f)
+    let mut i: int = 0
+    while i < got is
+        out.push(rt_ptr::peek_byte(buf + i))
+        i += 1
+    end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_fs_write_bytes: the low 8 bits of every element, true once the file could be opened
+pub fn fs_write_bytes(path: string, data: [int]) -> bool is
+    let f: int = fopen(path, "wb")
+    if f == 0 is return false end
+    if data.len() > 0 is
+        let buf: int = rt_ptr::buf_new(data.len())
+        let mut i: int = 0
+        while i < data.len() is
+            rt_ptr::ptr_write_i8(buf, i, data[i])
+            i += 1
+        end
+        fwrite(buf, 1, data.len(), f)
+        rt_ptr::buf_free(buf)
+    end
+    fclose(f)
+    return true
+end
+
+;; core.c hsh_fs_read_lines: lines split on '\n', one '\r' before it dropped, no empty last line after a final '\n'
+;; (like the C the content is a C string: text after a NUL byte is lost)
+pub fn fs_read_lines(path: string) -> [string] is
+    let mut out: [string] = []
+    let f: int = fopen(path, "rb")
+    if f == 0 is return out end
+    fseek(f, 0, 2)
+    let sz: int = ftell(f)
+    fseek(f, 0, 0)
+    if sz < 0 is
+        fclose(f)
+        return out
+    end
+    let buf: int = rt_ptr::buf_new(sz + 1)
+    let got: int = fread(buf, 1, sz, f)
+    fclose(f)
+    rt_ptr::ptr_write_i8(buf, got, 0)
+    let text: string = strdup(buf)
+    rt_ptr::buf_free(buf)
+    let n: int = text.len()
+    let mut start: int = 0
+    let mut i: int = 0
+    while i <= n is
+        if i == n || byte_at(text, i) == 10 is
+            if i == n && i == start is return out end
+            let mut e: int = i
+            if e > start && byte_at(text, e - 1) == 13 is e -= 1 end
+            out.push(text[start..e])
+            start = i + 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_fs_temp_file: mkstemp("$TMPDIR/<prefix>XXXXXX") (TMPDIR, else /tmp), closed again; the path, "" on failure
+pub fn fs_temp_file(prefix: string) -> string is
+    let mut dir: string = getenv_s("TMPDIR")
+    if dir.len() == 0 is dir = "/tmp" end
+    let tmpl: string = dir + "/" + prefix + "XXXXXX"
+    let buf: int = rt_ptr::buf_new(tmpl.len() + 1)
+    memcpy(buf, tmpl, tmpl.len())
+    let fd: int = mkstemp(buf) & 4294967295
+    let mut out: string = ""
+    if fd != 4294967295 is
+        close(fd)
+        out = strdup(buf)
+    end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_fs_walk: every non-directory below `root` as root/.../name, depth first in readdir order; symlinks are not followed
+fn walk_into(dir: string, out: [string]) is
+    let d: int = opendir(dir)
+    if d == 0 is return end
+    let names: [string] = dir_names(d)
+    closedir(d)
+    let mut i: int = 0
+    while i < names.len() is
+        let mut path: string = dir
+        if dir.len() > 0 && byte_at(dir, dir.len() - 1) != 47 is path += "/" end
+        path += names[i]
+        let buf: int = rt_ptr::buf_new(144)
+        if lstat(path, buf) == 0 is
+            let mode: int = rt_ptr::ptr_read_i32(buf, 24)
+            rt_ptr::buf_free(buf)
+            if mode_is(mode, 16384) is walk_into(path, out) else out.push(path) end
+        else
+            rt_ptr::buf_free(buf)
+        end
+        i += 1
+    end
+end
+pub fn fs_walk(root: string) -> [string] is
+    let mut out: [string] = []
+    walk_into(root, out)
+    return out
+end
+
+;; core.c hsh_dir_remove_all: system("rm -rf '<path>'") (no escaping, like the C); hsh_remove_dir_recursive: "" -> false,
+;; else system("rm -rf <shell-escaped path>")
+pub fn dir_remove_all(path: string) -> bool is
+    return (system("rm -rf '" + path + "'") & 4294967295) == 0
+end
+pub fn remove_dir_recursive(path: string) -> bool is
+    if path.len() == 0 is return false end
+    return (system("rm -rf " + rt_text::shell_escape(path)) & 4294967295) == 0
+end
