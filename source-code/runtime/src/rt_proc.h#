@@ -1,0 +1,539 @@
+mod rt_ptr
+mod rt_str
+mod rt_state
+
+extern static [c] is
+    fn pipe(fds: int) -> int
+    fn fork() -> int
+    fn dup2(a: int, b: int) -> int
+    fn close(fd: int) -> int
+    fn read(fd: int, buf: int, n: int) -> int
+    fn dprintf(fd: int, fmt: string, s: string) -> int
+    fn execvp(file: int, argv: int) -> int
+    fn execv(file: int, argv: int) -> int
+    fn _exit(code: int) -> int
+    fn waitpid(pid: int, status: int, opt: int) -> int
+    fn setsid() -> int
+    fn kill(pid: int, sig: int) -> int
+    fn access(path: string, mode: int) -> int
+    fn popen(cmd: string, mode: string) -> int
+    fn pclose(f: int) -> int
+    fn fread(buf: int, size: int, n: int, f: int) -> int
+    fn strdup(p: int) -> string
+    fn memcpy(dst: int, src: string, n: int) -> int
+    fn getenv(name: string) -> int
+    fn regcomp(re: int, pat: string, flags: int) -> int
+    fn regexec(re: int, text: int, nmatch: int, pmatch: int, flags: int) -> int
+    fn regfree(re: int) -> int
+    fn poll(fds: int, nfds: int, timeout: int) -> int
+    fn fcntl(fd: int, cmd: int, arg: int) -> int
+    fn usleep(us: int) -> int
+    fn time(t: int) -> int
+    fn __errno_location() -> int
+end
+
+;; a C int returned in a 64-bit register: low 32 bits, sign-extended
+fn cint(x: int) -> int is
+    let v: int = x & 4294967295
+    if v >= 2147483648 is return v - 4294967296 end
+    return v
+end
+
+;; a NUL-terminated copy of `s` in malloc'd memory; its address
+fn cstr(s: string) -> int is
+    let buf: int = rt_ptr::buf_new(s.len() + 1)
+    memcpy(buf, s, s.len())
+    return buf
+end
+
+;; char *argv[]: the strings, then a NULL
+fn make_argv(args: [string]) -> int is
+    let argv: int = rt_ptr::buf_new((args.len() + 1) * 8)
+    let mut i: int = 0
+    while i < args.len() is
+        rt_ptr::ptr_write_ptr(argv, i * 8, cstr(args[i]))
+        i += 1
+    end
+    return argv
+end
+
+;; everything readable from fd until EOF (a NUL ends a 4 KiB chunk, like the C's strlen-based copies)
+fn read_all(fd: int) -> string is
+    let buf: int = rt_ptr::buf_new(4097)
+    let mut out: string = ""
+    let mut n: int = read(fd, buf, 4096)
+    while n > 0 is
+        rt_ptr::ptr_write_i8(buf, n, 0)
+        out += strdup(buf)
+        n = read(fd, buf, 4096)
+    end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_exec_argv: run argv[0] with stdout and stderr on one pipe, return what it printed ("" if pipe/fork fail)
+fn exec_argv(args: [string]) -> string is
+    let fds: int = rt_ptr::buf_new(8)
+    if cint(pipe(fds)) != 0 is return "" end
+    let rfd: int = rt_ptr::ptr_read_i32(fds, 0)
+    let wfd: int = rt_ptr::ptr_read_i32(fds, 4)
+    let argv: int = make_argv(args)
+    let pid: int = cint(fork())
+    if pid < 0 is
+        close(rfd)
+        close(wfd)
+        return ""
+    end
+    if pid == 0 is
+        dup2(wfd, 1)
+        dup2(wfd, 2)
+        close(rfd)
+        close(wfd)
+        execvp(rt_ptr::ptr_read_ptr(argv, 0), argv)
+        _exit(127)
+    end
+    close(wfd)
+    let out: string = read_all(rfd)
+    close(rfd)
+    waitpid(pid, 0, 0)
+    return out
+end
+
+;; core.c hsh_exec1..4: a missing argument counts as ""
+pub fn exec1(cmd: string) -> string is return exec_argv([cmd]) end
+pub fn exec2(cmd: string, a1: string) -> string is return exec_argv([cmd, a1]) end
+pub fn exec3(cmd: string, a1: string, a2: string) -> string is return exec_argv([cmd, a1, a2]) end
+pub fn exec4(cmd: string, a1: string, a2: string, a3: string) -> string is return exec_argv([cmd, a1, a2, a3]) end
+
+;; core.c hsh_process_run_args: at most 63 arguments are passed on
+pub fn process_run_args(cmd: string, args: [string]) -> string is
+    let mut argv: [string] = [cmd]
+    let mut i: int = 0
+    while i < args.len() && i < 63 is
+        argv.push(args[i])
+        i += 1
+    end
+    return exec_argv(argv)
+end
+
+;; core.c hsh_process_spawn: fork, setsid, `sh -c cmd`; the child's pid (-1 if fork fails)
+pub fn process_spawn(cmd: string) -> int is
+    let argv: int = make_argv(["sh", "-c", cmd])
+    let path: int = cstr("/bin/sh")
+    let pid: int = cint(fork())
+    if pid < 0 is return -1 end
+    if pid == 0 is
+        setsid()
+        execv(path, argv)
+        _exit(127)
+    end
+    return pid
+end
+
+;; core.c hsh_process_kill: SIGTERM, true when kill() succeeded
+pub fn process_kill(pid: int) -> bool is
+    return cint(kill(pid, 15)) == 0
+end
+
+;; core.c hsh_process_which: a command with a '/' is checked as it is, otherwise every non-empty $PATH entry is tried (X_OK)
+pub fn process_which(cmd: string) -> string is
+    if cmd.len() == 0 is return "" end
+    if rt_str::index_of(cmd, "/") >= 0 is
+        if cint(access(cmd, 1)) == 0 is return cmd end
+        return ""
+    end
+    let p: int = getenv("PATH")
+    if p == 0 is return "" end
+    let dirs: [string] = __builtin_str_split(strdup(p), ":")
+    let mut i: int = 0
+    while i < dirs.len() is
+        if dirs[i].len() > 0 is
+            let full: string = dirs[i] + "/" + cmd
+            if cint(access(full, 1)) == 0 is return full end
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; core.c hsh_shell: popen(cmd, "r"), everything it printed ("" if it printed nothing or popen failed)
+pub fn shell(cmd: string) -> string is
+    let fp: int = popen(cmd, "r")
+    if fp == 0 is return "" end
+    let buf: int = rt_ptr::buf_new(4097)
+    let mut out: string = ""
+    let mut n: int = fread(buf, 1, 4096, fp)
+    while n > 0 is
+        rt_ptr::ptr_write_i8(buf, n, 0)
+        out += strdup(buf)
+        n = fread(buf, 1, 4096, fp)
+    end
+    pclose(fp)
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+;; core.c hsh_run_piped: run argv with `input` on its stdin; [stdout, exit code] (exit code -1 when it did not exit normally,
+;; or when pipes/fork fail -> ["", "-1"]).  Like the C, the whole input is written before any output is read.
+fn run_piped(args: [string], input: string) -> [string] is
+    let a: int = rt_ptr::buf_new(8)
+    let b: int = rt_ptr::buf_new(8)
+    if cint(pipe(a)) != 0 is return ["", "-1"] end
+    if cint(pipe(b)) != 0 is
+        close(rt_ptr::ptr_read_i32(a, 0))
+        close(rt_ptr::ptr_read_i32(a, 4))
+        return ["", "-1"]
+    end
+    let in_r: int = rt_ptr::ptr_read_i32(a, 0)
+    let in_w: int = rt_ptr::ptr_read_i32(a, 4)
+    let out_r: int = rt_ptr::ptr_read_i32(b, 0)
+    let out_w: int = rt_ptr::ptr_read_i32(b, 4)
+    let argv: int = make_argv(args)
+    let pid: int = cint(fork())
+    if pid < 0 is
+        close(in_r)
+        close(in_w)
+        close(out_r)
+        close(out_w)
+        return ["", "-1"]
+    end
+    if pid == 0 is
+        dup2(in_r, 0)
+        dup2(out_w, 1)
+        close(in_r)
+        close(in_w)
+        close(out_r)
+        close(out_w)
+        execvp(rt_ptr::ptr_read_ptr(argv, 0), argv)
+        _exit(127)
+    end
+    close(in_r)
+    close(out_w)
+    if input.len() > 0 is dprintf(in_w, "%s", input) end
+    close(in_w)
+    let out: string = read_all(out_r)
+    close(out_r)
+    let st: int = rt_ptr::buf_new(8)
+    waitpid(pid, st, 0)
+    let status: int = rt_ptr::ptr_read_i32(st, 0)
+    rt_ptr::buf_free(st)
+    let mut rc: int = -1
+    if (status & 127) == 0 is rc = (status >> 8) & 255 end
+    return [out, to_string(rc)]
+end
+
+;; core.c hsh_regex_match: `grep -qP pattern` over the text, true when grep exits 0
+pub fn regex_match(pattern: string, text: string) -> bool is
+    let r: [string] = run_piped(["grep", "-qP", pattern], text)
+    return to_int(r[1]) == 0
+end
+
+;; core.c hsh_regex_find: first line of `grep -oP pattern`, trimmed at both ends ("" when nothing matched)
+pub fn regex_find(pattern: string, text: string) -> string is
+    let r: [string] = run_piped(["grep", "-oP", pattern], text)
+    if to_int(r[1]) < 0 is return "" end
+    let nl: int = rt_str::index_of(r[0], "\n")
+    if nl >= 0 is return rt_str::trim(r[0][0..nl]) end
+    return rt_str::trim(r[0])
+end
+
+;; core.c hsh_regex_find_all: every non-empty line of `grep -oP pattern`
+pub fn regex_find_all(pattern: string, text: string) -> [string] is
+    let mut out: [string] = []
+    let r: [string] = run_piped(["grep", "-oP", pattern], text)
+    if to_int(r[1]) < 0 is return out end
+    let lines: [string] = __builtin_str_split(r[0], "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i].len() > 0 is out.push(lines[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_regex_split: "\s+" / "\s*" split on whitespace runs, anything else is a LITERAL separator (string_split)
+pub fn regex_split(text: string, pattern: string) -> [string] is
+    if pattern == "\\s+" || pattern == "\\s*" is return rt_str::split_whitespace(text) end
+    return rt_str::string_split(text, pattern)
+end
+
+;; core.c hsh_regex_replace: `sed -E 's<d>pattern<d>repl<d>g'` with the first of | # ~ \x01 \x02 \x03 that occurs in neither;
+;; the text comes back unchanged when pattern/repl contain a newline, no delimiter is free, or sed cannot run;
+;; trailing \n \r space tab of the result are removed
+pub fn regex_replace(pattern: string, repl: string, text: string) -> string is
+    if rt_str::index_of(pattern, "\n") >= 0 || rt_str::index_of(repl, "\n") >= 0 is return text end
+    let cands: [string] = ["|", "#", "~", "\u{1}", "\u{2}", "\u{3}"]
+    let mut delim: string = ""
+    let mut i: int = 0
+    while i < cands.len() && delim.len() == 0 is
+        if rt_str::index_of(pattern, cands[i]) < 0 && rt_str::index_of(repl, cands[i]) < 0 is delim = cands[i] end
+        i += 1
+    end
+    if delim.len() == 0 is return text end
+    let script: string = "s" + delim + pattern + delim + repl + delim + "g"
+    let r: [string] = run_piped(["sed", "-E", script], text)
+    if to_int(r[1]) < 0 is return text end
+    let s: string = r[0]
+    let mut n: int = s.len()
+    while n > 0 && (byte_at(s, n - 1) == 10 || byte_at(s, n - 1) == 13 || byte_at(s, n - 1) == 32 || byte_at(s, n - 1) == 9) is n -= 1 end
+    return s[0..n]
+end
+
+;; one row of capture groups: group 0 is the whole match; a group that did not take part is ""
+fn match_row(text: string, base: int, pm: int, ng: int) -> [string] is
+    let mut row: [string] = []
+    let mut g: int = 0
+    while g < ng is
+        let so: int = rt_ptr::ptr_read_i32(pm, g * 8)
+        let eo: int = rt_ptr::ptr_read_i32(pm, g * 8 + 4)
+        if so >= 0 is row.push(text[base + so..base + eo]) else row.push("") end
+        g += 1
+    end
+    return row
+end
+
+;; core.c hsh_re_captures_impl (POSIX ERE via regcomp/regexec).  Returns the matches (one row each) as [[string]];
+;; `all` false stops after the first.  An empty match advances by one byte; REG_NOTBOL after the first search.
+fn captures_impl(pattern: string, text: string, all: bool) -> [[string]] is
+    let mut result: [[string]] = []
+    let re: int = rt_ptr::buf_new(128)
+    if cint(regcomp(re, pattern, 1)) != 0 is return result end
+    let ng: int = rt_ptr::ptr_read_i64(re, 48) + 1
+    let pm: int = rt_ptr::buf_new(ng * 8)
+    let tb: int = cstr(text)
+    let mut off: int = 0
+    let mut first: bool = true
+    let n: int = text.len()
+    let mut flags: int = 0
+    while (off < n || first) && true is
+        if off > 0 is flags = 1 end
+        if cint(regexec(re, tb + off, ng, pm, flags)) != 0 is
+            regfree(re)
+            return result
+        end
+        let row: [string] = match_row(text, off, pm, ng)
+        result.push(row)
+        if !all is
+            regfree(re)
+            return result
+        end
+        first = false
+        let so0: int = rt_ptr::ptr_read_i32(pm, 0)
+        let eo0: int = rt_ptr::ptr_read_i32(pm, 4)
+        let mut adv: int = eo0 + 1
+        if eo0 > so0 is adv = eo0 end
+        if adv <= 0 is adv = 1 end
+        off += adv
+        if off > n is
+            regfree(re)
+            return result
+        end
+    end
+    regfree(re)
+    return result
+end
+
+;; core.c hsh_regex_captures: the groups of the first match ([] when there is none)
+pub fn regex_captures(pattern: string, text: string) -> [string] is
+    let rows: [[string]] = captures_impl(pattern, text, false)
+    if rows.len() == 0 is
+        let empty: [string] = []
+        return empty
+    end
+    return rows[0]
+end
+
+;; core.c hsh_regex_captures_all: the groups of every match
+pub fn regex_captures_all(pattern: string, text: string) -> [[string]] is
+    return captures_impl(pattern, text, true)
+end
+
+;; core.c hsh_py_eval: `python3 -c code`, stdout and stderr together
+pub fn py_eval(code: string) -> string is
+    return exec_argv(["python3", "-c", code])
+end
+
+;; core.c hsh_http_get / hsh_http_post: the same curl command lines through the shell (url / body are pasted in unescaped, like the C)
+pub fn http_get(url: string) -> string is
+    return shell("curl -s -L --max-time 15 -A 'H#/0.9' '" + url + "' 2>/dev/null")
+end
+pub fn http_post(url: string, body: string) -> string is
+    return shell("curl -s -L -X POST --max-time 15 -H 'Content-Type: application/json' -d '" + body + "' '" + url + "' 2>/dev/null")
+end
+
+;; ── hsh_run_cmd_exec: run `sh -c cmd`, stdout and stderr captured SEPARATELY, optional timeout ──
+;; The two captured texts of the last run live in the global slot _HSH_RT_RUNCMD (two pointers to C strings), like the C's
+;; g_hsh_run_cmd_stdout / g_hsh_run_cmd_stderr.
+fn runcmd_store(out: string, err: string) is
+    let slot: int = rt_state::global_slot("_HSH_RT_RUNCMD", 16)
+    rt_ptr::ptr_write_ptr(slot, 0, cstr(out))
+    rt_ptr::ptr_write_ptr(slot, 8, cstr(err))
+end
+
+;; drain what is readable from a non-blocking fd; [text, closed]  (closed = "1" once EOF / a real error was seen)
+fn drain_nonblock(fd: int, buf: int) -> [string] is
+    let mut text: string = ""
+    let mut closed: string = "0"
+    let mut go: bool = true
+    while go is
+        let n: int = read(fd, buf, 8192)
+        if n > 0 is
+            rt_ptr::ptr_write_i8(buf, n, 0)
+            text += strdup(buf)
+        else
+            go = false
+            if n < 0 is
+                let en: int = rt_ptr::ptr_read_i32(__errno_location(), 0)
+                if en != 11 && en != 4 is closed = "1" end
+            else
+                closed = "1"
+            end
+        end
+    end
+    return [text, closed]
+end
+
+;; core.c hsh_run_cmd_exec: the exit code (-1: could not start or not a normal exit, -2: killed on timeout)
+pub fn run_cmd_exec(cmd: string, timeout_secs: int) -> int is
+    runcmd_store("", "")
+    let a: int = rt_ptr::buf_new(8)
+    let b: int = rt_ptr::buf_new(8)
+    if cint(pipe(a)) != 0 is return -1 end
+    if cint(pipe(b)) != 0 is
+        close(rt_ptr::ptr_read_i32(a, 0))
+        close(rt_ptr::ptr_read_i32(a, 4))
+        return -1
+    end
+    let out_r: int = rt_ptr::ptr_read_i32(a, 0)
+    let out_w: int = rt_ptr::ptr_read_i32(a, 4)
+    let err_r: int = rt_ptr::ptr_read_i32(b, 0)
+    let err_w: int = rt_ptr::ptr_read_i32(b, 4)
+    let argv: int = make_argv(["sh", "-c", cmd])
+    let shpath: int = cstr("/bin/sh")
+    let pid: int = cint(fork())
+    if pid < 0 is
+        close(out_r)
+        close(out_w)
+        close(err_r)
+        close(err_w)
+        return -1
+    end
+    if pid == 0 is
+        dup2(out_w, 1)
+        dup2(err_w, 2)
+        close(out_r)
+        close(out_w)
+        close(err_r)
+        close(err_w)
+        execv(shpath, argv)
+        _exit(127)
+    end
+    close(out_w)
+    close(err_w)
+    let mut ofd: int = out_r
+    let mut efd: int = err_r
+    fcntl(ofd, 4, cint(fcntl(ofd, 3, 0)) | 2048)
+    fcntl(efd, 4, cint(fcntl(efd, 3, 0)) | 2048)
+    let mut deadline: int = 0
+    if timeout_secs > 0 is deadline = time(0) + timeout_secs end
+    let mut killed: bool = false
+    let mut ob: string = ""
+    let mut eb: string = ""
+    let pf: int = rt_ptr::buf_new(16)
+    let chunk: int = rt_ptr::buf_new(8193)
+    let mut running: bool = true
+    while (ofd >= 0 || efd >= 0) && running is
+        let mut np: int = 0
+        let mut which0: int = -1
+        let mut which1: int = -1
+        if ofd >= 0 is
+            rt_ptr::ptr_write_i32(pf, np * 8, ofd)
+            rt_ptr::ptr_write_i16(pf, np * 8 + 4, 1)
+            rt_ptr::ptr_write_i16(pf, np * 8 + 6, 0)
+            which0 = np
+            np += 1
+        end
+        if efd >= 0 is
+            rt_ptr::ptr_write_i32(pf, np * 8, efd)
+            rt_ptr::ptr_write_i16(pf, np * 8 + 4, 1)
+            rt_ptr::ptr_write_i16(pf, np * 8 + 6, 0)
+            which1 = np
+            np += 1
+        end
+        poll(pf, np, 50)
+        let mut i: int = 0
+        while i < np is
+            let rev: int = rt_ptr::ptr_read_i16(pf, i * 8 + 6)
+            if (rev & 25) != 0 is
+                if i == which0 is
+                    let r: [string] = drain_nonblock(ofd, chunk)
+                    ob += r[0]
+                    if r[1] == "1" is
+                        close(ofd)
+                        ofd = -1
+                    end
+                else
+                    let r2: [string] = drain_nonblock(efd, chunk)
+                    eb += r2[0]
+                    if r2[1] == "1" is
+                        close(efd)
+                        efd = -1
+                    end
+                end
+            end
+            i += 1
+        end
+        if deadline != 0 && time(0) >= deadline is
+            kill(pid, 9)
+            killed = true
+            running = false
+        end
+    end
+    let st: int = rt_ptr::buf_new(8)
+    if killed is
+        waitpid(pid, st, 0)
+    else
+        let mut waiting: bool = true
+        while waiting is
+            let r: int = cint(waitpid(pid, st, 1))
+            if r == pid is
+                waiting = false
+            elsif deadline != 0 && time(0) >= deadline is
+                kill(pid, 9)
+                waitpid(pid, st, 0)
+                killed = true
+                waiting = false
+            else
+                usleep(20000)
+            end
+        end
+    end
+    let status: int = rt_ptr::ptr_read_i32(st, 0)
+    let mut code: int = -1
+    if killed is
+        code = -2
+    elsif (status & 127) == 0 is
+        code = (status >> 8) & 255
+    end
+    if ofd >= 0 is close(ofd) end
+    if efd >= 0 is close(efd) end
+    rt_ptr::buf_free(pf)
+    rt_ptr::buf_free(chunk)
+    rt_ptr::buf_free(st)
+    runcmd_store(ob, eb)
+    return code
+end
+
+;; core.c hsh_run_cmd_last_stdout / last_stderr: what the previous run_cmd_exec captured ("" before the first one)
+pub fn run_cmd_last_stdout() -> string is
+    let slot: int = rt_state::global_slot("_HSH_RT_RUNCMD", 16)
+    let p: int = rt_ptr::ptr_read_ptr(slot, 0)
+    if p == 0 is return "" end
+    return strdup(p)
+end
+pub fn run_cmd_last_stderr() -> string is
+    let slot: int = rt_state::global_slot("_HSH_RT_RUNCMD", 16)
+    let p: int = rt_ptr::ptr_read_ptr(slot, 8)
+    if p == 0 is return "" end
+    return strdup(p)
+end
