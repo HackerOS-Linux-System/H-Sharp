@@ -58,8 +58,6 @@ pub fn to_upper(s: string) -> string is
         if c >= 97 && c <= 122 is out += str_from_byte(c - 32) else out += s[i..i + 1] end
         i += 1
     end
-    return out
-end
 
 pub fn to_lower(s: string) -> string is
     let mut out: string = ""
@@ -74,15 +72,20 @@ end
 
 ;; core.c hsh_hex_encode: lowercase hex of every byte
 pub fn hex_encode(s: string) -> string is
-    let digits: string = "0123456789abcdef"
-    let mut out: string = ""
+    ;; one allocation: the digits go into an int array and become the string at the end (appending to a string per byte allocates
+    ;; a new string each time, quadratic for large inputs)
+    let mut out: [int] = []
     let mut i: int = 0
     while i < s.len() is
         let c: int = byte_at(s, i)
-        out += digits[c / 16..c / 16 + 1]
-        out += digits[c % 16..c % 16 + 1]
+        let hi: int = c / 16
+        let lo: int = c % 16
+        if hi < 10 is out.push(48 + hi) else out.push(87 + hi) end
+        if lo < 10 is out.push(48 + lo) else out.push(87 + lo) end
         i += 1
     end
+    return __builtin_bytes_to_string(__builtin_bytes_from_ints(out))
+end
     return out
 end
 
@@ -205,4 +208,114 @@ pub fn split_part(s: string, sep: string, index: int) -> string is
         cur += 1
     end
     return ""
+end
+
+;; ── thin aliases in core.c (hsh_string_* / hsh_strlen / hsh_strcat): the C bodies just call the function ported above ──
+;; core.c hsh_string_contains -> hsh_str_contains; hsh_string_starts_with/ends_with -> hsh_starts_with/ends_with;
+;; hsh_string_trim -> hsh_trim; hsh_string_replace -> hsh_str_replace; hsh_string_lower/upper = ASCII tolower/toupper
+pub fn string_contains(s: string, sub: string) -> bool is return contains(s, sub) end
+pub fn string_starts_with(s: string, p: string) -> bool is return starts_with(s, p) end
+pub fn string_ends_with(s: string, p: string) -> bool is return ends_with(s, p) end
+pub fn string_trim(s: string) -> string is return trim(s) end
+pub fn string_replace(s: string, from: string, to: string) -> string is return replace(s, from, to) end
+pub fn string_lower(s: string) -> string is return to_lower(s) end
+pub fn string_upper(s: string) -> string is return to_upper(s) end
+
+;; core.c hsh_string_len / hsh_strlen: length in BYTES (NULL -> 0)
+pub fn string_len(s: string) -> int is return s.len() end
+pub fn strlen(s: string) -> int is return s.len() end
+
+;; core.c hsh_strcat
+pub fn strcat(a: string, b: string) -> string is return a + b end
+
+;; core.c hsh_substr: byte range [start, end); start < 0 -> 0, end < 0 or end > len -> len (NOT clamped to 0 like string_slice);
+;; "" when start >= end
+pub fn substr(s: string, start0: int, end0: int) -> string is
+    let n: int = s.len()
+    let mut start: int = start0
+    let mut e: int = end0
+    if start < 0 is start = 0 end
+    if e < 0 || e > n is e = n end
+    if start >= e is return "" end
+    return s[start..e]
+end
+
+;; core.c hsh_str_split_whitespace: runs of isspace (' ', \t \n \v \f \r) separate tokens, no empty tokens
+pub fn split_whitespace(s: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n is
+        while i < n && is_ws6(byte_at(s, i)) is i += 1 end
+        if i < n is
+            let start: int = i
+            while i < n && !is_ws6(byte_at(s, i)) is i += 1 end
+            out.push(s[start..i])
+        end
+    end
+    return out
+end
+
+;; core.c hsh_string_chars: one string per UTF-8 character.  Length from the lead byte (1 for ASCII/continuation/invalid, 2 for
+;; C0.., 3 for E0.., 4 for F0..), cut short at the end of the string or at the first byte that is not a continuation byte.
+pub fn string_chars(s: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n is
+        let b: int = byte_at(s, i)
+        let mut len: int = 1
+        if b >= 240 is
+            len = 4
+        elsif b >= 224 is
+            len = 3
+        elsif b >= 192 is
+            len = 2
+        end
+        if b < 128 is len = 1 end
+        if i + len > n is len = n - i end
+        let mut k: int = 1
+        while k < len is
+            if (byte_at(s, i + k) & 192) != 128 is
+                len = k
+                k = len + 1
+            else
+                k += 1
+            end
+        end
+        out.push(s[i..i + len])
+        i += len
+    end
+    return out
+end
+
+;; core.c hsh_string_split: split on every occurrence of `sep` (non-overlapping, left to right, empty parts kept); an empty `sep`
+;; gives [str]
+pub fn string_split(str: string, sep: string) -> [string] is
+    let mut out: [string] = []
+    if sep.len() == 0 is
+        out.push(str)
+        return out
+    end
+    let mut rest: string = str
+    let mut at_: int = index_of(rest, sep)
+    while at_ >= 0 is
+        out.push(rest[0..at_])
+        rest = rest[at_ + sep.len()..rest.len()]
+        at_ = index_of(rest, sep)
+    end
+    out.push(rest)
+    return out
+end
+
+;; core.c hsh_array_join (array of strings): parts glued with `sep`; "" for an empty array
+pub fn array_join(a: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is out += sep end
+        out += a[i]
+        i += 1
+    end
+    return out
 end
