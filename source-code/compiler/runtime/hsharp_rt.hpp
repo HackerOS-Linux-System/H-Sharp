@@ -133,6 +133,11 @@ template<class A, class B> constexpr auto tern_pick() {
     if constexpr (std::is_same_v<a, b>) return tern_tag<a>{};
     else if constexpr (std::is_same_v<a, Any>) return tern_tag<b>{};
     else if constexpr (std::is_same_v<b, Any>) return tern_tag<a>{};
+    // `Arr<Str>` vs `Arr<Any>` (e.g. `[]` hinted as `[string]` vs `string_split`): both convert to each other, so `?:` is
+    // ambiguous - prefer the concretely typed array
+    else if constexpr (is_arr<a>::value && is_arr<b>::value && std::is_convertible_v<a, b> && std::is_convertible_v<b, a>) {
+        if constexpr (std::is_same_v<a, Arr<Any>>) return tern_tag<b>{}; else return tern_tag<a>{};
+    }
     else if constexpr (is_opt<a>::value && !is_opt<b>::value && std::is_convertible_v<b, a>) return tern_tag<a>{};
     else if constexpr (is_opt<b>::value && !is_opt<a>::value && std::is_convertible_v<a, b>) return tern_tag<b>{};
     else return tern_tag<decltype(true ? std::declval<A>() : std::declval<B>())>{};
@@ -673,6 +678,37 @@ template<class T, class F> inline Arr<T> hs_b_sort_by_key(Arr<T> a, F f) {
     std::function<int64_t(int64_t, int64_t)> w = [&](int64_t x, int64_t y) -> int64_t { auto kx = f(hs::unpack<T>(x)), ky = f(hs::unpack<T>(y)); return hs::lt(kx, ky) ? -1 : (hs::lt(ky, kx) ? 1 : 0); };
     auto* saved = hs::cmp_slot(); hs::cmp_slot() = &w;
     Arr<T> r(hsh_sort_by(a.a, &hs::cmp_tramp)); hs::cmp_slot() = saved; return r;
+}
+
+// `std/sort.h#` calls `__builtin_sort_by(arr, cmp)` / `__builtin_sort_by_key(arr, key)`. The generic registry wrapper turned the
+// std::function into a "function pointer" by boxing it on the heap (hs::cv -> unpack<fnptr>(pack(f))) and the C sorter then jumped into
+// that heap object (SIGSEGV). Both go through the trampolines instead.
+template<class T, class F> inline Arr<T> hs_b___builtin_sort_by(Arr<T> a, F f) { return hs_b_sort_by(a, f); }
+// keys compared as strings when both look like pointers, as signed ints otherwise (same rule as hsh_sort_by_key); stable
+template<class T, class F> inline Arr<T> hs_b___builtin_sort_by_key(Arr<T> a, F f) {
+    if (!a.a) return Arr<T>(hsh_array_new());
+    int64_t n = a.a->len;
+    if (n < 2) return a;
+    int64_t* keys = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* idx  = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* out  = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!keys || !idx || !out) { free(keys); free(idx); free(out); return a; }
+    auto looks_ptr = [](int64_t v) { return (uint64_t)v > 0x10000ULL && (uint64_t)v < 0x7ffffffffffeULL; };
+    for (int64_t i = 0; i < n; i++) { keys[i] = hs::pack(f(hs::unpack<T>(a.a->data[i]))); idx[i] = i; }
+    for (int64_t i = 1; i < n; i++) {
+        int64_t cur = idx[i], j = i;
+        while (j > 0) {
+            int64_t k1 = keys[idx[j-1]], k2 = keys[cur];
+            bool gt = (looks_ptr(k1) && looks_ptr(k2)) ? (strcmp((const char*)(uintptr_t)k1, (const char*)(uintptr_t)k2) > 0) : (k1 > k2);
+            if (!gt) break;
+            idx[j] = idx[j-1]; j--;
+        }
+        idx[j] = cur;
+    }
+    for (int64_t i = 0; i < n; i++) out[i] = a.a->data[idx[i]];
+    memcpy(a.a->data, out, (size_t)n * sizeof(int64_t));
+    free(keys); free(idx); free(out);
+    return a;
 }
 
 // ── C++-implemented builtins that never had a C symbol ────────────────────────
