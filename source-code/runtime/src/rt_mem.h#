@@ -15,6 +15,9 @@ extern static [c] is
     fn memcpy(dst: int, src: string, n: int) -> int
     fn pthread_mutex_lock(m: int) -> int
     fn pthread_mutex_unlock(m: int) -> int
+    ;; the C runtime's indirect-call entry points (compiler/runtime/core.c) — see closure_call1/2 below
+    fn hsh_closure_call1(c: int, a0: int) -> int
+    fn hsh_closure_call2(c: int, a0: int, a1: int) -> int
 end
 
 fn rd(p: int, off: int) -> int is return rt_ptr::ptr_read_i64(p, off) end
@@ -596,24 +599,20 @@ pub fn closure_create(fn_ptr: int, n_caps: int, c0: int, c1: int, c2: int, c3: i
 end
 
 ;; core.c hsh_closure_call1 / hsh_closure_call2: call the function at c->fn_ptr with the arguments, then the captures (n_caps 0, 1 or 2; any
-;; other count calls it with the bare arguments); a NULL closure gives 0.  Needs the compiler builtin `call_ptr` (an indirect call through an
-;; address: SysV passes the arguments in registers, a callee that takes fewer ignores the rest).
+;; other count calls it with the bare arguments); a NULL closure gives 0.
+;;
+;; An indirect call through a raw address needs a compiler builtin (`call_ptr`) that h# 0.9.0 does not have (and neither does any compiler in this
+;; repository), so these two stay thin forwarders to the C runtime, which is linked into every program anyway.  The closure block built by
+;; closure_create above has exactly the HshClosure layout of core.c ({fn_ptr, n_caps, caps[8]}), so the two sides agree on it byte for byte.
+;; The NULL check stays on the H# side so a NULL closure never reaches C.
 pub fn closure_call1(c: int, a0: int) -> int is
     if c == 0 is return 0 end
-    let f: int = rd(c, 0)
-    let n: int = rd(c, 8)
-    if n == 1 is return call_ptr(f, a0, rd(c, 16), 0, 0) end
-    if n == 2 is return call_ptr(f, a0, rd(c, 16), rd(c, 24), 0) end
-    return call_ptr(f, a0, 0, 0, 0)
+    return hsh_closure_call1(c, a0)
 end
 
 pub fn closure_call2(c: int, a0: int, a1: int) -> int is
     if c == 0 is return 0 end
-    let f: int = rd(c, 0)
-    let n: int = rd(c, 8)
-    if n == 1 is return call_ptr(f, a0, a1, rd(c, 16), 0) end
-    if n == 2 is return call_ptr(f, a0, a1, rd(c, 16), rd(c, 24)) end
-    return call_ptr(f, a0, a1, 0, 0)
+    return hsh_closure_call2(c, a0, a1)
 end
 
 ;; core.c hsh_val_to_str: 0 -> "0"; an int that looks like a pointer (65536 < v < 0x7fffffffffff) whose first byte is NUL or
