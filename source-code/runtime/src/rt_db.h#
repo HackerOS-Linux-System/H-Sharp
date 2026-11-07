@@ -1,0 +1,611 @@
+mod rt_ptr
+mod rt_mem
+mod rt_state
+mod rt_io
+mod rt_conv
+mod rt_str
+mod rt_num
+
+extern static [c, "sqlite3"] is
+    fn sqlite3_open_v2(path: string, ppdb: int, flags: int, vfs: int) -> int
+    fn sqlite3_close(db: int) -> int
+    fn sqlite3_busy_timeout(db: int, ms: int) -> int
+    fn sqlite3_prepare_v2(db: int, sql: int, nbyte: int, ppstmt: int, pztail: int) -> int
+    fn sqlite3_step(stmt: int) -> int
+    fn sqlite3_finalize(stmt: int) -> int
+    fn sqlite3_column_count(stmt: int) -> int
+    fn sqlite3_column_name(stmt: int, i: int) -> int
+    fn sqlite3_column_text(stmt: int, i: int) -> int
+    fn sqlite3_errmsg(db: int) -> int
+    fn sqlite3_error_offset(db: int) -> int
+end
+
+extern static [c] is
+    fn strdup(p: int) -> string
+    fn free(p: int) -> int
+end
+
+fn cint(x: int) -> int is
+    let v: int = x & 4294967295
+    if v >= 2147483648 is return v - 4294967296 end
+    return v
+end
+
+fn ctext(p: int) -> string is
+    if p == 0 is return "" end
+    return strdup(p)
+end
+
+;; ───────────────────────── the "CLI" ─────────────────────────
+fn spaces(n: int) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < n is
+        s += " "
+        i += 1
+    end
+    return s
+end
+
+;; the CLI's shell_error_context: the offending SQL (cut to 78 bytes around the error, blanks for white space) and a caret
+fn error_context(zsql: string, off: int) -> string is
+    if off < 0 || off >= zsql.len() is return "" end
+    let mut s: string = zsql
+    let mut o: int = off
+    while o > 50 is
+        o -= 1
+        s = s[1..s.len()]
+        while s.len() > 0 && (byte_at(s, 0) & 192) == 128 is
+            s = s[1..s.len()]
+            o -= 1
+        end
+    end
+    let mut len: int = s.len()
+    if len > 78 is
+        len = 78
+        while len > 0 && len < s.len() && (byte_at(s, len) & 192) == 128 is len -= 1 end
+    end
+    let mut code: [int] = []
+    let mut i: int = 0
+    while i < len is
+        let c: int = byte_at(s, i)
+        if c == 32 || (c >= 9 && c <= 13) is code.push(32) else code.push(c) end
+        i += 1
+    end
+    let ctext2: string = __builtin_bytes_to_string(__builtin_bytes_from_ints(code))
+    if o < 25 is return "\n  " + ctext2 + "\n  " + spaces(o) + "^--- error here" end
+    return "\n  " + ctext2 + "\n  " + spaces(o - 14) + "error here ---^"
+end
+
+fn code_suffix(rc: int) -> string is
+    if rc != 1 is return " (" + rt_conv::int_to_str(rc) + ")" end
+    return ""
+end
+
+;; run `sql` on the database file `path`; [stdout text, stderr text, exit status]
+fn engine(path: string, sql: string, header: bool, arg_mode: bool) -> [string] is
+    let dbp: int = rt_ptr::buf_new(8)
+    let orc: int = cint(sqlite3_open_v2(path, dbp, 6, 0))
+    let db: int = rt_ptr::ptr_read_ptr(dbp, 0)
+    rt_ptr::buf_free(dbp)
+    if orc != 0 || db == 0 is
+        let mut m: string = "unable to open database file"
+        if db != 0 is
+            m = ctext(sqlite3_errmsg(db))
+            sqlite3_close(db)
+        end
+        return ["", "Error: unable to open database \"" + path + "\": " + m + "\n", "1"]
+    end
+    if !arg_mode is sqlite3_busy_timeout(db, 5000) end
+    let buf: int = rt_mem::c_string(sql)
+    let stmtp: int = rt_ptr::buf_new(8)
+    let tailp: int = rt_ptr::buf_new(8)
+    let mut cur: int = buf
+    let mut out: string = ""
+    let mut err: string = ""
+    let mut rcode: int = 0
+    let mut go: bool = true
+    while go is
+        ;; the CLI steps over white space between statements (it matters for the error context below)
+        while rt_ptr::peek_byte(cur) == 32 || (rt_ptr::peek_byte(cur) >= 9 && rt_ptr::peek_byte(cur) <= 13) is cur += 1 end
+        if rt_ptr::peek_byte(cur) == 0 is
+            go = false
+        else
+            let prc: int = cint(sqlite3_prepare_v2(db, cur, -1, stmtp, tailp))
+            let stmt: int = rt_ptr::ptr_read_ptr(stmtp, 0)
+            let tail: int = rt_ptr::ptr_read_ptr(tailp, 0)
+            if prc != 0 is
+                let msg: string = ctext(sqlite3_errmsg(db))
+                if arg_mode is
+                    err += "Error: in prepare, " + msg + code_suffix(prc) + error_context(ctext(cur), cint(sqlite3_error_offset(db))) + "\n"
+                else
+                    err += "Error: " + msg + "\n"
+                end
+                rcode = 1
+                go = false
+            elsif stmt == 0 is
+                if tail == cur is go = false end
+                cur = tail
+            else
+                let ncol: int = cint(sqlite3_column_count(stmt))
+                let mut printed: bool = false
+                let mut stepping: bool = true
+                let mut failed: bool = false
+                while stepping is
+                    let sr: int = cint(sqlite3_step(stmt))
+                    if sr == 100 is
+                        if header && !printed && ncol > 0 is
+                            let mut names: string = ""
+                            let mut i: int = 0
+                            while i < ncol is
+                                if i > 0 is names += "\t" end
+                                names += ctext(sqlite3_column_name(stmt, i))
+                                i += 1
+                            end
+                            out += names + "\n"
+                            printed = true
+                        end
+                        let mut row: string = ""
+                        let mut j: int = 0
+                        while j < ncol is
+                            if j > 0 is row += "\t" end
+                            row += ctext(sqlite3_column_text(stmt, j))
+                            j += 1
+                        end
+                        out += row + "\n"
+                    elsif sr == 101 is
+                        stepping = false
+                    else
+                        let msg2: string = ctext(sqlite3_errmsg(db))
+                        if arg_mode is
+                            err += "Error: stepping, " + msg2 + code_suffix(sr) + "\n"
+                            rcode = sr
+                        else
+                            err += "Error: " + msg2 + "\n"
+                            rcode = 1
+                        end
+                        failed = true
+                        stepping = false
+                    end
+                end
+                sqlite3_finalize(stmt)
+                if failed is
+                    go = false
+                else
+                    cur = tail
+                end
+            end
+        end
+    end
+    sqlite3_close(db)
+    rt_ptr::buf_free(stmtp)
+    rt_ptr::buf_free(tailp)
+    return [out, err, rt_conv::int_to_str(rcode)]
+end
+
+;; core.c hsh_db_report: "db error: <err or 'sqlite3 failed'>" on stderr when rc != 0
+fn db_report(rc: int, err: string) is
+    if rc == 0 is return end
+    if err.len() > 0 is
+        rt_io::eprint_s("db error: " + err + "\n")
+    else
+        rt_io::eprint_s("db error: sqlite3 failed\n")
+    end
+end
+
+;; ───────────────────────── handles ─────────────────────────
+fn txbase() -> int is return rt_state::global_slot("_HSH_RT_DBTX", 64 * 40 + 8) end
+
+fn strtol_prefix(s: string) -> int is
+    let mut i: int = 0
+    while i < s.len() && (byte_at(s, i) == 32 || (byte_at(s, i) >= 9 && byte_at(s, i) <= 13)) is i += 1 end
+    let mut neg: bool = false
+    if i < s.len() && (byte_at(s, i) == 43 || byte_at(s, i) == 45) is
+        neg = byte_at(s, i) == 45
+        i += 1
+    end
+    let mut v: int = 0
+    while i < s.len() && byte_at(s, i) >= 48 && byte_at(s, i) <= 57 && v < 100000000000000000 is
+        v = v * 10 + (byte_at(s, i) - 48)
+        i += 1
+    end
+    if neg is return -v end
+    return v
+end
+
+;; strtoll(s, NULL, 10): blanks, sign, digits; out-of-range values saturate
+fn strtoll_sat(s: string) -> int is
+    let mut i: int = 0
+    while i < s.len() && (byte_at(s, i) == 32 || (byte_at(s, i) >= 9 && byte_at(s, i) <= 13)) is i += 1 end
+    let mut neg: bool = false
+    if i < s.len() && (byte_at(s, i) == 43 || byte_at(s, i) == 45) is
+        neg = byte_at(s, i) == 45
+        i += 1
+    end
+    let max: int = 9223372036854775807
+    let mut v: int = 0
+    while i < s.len() && byte_at(s, i) >= 48 && byte_at(s, i) <= 57 is
+        let d: int = byte_at(s, i) - 48
+        if v < (-max - 1 + d) / 10 is
+            if neg is return -max - 1 end
+            return max
+        end
+        v = v * 10 - d
+        i += 1
+    end
+    if neg is return v end
+    if v == -max - 1 is return max end
+    return -v
+end
+
+fn is_tx(h: string) -> bool is return rt_str::starts_with(h, "sqlite-tx://") end
+
+;; index of the open transaction named by the handle, -1 when it is not one
+fn tx_get(h: string) -> int is
+    if !is_tx(h) is return -1 end
+    let i: int = strtol_prefix(h[12..h.len()])
+    if i < 0 || i >= 64 is return -1 end
+    if rt_ptr::ptr_read_i32(txbase() + i * 40, 0) == 0 is return -1 end
+    return i
+end
+
+fn path_of(h: string) -> string is
+    let t: int = tx_get(h)
+    if t >= 0 is return rt_mem::text_at(rt_ptr::ptr_read_ptr(txbase() + t * 40, 8)) end
+    if rt_str::starts_with(h, "sqlite://") is return h[9..h.len()] end
+    return h
+end
+
+fn tx_free_entry(t: int) is
+    let e: int = txbase() + t * 40
+    let p: int = rt_ptr::ptr_read_ptr(e, 8)
+    if p != 0 is free(p) end
+    let b: int = rt_ptr::ptr_read_ptr(e, 16)
+    if b != 0 is free(b) end
+    let mut k: int = 0
+    while k < 40 is
+        rt_ptr::ptr_write_i8(e, k, 0)
+        k += 1
+    end
+end
+
+fn tx_append(t: int, sql: string) is
+    let e: int = txbase() + t * 40
+    let old: int = rt_ptr::ptr_read_ptr(e, 16)
+    let mut cur: string = ""
+    if old != 0 is
+        cur = rt_mem::text_at(old)
+        free(old)
+    end
+    let n: string = cur + sql + "\n;\n"
+    rt_ptr::ptr_write_ptr(e, 16, rt_mem::c_string(n))
+    rt_ptr::ptr_write_i64(e, 24, n.len())
+    rt_ptr::ptr_write_i64(e, 32, n.len() + 1)
+end
+
+fn tx_buf(t: int) -> string is
+    let b: int = rt_ptr::ptr_read_ptr(txbase() + t * 40, 16)
+    if b == 0 is return "" end
+    return rt_mem::text_at(b)
+end
+
+;; ───────────────────────── result rows ─────────────────────────
+fn colsbase() -> int is return rt_state::global_slot("_HSH_RT_DBCOLS", 16) end
+
+;; the header names of the last query (the first output line of every query, even an empty one)
+fn set_header(line: string) is
+    let g: int = colsbase()
+    let old: int = rt_ptr::ptr_read_ptr(g, 0)
+    let oldn: int = rt_ptr::ptr_read_i64(g, 8)
+    if old != 0 is
+        let mut i: int = 0
+        while i < oldn is
+            free(rt_ptr::ptr_read_ptr(old, i * 8))
+            i += 1
+        end
+        free(old)
+    end
+    let parts: [string] = __builtin_str_split(line, "\t")
+    let arr: int = rt_ptr::buf_new(parts.len() * 8)
+    let mut k: int = 0
+    while k < parts.len() is
+        rt_ptr::ptr_write_ptr(arr, k * 8, rt_mem::c_string(parts[k]))
+        k += 1
+    end
+    rt_ptr::ptr_write_ptr(g, 0, arr)
+    rt_ptr::ptr_write_i64(g, 8, parts.len())
+end
+
+;; core.c hsh_db_parse_rows: line 1 is the header, every later non-empty line one row (cells split on TAB); an empty text changes nothing
+fn parse_rows(out: string) -> int is
+    let mut rows: int = rt_mem::array_new()
+    let lines: [string] = __builtin_str_split(out, "\n")
+    let mut first: bool = true
+    let mut i: int = 0
+    while i < lines.len() is
+        let mut line: string = lines[i]
+        let is_last: bool = i == lines.len() - 1
+        if !(is_last && line.len() == 0) is
+            if line.len() > 0 && byte_at(line, line.len() - 1) == 13 is line = line[0..line.len() - 1] end
+            if first is
+                set_header(line)
+                first = false
+            elsif line.len() > 0 is
+                let mut row: int = rt_mem::array_new()
+                let cells: [string] = __builtin_str_split(line, "\t")
+                let mut c: int = 0
+                while c < cells.len() is
+                    row = rt_mem::array_push(row, rt_mem::alloc_string(cells[c]))
+                    c += 1
+                end
+                rows = rt_mem::array_push(rows, row)
+            end
+        end
+        i += 1
+    end
+    return rows
+end
+
+;; core.c hsh_db_cell: a column by number or by header name; "" when missing
+fn cell(row: int, col: string) -> string is
+    if row == 0 is return "" end
+    let mut idx: int = -1
+    let mut digits: bool = col.len() > 0
+    let mut i: int = 0
+    while i < col.len() is
+        if byte_at(col, i) < 48 || byte_at(col, i) > 57 is
+            digits = false
+            i = col.len()
+        else
+            i += 1
+        end
+    end
+    if digits is
+        idx = strtoll_sat(col)
+    else
+        let g: int = colsbase()
+        let arr: int = rt_ptr::ptr_read_ptr(g, 0)
+        let n: int = rt_ptr::ptr_read_i64(g, 8)
+        let mut k: int = 0
+        while k < n && idx < 0 is
+            let p: int = rt_ptr::ptr_read_ptr(arr, k * 8)
+            if p != 0 && rt_mem::text_at(p) == col is idx = k end
+            k += 1
+        end
+    end
+    if idx < 0 || idx >= rt_mem::array_len(row) is return "" end
+    return rt_mem::text_at(rt_mem::array_get(row, idx))
+end
+
+;; ───────────────────────── SQL text helpers ─────────────────────────
+;; core.c hsh_sql_escape: 'text' with every ' doubled
+fn sql_escape(s: string) -> string is
+    let mut out: string = "'"
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 39 is out += "''" else out += s[i..i + 1] end
+        i += 1
+    end
+    return out + "'"
+end
+
+;; core.c hsh_sql_bind: the n-th '?' becomes the n-th escaped value (no quote awareness)
+fn sql_bind(sql: string, escaped: [string], n: int) -> string is
+    let mut out: string = ""
+    let mut bi: int = 0
+    let mut i: int = 0
+    while i < sql.len() is
+        if byte_at(sql, i) == 63 && bi < n is
+            out += escaped[bi]
+            bi += 1
+        else
+            out += sql[i..i + 1]
+        end
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_db_bind_array: '?' outside quotes takes the next parameter: an int-looking value (<= 0x10000 or >= 0x7ffffffffffe as
+;; unsigned) is printed as a number, anything else is the address of a C string and is quoted
+fn bind_array(sql: string, params: int) -> string is
+    let np: int = rt_mem::array_len(params)
+    let mut lit: [string] = []
+    let mut i: int = 0
+    while i < np is
+        let v: int = rt_mem::array_get(params, i)
+        if v < 0 || v <= 65536 || v >= 140737488355326 is
+            lit.push(rt_conv::int_to_str(v))
+        else
+            lit.push(sql_escape(rt_mem::text_at(v)))
+        end
+        i += 1
+    end
+    let mut out: string = ""
+    let mut bi: int = 0
+    let mut q: int = 0
+    let mut p: int = 0
+    while p < sql.len() is
+        let c: int = byte_at(sql, p)
+        if q != 0 is
+            out += sql[p..p + 1]
+            if c == q is q = 0 end
+        elsif c == 39 || c == 34 is
+            q = c
+            out += sql[p..p + 1]
+        elsif c == 63 && bi < np is
+            out += lit[bi]
+            bi += 1
+        else
+            out += sql[p..p + 1]
+        end
+        p += 1
+    end
+    return out
+end
+
+;; ───────────────────────── the API ─────────────────────────
+;; core.c hsh_sqlite_open: "sqlite://<path>" (a leading "sqlite://" is not doubled)
+pub fn sqlite_open(uri: string) -> string is
+    let mut p: string = uri
+    if rt_str::starts_with(p, "sqlite://") is p = p[9..p.len()] end
+    return "sqlite://" + p
+end
+
+;; core.c hsh_sqlite_exec: inside a transaction handle the SQL is only buffered (0); otherwise it runs followed by SELECT changes() and
+;; the number of changed rows comes back (-1 on error)
+pub fn sqlite_exec(h: string, sql: string) -> int is
+    let t: int = tx_get(h)
+    if t >= 0 is
+        tx_append(t, sql)
+        return 0
+    end
+    let r: [string] = engine(path_of(h), sql + "\n;\n" + "SELECT changes();\n", false, false)
+    let rc: int = to_int(r[2])
+    if rc != 0 is
+        db_report(rc, r[1])
+        return -1
+    end
+    let mut out: string = r[0]
+    let mut n: int = out.len()
+    while n > 0 && (byte_at(out, n - 1) == 10 || byte_at(out, n - 1) == 13) is n -= 1 end
+    out = out[0..n]
+    let mut last: string = out
+    let mut k: int = n - 1
+    while k >= 0 is
+        if byte_at(out, k) == 10 is
+            last = out[k + 1..n]
+            k = -1
+        else
+            k -= 1
+        end
+    end
+    return strtoll_sat(last)
+end
+
+;; core.c hsh_sqlite_query: rows as an array of rows (each an array of C strings); inside a transaction the buffered SQL runs first
+;; in a BEGIN ... ROLLBACK that is never committed
+pub fn sqlite_query(h: string, sql: string) -> int is
+    let t: int = tx_get(h)
+    let mut full: string = sql + "\n;\n"
+    if t >= 0 is full = "BEGIN;\n" + tx_buf(t) + sql + "\n;\n" + "ROLLBACK;\n" end
+    let r: [string] = engine(path_of(h), full, true, false)
+    let rc: int = to_int(r[2])
+    if rc != 0 is
+        db_report(rc, r[1])
+        return rt_mem::array_new()
+    end
+    return parse_rows(r[0])
+end
+
+;; core.c hsh_sqlite_ping: SELECT 1 answers "1"
+pub fn sqlite_ping(h: string) -> int is
+    let r: [string] = engine(path_of(h), "SELECT 1;\n", false, false)
+    if to_int(r[2]) == 0 && r[0].len() > 0 && byte_at(r[0], 0) == 49 is return 1 end
+    return 0
+end
+
+;; core.c hsh_sqlite_begin: a new transaction handle "sqlite-tx://<n>" (the C returns the string's address as an int64); 0 for a
+;; transaction handle or when all 64 slots are taken
+pub fn sqlite_begin(h: string) -> int is
+    if is_tx(h) is return 0 end
+    let mut i: int = 0
+    while i < 64 is
+        let e: int = txbase() + i * 40
+        if rt_ptr::ptr_read_i32(e, 0) == 0 is
+            rt_ptr::ptr_write_i32(e, 0, 1)
+            rt_ptr::ptr_write_ptr(e, 8, rt_mem::c_string(path_of(h)))
+            rt_ptr::ptr_write_ptr(e, 16, 0)
+            rt_ptr::ptr_write_i64(e, 24, 0)
+            rt_ptr::ptr_write_i64(e, 32, 0)
+            return rt_mem::alloc_string("sqlite-tx://" + rt_conv::int_to_str(i))
+        end
+        i += 1
+    end
+    rt_io::eprint_s("db error: too many open transactions\n")
+    return 0
+end
+
+;; core.c hsh_sqlite_commit: BEGIN + everything buffered + COMMIT in one go; 1 on success (or an empty transaction), 0 otherwise
+pub fn sqlite_commit(h: string) -> int is
+    let t: int = tx_get(h)
+    if t < 0 is return 0 end
+    let e: int = txbase() + t * 40
+    let mut ok: int = 1
+    if rt_ptr::ptr_read_ptr(e, 16) != 0 && rt_ptr::ptr_read_i64(e, 24) > 0 is
+        let r: [string] = engine(rt_mem::text_at(rt_ptr::ptr_read_ptr(e, 8)), "BEGIN;\n" + tx_buf(t) + "COMMIT;\n", false, false)
+        let rc: int = to_int(r[2])
+        db_report(rc, r[1])
+        if rc != 0 is ok = 0 end
+    end
+    tx_free_entry(t)
+    return ok
+end
+
+pub fn sqlite_rollback(h: string) -> int is
+    let t: int = tx_get(h)
+    if t < 0 is return 0 end
+    tx_free_entry(t)
+    return 1
+end
+
+pub fn sqlite_close(h: string) is
+    let t: int = tx_get(h)
+    if t >= 0 is tx_free_entry(t) end
+end
+
+pub fn sqlite_exec_params(h: string, sql: string, params: int) -> int is
+    return sqlite_exec(h, bind_array(sql, params))
+end
+
+pub fn sqlite_query_params(h: string, sql: string, params: int) -> int is
+    return sqlite_query(h, bind_array(sql, params))
+end
+
+;; core.c hsh_sqlite_query_bind_n: `sqlite3 -separator TAB <db> <bound sql>`, stdout and stderr merged (errors first: stderr is
+;; unbuffered, stdout is flushed at exit).  `db` goes to the tool as it is (a path, not an "sqlite://" handle).
+fn query_bind_n(db: string, sql: string, binds: [string], n: int) -> string is
+    let mut escaped: [string] = []
+    let mut i: int = 0
+    while i < n is
+        escaped.push(sql_escape(binds[i]))
+        i += 1
+    end
+    let bound: string = sql_bind(sql, escaped, n)
+    if bound.len() > 0 && byte_at(bound, 0) == 45 is
+        ;; the tool drops one dash of "--name" before it reports the option
+        let mut opt: string = bound
+        if bound.len() > 1 && byte_at(bound, 1) == 45 is opt = bound[1..bound.len()] end
+        return "sqlite3: Error: unknown option: " + opt + "\nUse -help for a list of options.\n"
+    end
+    let r: [string] = engine(db, bound, false, true)
+    return r[1] + r[0]
+end
+
+pub fn sqlite_query_bind1(db: string, sql: string, b1: string) -> string is
+    let mut n: int = 0
+    if b1.len() > 0 is n = 1 end
+    return query_bind_n(db, sql, [b1], n)
+end
+pub fn sqlite_query_bind2(db: string, sql: string, b1: string, b2: string) -> string is
+    return query_bind_n(db, sql, [b1, b2], 2)
+end
+pub fn sqlite_query_bind3(db: string, sql: string, b1: string, b2: string, b3: string) -> string is
+    return query_bind_n(db, sql, [b1, b2, b3], 3)
+end
+
+;; core.c hsh_db_col_*: a cell of a row from sqlite_query, by column number or name
+pub fn db_col_str(row: int, col: string) -> string is return cell(row, col) end
+pub fn db_col_int(row: int, col: string) -> int is return strtoll_sat(cell(row, col)) end
+pub fn db_col_float(row: int, col: string) -> f64 is return rt_num::to_float(cell(row, col)) end
+pub fn db_col_bool(row: int, col: string) -> int is
+    let v: string = cell(row, col)
+    if v == "1" is return 1 end
+    let lower: string = rt_str::to_lower(v)
+    if lower == "true" || lower == "t" is return 1 end
+    return 0
+end
+pub fn db_col_is_null(row: int, col: string) -> int is
+    if cell(row, col).len() == 0 is return 1 end
+    return 0
+end
