@@ -1,0 +1,242 @@
+mod rt_ptr
+mod rt_mem
+mod rt_str
+mod rt_conv
+
+extern static [c] is
+    fn getaddrinfo(host: string, service: int, hints: int, res: int) -> int
+    fn freeaddrinfo(res: int) -> int
+    fn socket(domain: int, kind: int, proto: int) -> int
+    fn fcntl(fd: int, cmd: int, arg: int) -> int
+    fn connect(fd: int, addr: int, len: int) -> int
+    fn poll(fds: int, nfds: int, timeout: int) -> int
+    fn getsockopt(fd: int, level: int, name: int, val: int, len: int) -> int
+    fn setsockopt(fd: int, level: int, name: int, val: int, len: int) -> int
+    fn send(fd: int, buf: int, n: int, flags: int) -> int
+    fn recv(fd: int, buf: int, n: int, flags: int) -> int
+    fn close(fd: int) -> int
+    fn strerror(errnum: int) -> string
+    fn __errno_location() -> int
+    fn malloc(n: int) -> int
+    fn realloc(p: int, n: int) -> int
+    fn free(p: int) -> int
+    fn memmove(dst: int, src: int, n: int) -> int
+    fn memcpy(dst: int, src: string, n: int) -> int
+    fn strchr(p: int, c: int) -> int
+    fn strstr(h: int, n: int) -> int
+    fn strncmp(a: int, b: int, n: int) -> int
+    fn strtoll(p: int, endp: int, base: int) -> int
+end
+
+fn cint(x: int) -> int is
+    let v: int = x & 4294967295
+    if v >= 2147483648 is return v - 4294967296 end
+    return v
+end
+
+fn errno_get() -> int is return rt_ptr::ptr_read_i32(__errno_location(), 0) end
+fn errno_set(e: int) is rt_ptr::ptr_write_i32(__errno_location(), 0, e) end
+
+;; hsh_http_make
+fn http_make(status: int, src: int, blen: int) -> int is
+    let b: int = rt_mem::alloc(blen + 1)
+    memmove(b, src, blen)
+    rt_ptr::ptr_write_i8(b, blen, 0)
+    let r: int = rt_mem::struct_new(2)
+    rt_ptr::ptr_write_i64(r, 0, status)
+    rt_ptr::ptr_write_i64(r, 8, b)
+    return r
+end
+
+fn http_fail(msg: string) -> int is
+    let b: int = rt_mem::alloc_string(msg)
+    let r: int = rt_mem::struct_new(2)
+    rt_ptr::ptr_write_i64(r, 0, 0)
+    rt_ptr::ptr_write_i64(r, 8, b)
+    return r
+end
+
+;; strtol(s, NULL, 10): leading blanks, an optional sign, then the digits (0 when there are none)
+fn strtol10(s: string) -> int is
+    let mut i: int = 0
+    while i < s.len() && (byte_at(s, i) == 32 || (byte_at(s, i) >= 9 && byte_at(s, i) <= 13)) is i += 1 end
+    let mut neg: bool = false
+    if i < s.len() && (byte_at(s, i) == 43 || byte_at(s, i) == 45) is
+        neg = byte_at(s, i) == 45
+        i += 1
+    end
+    let mut v: int = 0
+    while i < s.len() && byte_at(s, i) >= 48 && byte_at(s, i) <= 57 is
+        v = v * 10 + (byte_at(s, i) - 48)
+        i += 1
+    end
+    if neg is return -v end
+    return v
+end
+
+fn last_index_of(s: string, c: int) -> int is
+    let mut i: int = s.len() - 1
+    while i >= 0 is
+        if byte_at(s, i) == c is return i end
+        i -= 1
+    end
+    return -1
+end
+
+;; the first `n` bytes of `s` as a malloc'd buffer
+fn buf_of(s: string) -> int is
+    let b: int = rt_ptr::buf_new(s.len() + 1)
+    memcpy(b, s, s.len())
+    return b
+end
+
+;; core.c hsh_http_request(method, url, body): "" method = GET.  Returns the { status, body } struct (see the header comment).
+pub fn http_request(method0: string, url: string, body0: string) -> int is
+    let mut method: string = method0
+    if method.len() == 0 is method = "GET" end
+    let body: string = body0
+    let mut rest: string = url
+    if rt_str::starts_with(url, "http://") is
+        rest = url[7..url.len()]
+    elsif rt_str::starts_with(url, "https://") is
+        return http_fail("https:// is not supported — this runtime has no TLS backend, use http:// or a reverse proxy")
+    end
+    let slash: int = rt_str::index_of(rest, "/")
+    let mut host_port: string = rest
+    let mut path: string = "/"
+    if slash >= 0 is
+        host_port = rest[0..slash]
+        path = rest[slash..rest.len()]
+    end
+    if host_port.len() == 0 || host_port.len() >= 300 is return http_fail("DNS resolution failed") end
+    let mut host: string = host_port
+    let mut port: string = "80"
+    let colon: int = last_index_of(host, 58)
+    if colon >= 0 && rt_str::index_of(host, "]") < 0 is
+        let p: int = strtol10(host[colon + 1..host.len()])
+        host = host[0..colon]
+        if p > 0 && p < 65536 is port = rt_conv::int_to_str(p) end
+    end
+
+    let hints: int = rt_ptr::buf_new(48)
+    rt_ptr::ptr_write_i32(hints, 4, 0)
+    rt_ptr::ptr_write_i32(hints, 8, 1)
+    let resp: int = rt_ptr::buf_new(8)
+    let rc0: int = cint(getaddrinfo(host, buf_of(port), hints, resp))
+    let res: int = rt_ptr::ptr_read_ptr(resp, 0)
+    if rc0 != 0 || res == 0 is return http_fail("DNS resolution failed") end
+
+    let mut fd: int = -1
+    let mut saved_errno: int = 0
+    let mut ai: int = res
+    let mut found: bool = false
+    while ai != 0 && !found is
+        fd = cint(socket(rt_ptr::ptr_read_i32(ai, 4), rt_ptr::ptr_read_i32(ai, 8), rt_ptr::ptr_read_i32(ai, 12)))
+        if fd < 0 is
+            saved_errno = errno_get()
+            ai = rt_ptr::ptr_read_ptr(ai, 40)
+        else
+            let fl: int = cint(fcntl(fd, 3, 0))
+            fcntl(fd, 4, fl | 2048)
+            let mut rc: int = cint(connect(fd, rt_ptr::ptr_read_ptr(ai, 24), rt_ptr::ptr_read_i32(ai, 16)))
+            if rc < 0 && errno_get() == 115 is
+                let pfd: int = rt_ptr::buf_new(8)
+                rt_ptr::ptr_write_i32(pfd, 0, fd)
+                rt_ptr::ptr_write_i16(pfd, 4, 4)
+                rt_ptr::ptr_write_i16(pfd, 6, 0)
+                if cint(poll(pfd, 1, 10000)) == 1 is
+                    let ev: int = rt_ptr::buf_new(16)
+                    rt_ptr::ptr_write_i32(ev, 0, 0)
+                    rt_ptr::ptr_write_i32(ev, 8, 4)
+                    getsockopt(fd, 1, 4, ev, ev + 8)
+                    let err: int = rt_ptr::ptr_read_i32(ev, 0)
+                    if err == 0 is rc = 0 else errno_set(err) end
+                    rt_ptr::buf_free(ev)
+                else
+                    errno_set(110)
+                end
+                rt_ptr::buf_free(pfd)
+            end
+            if rc == 0 is
+                fcntl(fd, 4, fl)
+                found = true
+            else
+                saved_errno = errno_get()
+                close(fd)
+                fd = -1
+                ai = rt_ptr::ptr_read_ptr(ai, 40)
+            end
+        end
+    end
+    freeaddrinfo(res)
+    if fd < 0 is return http_fail("connection failed: " + strerror(saved_errno)) end
+    let tv: int = rt_ptr::buf_new(16)
+    rt_ptr::ptr_write_i64(tv, 0, 10)
+    rt_ptr::ptr_write_i64(tv, 8, 0)
+    setsockopt(fd, 1, 20, tv, 16)
+
+    let blen: int = body.len()
+    let mut head: string = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: hsharp\r\n"
+    if blen > 0 is head += "Content-Length: " + rt_conv::int_to_str(blen) + "\r\n" end
+    head += "\r\n"
+    let total: int = head.len() + blen
+    let req: int = rt_ptr::buf_new(total + 1)
+    memcpy(req, head, head.len())
+    if blen > 0 is memcpy(req + head.len(), body, blen) end
+    let mut sent: int = 0
+    while sent < total is
+        let w: int = send(fd, req + sent, total - sent, 16384)
+        if w < 0 is
+            let en: int = errno_get()
+            if en != 4 is
+                let m: string = "write failed: " + strerror(en)
+                rt_ptr::buf_free(req)
+                close(fd)
+                return http_fail(m)
+            end
+        else
+            sent += w
+        end
+    end
+    rt_ptr::buf_free(req)
+
+    let mut rcap: int = 8192
+    let mut rlen: int = 0
+    let mut raw: int = malloc(rcap)
+    let mut reading: bool = true
+    while reading is
+        if rlen + 4096 + 1 > rcap is
+            rcap = rcap * 2
+            raw = realloc(raw, rcap)
+        end
+        let n: int = recv(fd, raw + rlen, 4096, 0)
+        if n < 0 is
+            let en2: int = errno_get()
+            if en2 != 4 is
+                let m2: string = "read failed: " + strerror(en2)
+                free(raw)
+                close(fd)
+                return http_fail(m2)
+            end
+        elsif n == 0 is
+            reading = false
+        else
+            rlen += n
+        end
+    end
+    close(fd)
+    rt_ptr::ptr_write_i8(raw, rlen, 0)
+
+    let mut status: int = 0
+    let sp1: int = strchr(raw, 32)
+    if sp1 != 0 && cint(strncmp(raw, buf_of("HTTP/"), 5)) == 0 is status = strtoll(sp1 + 1, 0, 10) end
+    let sep: int = strstr(raw, buf_of("\r\n\r\n"))
+    let mut r: int = 0
+    if sep != 0 is
+        r = http_make(status, sep + 4, rlen - (sep + 4 - raw))
+    else
+        r = http_make(status, raw, 0)
+    end
+    free(raw)
+    return r
+end
