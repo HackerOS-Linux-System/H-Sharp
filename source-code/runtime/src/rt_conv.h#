@@ -68,3 +68,151 @@ pub fn char_code(s: string) -> int is
     end
     return b0
 end
+
+;; decimal digits of a NON-NEGATIVE number as ints (most significant first); 0 -> [0]
+fn digits_of(v0: int, base: int) -> [int] is
+    let mut rev: [int] = []
+    let mut v: int = v0
+    if v == 0 is return [0] end
+    while v > 0 is
+        rev.push(v % base)
+        v = v / base
+    end
+    let mut out: [int] = []
+    let mut i: int = rev.len() - 1
+    while i >= 0 is
+        out.push(rev[i])
+        i -= 1
+    end
+    return out
+end
+
+fn digit_char(d: int) -> string is
+    let digits: string = "0123456789abcdef"
+    return digits[d..d + 1]
+end
+
+;; core.c hsh_int_to_str / hsh_int_to_string: snprintf("%lld"), also for INT64_MIN
+pub fn int_to_str(n: int) -> string is
+    if n == 0 is return "0" end
+    let mut out: string = ""
+    if n < 0 is
+        ;; peel the last digit off first: -n would overflow for INT64_MIN
+        let q: int = n / 10
+        let r: int = n % 10
+        let mut d: int = r
+        let mut head: int = q
+        if r > 0 is
+            ;; floored division: bring it to the C (truncating) convention
+            d = r - 10
+            head = q + 1
+        end
+        out = "-"
+        if head != 0 is
+            let ds: [int] = digits_of(-head, 10)
+            let mut i: int = 0
+            while i < ds.len() is
+                out += digit_char(ds[i])
+                i += 1
+            end
+        end
+        out += digit_char(-d)
+        return out
+    end
+    let ds2: [int] = digits_of(n, 10)
+    let mut j: int = 0
+    while j < ds2.len() is
+        out += digit_char(ds2[j])
+        j += 1
+    end
+    return out
+end
+
+pub fn int_to_string(n: int) -> string is
+    return int_to_str(n)
+end
+
+;; core.c hsh_conv_int_to_hex: snprintf("%llx", (unsigned long long)n) — lowercase, no 0x, 16 digits for negatives
+pub fn int_to_hex(n: int) -> string is
+    let mut out: string = ""
+    if n >= 0 is
+        let ds: [int] = digits_of(n, 16)
+        let mut i: int = 0
+        while i < ds.len() is
+            out += digit_char(ds[i])
+            i += 1
+        end
+        return out
+    end
+    ;; two's complement: unsigned = n + 2^64.  low nibble first, the rest is floor(n / 16) + 2^60 (cannot overflow)
+    let q: int = n / 16
+    let r: int = n % 16
+    let mut low: int = r
+    let mut rest: int = q + 1152921504606846976
+    if r < 0 is
+        low = r + 16
+        rest = rest - 1
+    end
+    let ds2: [int] = digits_of(rest, 16)
+    let mut j: int = 0
+    while j < ds2.len() is
+        out += digit_char(ds2[j])
+        j += 1
+    end
+    out += digit_char(low)
+    return out
+end
+
+;; core.c hsh_char_code_to_str: UTF-8 encode a code point. code < 0 -> 0; no validity check (surrogates, > 0x10FFFF are
+;; encoded as plain 3/4-byte forms, the lead byte keeps only its low 8 bits like the C cast); code 0 gives "" (C string)
+pub fn char_code_to_str(code0: int) -> string is
+    let mut code: int = code0
+    if code < 0 is code = 0 end
+    if code == 0 is return "" end
+    let mut bs: [int] = []
+    if code < 128 is
+        bs.push(code)
+    elsif code < 2048 is
+        bs.push(192 + code / 64)
+        bs.push(128 + code % 64)
+    elsif code < 65536 is
+        bs.push(224 + code / 4096)
+        bs.push(128 + (code / 64) % 64)
+        bs.push(128 + code % 64)
+    else
+        ;; (char)(0xF0 | (code >> 18)): OR with 0xF0 keeps the high nibble set and the low nibble of code>>18
+        bs.push(240 + (code / 262144) % 16)
+        bs.push(128 + (code / 4096) % 64)
+        bs.push(128 + (code / 64) % 64)
+        bs.push(128 + code % 64)
+    end
+    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+end
+
+;; core.c hsh_parse_int_opt: the WHOLE string must be [+-]digits (no whitespace, no empty digits) and fit an i64, else 0
+;; (an `int?` is a plain i64 there and nil is 0, so a parsed "0" and a failure look the same)
+pub fn parse_int_opt(s: string) -> int is
+    let n: int = s.len()
+    if n == 0 is return 0 end
+    let mut i: int = 0
+    let mut neg: bool = false
+    if byte_at(s, 0) == 43 || byte_at(s, 0) == 45 is
+        neg = byte_at(s, 0) == 45
+        i = 1
+    end
+    if i >= n is return 0 end
+    let max: int = 9223372036854775807
+    let mut v: int = 0
+    while i < n is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return 0 end
+        let d: int = c - 48
+        ;; accumulate negatively: the range of i64 is one larger on the negative side
+        if v < (-max - 1 + d) / 10 is return 0 end
+        v = v * 10 - d
+        i += 1
+    end
+    if neg is return v end
+    if v == -max - 1 is return 0 end
+    return -v
+end
