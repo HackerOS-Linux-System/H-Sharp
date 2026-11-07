@@ -1,0 +1,585 @@
+mod rt_bytes
+mod rt_rand
+
+fn lsr64(x: int, n: int) -> int is
+    if n == 0 is return x end
+    return (x >> n) & ((1 << (64 - n)) - 1)
+end
+fn ror64(x: int, n: int) -> int is return lsr64(x, n) | (x << (64 - n)) end
+
+fn iv() -> [int] is
+    return [
+    7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935,
+    5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809
+    ]
+end
+
+;; blake2b sigma, rounds 0..9 flattened (rounds 10, 11 reuse 0, 1)
+fn sigma() -> [int] is
+    return [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+    11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+    7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+    9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+    2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+    12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+    13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10,
+    6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5,
+    10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0
+    ]
+end
+
+fn b2g(v: &mut [int], a: int, b: int, c: int, d: int, x: int, y: int) is
+    v[a] = v[a] + v[b] + x
+    v[d] = ror64(v[d] ^ v[a], 32)
+    v[c] = v[c] + v[d]
+    v[b] = ror64(v[b] ^ v[c], 24)
+    v[a] = v[a] + v[b] + y
+    v[d] = ror64(v[d] ^ v[a], 16)
+    v[c] = v[c] + v[d]
+    v[b] = ror64(v[b] ^ v[c], 63)
+end
+
+;; one compression of the 128 bytes at msg[off..off+128] (zero padded by the caller)
+fn b2_compress(h: &mut [int], msg: &[int], off: int, t: int, last: bool, sg: &[int], ivv: &[int]) is
+    let mut m: [int] = []
+    let mut i: int = 0
+    while i < 16 is
+        let mut x: int = 0
+        let mut j: int = 7
+        while j >= 0 is
+            x = (x << 8) | msg[off + 8 * i + j]
+            j -= 1
+        end
+        m.push(x)
+        i += 1
+    end
+    let mut v: [int] = []
+    i = 0
+    while i < 8 is
+        v.push(h[i])
+        i += 1
+    end
+    i = 0
+    while i < 8 is
+        v.push(ivv[i])
+        i += 1
+    end
+    v[12] = v[12] ^ t
+    if last is v[14] = ~v[14] end
+    let mut r: int = 0
+    while r < 12 is
+        let s: int = (r % 10) * 16
+        b2g(&mut v, 0, 4, 8, 12, m[sg[s]], m[sg[s + 1]])
+        b2g(&mut v, 1, 5, 9, 13, m[sg[s + 2]], m[sg[s + 3]])
+        b2g(&mut v, 2, 6, 10, 14, m[sg[s + 4]], m[sg[s + 5]])
+        b2g(&mut v, 3, 7, 11, 15, m[sg[s + 6]], m[sg[s + 7]])
+        b2g(&mut v, 0, 5, 10, 15, m[sg[s + 8]], m[sg[s + 9]])
+        b2g(&mut v, 1, 6, 11, 12, m[sg[s + 10]], m[sg[s + 11]])
+        b2g(&mut v, 2, 7, 8, 13, m[sg[s + 12]], m[sg[s + 13]])
+        b2g(&mut v, 3, 4, 9, 14, m[sg[s + 14]], m[sg[s + 15]])
+        r += 1
+    end
+    i = 0
+    while i < 8 is
+        h[i] = h[i] ^ v[i] ^ v[i + 8]
+        i += 1
+    end
+end
+
+;; unkeyed BLAKE2b of `data` with `outlen` (1..64) bytes of output
+pub fn blake2b(data: [int], outlen: int) -> [int] is
+    let sg: [int] = sigma()
+    let ivv: [int] = iv()
+    let mut h: [int] = iv()
+    h[0] = h[0] ^ 16842752 ^ outlen
+    let n: int = data.len()
+    let mut buf: [int] = []
+    let mut i: int = 0
+    while i < n is
+        buf.push(data[i] & 255)
+        i += 1
+    end
+    let mut blocks: int = (n + 127) / 128
+    if blocks == 0 is blocks = 1 end
+    while buf.len() < blocks * 128 is buf.push(0) end
+    let mut k: int = 0
+    while k < blocks is
+        let last: bool = (k == blocks - 1)
+        let mut t: int = (k + 1) * 128
+        if last is t = n end
+        b2_compress(&mut h, &buf, k * 128, t, last, &sg, &ivv)
+        k += 1
+    end
+    let mut out: [int] = []
+    i = 0
+    while i < outlen is
+        out.push(lsr64(h[i / 8], 8 * (i % 8)) & 255)
+        i += 1
+    end
+    return out
+end
+
+fn le32(x: int) -> [int] is return [x & 255, (x >> 8) & 255, (x >> 16) & 255, (x >> 24) & 255] end
+
+fn push_le32(dst: &mut [int], x: int) is
+    dst.push(x & 255)
+    dst.push((x >> 8) & 255)
+    dst.push((x >> 16) & 255)
+    dst.push((x >> 24) & 255)
+end
+
+fn append(dst: &mut [int], src: &[int]) is
+    let mut i: int = 0
+    while i < src.len() is
+        dst.push(src[i])
+        i += 1
+    end
+end
+
+;; H'(T, in): variable length hash of RFC 9106 §3.3
+fn hprime(tlen: int, inp: [int]) -> [int] is
+    let mut first: [int] = []
+    push_le32(&mut first, tlen)
+    append(&mut first, &inp)
+    if tlen <= 64 is return blake2b(first, tlen) end
+    let mut v: [int] = blake2b(first, 64)
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < 32 is
+        out.push(v[i])
+        i += 1
+    end
+    let mut rem: int = tlen - 32
+    while rem > 64 is
+        v = blake2b(v, 64)
+        i = 0
+        while i < 32 is
+            out.push(v[i])
+            i += 1
+        end
+        rem -= 32
+    end
+    let tail: [int] = blake2b(v, rem)
+    i = 0
+    while i < rem is
+        out.push(tail[i])
+        i += 1
+    end
+    return out
+end
+
+;; ── the compression function G of Argon2 (BlaMka) ──
+fn mka(x: int, y: int) -> int is
+    return x + y + 2 * (x & 4294967295) * (y & 4294967295)
+end
+
+fn a2g(v: &mut [int], a: int, b: int, c: int, d: int) is
+    v[a] = mka(v[a], v[b])
+    v[d] = ror64(v[d] ^ v[a], 32)
+    v[c] = mka(v[c], v[d])
+    v[b] = ror64(v[b] ^ v[c], 24)
+    v[a] = mka(v[a], v[b])
+    v[d] = ror64(v[d] ^ v[a], 16)
+    v[c] = mka(v[c], v[d])
+    v[b] = ror64(v[b] ^ v[c], 63)
+end
+
+fn a2round(v: &mut [int], x0: int, x1: int, x2: int, x3: int, x4: int, x5: int, x6: int, x7: int,
+           x8: int, x9: int, x10: int, x11: int, x12: int, x13: int, x14: int, x15: int) is
+    a2g(v, x0, x4, x8, x12)
+    a2g(v, x1, x5, x9, x13)
+    a2g(v, x2, x6, x10, x14)
+    a2g(v, x3, x7, x11, x15)
+    a2g(v, x0, x5, x10, x15)
+    a2g(v, x1, x6, x11, x12)
+    a2g(v, x2, x7, x8, x13)
+    a2g(v, x3, x4, x9, x14)
+end
+
+;; permutation P over a 1 KiB block r (8 rows, then 8 columns of 128-bit pairs)
+fn a2permute(r: &mut [int]) is
+    let mut i: int = 0
+    while i < 8 is
+        let b: int = 16 * i
+        a2round(r, b, b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8, b + 9, b + 10, b + 11, b + 12, b + 13, b + 14, b + 15)
+        i += 1
+    end
+    i = 0
+    while i < 8 is
+        let c: int = 2 * i
+        a2round(r, c, c + 1, c + 16, c + 17, c + 32, c + 33, c + 48, c + 49, c + 64, c + 65, c + 80, c + 81, c + 96, c + 97, c + 112, c + 113)
+        i += 1
+    end
+end
+
+;; G(prev, ref) on small scratch blocks (used for the data-independent address blocks): next = G(...) (^ next when xor)
+fn a2fill_small(next: &mut [int], prev: &[int], rf: &[int], r: &mut [int], t: &mut [int]) is
+    let mut i: int = 0
+    while i < 128 is
+        r[i] = rf[i] ^ prev[i]
+        t[i] = r[i]
+        i += 1
+    end
+    a2permute(r)
+    i = 0
+    while i < 128 is
+        next[i] = t[i] ^ r[i]
+        i += 1
+    end
+end
+
+;; the same with ref == next (in place)
+fn a2fill_self(next: &mut [int], prev: &[int], r: &mut [int], t: &mut [int]) is
+    let mut i: int = 0
+    while i < 128 is
+        r[i] = next[i] ^ prev[i]
+        t[i] = r[i]
+        i += 1
+    end
+    a2permute(r)
+    i = 0
+    while i < 128 is
+        next[i] = t[i] ^ r[i]
+        i += 1
+    end
+end
+
+fn a2next_addr(addr: &mut [int], inp: &mut [int], zero: &[int], r: &mut [int], t: &mut [int]) is
+    inp[6] = inp[6] + 1
+    a2fill_small(addr, zero, inp, r, t)
+    a2fill_self(addr, zero, r, t)
+end
+
+fn zeros(n: int) -> [int] is
+    let mut z: [int] = []
+    let mut i: int = 0
+    while i < n is
+        z.push(0)
+        i += 1
+    end
+    return z
+end
+
+;; Argon2id raw tag, `[]` when the parameters are invalid (the C returns -1).  Same checks as the C:
+;; lanes >= 1, t >= 1, m >= 8 * lanes.  No secret, no associated data.
+@safety
+pub fn argon2id_raw(pw: [int], salt: [int], t_cost: int, m_cost: int, lanes: int, outlen: int) -> [int] is
+    let empty: [int] = []
+    if lanes < 1 || t_cost < 1 || m_cost < 8 * lanes || outlen < 4 is return empty end
+    let mblocks: int = (m_cost / (4 * lanes)) * (4 * lanes)
+    let lane_len: int = mblocks / lanes
+    let seg_len: int = lane_len / 4
+    let mem: [int] = [0]
+    let mut z: int = 1
+    while z < mblocks * 128 is
+        mem.push(0)
+        z += 1
+    end
+    ;; H0
+    let mut hin: [int] = []
+    push_le32(&mut hin, lanes)
+    push_le32(&mut hin, outlen)
+    push_le32(&mut hin, m_cost)
+    push_le32(&mut hin, t_cost)
+    push_le32(&mut hin, 19)
+    push_le32(&mut hin, 2)
+    push_le32(&mut hin, pw.len())
+    append(&mut hin, &pw)
+    push_le32(&mut hin, salt.len())
+    append(&mut hin, &salt)
+    push_le32(&mut hin, 0)
+    push_le32(&mut hin, 0)
+    let h0: [int] = blake2b(hin, 64)
+    let mut l: int = 0
+    while l < lanes is
+        let mut i: int = 0
+        while i < 2 is
+            let mut seed: [int] = []
+            append(&mut seed, &h0)
+            push_le32(&mut seed, i)
+            push_le32(&mut seed, l)
+            let blk: [int] = hprime(1024, seed)
+            let base: int = (l * lane_len + i) * 128
+            let mut w: int = 0
+            while w < 128 is
+                let mut x: int = 0
+                let mut j: int = 7
+                while j >= 0 is
+                    x = (x << 8) | blk[8 * w + j]
+                    j -= 1
+                end
+                mem[base + w] = x
+                w += 1
+            end
+            i += 1
+        end
+        l += 1
+    end
+    let mut r: [int] = zeros(128)
+    let mut t: [int] = zeros(128)
+    let zero: [int] = zeros(128)
+    let mut inp: [int] = zeros(128)
+    let mut addr: [int] = zeros(128)
+    let mut pass: int = 0
+    while pass < t_cost is
+        let mut slice: int = 0
+        while slice < 4 is
+            let mut lane: int = 0
+            while lane < lanes is
+                let indep: bool = (pass == 0 && slice < 2)
+                let mut q: int = 0
+                while q < 128 is
+                    inp[q] = 0
+                    addr[q] = 0
+                    q += 1
+                end
+                inp[0] = pass
+                inp[1] = lane
+                inp[2] = slice
+                inp[3] = mblocks
+                inp[4] = t_cost
+                inp[5] = 2
+                let mut start: int = 0
+                if pass == 0 && slice == 0 is
+                    start = 2
+                    if indep is a2next_addr(&mut addr, &mut inp, &zero, &mut r, &mut t) end
+                end
+                let mut cur: int = lane * lane_len + slice * seg_len + start
+                let mut prv: int = cur - 1
+                if cur % lane_len == 0 is prv = cur + lane_len - 1 end
+                let mut i: int = start
+                while i < seg_len is
+                    if cur % lane_len == 1 is prv = cur - 1 end
+                    let mut rnd: int = 0
+                    if indep is
+                        if i % 128 == 0 is a2next_addr(&mut addr, &mut inp, &zero, &mut r, &mut t) end
+                        rnd = addr[i % 128]
+                    else
+                        rnd = mem[prv * 128]
+                    end
+                    let mut rlane: int = lsr64(rnd, 32) % lanes
+                    if pass == 0 && slice == 0 is rlane = lane end
+                    let same: bool = (rlane == lane)
+                    let mut area: int = 0
+                    if pass == 0 is
+                        if slice == 0 is area = i - 1 end
+                        if slice != 0 && same is area = slice * seg_len + i - 1 end
+                        if slice != 0 && !same is
+                            if i == 0 is area = slice * seg_len - 1 else area = slice * seg_len end
+                        end
+                    else
+                        if same is area = lane_len - seg_len + i - 1
+                        else
+                            if i == 0 is area = lane_len - seg_len - 1 else area = lane_len - seg_len end
+                        end
+                    end
+                    let mut rel: int = rnd & 4294967295
+                    rel = lsr64(rel * rel, 32)
+                    rel = area - 1 - lsr64(area * rel, 32)
+                    let mut startpos: int = 0
+                    if pass != 0 is
+                        if slice == 3 is startpos = 0 else startpos = (slice + 1) * seg_len end
+                    end
+                    let refidx: int = (startpos + rel) % lane_len
+                    let roff: int = (rlane * lane_len + refidx) * 128
+                    let poff: int = prv * 128
+                    let coff: int = cur * 128
+                    let mut w: int = 0
+                    while w < 128 is
+                        r[w] = mem[roff + w] ^ mem[poff + w]
+                        t[w] = r[w]
+                        if pass != 0 is t[w] = t[w] ^ mem[coff + w] end
+                        w += 1
+                    end
+                    a2permute(&mut r)
+                    w = 0
+                    while w < 128 is
+                        mem[coff + w] = t[w] ^ r[w]
+                        w += 1
+                    end
+                    i += 1
+                    cur += 1
+                    prv += 1
+                end
+                lane += 1
+            end
+            slice += 1
+        end
+        pass += 1
+    end
+    ;; final block = XOR of the last block of every lane
+    let mut fin: [int] = zeros(128)
+    let mut lq: int = 0
+    while lq < lanes is
+        let off: int = (lq * lane_len + lane_len - 1) * 128
+        let mut w2: int = 0
+        while w2 < 128 is
+            fin[w2] = fin[w2] ^ mem[off + w2]
+            w2 += 1
+        end
+        lq += 1
+    end
+    let mut fb: [int] = []
+    let mut w3: int = 0
+    while w3 < 128 is
+        let mut j2: int = 0
+        while j2 < 8 is
+            fb.push(lsr64(fin[w3], 8 * j2) & 255)
+            j2 += 1
+        end
+        w3 += 1
+    end
+    return hprime(outlen, fb)
+end
+
+;; ── base64 without padding (PHC) ──
+fn b64_char(v: int) -> int is
+    if v < 26 is return 65 + v end
+    if v < 52 is return 97 + v - 26 end
+    if v < 62 is return 48 + v - 52 end
+    if v == 62 is return 43 end
+    return 47
+end
+
+fn b64_val(c: int) -> int is
+    if c >= 65 && c <= 90 is return c - 65 end
+    if c >= 97 && c <= 122 is return c - 97 + 26 end
+    if c >= 48 && c <= 57 is return c - 48 + 52 end
+    if c == 43 is return 62 end
+    if c == 47 is return 63 end
+    return -1
+end
+
+pub fn b64_encode_nopad(d: [int]) -> string is
+    let mut o: [int] = []
+    let n: int = d.len()
+    let mut i: int = 0
+    while i + 2 < n is
+        let v: int = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2]
+        o.push(b64_char(v >> 18))
+        o.push(b64_char((v >> 12) & 63))
+        o.push(b64_char((v >> 6) & 63))
+        o.push(b64_char(v & 63))
+        i += 3
+    end
+    if n - i == 1 is
+        let v1: int = d[i] << 16
+        o.push(b64_char(v1 >> 18))
+        o.push(b64_char((v1 >> 12) & 63))
+    end
+    if n - i == 2 is
+        let v2: int = (d[i] << 16) | (d[i + 1] << 8)
+        o.push(b64_char(v2 >> 18))
+        o.push(b64_char((v2 >> 12) & 63))
+        o.push(b64_char((v2 >> 6) & 63))
+    end
+    return rt_bytes::bytes_to_string(o, o.len())
+end
+
+;; [] + ok=false through the second element is awkward in H#; returns (bytes, valid) as: bytes with a trailing 1 / just [0]
+fn b64_decode_nopad(s: string) -> [int] is
+    let mut out: [int] = []
+    let mut acc: int = 0
+    let mut bits: int = 0
+    let mut i: int = 0
+    while i < s.len() is
+        let v: int = b64_val(byte_at(s, i))
+        if v < 0 is return [0] end
+        acc = ((acc << 6) | v) & 4294967295
+        bits += 6
+        if bits >= 8 is
+            bits -= 8
+            out.push((acc >> bits) & 255)
+        end
+        i += 1
+    end
+    out.push(1)
+    return out
+end
+
+fn str_bytes(s: string) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < s.len() is
+        out.push(byte_at(s, i))
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_crypto_argon2_hash: "$argon2id$v=19$m=19456,t=2,p=1$<salt b64>$<tag b64>"; "" on failure
+pub fn hash(pw: string) -> string is
+    let salt: [int] = rt_rand::crypto_random_bytes(16)
+    let tag: [int] = argon2id_raw(str_bytes(pw), salt, 2, 19456, 1, 32)
+    if tag.len() == 0 is return "" end
+    return "$argon2id$v=19$m=19456,t=2,p=1$" + b64_encode_nopad(salt) + "$" + b64_encode_nopad(tag)
+end
+
+;; strict unsigned decimal field "<prefix>NNN" -> value, -1 when the text is not exactly prefix + 1..10 digits
+fn field_u(s: string, prefix: string) -> int is
+    let pl: int = prefix.len()
+    if s.len() <= pl || s.len() > pl + 10 is return -1 end
+    let mut i: int = 0
+    while i < pl is
+        if byte_at(s, i) != byte_at(prefix, i) is return -1 end
+        i += 1
+    end
+    let mut v: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c < 48 || c > 57 is return -1 end
+        v = v * 10 + (c - 48)
+        i += 1
+    end
+    if v > 4294967295 is return -1 end
+    return v
+end
+
+fn cut_ws(s: string) -> string is
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 32 || (c >= 9 && c <= 13) is return rt_str::slice(s, 0, i) end
+        i += 1
+    end
+    return s
+end
+
+;; core.c hsh_crypto_argon2_verify: 1 when `pw` matches the PHC string, 0 otherwise (also for any malformed input)
+pub fn verify(pw: string, hashed: string) -> int is
+    let parts: [string] = hashed.split("$")
+    ;; "" "argon2id" "v=19" "m=..,t=..,p=.." salt hash   (the C's %255s would stop at a blank inside hash)
+    if parts.len() != 6 is return 0 end
+    if parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" is return 0 end
+    let params: [string] = parts[3].split(",")
+    if params.len() != 3 is return 0 end
+    let m: int = field_u(params[0], "m=")
+    let t: int = field_u(params[1], "t=")
+    let p: int = field_u(params[2], "p=")
+    if m < 0 || t < 0 || p < 0 is return 0 end
+    if m > 4194304 || p == 0 || p > 64 is return 0 end
+    let salt_s: string = parts[4]
+    let mut hash_s: string = cut_ws(parts[5])
+    if salt_s.len() == 0 || salt_s.len() > 127 || hash_s.len() == 0 is return 0 end
+    if hash_s.len() > 255 is hash_s = rt_str::slice(hash_s, 0, 255) end
+    let salt_d: [int] = b64_decode_nopad(salt_s)
+    if salt_d.len() == 1 && salt_d[0] == 0 is return 0 end
+    salt_d.pop()
+    if salt_d.len() > 96 is return 0 end
+    let want_d: [int] = b64_decode_nopad(hash_s)
+    if want_d.len() == 1 && want_d[0] == 0 is return 0 end
+    want_d.pop()
+    if want_d.len() < 4 || want_d.len() > 128 is return 0 end
+    let got: [int] = argon2id_raw(str_bytes(pw), salt_d, t, m, p, want_d.len())
+    if got.len() == 0 is return 0 end
+    let mut diff: int = 0
+    let mut i: int = 0
+    while i < got.len() is
+        diff = diff | (got[i] ^ want_d[i])
+        i += 1
+    end
+    if diff == 0 is return 1 end
+    return 0
+end
