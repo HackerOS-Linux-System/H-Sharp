@@ -1,0 +1,61 @@
+mod rt_ptr
+
+extern static [c] is
+    fn getaddrinfo(host: string, service: int, hints: int, res: int) -> int
+    fn freeaddrinfo(res: int) -> int
+    fn inet_ntop(af: int, src: int, dst: int, size: int) -> int
+    fn inet_pton(af: int, src: string, dst: int) -> int
+    fn socket(domain: int, kind: int, proto: int) -> int
+    fn setsockopt(fd: int, level: int, name: int, val: int, len: int) -> int
+    fn connect(fd: int, addr: int, len: int) -> int
+    fn close(fd: int) -> int
+    fn strdup(p: int) -> string
+end
+
+fn cint(x: int) -> int is
+    let v: int = x & 4294967295
+    if v >= 2147483648 is return v - 4294967296 end
+    return v
+end
+
+;; core.c hsh_dns_resolve: the first IPv4 address of the host as dotted text, "" when it does not resolve
+pub fn dns_resolve(host: string) -> string is
+    let hints: int = rt_ptr::buf_new(48)
+    rt_ptr::ptr_write_i32(hints, 4, 2)
+    rt_ptr::ptr_write_i32(hints, 8, 1)
+    let resp: int = rt_ptr::buf_new(8)
+    let mut out: string = ""
+    if cint(getaddrinfo(host, 0, hints, resp)) == 0 is
+        let res: int = rt_ptr::ptr_read_ptr(resp, 0)
+        let addr: int = rt_ptr::ptr_read_ptr(res, 24)
+        let buf: int = rt_ptr::buf_new(32)
+        inet_ntop(2, addr + 4, buf, 16)
+        out = strdup(buf)
+        rt_ptr::buf_free(buf)
+        freeaddrinfo(res)
+    end
+    rt_ptr::buf_free(hints)
+    rt_ptr::buf_free(resp)
+    return out
+end
+
+;; core.c hsh_scan_port_net: TCP connect to host:port; true when it succeeds.  A host that is not dotted IPv4 leaves the address at
+;; 0.0.0.0, exactly like the C (which ignores inet_pton's result).  The timeout only sets SO_RCVTIMEO, as in the C.
+pub fn scan_port_net(host: string, port: int, timeout_ms: int) -> bool is
+    let fd: int = cint(socket(2, 1, 0))
+    if fd < 0 is return false end
+    let addr: int = rt_ptr::buf_new(16)
+    rt_ptr::ptr_write_i16(addr, 0, 2)
+    rt_ptr::ptr_write_i8(addr, 2, (port >> 8) & 255)
+    rt_ptr::ptr_write_i8(addr, 3, port & 255)
+    inet_pton(2, host, addr + 4)
+    let tv: int = rt_ptr::buf_new(16)
+    rt_ptr::ptr_write_i64(tv, 0, timeout_ms / 1000)
+    rt_ptr::ptr_write_i64(tv, 8, (timeout_ms % 1000) * 1000)
+    setsockopt(fd, 1, 20, tv, 16)
+    let rc: int = cint(connect(fd, addr, 16))
+    close(fd)
+    rt_ptr::buf_free(addr)
+    rt_ptr::buf_free(tv)
+    return rc == 0
+end
