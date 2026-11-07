@@ -700,7 +700,35 @@ fn sort_by_is_stable_and_in_place() is
     eq_s(join_ints(rt_sort::sort_by([7], cmp_asc)), "7")
 end
 
-;; ── function pointers through the compiler builtins fn_addr / call_ptr: closures and spawned tasks ──
+;; ── closures and spawned tasks ──
+;; closure_call1/2 and task_spawn/task_spawn_shell forward to the C runtime (see rt_mem.h# / rt_task.h#), so what can be checked WITHOUT a raw
+;; function address runs below.  The checks that hand an H# function to them need the compiler builtin `fn_addr`, which h# 0.9.0 does not have;
+;; they are kept in the block comment further down, to be switched back on the day the compiler gains it.
+
+#[test]
+fn closure_call_null_closure_is_zero() is
+    eq_i(rt_mem::closure_call1(0, 8), 0)
+    eq_i(rt_mem::closure_call2(0, 8, 9), 0)
+end
+
+#[test]
+fn task_spawn_shell_runs_on_threads() is
+    let s: int = rt_task::task_spawn_shell("printf spawned")
+    eq_s(strdup(rt_task::task_wait(s)), "spawned")
+    let q: int = rt_task::task_spawn_shell("sleep 1; printf slow")
+    eq_i(rt_task::task_wait_timeout(q, 20), 0)
+    eq_s(strdup(rt_task::task_wait(q)), "slow")
+    let hs: int = rt_ptr::buf_new(24)
+    rt_ptr::ptr_write_i64(hs, 0, rt_task::task_spawn_shell("printf a"))
+    rt_ptr::ptr_write_i64(hs, 8, rt_task::task_spawn_shell("printf b"))
+    rt_ptr::ptr_write_i64(hs, 16, rt_task::task_spawn_shell("printf c"))
+    let r: int = rt_task::task_join_all(hs, 3)
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 0)), "a")
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 8)), "b")
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 16)), "c")
+end
+
+// ── DISABLED until the compiler has the `fn_addr` builtin (the address of a named fn as an int) ──
 fn f_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
 fn f_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
 fn f_dbl(x: int) -> int is return x * 2 end
@@ -718,8 +746,6 @@ fn closure_call_appends_captures() is
     eq_i(rt_mem::closure_call1(c3, 7), 790)
     let c4: int = rt_mem::closure_create(fn_addr(f_dbl), 5, 1, 2, 3, 4, 5, 0, 0, 0)
     eq_i(rt_mem::closure_call1(c4, 8), 16)
-    eq_i(rt_mem::closure_call1(0, 8), 0)
-    eq_i(rt_mem::closure_call2(0, 8, 9), 0)
 end
 
 #[test]
@@ -736,9 +762,5 @@ fn task_spawn_runs_h_functions_on_threads() is
     eq_i(rt_ptr::ptr_read_i64(r, 0), 2)
     eq_i(rt_ptr::ptr_read_i64(r, 16), 6)
     eq_i(rt_ptr::ptr_read_i64(r, 32), 10)
-    let s: int = rt_task::task_spawn_shell("printf spawned")
-    eq_s(strdup(rt_task::task_wait(s)), "spawned")
-    let q: int = rt_task::task_spawn_shell("sleep 1; printf slow")
-    eq_i(rt_task::task_wait_timeout(q, 20), 0)
-    eq_s(strdup(rt_task::task_wait(q)), "slow")
 end
+\\
