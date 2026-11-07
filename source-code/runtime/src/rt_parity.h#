@@ -8,6 +8,23 @@ mod rt_conv
 mod rt_date
 mod rt_num
 mod rt_sys
+mod rt_bytes
+mod rt_text
+mod rt_sort
+mod rt_crypto
+mod rt_ptr
+mod rt_os
+mod rt_rand
+mod rt_proc
+mod rt_net
+mod rt_mem
+mod rt_fmt
+mod rt_env
+mod rt_http
+mod rt_db
+mod rt_argon2
+mod rt_task
+mod rt_mem
 
 fn nib(c: int) -> int is
     if c >= 48 && c <= 57 is return c - 48 end
@@ -71,6 +88,828 @@ fn run_float(op: string, x: f64, y: f64) -> string is
     return "?float-op"
 end
 
+;; "1,2,300" -> [1, 2, 300]; "" -> []
+fn ints(a: string) -> [int] is
+    let mut out: [int] = []
+    if a.len() == 0 is return out end
+    let parts: [string] = __builtin_str_split(a, ",")
+    let mut i: int = 0
+    while i < parts.len() is
+        out.push(to_int(parts[i]))
+        i += 1
+    end
+    return out
+end
+
+fn list_s(a: [int]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is out += "," end
+        out += to_string(a[i])
+        i += 1
+    end
+    return out
+end
+
+fn words_s(a: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is out += " " end
+        out += a[i]
+        i += 1
+    end
+    return out
+end
+
+fn join_c(a: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is out += "," end
+        out += a[i]
+        i += 1
+    end
+    return out
+end
+
+;; ── script ops (see tests/parity_c.c): "cmd,arg,arg;cmd,arg" -> one comma separated token per command ──
+fn tok_h(s: string) -> string is
+    if s.len() == 0 is return "-" end
+    return rt_str::hex_encode(s)
+end
+
+fn tok_add(acc: string, t: string) -> string is
+    if acc.len() == 0 is return t end
+    return acc + "," + t
+end
+
+fn sgn(v: int) -> int is
+    if v < 0 is return -1 end
+    if v > 0 is return 1 end
+    return 0
+end
+
+fn nb(b: bool) -> string is
+    if b is return "1" end
+    return "0"
+end
+
+fn run_ptrs(script: string) -> string is
+    let buf: int = rt_ptr::buf_new(64)
+    let mut out: string = ""
+    let cmds: [string] = __builtin_str_split(script, ";")
+    let mut i: int = 0
+    while i < cmds.len() is
+        let f: [string] = __builtin_str_split(cmds[i], ",")
+        let c: string = f[0]
+        if c == "w8" is
+            rt_ptr::ptr_write_i8(buf, to_int(f[1]), to_int(f[2]))
+        elsif c == "w16" is
+            rt_ptr::ptr_write_i16(buf, to_int(f[1]), to_int(f[2]))
+        elsif c == "w32" is
+            rt_ptr::ptr_write_i32(buf, to_int(f[1]), to_int(f[2]))
+        elsif c == "w64" is
+            rt_ptr::ptr_write_i64(buf, to_int(f[1]), to_int(f[2]))
+        elsif c == "wp" is
+            rt_ptr::ptr_write_ptr(buf, to_int(f[1]), to_int(f[2]))
+        elsif c == "r8" is
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i8(buf, to_int(f[1]))))
+        elsif c == "r16" is
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i16(buf, to_int(f[1]))))
+        elsif c == "r32" is
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i32(buf, to_int(f[1]))))
+        elsif c == "r64" is
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(buf, to_int(f[1]))))
+        elsif c == "rp" is
+            out = tok_add(out, to_string(rt_ptr::ptr_read_ptr(buf, to_int(f[1]))))
+        elsif c == "fill" is
+            rt_ptr::ptr_fill(buf + to_int(f[1]), to_int(f[2]), to_int(f[3]))
+        elsif c == "zero" is
+            rt_ptr::ptr_zero(buf + to_int(f[1]), to_int(f[2]))
+        elsif c == "copy" is
+            rt_ptr::ptr_copy(buf + to_int(f[1]), buf + to_int(f[2]), to_int(f[3]))
+        elsif c == "cmp" is
+            out = tok_add(out, to_string(sgn(rt_ptr::ptr_compare(buf + to_int(f[1]), buf + to_int(f[2]), to_int(f[3])))))
+        elsif c == "null" is
+            out = tok_add(out, nb(rt_ptr::ptr_is_null(buf)))
+            out = tok_add(out, nb(rt_ptr::ptr_is_null(0)))
+        elsif c == "add" is
+            out = tok_add(out, to_string(rt_ptr::ptr_add(buf, to_int(f[1])) - buf))
+        elsif c == "addnull" is
+            out = tok_add(out, to_string(rt_ptr::ptr_add(0, 5)))
+        elsif c == "rnull" is
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(0, 0)))
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i8(0, 3)))
+            out = tok_add(out, to_string(rt_ptr::ptr_read_ptr(0, 0)))
+        elsif c == "wnull" is
+            rt_ptr::ptr_write_i64(0, 0, 1)
+            rt_ptr::ptr_write_i8(0, 2, 3)
+            rt_ptr::ptr_fill(0, 1, 4)
+            rt_ptr::ptr_zero(0, 4)
+            rt_ptr::ptr_copy(0, buf, 4)
+            rt_ptr::ptr_copy(buf, 0, 4)
+            out = tok_add(out, "ok")
+        elsif c == "wd" is
+            rt_ptr::ptr_write_f64(buf, to_int(f[1]), rt_num::to_float(f[2]))
+        elsif c == "rd" is
+            out = tok_add(out, to_string(rt_ptr::f64_bits(rt_ptr::ptr_read_f64(buf, to_int(f[1])))))
+        elsif c == "wf" is
+            rt_ptr::ptr_write_f32(buf, to_int(f[1]), rt_num::to_float(f[2]))
+        elsif c == "rf" is
+            out = tok_add(out, to_string(rt_ptr::f64_bits(rt_ptr::ptr_read_f32(buf, to_int(f[1])))))
+        elsif c == "fnull" is
+            out = tok_add(out, to_string(rt_ptr::f64_bits(rt_ptr::ptr_read_f64(0, 0))))
+            out = tok_add(out, to_string(rt_ptr::f64_bits(rt_ptr::ptr_read_f32(0, 0))))
+            rt_ptr::ptr_write_f64(0, 0, 1.5)
+            rt_ptr::ptr_write_f32(0, 0, 1.5)
+        elsif c == "sset" is
+            out = tok_add(out, to_string(rt_ptr::struct_set(buf, to_int(f[1]), to_int(f[2])) - buf))
+        elsif c == "sget" is
+            out = tok_add(out, to_string(rt_ptr::struct_get(buf, to_int(f[1]))))
+        elsif c == "snull" is
+            out = tok_add(out, to_string(rt_ptr::struct_get(0, 3)))
+            out = tok_add(out, to_string(rt_ptr::struct_set(0, 1, 2)))
+        elsif c == "rc" is
+            let blk: int = rt_ptr::rc_alloc(to_int(f[1]))
+            out = tok_add(out, to_string(rt_ptr::ptr_alloc_size(blk)))
+            out = tok_add(out, to_string(rt_ptr::ptr_alloc_size(0)))
+        elsif c == "sfree" is
+            rt_ptr::string_free("x")
+            out = tok_add(out, "ok")
+        elsif c == "cmpn" is
+            out = tok_add(out, to_string(sgn(rt_ptr::ptr_compare(0, buf, 4))))
+            out = tok_add(out, to_string(sgn(rt_ptr::ptr_compare(buf, 0, 4))))
+            out = tok_add(out, to_string(sgn(rt_ptr::ptr_compare(0, 0, 4))))
+            out = tok_add(out, to_string(sgn(rt_ptr::ptr_compare(buf, buf, 4))))
+            out = tok_add(out, to_string(sgn(rt_ptr::ptr_compare(buf, buf + 1, 0))))
+        end
+        i += 1
+    end
+    rt_ptr::buf_free(buf)
+    return out
+end
+
+fn strs_tok(a: [string]) -> string is
+    if a.len() == 0 is return "-" end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is out += "." end
+        if a[i].len() == 0 is out += "_" else out += rt_str::hex_encode(a[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn ints_tok(a: [int]) -> string is
+    if a.len() == 0 is return "-" end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        if i > 0 is out += "." end
+        out += to_string(a[i])
+        i += 1
+    end
+    return out
+end
+
+fn dints(l: string) -> [int] is
+    let mut out: [int] = []
+    if l.len() == 0 is return out end
+    let parts: [string] = __builtin_str_split(l, ".")
+    let mut i: int = 0
+    while i < parts.len() is
+        out.push(to_int(parts[i]))
+        i += 1
+    end
+    return out
+end
+
+fn run_fs(script: string) -> string is
+    let dir: string = "/tmp/hsfs_parity_" + to_string(rt_sys::pid()) + "_" + rt_crypto::md5(script)
+    rt_os::mkdir_all(dir)
+    rt_os::change_dir(dir)
+    let mut out: string = ""
+    let cmds: [string] = __builtin_str_split(script, ";")
+    let mut i: int = 0
+    while i < cmds.len() is
+        let f: [string] = __builtin_str_split(cmds[i], ",")
+        let c: string = f[0]
+        let mut x: string = ""
+        let mut y: string = ""
+        if f.len() > 1 is x = f[1] end
+        if f.len() > 2 is y = f[2] end
+        if c == "mkd" is
+            out = tok_add(out, nb(rt_os::dir_create(x)))
+        elsif c == "mkall" is
+            out = tok_add(out, nb(rt_os::mkdir_all(x)))
+        elsif c == "wf" is
+            out = tok_add(out, nb(rt_os::write_file(x, y)))
+        elsif c == "af" is
+            out = tok_add(out, nb(rt_os::append_file(x, y)))
+        elsif c == "rf" is
+            out = tok_add(out, tok_h(rt_os::read_file(x)))
+        elsif c == "ex" is
+            out = tok_add(out, nb(rt_os::file_exists(x)))
+        elsif c == "isf" is
+            out = tok_add(out, nb(rt_os::is_file(x)))
+        elsif c == "isd" is
+            out = tok_add(out, nb(rt_os::is_dir(x)))
+        elsif c == "de" is
+            out = tok_add(out, nb(rt_os::dir_exists(x)))
+        elsif c == "sz" is
+            out = tok_add(out, to_string(rt_os::file_size(x)))
+        elsif c == "del" is
+            out = tok_add(out, nb(rt_os::file_delete(x)))
+        elsif c == "rm" is
+            out = tok_add(out, nb(rt_os::remove_file(x)))
+        elsif c == "mv" is
+            out = tok_add(out, nb(rt_os::rename_file(x, y)))
+        elsif c == "rmd" is
+            out = tok_add(out, nb(rt_os::fs_rmdir(x)))
+        elsif c == "cd" is
+            out = tok_add(out, nb(rt_os::change_dir(x)))
+        elsif c == "cp" is
+            out = tok_add(out, nb(rt_os::fs_copy(x, y)))
+        elsif c == "ls" is
+            out = tok_add(out, strs_tok(rt_sort::sort_strings(rt_os::fs_list_dir(x))))
+        elsif c == "walk" is
+            out = tok_add(out, strs_tok(rt_sort::sort_strings(rt_os::fs_walk(x))))
+        elsif c == "mtime" is
+            let m: int = rt_os::fs_modified_time(x)
+            if m == -1 is
+                out = tok_add(out, "-1")
+            else
+                let d: int = m - rt_sys::now_unix()
+                if d > -100 && d < 100 is out = tok_add(out, "ok") else out = tok_add(out, "bad") end
+            end
+        elsif c == "rb" is
+            out = tok_add(out, ints_tok(rt_os::fs_read_bytes(x)))
+        elsif c == "wb" is
+            out = tok_add(out, nb(rt_os::fs_write_bytes(x, dints(y))))
+        elsif c == "rl" is
+            out = tok_add(out, strs_tok(rt_os::fs_read_lines(x)))
+        elsif c == "tmpf" is
+            let t: string = rt_os::fs_temp_file(x)
+            let mut ok: bool = t.len() > 0 && rt_os::file_exists(t)
+            if ok is
+                let parts: [string] = __builtin_str_split(t, "/")
+                let base: string = parts[parts.len() - 1]
+                ok = rt_str::starts_with(base, x) && base.len() == x.len() + 6
+            end
+            if t.len() > 0 is rt_os::file_delete(t) end
+            if ok is out = tok_add(out, "ok") else out = tok_add(out, "bad") end
+        elsif c == "rmall" is
+            out = tok_add(out, nb(rt_os::dir_remove_all(x)))
+        elsif c == "rmrec" is
+            out = tok_add(out, nb(rt_os::remove_dir_recursive(x)))
+        end
+        i += 1
+    end
+    rt_os::change_dir("/")
+    return out
+end
+
+fn run_env(script: string) -> string is
+    let mut out: string = ""
+    let cmds: [string] = __builtin_str_split(script, ";")
+    let mut i: int = 0
+    while i < cmds.len() is
+        let f: [string] = __builtin_str_split(cmds[i], ",")
+        let c: string = f[0]
+        let mut x: string = ""
+        let mut y: string = ""
+        if f.len() > 1 is x = f[1] end
+        if f.len() > 2 is y = f[2] end
+        if c == "set" is
+            out = tok_add(out, nb(rt_os::setenv_s(x, y)))
+        elsif c == "get" is
+            out = tok_add(out, tok_h(rt_os::getenv_s(x)))
+        elsif c == "eget" is
+            out = tok_add(out, tok_h(rt_os::env_get(x)))
+        elsif c == "rm" is
+            out = tok_add(out, nb(rt_os::env_remove(x)))
+        elsif c == "vars" is
+            let a: int = rt_env::env_vars()
+            let mut joined: string = ""
+            let mut cnt: int = 0
+            let mut j: int = 0
+            while j < rt_mem::array_len(a) is
+                let e: string = rt_mem::text_at(rt_mem::array_get(a, j))
+                if !(e.len() >= 2 && e[0..2] == "_=") is
+                    joined += e + "\n"
+                    cnt += 1
+                end
+                j += 1
+            end
+            out = tok_add(out, to_string(cnt))
+            out = tok_add(out, rt_crypto::md5(joined))
+        end
+        i += 1
+    end
+    return out
+end
+
+fn hexlist(a: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < a.len() is
+        out = tok_add(out, tok_h(a[i]))
+        i += 1
+    end
+    return out
+end
+
+;; decimal text of an int read as UNSIGNED 64-bit
+fn utext(v: int) -> string is
+    if v >= 0 is return to_string(v) end
+    let q: int = ((v >> 1) & 9223372036854775807) / 5
+    let r: int = v - q * 10
+    return to_string(q) + to_string(r)
+end
+
+fn ok_bad(b: bool) -> string is
+    if b is return "ok" end
+    return "bad"
+end
+
+fn is_hex_n(s: string, n: int) -> bool is
+    if s.len() != n is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: int = byte_at(s, i)
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) is return false end
+        i += 1
+    end
+    return true
+end
+
+fn is_alnum(c: int) -> bool is
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+end
+
+fn prop_rhex(n: int) -> string is
+    if n <= 0 is return ok_bad(rt_rand::random_hex(n).len() == 0) end
+    let a: string = rt_rand::random_hex(n)
+    let b: string = rt_rand::random_hex(n)
+    if !is_hex_n(a, n * 2) is return "bad" end
+    if n >= 8 && a == b is return "bad" end
+    return "ok"
+end
+
+fn prop_rstr(n: int) -> string is
+    if n <= 0 is return ok_bad(rt_rand::random_string(n).len() == 0) end
+    let a: string = rt_rand::random_string(n)
+    let b: string = rt_rand::random_string(n)
+    if a.len() != n is return "bad" end
+    let mut i: int = 0
+    while i < n is
+        if !is_alnum(byte_at(a, i)) is return "bad" end
+        i += 1
+    end
+    if n >= 8 && a == b is return "bad" end
+    return "ok"
+end
+
+fn prop_rint(lo: int, hi: int) -> string is
+    let mut i: int = 0
+    while i < 300 is
+        let v: int = rt_rand::random_int(lo, hi)
+        if hi <= lo is
+            if v != lo is return "bad" end
+        else
+            if v < lo || v >= hi is return "bad" end
+        end
+        i += 1
+    end
+    return "ok"
+end
+
+fn prop_uuid() -> string is
+    let a: string = rt_rand::uuid_v4()
+    let b: string = rt_rand::uuid_v4()
+    if a.len() != 36 || a == b is return "bad" end
+    let mut i: int = 0
+    while i < 36 is
+        let c: int = byte_at(a, i)
+        if i == 8 || i == 13 || i == 18 || i == 23 is
+            if c != 45 is return "bad" end
+        elsif !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) is
+            return "bad"
+        end
+        i += 1
+    end
+    if byte_at(a, 14) != 52 is return "bad" end
+    let v: int = byte_at(a, 19)
+    if !(v == 56 || v == 57 || v == 97 || v == 98) is return "bad" end
+    return "ok"
+end
+
+fn prop_rbytes(n: int) -> string is
+    let a: [int] = rt_rand::crypto_random_bytes(n)
+    if n <= 0 is return ok_bad(a.len() == 0) end
+    if a.len() != n is return "bad" end
+    let mut same: bool = true
+    let mut i: int = 0
+    while i < n is
+        if a[i] < 0 || a[i] > 255 is return "bad" end
+        if a[i] != a[0] is same = false end
+        i += 1
+    end
+    if n >= 16 && same is return "bad" end
+    return "ok"
+end
+
+fn prop_sys(w: string) -> string is
+    if w == "uptime" is return ok_bad(rt_sys::uptime() > 0) end
+    if w == "loadavg" is
+        let l: f64 = rt_sys::load_avg()
+        return ok_bad(l >= 0.0 && l < 100000.0)
+    end
+    if w == "memfree" is
+        let f: int = rt_sys::memory_free()
+        return ok_bad(f > 0 && f <= rt_sys::memory_total())
+    end
+    if w == "diskfree" is
+        return ok_bad(rt_sys::disk_free("") <= rt_sys::disk_total("") && rt_sys::disk_free("/tmp") <= rt_sys::disk_total("/tmp") && rt_sys::disk_total("") > 0)
+    end
+    if w == "nowms" is
+        let d: int = rt_sys::now_ms() - rt_sys::now_unix() * 1000
+        return ok_bad(d > -5000 && d < 5000)
+    end
+    return "?"
+end
+
+fn rows_tok(rows: [[string]]) -> string is
+    if rows.len() == 0 is return "-" end
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < rows.len() is
+        if i > 0 is out += "/" end
+        out += strs_tok(rows[i])
+        i += 1
+    end
+    return out
+end
+
+fn spawnkill(cmd: string) -> string is
+    let pid: int = rt_proc::process_spawn(cmd)
+    let ok1: bool = pid > 0
+    let mut ok2: bool = false
+    if ok1 is ok2 = rt_proc::process_kill(pid) end
+    let none: bool = rt_proc::process_kill(99999999)
+    return nb(ok1) + "," + nb(ok2) + "," + nb(none)
+end
+
+fn dump_arr(a: int, strs: bool) -> string is
+    if a == 0 is return "-" end
+    let n: int = rt_mem::array_len(a)
+    let mut out: string = to_string(n) + ":"
+    let mut i: int = 0
+    while i < n is
+        if i > 0 is out += "." end
+        let v: int = rt_mem::array_get(a, i)
+        if strs is
+            let t: string = rt_mem::text_at(v)
+            if t.len() == 0 is out += "_" else out += rt_str::hex_encode(t) end
+        else
+            out += to_string(v)
+        end
+        i += 1
+    end
+    return out
+end
+
+fn same(a: int, b: int) -> string is
+    if a == b is return "1" end
+    return "0"
+end
+
+fn run_mem(script: string) -> string is
+    let mut out: string = ""
+    let mut r: [int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let mut skf: [int] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let cmds: [string] = __builtin_str_split(script, ";")
+    let mut i: int = 0
+    while i < cmds.len() is
+        let f: [string] = __builtin_str_split(cmds[i], ",")
+        let c: string = f[0]
+        if c == "clr" is
+            r[to_int(f[1])] = 0
+        elsif c == "anew" is
+            r[to_int(f[1])] = rt_mem::array_new()
+        elsif c == "apush" is
+            let k: int = to_int(f[1])
+            let nr: int = rt_mem::array_push(r[k], to_int(f[2]))
+            out = tok_add(out, same(nr, r[k]))
+            r[k] = nr
+        elsif c == "apushn" is
+            r[to_int(f[1])] = rt_mem::array_push(0, to_int(f[2]))
+            out = tok_add(out, "n")
+        elsif c == "apushs" is
+            let k: int = to_int(f[1])
+            r[k] = rt_mem::array_push_str(r[k], rt_mem::c_string(f[2]))
+        elsif c == "agets" is
+            out = tok_add(out, tok_h(rt_mem::text_at(rt_mem::array_get(r[to_int(f[1])], to_int(f[2])))))
+        elsif c == "aget" is
+            out = tok_add(out, to_string(rt_mem::array_get(r[to_int(f[1])], to_int(f[2]))))
+        elsif c == "aset" is
+            let k: int = to_int(f[1])
+            out = tok_add(out, same(rt_mem::array_set(r[k], to_int(f[2]), to_int(f[3])), r[k]))
+        elsif c == "alen" is
+            out = tok_add(out, to_string(rt_mem::array_len(r[to_int(f[1])])))
+        elsif c == "acat" is
+            let ra: int = r[to_int(f[1])]
+            let rb: int = r[to_int(f[2])]
+            let rr: int = rt_mem::array_concat(ra, rb)
+            if rr == ra && rr != 0 is
+                out = tok_add(out, "1")
+            elsif rr == rb && rr != 0 is
+                out = tok_add(out, "2")
+            else
+                out = tok_add(out, "0")
+            end
+            r[to_int(f[3])] = rr
+        elsif c == "acont" is
+            out = tok_add(out, to_string(rt_mem::array_contains(r[to_int(f[1])], to_int(f[2]))))
+        elsif c == "arem" is
+            out = tok_add(out, to_string(rt_mem::array_remove(r[to_int(f[1])], to_int(f[2]))))
+        elsif c == "aslice" is
+            r[to_int(f[4])] = rt_mem::array_slice(r[to_int(f[1])], to_int(f[2]), to_int(f[3]))
+        elsif c == "adump" is
+            out = tok_add(out, dump_arr(r[to_int(f[1])], false))
+        elsif c == "adumps" is
+            out = tok_add(out, dump_arr(r[to_int(f[1])], true))
+        elsif c == "adrop" is
+            rt_mem::array_drop(r[to_int(f[1])])
+            r[to_int(f[1])] = 0
+        elsif c == "afree" is
+            rt_mem::array_free(r[to_int(f[1])])
+            r[to_int(f[1])] = 0
+        elsif c == "arenanew" is
+            r[to_int(f[1])] = rt_mem::arena_new_kind(to_int(f[2]), to_int(f[3]))
+        elsif c == "arenapush" is
+            rt_mem::arena_push_current(r[to_int(f[1])])
+        elsif c == "arenapop" is
+            out = tok_add(out, same(rt_mem::arena_pop_current(), r[to_int(f[1])]))
+        elsif c == "aalloc" is
+            let a: int = r[to_int(f[1])]
+            let p: int = rt_mem::arena_alloc(a, to_int(f[2]))
+            r[to_int(f[3])] = p
+            if a != 0 is out = tok_add(out, to_string(p - rt_ptr::ptr_read_i64(a, 0))) else out = tok_add(out, "m") end
+        elsif c == "ainfo" is
+            let a: int = r[to_int(f[1])]
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(a, 16)))
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(a, 8)))
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(a, 24)))
+            let mut n: int = 0
+            let mut b: int = rt_ptr::ptr_read_i64(a, 32)
+            while b != 0 is
+                n += 1
+                b = rt_ptr::ptr_read_i64(b, 32)
+            end
+            out = tok_add(out, to_string(n))
+        elsif c == "arenafree" is
+            rt_mem::arena_free(r[to_int(f[1])])
+            r[to_int(f[1])] = 0
+        elsif c == "chk" is
+            out = tok_add(out, to_string(rt_mem::arena_checkpoint()))
+        elsif c == "rew" is
+            rt_mem::arena_rewind(to_int(f[1]))
+        elsif c == "used" is
+            out = tok_add(out, to_string(rt_mem::arena_used()))
+        elsif c == "capa" is
+            out = tok_add(out, to_string(rt_mem::arena_capacity()))
+        elsif c == "alloc" is
+            let u0: int = rt_mem::arena_used()
+            rt_mem::alloc_ex(to_int(f[1]))
+            out = tok_add(out, to_string(rt_mem::arena_used() - u0))
+        elsif c == "snew" is
+            let sp: int = rt_mem::struct_new(to_int(f[2]))
+            let mut sum: int = 0
+            let mut j: int = 0
+            while j < to_int(f[2]) is
+                sum += rt_ptr::ptr_read_i64(sp, j * 8)
+                j += 1
+            end
+            out = tok_add(out, to_string(sum))
+            rt_ptr::ptr_write_i64(sp, 0, 7)
+            r[to_int(f[1])] = sp
+        elsif c == "mnew" is
+            r[to_int(f[1])] = rt_mem::map_new(to_int(f[2]))
+            skf[to_int(f[1])] = to_int(f[2])
+        elsif c == "mset" is
+            let k: int = to_int(f[1])
+            if skf[k] != 0 is rt_mem::map_set(r[k], rt_mem::c_string(f[2]), to_int(f[3])) else rt_mem::map_set(r[k], to_int(f[2]), to_int(f[3])) end
+        elsif c == "mget" is
+            let k: int = to_int(f[1])
+            if skf[k] != 0 is out = tok_add(out, to_string(rt_mem::map_get(r[k], rt_mem::c_string(f[2])))) else out = tok_add(out, to_string(rt_mem::map_get(r[k], to_int(f[2])))) end
+        elsif c == "mhas" is
+            let k: int = to_int(f[1])
+            if skf[k] != 0 is out = tok_add(out, to_string(rt_mem::map_has(r[k], rt_mem::c_string(f[2])))) else out = tok_add(out, to_string(rt_mem::map_has(r[k], to_int(f[2])))) end
+        elsif c == "mrem" is
+            let k: int = to_int(f[1])
+            if skf[k] != 0 is out = tok_add(out, to_string(rt_mem::map_remove(r[k], rt_mem::c_string(f[2])))) else out = tok_add(out, to_string(rt_mem::map_remove(r[k], to_int(f[2])))) end
+        elsif c == "mlen" is
+            out = tok_add(out, to_string(rt_mem::map_len(r[to_int(f[1])])))
+        elsif c == "mclear" is
+            rt_mem::map_clear(r[to_int(f[1])])
+        elsif c == "mcap" is
+            let m: int = r[to_int(f[1])]
+            if m == 0 is out = tok_add(out, "0") else out = tok_add(out, to_string(rt_ptr::ptr_read_i64(m, 8))) end
+        elsif c == "mkeys" is
+            out = tok_add(out, dump_arr(rt_mem::map_keys(r[to_int(f[1])]), skf[to_int(f[1])] != 0))
+        elsif c == "mvals" is
+            out = tok_add(out, dump_arr(rt_mem::map_values(r[to_int(f[1])]), false))
+        elsif c == "mnull" is
+            out = tok_add(out, to_string(rt_mem::map_len(0)))
+            out = tok_add(out, to_string(rt_mem::map_get(0, 5)))
+            out = tok_add(out, to_string(rt_mem::map_has(0, 5)))
+            out = tok_add(out, to_string(rt_mem::map_remove(0, 5)))
+            rt_mem::map_set(0, 1, 2)
+            rt_mem::map_clear(0)
+            out = tok_add(out, dump_arr(rt_mem::map_keys(0), false))
+            out = tok_add(out, dump_arr(rt_mem::map_values(0), false))
+        elsif c == "rc" is
+            r[to_int(f[1])] = rt_ptr::rc_alloc(to_int(f[2]))
+        elsif c == "retain" is
+            rt_mem::rc_retain(r[to_int(f[1])])
+        elsif c == "release" is
+            rt_mem::rc_release(r[to_int(f[1])])
+        elsif c == "count" is
+            out = tok_add(out, to_string(rt_mem::rc_count(r[to_int(f[1])])))
+        elsif c == "down" is
+            out = tok_add(out, same(rt_mem::arc_downgrade(r[to_int(f[1])]), r[to_int(f[1])]))
+        elsif c == "up" is
+            let p: int = r[to_int(f[1])]
+            let u: int = rt_mem::arc_upgrade(p)
+            if u == p && p != 0 is out = tok_add(out, "1") else out = tok_add(out, "0") end
+        elsif c == "wcount" is
+            out = tok_add(out, to_string(rt_mem::arc_weak_count(r[to_int(f[1])])))
+        elsif c == "wrel" is
+            rt_mem::arc_weak_release(r[to_int(f[1])])
+        elsif c == "rcnull" is
+            out = tok_add(out, to_string(rt_mem::rc_count(0)))
+            rt_mem::rc_retain(0)
+            rt_mem::rc_release(0)
+            out = tok_add(out, to_string(rt_mem::arc_downgrade(0)))
+            out = tok_add(out, to_string(rt_mem::arc_upgrade(0)))
+            out = tok_add(out, to_string(rt_mem::arc_weak_count(0)))
+            rt_mem::arc_weak_release(0)
+        elsif c == "args" is
+            r[to_int(f[1])] = rt_mem::args_alloc(to_int(f[2]))
+            if r[to_int(f[1])] != 0 is out = tok_add(out, "1") else out = tok_add(out, "0") end
+        elsif c == "argset" is
+            rt_mem::args_set(r[to_int(f[1])], to_int(f[2]), to_int(f[3]))
+        elsif c == "argget" is
+            out = tok_add(out, to_string(rt_mem::args_get(r[to_int(f[1])], to_int(f[2]))))
+        elsif c == "argfree" is
+            rt_mem::args_free(r[to_int(f[1])])
+            r[to_int(f[1])] = 0
+        elsif c == "argnull" is
+            out = tok_add(out, to_string(rt_mem::args_get(0, 0)))
+            rt_mem::args_set(0, 0, 1)
+            rt_mem::args_free(0)
+        elsif c == "clo" is
+            let n: int = to_int(f[2])
+            let mut cp: [int] = [0, 0, 0, 0, 0, 0, 0, 0]
+            let mut j: int = 0
+            while j < 8 && 3 + j < f.len() is
+                cp[j] = to_int(f[3 + j])
+                j += 1
+            end
+            let p: int = rt_mem::closure_create(to_int(f[1]), n, cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7])
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(p, 0)))
+            out = tok_add(out, to_string(rt_ptr::ptr_read_i64(p, 8)))
+            let mut q: int = 0
+            while q < n && q < 8 is
+                out = tok_add(out, to_string(rt_ptr::ptr_read_i64(p, 16 + q * 8)))
+                q += 1
+            end
+        elsif c == "v2s" is
+            out = tok_add(out, tok_h(rt_mem::val_to_str(to_int(f[1]))))
+        elsif c == "v2ss" is
+            out = tok_add(out, tok_h(rt_mem::val_to_str(rt_mem::c_string(f[1]))))
+        end
+        i += 1
+    end
+    return out
+end
+
+fn lm_tok(t: string) -> string is
+    return to_string(t.len()) + "," + rt_crypto::md5(t)
+end
+
+fn fld(f: string) -> string is
+    if f.len() >= 2 && f[0..2] == "x:" is return rt_bytes::hex_decode(f[2..f.len()]) end
+    return f
+end
+
+fn dparams(f: [string], from: int) -> int is
+    let mut a: int = rt_mem::array_new()
+    let mut i: int = from
+    while i < f.len() is
+        if f[i][0..1] == "i" is
+            a = rt_mem::array_push(a, to_int(f[i][1..f[i].len()]))
+        else
+            a = rt_mem::array_push(a, rt_mem::c_string(fld(f[i][1..f[i].len()])))
+        end
+        i += 1
+    end
+    return a
+end
+
+fn dump_rows(q: int) -> string is
+    let n: int = rt_mem::array_len(q)
+    if n == 0 is return "0:" end
+    let mut out: string = to_string(n) + ":"
+    let mut i: int = 0
+    while i < n is
+        let r: int = rt_mem::array_get(q, i)
+        if i > 0 is out += "/" end
+        let m: int = rt_mem::array_len(r)
+        let mut j: int = 0
+        while j < m is
+            if j > 0 is out += "." end
+            let t: string = rt_mem::text_at(rt_mem::array_get(r, j))
+            if t.len() == 0 is out += "_" else out += rt_str::hex_encode(t) end
+            j += 1
+        end
+        i += 1
+    end
+    return out
+end
+
+fn run_db(script: string) -> string is
+    let dir: string = "/tmp/hsfs_parity_" + to_string(rt_sys::pid()) + "_db" + rt_crypto::md5(script)
+    rt_os::mkdir_all(dir)
+    rt_os::change_dir(dir)
+    let mut out: string = ""
+    let mut hs: [string] = ["", "", "", "", "", "", "", ""]
+    let mut q: int = 0
+    let cmds: [string] = __builtin_str_split(script, ";")
+    let mut i: int = 0
+    while i < cmds.len() is
+        let f: [string] = __builtin_str_split(cmds[i], ",")
+        let c: string = f[0]
+        let mut k: int = 0
+        if f.len() > 1 is k = to_int(f[1]) end
+        if c == "open" is
+            hs[k] = rt_db::sqlite_open(f[2])
+            out = tok_add(out, tok_h(hs[k]))
+        elsif c == "exec" is
+            out = tok_add(out, to_string(rt_db::sqlite_exec(hs[k], fld(f[2]))))
+        elsif c == "query" is
+            q = rt_db::sqlite_query(hs[k], fld(f[2]))
+            out = tok_add(out, dump_rows(q))
+        elsif c == "execp" is
+            out = tok_add(out, to_string(rt_db::sqlite_exec_params(hs[k], fld(f[2]), dparams(f, 3))))
+        elsif c == "queryp" is
+            q = rt_db::sqlite_query_params(hs[k], fld(f[2]), dparams(f, 3))
+            out = tok_add(out, dump_rows(q))
+        elsif c == "ping" is
+            out = tok_add(out, to_string(rt_db::sqlite_ping(hs[k])))
+        elsif c == "begin" is
+            let t: string = rt_mem::text_at(rt_db::sqlite_begin(hs[k]))
+            hs[to_int(f[2])] = t
+            out = tok_add(out, tok_h(t))
+        elsif c == "commit" is
+            out = tok_add(out, to_string(rt_db::sqlite_commit(hs[k])))
+        elsif c == "rollback" is
+            out = tok_add(out, to_string(rt_db::sqlite_rollback(hs[k])))
+        elsif c == "close" is
+            rt_db::sqlite_close(hs[k])
+        elsif c == "qb1" is
+            out = tok_add(out, tok_h(rt_db::sqlite_query_bind1(fld(f[1]), fld(f[2]), fld(f[3]))))
+        elsif c == "qb2" is
+            out = tok_add(out, tok_h(rt_db::sqlite_query_bind2(fld(f[1]), fld(f[2]), fld(f[3]), fld(f[4]))))
+        elsif c == "qb3" is
+            out = tok_add(out, tok_h(rt_db::sqlite_query_bind3(fld(f[1]), fld(f[2]), fld(f[3]), fld(f[4]), fld(f[5]))))
+        elsif c == "cs" || c == "ci" || c == "cf" || c == "cb" || c == "cn" is
+            let mut row: int = 0
+            if q != 0 && k >= 0 is row = rt_mem::array_get(q, k) end
+            let mut col: string = ""
+            if f.len() > 2 is col = f[2] end
+            if c == "cs" is
+                out = tok_add(out, tok_h(rt_db::db_col_str(row, col)))
+            elsif c == "ci" is
+                out = tok_add(out, to_string(rt_db::db_col_int(row, col)))
+            elsif c == "cf" is
+                out = tok_add(out, to_string(rt_ptr::f64_bits(rt_db::db_col_float(row, col))))
+            elsif c == "cb" is
+                out = tok_add(out, to_string(rt_db::db_col_bool(row, col)))
+            else
+                out = tok_add(out, to_string(rt_db::db_col_is_null(row, col)))
+            end
+        end
+        i += 1
+    end
+    rt_os::change_dir("/")
+    return out
+end
+
 fn run_op(op: string, a: string, b: string, c: string) -> string is
     if op == "trim" is return rt_str::hex_encode(rt_str::trim(a)) end
     if op == "trim_start" is return rt_str::hex_encode(rt_str::trim_start(a)) end
@@ -121,6 +960,179 @@ fn run_op(op: string, a: string, b: string, c: string) -> string is
     if op == "f2i" is return "#" + to_string(rt_num::float_to_int(dd(a))) end
     if op == "f_tofloat" is return "!" + rt_num::fmt6(rt_num::to_float(a)) end
     if starts_f(op) is return "!" + run_float(op, dd(a), dd(b)) end
+    if op == "hexd" is return rt_str::hex_encode(rt_bytes::hex_decode(a)) end
+    if op == "hexx" is return rt_str::hex_encode(rt_bytes::hex_xor(a, b)) end
+    if op == "hexeb" is return rt_str::hex_encode(rt_bytes::hex_encode_bytes(ints(a))) end
+    if op == "bfrom" is return rt_str::hex_encode(list_s(rt_bytes::bytes_from_ints(ints(a)))) end
+    if op == "bto" is return rt_str::hex_encode(list_s(rt_bytes::bytes_to_ints(ints(a)))) end
+    if op == "bcat" is return rt_str::hex_encode(list_s(rt_bytes::bytes_concat(ints(a), ints(b)))) end
+    if op == "blen" is return "#" + to_string(rt_bytes::bytes_len(ints(a))) end
+    if op == "bstr" is return rt_str::hex_encode(rt_bytes::bytes_to_str_lossy(ints(a))) end
+    if op == "slower" is return rt_str::hex_encode(rt_str::string_lower(a)) end
+    if op == "supper" is return rt_str::hex_encode(rt_str::string_upper(a)) end
+    if op == "strim" is return rt_str::hex_encode(rt_str::string_trim(a)) end
+    if op == "slen" is return "#" + to_string(rt_str::string_len(a)) end
+    if op == "strlen" is return "#" + to_string(rt_str::strlen(a)) end
+    if op == "scontains" is return "#" + bool_n(rt_str::string_contains(a, b)) end
+    if op == "sstarts" is return "#" + bool_n(rt_str::string_starts_with(a, b)) end
+    if op == "sends" is return "#" + bool_n(rt_str::string_ends_with(a, b)) end
+    if op == "sreplace" is return rt_str::hex_encode(rt_str::string_replace(a, b, c)) end
+    if op == "strcat" is return rt_str::hex_encode(rt_str::strcat(a, b)) end
+    if op == "substr" is return rt_str::hex_encode(rt_str::substr(a, to_int(b), to_int(c))) end
+    if op == "splitws" is return rt_str::hex_encode(words_s(rt_str::split_whitespace(a))) end
+    if op == "i2s" is return rt_str::hex_encode(rt_conv::int_to_str(to_int(a))) end
+    if op == "i2str" is return rt_str::hex_encode(rt_conv::int_to_string(to_int(a))) end
+    if op == "i2hex" is return rt_str::hex_encode(rt_conv::int_to_hex(to_int(a))) end
+    if op == "c2s" is return rt_str::hex_encode(rt_conv::char_code_to_str(to_int(a))) end
+    if op == "uuidv" is return "#" + bool_n(rt_text::uuid_is_valid(a)) end
+    if op == "shesc" is return rt_str::hex_encode(rt_text::shell_escape(a)) end
+    if op == "jget" is return rt_str::hex_encode(rt_text::json_get(a, b)) end
+    if op == "parseopt" is return "#" + to_string(rt_conv::parse_int_opt(a)) end
+    if op == "sorti" is return rt_str::hex_encode(list_s(rt_sort::sort_ints(ints(a)))) end
+    if op == "sorts" is return rt_str::hex_encode(join_c(rt_sort::sort_strings(__builtin_str_split(a, ",")))) end
+    if op == "sha256" is return rt_str::hex_encode(rt_crypto::sha256(a)) end
+    if op == "sha512" is return rt_str::hex_encode(rt_crypto::sha512(a)) end
+    if op == "sha1" is return rt_str::hex_encode(rt_crypto::sha1(a)) end
+    if op == "md5" is return rt_str::hex_encode(rt_crypto::md5(a)) end
+    if op == "blake3" is return rt_str::hex_encode(rt_crypto::blake3(a)) end
+    if op == "hmac256" is return rt_str::hex_encode(rt_crypto::hmac_sha256(a, b)) end
+    if op == "hmac512" is return rt_str::hex_encode(rt_crypto::hmac_sha512(a, b)) end
+    if op == "sha256b" is return rt_str::hex_encode(rt_crypto::sha256_bytes(ints(a))) end
+    if op == "pbkdf2" is
+        let kv: [string] = __builtin_str_split(c, ",")
+        return rt_str::hex_encode(list_s(rt_crypto::pbkdf2(a, ints(b), to_int(kv[0]), to_int(kv[1]))))
+    end
+    if op == "a2verify" is return "#" + to_string(rt_argon2::verify(a, b)) end
+    if op == "a2round" is
+        let hh: string = rt_argon2::hash(a)
+        return rt_str::hex_encode(to_string(rt_argon2::verify(a, hh)) + to_string(rt_argon2::verify("not-the-password", hh)))
+    end
+    if op == "taskw" is
+        return rt_str::hex_encode(c_str(rt_task::task_wait(spawn_shell(a))))
+    end
+    if op == "taskwt" is
+        let hh: int = spawn_shell(a)
+        let rd: int = rt_task::task_wait_timeout(hh, to_int(b))
+        return rt_str::hex_encode(to_string(rd) + ":" + c_str(rt_task::task_wait(hh)))
+    end
+    if op == "taskj" is
+        let hs: int = rt_ptr::buf_new(24)
+        rt_ptr::ptr_write_i64(hs, 0, spawn_shell(a))
+        rt_ptr::ptr_write_i64(hs, 8, spawn_shell(b))
+        rt_ptr::ptr_write_i64(hs, 16, 42)
+        let res: int = rt_task::task_join_all(hs, 3)
+        return rt_str::hex_encode(c_str(rt_ptr::ptr_read_i64(res, 0)) + "|" + c_str(rt_ptr::ptr_read_i64(res, 8)) + "|" + to_string(rt_ptr::ptr_read_i64(res, 16)))
+    end
+    if op == "taskp" is
+        let v: int = to_int(a)
+        return rt_str::hex_encode(to_string(rt_task::task_wait(v)) + "," + to_string(rt_task::task_wait_timeout(v, 5)))
+    end
+    if op == "taskn" is
+        let blk: int = rt_ptr::buf_new(64)
+        let same: int = 0
+        let mut s1: int = 0
+        if rt_task::task_wait(blk) == blk is s1 = 1 end
+        return rt_str::hex_encode(to_string(s1) + to_string(rt_task::task_wait_timeout(blk, 1)))
+    end
+    if op == "sortby" is return rt_str::hex_encode(list_s(rt_sort::sort_by(ints(a), pick_cmp(b)))) end
+    if op == "closure" is
+        let ps: [string] = b.split(",")
+        let a0: int = to_int(ps[0])
+        let a1: int = to_int(ps[1])
+        if a == "null" is
+            return rt_str::hex_encode(to_string(rt_mem::closure_call1(0, a0)) + "," + to_string(rt_mem::closure_call2(0, a0, a1)))
+        end
+        let fs: [string] = a.split(",")
+        let c: int = rt_mem::closure_create(fn_addr_of(fs[0]), to_int(fs[1]), to_int(ps[2]), to_int(ps[3]), 0, 0, 0, 0, 0, 0)
+        if to_int(fs[2]) == 1 is return rt_str::hex_encode(to_string(rt_mem::closure_call1(c, a0))) end
+        return rt_str::hex_encode(to_string(rt_mem::closure_call2(c, a0, a1)))
+    end
+    if op == "spawnfn" is
+        return "#" + to_string(rt_task::task_wait(rt_task::task_spawn(fn_addr_of(a), to_int(b))))
+    end
+    if op == "beq" is return "#" + bool_n(rt_crypto::bytes_eq(ints(a), ints(b))) end
+    if op == "xorb" is return rt_str::hex_encode(list_s(rt_crypto::xor_bytes(ints(a), ints(b)))) end
+    if op == "ptrs" is return rt_str::hex_encode(run_ptrs(a)) end
+    if op == "fsops" is return rt_str::hex_encode(run_fs(a)) end
+    if op == "envops" is return rt_str::hex_encode(run_env(a)) end
+    if op == "chars" is return rt_str::hex_encode(hexlist(rt_str::string_chars(a))) end
+    if op == "split" is return rt_str::hex_encode(hexlist(rt_str::string_split(a, b))) end
+    if op == "s2b" is return rt_str::hex_encode(list_s(rt_bytes::string_to_bytes(a))) end
+    if op == "b2s" is return rt_str::hex_encode(rt_bytes::bytes_to_string(ints(a), to_int(b))) end
+    if op == "ajoin" is return rt_str::hex_encode(rt_str::array_join(__builtin_str_split(a, ","), b)) end
+    if op == "jset" is return rt_str::hex_encode(rt_text::json_set_str(a, b, c)) end
+    if op == "platform" is return rt_str::hex_encode(rt_os::platform()) end
+    if op == "sleep" is
+        rt_os::sleep_ms(to_int(a))
+        return rt_str::hex_encode("ok")
+    end
+    if op == "sysname" is return rt_str::hex_encode(rt_sys::sysname()) end
+    if op == "machine" is return rt_str::hex_encode(rt_sys::machine()) end
+    if op == "kernelv" is return rt_str::hex_encode(rt_sys::kernel_version()) end
+    if op == "hostname" is return rt_str::hex_encode(rt_sys::hostname()) end
+    if op == "username" is return rt_str::hex_encode(rt_sys::username()) end
+    if op == "getcwd" is return rt_str::hex_encode(rt_sys::getcwd_s()) end
+    if op == "termw" is return "#" + to_string(rt_sys::term_width()) end
+    if op == "termh" is return "#" + to_string(rt_sys::term_height()) end
+    if op == "memtotal" is return "#" + to_string(rt_sys::memory_total()) end
+    if op == "cpucount" is return "#" + to_string(rt_sys::cpu_count()) end
+    if op == "disktotal" is return "#" + to_string(rt_sys::disk_total(a)) end
+    if op == "sysprop" is return rt_str::hex_encode(prop_sys(a)) end
+    if op == "bold" is return rt_str::hex_encode(rt_text::bold(a)) end
+    if op == "green" is return rt_str::hex_encode(rt_text::green_text(a)) end
+    if op == "red" is return rt_str::hex_encode(rt_text::red_text(a)) end
+    if op == "yellow" is return rt_str::hex_encode(rt_text::yellow_text(a)) end
+    if op == "dim" is return rt_str::hex_encode(rt_text::dim_text(a)) end
+    if op == "cyan" is return rt_str::hex_encode(rt_text::cyan_text(a)) end
+    if op == "datefmt" is return rt_str::hex_encode(rt_os::date_format(to_int(a), b)) end
+    if op == "b64db" is return rt_str::hex_encode(list_s(rt_codec::base64_decode_bytes(a))) end
+    if op == "rhex" is return rt_str::hex_encode(prop_rhex(to_int(a))) end
+    if op == "rstr" is return rt_str::hex_encode(prop_rstr(to_int(a))) end
+    if op == "rint" is return rt_str::hex_encode(prop_rint(to_int(a), to_int(b))) end
+    if op == "uuid" is return rt_str::hex_encode(prop_uuid()) end
+    if op == "rbytes" is return rt_str::hex_encode(prop_rbytes(to_int(a))) end
+    if op == "umod" is
+        return rt_str::hex_encode(utext(rt_rand::umod64(to_int(a), to_int(b))))
+    end
+    if op == "exec1" is return rt_str::hex_encode(rt_proc::exec1(a)) end
+    if op == "exec2" is return rt_str::hex_encode(rt_proc::exec2(a, b)) end
+    if op == "exec3" is return rt_str::hex_encode(rt_proc::exec3(a, b, c)) end
+    if op == "exec4" is
+        let cs: [string] = __builtin_str_split(c, "\u{1}")
+        let mut a3: string = ""
+        if cs.len() > 1 is a3 = cs[1] end
+        return rt_str::hex_encode(rt_proc::exec4(a, b, cs[0], a3))
+    end
+    if op == "runargs" is return rt_str::hex_encode(rt_proc::process_run_args(a, __builtin_str_split(b, ","))) end
+    if op == "shell" is return rt_str::hex_encode(rt_proc::shell(a)) end
+    if op == "which" is return rt_str::hex_encode(rt_proc::process_which(a)) end
+    if op == "spawnkill" is return rt_str::hex_encode(spawnkill(a)) end
+    if op == "rematch" is return "#" + bool_n(rt_proc::regex_match(a, b)) end
+    if op == "refind" is return rt_str::hex_encode(rt_proc::regex_find(a, b)) end
+    if op == "refindall" is return rt_str::hex_encode(strs_tok(rt_proc::regex_find_all(a, b))) end
+    if op == "resplit" is return rt_str::hex_encode(strs_tok(rt_proc::regex_split(a, b))) end
+    if op == "rerepl" is return rt_str::hex_encode(rt_proc::regex_replace(a, b, c)) end
+    if op == "recap" is return rt_str::hex_encode(strs_tok(rt_proc::regex_captures(a, b))) end
+    if op == "recapall" is return rt_str::hex_encode(rows_tok(rt_proc::regex_captures_all(a, b))) end
+    if op == "pyeval" is return rt_str::hex_encode(rt_proc::py_eval(a)) end
+    if op == "httpget" is return rt_str::hex_encode(rt_proc::http_get(a)) end
+    if op == "httppost" is return rt_str::hex_encode(rt_proc::http_post(a, b)) end
+    if op == "dns" is return rt_str::hex_encode(rt_net::dns_resolve(a)) end
+    if op == "scan" is return "#" + bool_n(rt_net::scan_port_net(a, to_int(b), to_int(c))) end
+    if op == "mem" is return rt_str::hex_encode(run_mem(a)) end
+    if op == "f2s" is return rt_str::hex_encode(rt_fmt::float_to_string(rt_num::to_float(a))) end
+    if op == "pyrepr" is return rt_str::hex_encode(rt_fmt::py_repr(a)) end
+    if op == "runcmd" is
+        let rc: int = rt_proc::run_cmd_exec(a, to_int(b))
+        return rt_str::hex_encode(to_string(rc) + "," + lm_tok(rt_proc::run_cmd_last_stdout()) + "," + lm_tok(rt_proc::run_cmd_last_stderr()))
+    end
+    if op == "runcmd0" is return rt_str::hex_encode(lm_tok(rt_proc::run_cmd_last_stdout()) + "," + lm_tok(rt_proc::run_cmd_last_stderr())) end
+    if op == "http" is
+        let h: int = rt_http::http_request(a, b, c)
+        let body: string = rt_mem::text_at(rt_ptr::ptr_read_ptr(h, 8))
+        return rt_str::hex_encode(to_string(rt_ptr::ptr_read_i64(h, 0)) + "," + lm_tok(body))
+    end
+    if op == "dbops" is return rt_str::hex_encode(run_db(a)) end
     if op == "uid" is return "#" + to_string(rt_sys::uid()) end
     if op == "gid" is return "#" + to_string(rt_sys::gid()) end
     if op == "ppid" is return "#" + to_string(rt_sys::ppid()) end
@@ -150,4 +1162,62 @@ fn main() is
         end
         i += 1
     end
+end
+
+;; hsh_task_spawn_shell stays in C (it needs a C-callable entry point); both sides of the parity run spawn with it
+extern static [c] is
+    fn strdup(p: int) -> string
+end
+fn spawn_shell(cmd: string) -> int is return rt_task::task_spawn_shell(cmd) end
+
+;; the named functions of the closure / spawn vectors (parity_c.c has the same ones as pf_*)
+fn pf_dbl(x: int) -> int is return x * 2 end
+fn pf_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
+fn pf_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
+fn pf_sub2(a: int, b: int) -> int is return a - b end
+fn pf_neg(x: int) -> int is return -x end
+fn pf_sq(x: int) -> int is return x * x end
+fn fn_addr_of(name: string) -> int is
+    if name == "dbl" is return fn_addr(pf_dbl) end
+    if name == "add3" is return fn_addr(pf_add3) end
+    if name == "add4" is return fn_addr(pf_add4) end
+    if name == "neg" is return fn_addr(pf_neg) end
+    if name == "sq" is return fn_addr(pf_sq) end
+    return fn_addr(pf_sub2)
+end
+fn c_str(p: int) -> string is
+    if p == 0 is return "" end
+    return strdup(p)
+end
+
+;; named comparators of the sort_by vectors (the same functions exist in parity_c.c)
+fn cmp_asc(a: int, b: int) -> int is
+    if a > b is return 1 end
+    if a < b is return -1 end
+    return 0
+end
+fn cmp_desc(a: int, b: int) -> int is
+    if b > a is return 1 end
+    if b < a is return -1 end
+    return 0
+end
+fn cmp_mod3(a: int, b: int) -> int is return (a % 3) - (b % 3) end
+fn cmp_mod4(a: int, b: int) -> int is return (a % 4) - (b % 4) end
+fn cmp_abs(a: int, b: int) -> int is
+    let mut x: int = a
+    let mut y: int = b
+    if x < 0 is x = -x end
+    if y < 0 is y = -y end
+    if x > y is return 1 end
+    if x < y is return -1 end
+    return 0
+end
+fn cmp_parity(a: int, b: int) -> int is return (a & 1) - (b & 1) end
+fn pick_cmp(name: string) -> fn(int, int) -> int is
+    if name == "asc" is return cmp_asc end
+    if name == "desc" is return cmp_desc end
+    if name == "mod3" is return cmp_mod3 end
+    if name == "mod4" is return cmp_mod4 end
+    if name == "abs" is return cmp_abs end
+    return cmp_parity
 end
