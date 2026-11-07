@@ -1,0 +1,230 @@
+fn raw_string(bs: [int]) -> string is
+    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+end
+
+;; (uint8_t)x for any int: the low 8 bits (also right for negatives)
+fn mask(x: int) -> int is
+    return ((x % 256) + 256) % 256
+end
+
+;; hsh_hexval: -1 when c is not a hex digit
+fn hexval(c: int) -> int is
+    if c >= 48 && c <= 57 is return c - 48 end
+    if c >= 97 && c <= 102 is return c - 97 + 10 end
+    if c >= 65 && c <= 70 is return c - 65 + 10 end
+    return -1
+end
+
+;; hsh_hex_pairs: "ab12ff" -> bytes; a pair that is not two hex digits is skipped, a trailing odd digit is ignored
+pub fn hex_pairs(h: string) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i + 1 < h.len() is
+        let hi: int = hexval(byte_at(h, i))
+        let lo: int = hexval(byte_at(h, i + 1))
+        if hi >= 0 && lo >= 0 is out.push(hi * 16 + lo) end
+        i += 2
+    end
+    return out
+end
+
+;; hsh_utf8_lossy_into: Rust `String::from_utf8_lossy` (maximal-subpart replacement by U+FFFD = EF BF BD)
+pub fn utf8_lossy(s: [int]) -> [int] is
+    let n: int = s.len()
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n is
+        let b: int = s[i]
+        if b < 128 is
+            out.push(b)
+            i += 1
+        else
+            let mut need: int = 0
+            let mut lo: int = 128
+            let mut hi: int = 191
+            if b >= 194 && b <= 223 is
+                need = 1
+            elsif b == 224 is
+                need = 2
+                lo = 160
+            elsif (b >= 225 && b <= 236) || b == 238 || b == 239 is
+                need = 2
+            elsif b == 237 is
+                need = 2
+                hi = 159
+            elsif b == 240 is
+                need = 3
+                lo = 144
+            elsif b >= 241 && b <= 243 is
+                need = 3
+            elsif b == 244 is
+                need = 3
+                hi = 143
+            end
+            if need == 0 is
+                ;; stray continuation byte, C0/C1, F5..FF
+                out.push(239)
+                out.push(191)
+                out.push(189)
+                i += 1
+            else
+                let mut j: int = 1
+                let mut ok: bool = true
+                while j <= need && ok is
+                    if i + j >= n is
+                        ok = false
+                    else
+                        let c: int = s[i + j]
+                        let mut l: int = 128
+                        let mut h: int = 191
+                        if j == 1 is
+                            l = lo
+                            h = hi
+                        end
+                        if c < l || c > h is ok = false else j += 1 end
+                    end
+                end
+                if !ok is
+                    ;; one U+FFFD for the maximal valid prefix; `j` is the offset where it broke
+                    out.push(239)
+                    out.push(191)
+                    out.push(189)
+                    i += j
+                else
+                    let mut k: int = 0
+                    while k <= need is
+                        out.push(s[i + k])
+                        k += 1
+                    end
+                    i += need + 1
+                end
+            end
+        end
+    end
+    return out
+end
+
+;; everything up to (not including) the first 0 byte — what a C string would keep
+fn cut_nul(bs: [int]) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < bs.len() && mask(bs[i]) != 0 is
+        out.push(mask(bs[i]))
+        i += 1
+    end
+    return out
+end
+
+;; hsh_hex_of: lowercase hex of every byte
+fn hex_of(bs: [int]) -> string is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < bs.len() is
+        let c: int = mask(bs[i])
+        let hi: int = c / 16
+        let lo: int = c % 16
+        if hi < 10 is out.push(48 + hi) else out.push(87 + hi) end
+        if lo < 10 is out.push(48 + lo) else out.push(87 + lo) end
+        i += 1
+    end
+    return raw_string(out)
+end
+
+;; core.c hsh_hex_decode: hex pairs -> bytes -> lossy UTF-8 (U+FFFD for invalid sequences)
+pub fn hex_decode(h: string) -> string is
+    return raw_string(cut_nul(utf8_lossy(hex_pairs(h))))
+end
+
+;; core.c hsh_hex_xor: a XOR b-repeated, both hex; an empty `b` gives "" (zip(a, b.cycle()) of the interpreter)
+pub fn hex_xor(a: string, b: string) -> string is
+    let x: [int] = hex_pairs(a)
+    let y: [int] = hex_pairs(b)
+    let mut out: [int] = []
+    if y.len() > 0 is
+        let mut i: int = 0
+        while i < x.len() is
+            let p: int = x[i]
+            let q: int = y[i % y.len()]
+            ;; p ^ q without bit operators, bit by bit
+            let mut r: int = 0
+            let mut bit: int = 1
+            let mut pp: int = p
+            let mut qq: int = q
+            while pp > 0 || qq > 0 is
+                if (pp % 2) != (qq % 2) is r += bit end
+                pp = pp / 2
+                qq = qq / 2
+                bit = bit * 2
+            end
+            out.push(r)
+            i += 1
+        end
+    end
+    return hex_of(out)
+end
+
+;; core.c hsh_hex_encode_bytes
+pub fn hex_encode_bytes(b: [int]) -> string is
+    return hex_of(b)
+end
+
+;; core.c hsh_bytes_from_ints / hsh_bytes_to_ints: copy with `& 0xff`
+pub fn bytes_from_ints(a: [int]) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < a.len() is
+        out.push(mask(a[i]))
+        i += 1
+    end
+    return out
+end
+
+pub fn bytes_to_ints(b: [int]) -> [int] is
+    return bytes_from_ints(b)
+end
+
+;; core.c hsh_bytes_concat
+pub fn bytes_concat(a: [int], b: [int]) -> [int] is
+    let mut out: [int] = bytes_from_ints(a)
+    let mut i: int = 0
+    while i < b.len() is
+        out.push(mask(b[i]))
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_bytes_len
+pub fn bytes_len(b: [int]) -> int is
+    return b.len()
+end
+
+;; core.c hsh_bytes_to_str_lossy
+pub fn bytes_to_str_lossy(b: [int]) -> string is
+    return raw_string(cut_nul(utf8_lossy(bytes_from_ints(b))))
+end
+
+;; core.c hsh_string_to_bytes: the bytes of the string up to its first NUL, as 0..255
+pub fn string_to_bytes(s: string) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < s.len() is
+        out.push(byte_at(s, i))
+        i += 1
+    end
+    return out
+end
+
+;; core.c hsh_bytes_to_string(bytes, n): the first n bytes (low 8 bits each) as a C string, "" for n <= 0 or no bytes.
+;; (C reads only min(n, len) elements and leaves the rest of its n-byte buffer uninitialised: n > len is not a defined result,
+;; here it simply ends at len.)  Goes through __builtin_bytes_to_string, so bytes that are not valid UTF-8 come back as U+FFFD.
+pub fn bytes_to_string(b: [int], n: int) -> string is
+    if b.len() == 0 || n <= 0 is return "" end
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n && i < b.len() is
+        out.push(mask(b[i]))
+        i += 1
+    end
+    return raw_string(cut_nul(out))
+end
