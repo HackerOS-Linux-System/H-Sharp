@@ -132,7 +132,13 @@ fn collect_externs(g: cg::Gen, items: [ast::Node]) is
     for it in items is
         if it.tag == "Extern" is
             for f in it.kids[3].kids is
-                g.externs.put(f.text, f)
+                ;; the same C symbol may be declared by several modules/libs (e.g. `syscall` with 5 vs 7 params):
+                ;; the wrapper `f_<name>` is emitted once, so keep the widest declaration instead of the first/last one
+                let prev: ast::Node = g.externs.get(f.text).unwrap_or(ast::nn())
+                let np: int = f.kids[0].kids.len()
+                let pm: int = g.extern_min.get(f.text).unwrap_or(np)
+                if np < pm is g.extern_min.put(f.text, np) else g.extern_min.put(f.text, pm) end
+                if cg::is_none(prev) || f.kids[0].kids.len() > prev.kids[0].kids.len() is g.externs.put(f.text, f) end
                 if it.kids[0].text == "Python" is g.extern_py.put(f.text, it.kids[2].text) end
             end
         elsif it.tag == "ModDecl" is
@@ -353,7 +359,11 @@ fn gen_extern(g: cg::Gen, name: string) -> string is
     let mut hps: [string] = []
     let mut i: int = 0
     while i < params.len() is
-        hps.push("{cg::ty(g, params[i].kids[1])} a{i}")
+        ;; parameters beyond the narrowest declaration of this symbol are optional (value-initialised): lets callers that
+        ;; declared `syscall` with 5 params and others with 7 share one wrapper
+        let mut dflt: string = ""
+        if i >= g.extern_min.get(name).unwrap_or(params.len()) is dflt = " = {{}}" end
+        hps.push("{cg::ty(g, params[i].kids[1])} a{i}{dflt}")
         i += 1
     end
     if g.extern_py.has(name) is
