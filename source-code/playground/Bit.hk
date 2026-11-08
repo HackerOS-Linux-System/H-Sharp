@@ -1,0 +1,27 @@
+[package]
+-> name        => hsharp-playground
+-> version     => 1.0.0
+-> description => In-browser H# playground — the H# parser + type checker compiled to WebAssembly (written in H#, built with `bit --target wasm`)
+-> license     => MPL-2.0
+-> lang        => h#
+
+[edition]
+-> edition => 2026
+
+[layout]
+-> src => src
+
+[build]
+-> link => static
+
+[default-build]
+-> profile => release
+-> target  => wasm
+
+[dependencies]
+-> wasm => newest
+
+[commands]
+-> build-wasm
+--> run => bit build --target wasm
+--> description => Build cache/build/release/hsharp-playground.js + .wasm (needs emsdk — bit sets it up on the first run)
