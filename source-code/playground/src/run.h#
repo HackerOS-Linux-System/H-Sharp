@@ -1,0 +1,189 @@
+use "std -> strbuf" from "strbuf"
+use "std -> strings" from "str"
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+use "workspace -> parser" from "lib -> *"
+use "workspace -> typecheck" from "lib -> *"
+
+mod types
+
+;; ── playground core ──────────────────────────────────────────────────────────────────────────────────────────────
+;; Port of the former Rust `run.rs` + `lib.rs`.  Same pipeline, same order, same JSON:
+;;   1. parse            -> parse errors rendered with their source excerpt (parser::error::render_error)
+;;   2. type check       -> error-severity diagnostics stop here, warnings never block (as `h# compile` / `h# check`)
+;;   3. execute          -> NOT POSSIBLE in the browser any more: the Rust playground ran the tree-walking interpreter
+;;                          (`hsharp-interpreter`), and H# no longer has one (`h# run` compiles to a native binary and runs
+;;                          that).  A program that passes 1+2 is therefore reported as `ok` + `executed: false` + a notice
+;;                          instead of pretending it printed nothing.  When an execution backend exists, step 3 is the only
+;;                          thing that has to be added here — the result type and the JSON already carry stdout / runtime_error.
+;;
+;; Panics: the Rust crate wrapped the interpreter in `catch_unwind` so that a panic became data.  Here every request is
+;; a separate `main()` invocation of the wasm module (Module.callMain on a fresh instance), so a crash can only ever
+;; take down that one request, never the page.
+
+pub fn version() -> string is
+    return edition::toolchain_version()
+end
+
+;; JSON array of the editions this build understands, oldest first (`["2026"]`)
+pub fn editions_json() -> string is
+    let mut sb = strbuf::new()
+    sb.push("[")
+    let mut first: bool = true
+    for y in string_split(edition::supported_list(), ",") is
+        let t: string = string_trim(y)
+        if t.len() > 0 is
+            if !first is sb.push(",") end
+            sb.push(jstr(t))
+            first = false
+        end
+    end
+    sb.push("]")
+    return sb.build()
+end
+
+;; the newest edition (what a snippet without `using` is read as)
+pub fn latest_edition() -> string is
+    return edition::latest()
+end
+
+;; ── JSON ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+fn hex_digit(n: int) -> string is
+    let digits: string = "0123456789abcdef"
+    return digits[n..n + 1]
+end
+
+fn jstr(s: string) -> string is
+    let mut sb = strbuf::new()
+    sb.push("\"")
+    let mut i: int = 0
+    while i < s.len() is
+        let c: int = byte_at(s, i)
+        if c == 34 is sb.push("\\\"")
+        elsif c == 92 is sb.push("\\\\")
+        elsif c == 10 is sb.push("\\n")
+        elsif c == 13 is sb.push("\\r")
+        elsif c == 9 is sb.push("\\t")
+        elsif c == 8 is sb.push("\\b")
+        elsif c == 12 is sb.push("\\f")
+        elsif c < 32 is sb.push("\\u00" + hex_digit(c / 16) + hex_digit(c % 16))
+        else sb.push(str_from_byte(c)) end
+        i += 1
+    end
+    sb.push("\"")
+    return sb.build()
+end
+
+fn diags_json(ds: [types::Diagnostic]) -> string is
+    let mut sb = strbuf::new()
+    sb.push("[")
+    let mut i: int = 0
+    while i < ds.len() is
+        if i > 0 is sb.push(",") end
+        sb.push("\{\"message\":")
+        sb.push(jstr(ds[i].message))
+        sb.push("}")
+        i += 1
+    end
+    sb.push("]")
+    return sb.build()
+end
+
+fn bool_json(b: bool) -> string is
+    if b is return "true" end
+    return "false"
+end
+
+;; serde_json::to_string(&RunResult) — same field names and order as the Rust struct, plus `warnings`, `executed`, `notice`
+pub fn to_json(r: types::RunResult) -> string is
+    let mut sb = strbuf::new()
+    sb.push("\{\"ok\":" + bool_json(r.ok))
+    sb.push(",\"stdout\":" + jstr(r.stdout))
+    sb.push(",\"parse_errors\":" + diags_json(r.parse_errors))
+    sb.push(",\"type_errors\":" + diags_json(r.type_errors))
+    sb.push(",\"warnings\":" + diags_json(r.warnings))
+    if r.has_runtime_error is sb.push(",\"runtime_error\":" + jstr(r.runtime_error)) else sb.push(",\"runtime_error\":null") end
+    sb.push(",\"executed\":" + bool_json(r.executed))
+    sb.push(",\"notice\":" + jstr(r.notice))
+    sb.push("}")
+    return sb.build()
+end
+
+;; last-resort JSON when something above this layer fails (fallback_error_json in the Rust version)
+pub fn fallback_error_json(msg: string) -> string is
+    return "\{\"ok\":false,\"stdout\":\"\",\"parse_errors\":[],\"type_errors\":[],\"warnings\":[],\"runtime_error\":" + jstr(msg) + ",\"executed\":false,\"notice\":\"\"}"
+end
+
+;; ── pipeline ─────────────────────────────────────────────────────────────────────────────────────────────────────
+fn empty_result() -> types::RunResult is
+    let none: [types::Diagnostic] = []
+    return types::RunResult {
+        ok: false, stdout: "", parse_errors: none, type_errors: none, warnings: none,
+        has_runtime_error: false, runtime_error: "", executed: false, notice: ""
+    }
+end
+
+;; message + fix-it hints, the same shape as a parse error (the UI does not care which stage produced a message)
+fn format_type_diag(d: diagnostics::Diag) -> string is
+    let mut msg: string = d.msg
+    if d.hints.len() > 0 is
+        msg += "\nhint: " + str::join(d.hints, "; ")
+    end
+    return msg
+end
+
+fn no_execution_notice() -> string is
+    return "Syntax and types are OK. The in-browser playground checks programs but cannot run them: H# no longer has an interpreter — compile with `h# run` (or `bit run`) to execute."
+end
+
+;; `max_steps` bounded the interpreter's statement count in the Rust version (run_with_limit).  There is no interpreter to
+;; bound, so it only travels along for API compatibility — wall-clock limits belong to the host page (a Worker it can terminate).
+pub fn run_source(source: string, max_steps: int) -> types::RunResult is
+    let mut result: types::RunResult = empty_result()
+    let parsed: parser::ParseResult = parser::parse(source, "playground.h#")
+
+    if parser::has_errors(parsed) is
+        for e in parsed.errors is
+            result.parse_errors.push(types::Diagnostic { message: error::render_error(e, parsed.source) })
+        end
+        return result
+    end
+
+    ;; real type checking — the same new_checker + check_module `h# check` uses
+    let tc: checker::TypeChecker = checker::new_checker("playground.h#")
+    let diags: [diagnostics::Diag] = checker::check_module(tc, parsed.module)
+    let mut has_type_errors: bool = false
+    for d in diags is
+        if d.sev == "E" is
+            has_type_errors = true
+            result.type_errors.push(types::Diagnostic { message: format_type_diag(d) })
+        else
+            result.warnings.push(types::Diagnostic { message: format_type_diag(d) })
+        end
+    end
+    if has_type_errors is
+        result.warnings = []
+        return result
+    end
+
+    result.ok = true
+    result.executed = false
+    result.notice = no_execution_notice()
+    return result
+end
+
+pub fn run(source: string) -> string is
+    return to_json(run_source(source, 0))
+end
+
+pub fn run_with_limit(source: string, max_steps: int) -> string is
+    return to_json(run_source(source, max_steps))
+end
+
+;; the typechecker looks for `use "std -> x"` modules under HSHARP_STD_DIR; in the browser the host mounts the std/
+;; directory into the virtual file system (emcc `--preload-file <repo>/std@/std`), so point it there when it is present
+pub fn prepare_env() is
+    if env::get("HSHARP_STD_DIR") == "" && fs::is_file("/std/strings.h#") is
+        env::set("HSHARP_STD_DIR", "/std")
+    end
+end
