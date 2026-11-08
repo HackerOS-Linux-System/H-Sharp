@@ -1,0 +1,27 @@
+pub struct Diagnostic is
+    pub message: string
+end
+
+pub struct RunResult is
+    ;; Whether the program parsed AND type-checked (and, once an execution backend exists, ran to completion).
+    ;; `false` never hides output: `stdout` still holds everything printed before the failure.
+    pub ok: bool
+    ;; Everything the program printed via `write`/`print`/`println`, in order.  Empty when nothing was printed or
+    ;; when the program was rejected before it could run.
+    pub stdout: string
+    ;; Parse errors — each already rendered as a human-readable, source-quoting message (parser::error::render_error).
+    pub parse_errors: [Diagnostic]
+    ;; Type errors (and hints).  Present, with `ok == false`, whenever parsing succeeded but `typecheck` found at
+    ;; least one error-severity diagnostic.  Warnings alone never block.
+    pub type_errors: [Diagnostic]
+    ;; Type warnings of a program that was accepted (the Rust version dropped these; surfacing them is free here)
+    pub warnings: [Diagnostic]
+    ;; Runtime error / panic message; only meaningful when `has_runtime_error`
+    pub has_runtime_error: bool
+    pub runtime_error: string
+    ;; true when the program was actually executed.  H# has no interpreter any more (`h# run` compiles to a native
+    ;; binary), so in the browser this is false: the playground checks, it does not run.
+    pub executed: bool
+    ;; human-readable explanation shown next to a check-only result ("" when there is nothing to say)
+    pub notice: string
+end
