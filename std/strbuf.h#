@@ -1,0 +1,29 @@
+struct StringBuilder is
+    pub _inner: any
+end
+
+pub fn new() -> StringBuilder is
+    return StringBuilder { _inner: sb_new() }
+end
+
+impl StringBuilder is
+    fn push(self, s: string) is
+        sb_push(self._inner, s)
+    end
+
+    fn len(self) -> int is
+        return sb_len(self._inner)
+    end
+
+    fn build(self) -> string is
+        return sb_build(self._inner)
+    end
+
+    fn clear(self) is
+        sb_clear(self._inner)
+    end
+
+    fn is_empty(self) -> bool is
+        return sb_len(self._inner) == 0
+    end
+end
