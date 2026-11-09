@@ -822,6 +822,19 @@ inline void hs_b_sb_push(Any b, Str s) { ((hs::StrBuf*)(intptr_t)b.v)->s.append(
 inline int64_t hs_b_sb_len(Any b) { return (int64_t)((hs::StrBuf*)(intptr_t)b.v)->s.size(); }
 inline Str hs_b_sb_build(Any b) { return Str(((hs::StrBuf*)(intptr_t)b.v)->s); }
 inline void hs_b_sb_clear(Any b) { ((hs::StrBuf*)(intptr_t)b.v)->s.clear(); }
+// ── function addresses and indirect calls (what lets the runtime itself be written in H#) ──
+// `fn_addr(f)` is the C-callable address of the named H# function `f` (0 for anything that is not a plain function);
+// `call_ptr0..4(p, a..)` call such an address with 0..4 integer arguments and give back its integer result.
+// A function taking/returning only int/pointer values is ABI-compatible with `void*(*)(void*)` thread entries.
+template<class F> inline int64_t hs_b_fn_addr(F f) {
+    if constexpr (std::is_pointer_v<F> || std::is_function_v<F>) return (int64_t)(intptr_t)f; else return 0;
+}
+inline int64_t hs_b_call_ptr0(int64_t p) { return p ? ((int64_t(*)())(intptr_t)p)() : 0; }
+inline int64_t hs_b_call_ptr1(int64_t p, int64_t a) { return p ? ((int64_t(*)(int64_t))(intptr_t)p)(a) : 0; }
+inline int64_t hs_b_call_ptr2(int64_t p, int64_t a, int64_t b) { return p ? ((int64_t(*)(int64_t, int64_t))(intptr_t)p)(a, b) : 0; }
+inline int64_t hs_b_call_ptr3(int64_t p, int64_t a, int64_t b, int64_t c) { return p ? ((int64_t(*)(int64_t, int64_t, int64_t))(intptr_t)p)(a, b, c) : 0; }
+
+inline int64_t hs_b_call_ptr4(int64_t p, int64_t a, int64_t b, int64_t c, int64_t d) { return p ? ((int64_t(*)(int64_t, int64_t, int64_t, int64_t))(intptr_t)p)(a, b, c, d) : 0; }
 template<class T> inline int64_t hs_b_hash_key(const T& k) {
     if constexpr (std::is_same_v<T, Str>) return hs_b_hash_str(k);
     else if constexpr (std::is_pointer_v<T>) {
