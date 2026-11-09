@@ -1,0 +1,9 @@
+pub enum Result<T, E> is
+    Ok(T)
+    Err(E)
+end
+
+pub enum Option<T> is
+    Some(T)
+    None
+end
