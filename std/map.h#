@@ -1,0 +1,150 @@
+pub struct Map<K, V> is
+    pub _h: any
+    pub _keys: [K]
+    pub _vals: [V]
+    pub _live: [bool]
+    pub _n: int
+end
+
+impl Map is
+    pub fn new() -> Map<K, V> is
+        return Map { _h: map_new(1), _keys: [], _vals: [], _live: [], _n: 0 }
+    end
+
+    pub fn has(self, k: K) -> bool is
+        return map_has(self._h, to_string(k))
+    end
+
+    pub fn get(self, k: K) -> V? is
+        let ks: string = to_string(k)
+        if !map_has(self._h, ks) is return nil end
+        let i: int = map_get(self._h, ks)
+        return self._vals[i]
+    end
+
+    pub fn put(self, k: K, v: V) is
+        let ks: string = to_string(k)
+        if map_has(self._h, ks) is
+            let i: int = map_get(self._h, ks)
+            self._vals[i] = v
+            return
+        end
+        let n: int = self._keys.len()
+        map_set(self._h, ks, n)
+        self._keys.push(k)
+        self._vals.push(v)
+        self._live.push(true)
+        self._n += 1
+    end
+
+    pub fn set(self, k: K, v: V) is self.put(k, v) end
+    pub fn insert(self, k: K, v: V) is self.put(k, v) end
+
+    pub fn remove(self, k: K) -> bool is
+        let ks: string = to_string(k)
+        if !map_has(self._h, ks) is return false end
+        let i: int = map_get(self._h, ks)
+        self._live[i] = false
+        map_remove(self._h, ks)
+        self._n -= 1
+        return true
+    end
+
+    pub fn len(self) -> int is return self._n end
+    pub fn size(self) -> int is return self._n end
+    pub fn is_empty(self) -> bool is return self._n == 0 end
+
+    pub fn key_list(self) -> [K] is
+        let mut out: [K] = []
+        let mut i: int = 0
+        while i < self._keys.len() is
+            if self._live[i] is out.push(self._keys[i]) end
+            i += 1
+        end
+        return out
+    end
+
+    pub fn keys(self) -> [K] is return self.key_list() end
+
+    pub fn values(self) -> [V] is
+        let mut out: [V] = []
+        let mut i: int = 0
+        while i < self._keys.len() is
+            if self._live[i] is out.push(self._vals[i]) end
+            i += 1
+        end
+        return out
+    end
+
+    pub fn clear(self) is
+        self._h = map_new(1)
+        self._keys = []
+        self._vals = []
+        self._live = []
+        self._n = 0
+    end
+end
+
+pub struct Set<T> is
+    pub _h: any
+    pub _items: [T]
+    pub _live: [bool]
+    pub _n: int
+end
+
+impl Set is
+    pub fn new() -> Set<T> is
+        return Set { _h: map_new(1), _items: [], _live: [], _n: 0 }
+    end
+
+    pub fn has(self, x: T) -> bool is
+        return map_has(self._h, to_string(x))
+    end
+
+    pub fn contains(self, x: T) -> bool is
+        return map_has(self._h, to_string(x))
+    end
+
+    pub fn add(self, x: T) is
+        let xs: string = to_string(x)
+        if map_has(self._h, xs) is return end
+        let n: int = self._items.len()
+        map_set(self._h, xs, n)
+        self._items.push(x)
+        self._live.push(true)
+        self._n += 1
+    end
+
+    pub fn insert(self, x: T) is self.add(x) end
+
+    pub fn remove(self, x: T) -> bool is
+        let xs: string = to_string(x)
+        if !map_has(self._h, xs) is return false end
+        let i: int = map_get(self._h, xs)
+        self._live[i] = false
+        map_remove(self._h, xs)
+        self._n -= 1
+        return true
+    end
+
+    pub fn items(self) -> [T] is
+        let mut out: [T] = []
+        let mut i: int = 0
+        while i < self._items.len() is
+            if self._live[i] is out.push(self._items[i]) end
+            i += 1
+        end
+        return out
+    end
+
+    pub fn len(self) -> int is return self._n end
+    pub fn size(self) -> int is return self._n end
+    pub fn is_empty(self) -> bool is return self._n == 0 end
+
+    pub fn clear(self) is
+        self._h = map_new(1)
+        self._items = []
+        self._live = []
+        self._n = 0
+    end
+end
