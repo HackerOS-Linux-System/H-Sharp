@@ -87,6 +87,15 @@ pub fn atoll(s: string) -> int is
     return rt_conv::to_int(s)
 end
 
+;; core.c hsh_atoll_export / hsh_atof_export: the same conversions as hsh_atoll / hsh_atof, kept as separate exported symbols
+pub fn atoll_export(s: string) -> int is
+    return atoll(s)
+end
+
+pub fn atof_export(s: string) -> f64 is
+    return to_float(s)
+end
+
 ;; test helper: v * 1e6 rounded to an integer, "nan" / "big" for the cases that cannot be compared that way
 pub fn fmt6(v: f64) -> string is
     if v != v is return "nan" end
