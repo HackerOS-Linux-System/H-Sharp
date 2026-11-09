@@ -296,7 +296,7 @@ pub fn extra_hand() -> [string] is
         "to_int_from_hex","string_upper","string_lower","string_chars","string_replace_all","string_replace","string_trim_start",
         "__builtin_tcp_connect","__builtin_tcp_send","__builtin_tcp_recv","__builtin_tcp_close","__builtin_atomic_add","__builtin_atomic_load","__builtin_atomic_store",
         "__builtin_base64url_encode","__builtin_base64url_decode","__builtin_hmac_sha256_b64url","__builtin_str_replace_all","__builtin_str_reverse","__builtin_str_is_numeric","__builtin_str_trim_start","__builtin_str_trim_end",
-        "byte_at","str_from_byte","is_alpha_byte","is_digit_byte","is_alnum_byte","is_space_byte","hash_str","hash_key","sb_new","sb_push","sb_len","sb_build","sb_clear",
+        "byte_at","str_from_byte","is_alpha_byte","is_digit_byte","is_alnum_byte","is_space_byte","hash_str","hash_key","fn_addr","call_ptr0","call_ptr1","call_ptr2","call_ptr3","call_ptr4","sb_new","sb_push","sb_len","sb_build","sb_clear",
         "string_to_bytes","array_remove","assert","math_pi","math_e","math_tau","math_fabs","math_fmin","math_fmax","min_int","max_int","math_clamp","math_fclamp","math_gcd","math_lcm","math_ipow"]
 end
 
