@@ -171,6 +171,9 @@ fn numbers() is
     eq_f(rt_num::fpow(2.0, 10.0), 1024.0)
     eq_i(rt_num::float_to_int(-3.9), -3)
     eq_f(rt_num::to_float(" 3.5xyz"), 3.5)
+    eq_i(rt_num::atoll_export("  -42abc"), -42)
+    eq_i(rt_num::atoll_export(""), 0)
+    eq_f(rt_num::atof_export("2.25e1"), 22.5)
     eq_s(rt_num::fmt6(0.5), "500000")
 end
 
@@ -628,9 +631,10 @@ end
 
 ;; ── tasks (rt_task): handles made by the C hsh_task_spawn_shell, waited for by the H# port ──
 extern static [c] is
-    fn hsh_task_spawn_shell(cmd: string) -> int
     fn strdup(p: int) -> string
 end
+
+fn hsh_task_spawn_shell(cmd: string) -> int is return rt_task::task_spawn_shell(cmd) end
 
 #[test]
 fn task_wait_and_timeout() is
@@ -764,3 +768,40 @@ fn task_spawn_runs_h_functions_on_threads() is
     eq_i(rt_ptr::ptr_read_i64(r, 32), 10)
 end
 \\
+
+;; ── indirect calls: closure_call, sort_by_raw / sort_by_key, task_spawn on a raw thread entry ──
+fn ic_add3(a: int, b: int, c: int) -> int is return a + b + c end
+fn ic_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
+fn ic_neg_cmp(a: int, b: int) -> int is return b - a end
+fn ic_key_mod(a: int) -> int is return a % 3 end
+fn ic_task_body(x: int) -> int is return x * 6 end
+
+#[test]
+fn closure_call_forwards_captures() is
+    let c1: int = rt_mem::closure_create(fn_addr(ic_add3), 2, 10, 20, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_mem::closure_call1(c1, 1), 31)
+    let c2: int = rt_mem::closure_create(fn_addr(ic_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_mem::closure_call2(c2, 1, 2), 1234)
+    eq_i(rt_mem::closure_call1(0, 5), 0)
+end
+
+#[test]
+fn sort_by_raw_and_key() is
+    let mut a: [int] = [3, 1, 2, 5, 4]
+    rt_sort::sort_by_raw(a, fn_addr(ic_neg_cmp))
+    eq_i(a[0], 5)
+    eq_i(a[4], 1)
+    let mut b: [int] = [5, 4, 3, 2, 1, 0]
+    rt_sort::sort_by_key(b, fn_addr(ic_key_mod))
+    eq_i(b[0] % 3, 0)
+    eq_i(b[5] % 3, 2)
+    eq_i(b[0], 3)
+    eq_i(b[1], 0)
+end
+
+#[test]
+fn task_spawn_runs_raw_entry() is
+    let h: int = rt_task::task_spawn(fn_addr(ic_task_body), 7)
+    if h == 0 is eq_i(1, 0) end
+    eq_i(rt_task::task_wait(h), 42)
+end
