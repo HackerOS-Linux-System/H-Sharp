@@ -1,0 +1,23 @@
+use "std -> env" from "env"
+
+;; Driver for tools/run_http_checks.sh:  rt_http_check <METHOD> <URL> <BODY>   prints  "<status>|<body>";  curl_get <URL> / curl_post <URL> <BODY> go through rt_proc::http_get / http_post
+mod rt_http
+mod rt_proc
+mod rt_ptr
+mod rt_mem
+
+fn main() is
+    let a: [string] = env::args()
+    if a[1] == "curl_get" is
+        write(rt_proc::http_get(a[2]))
+        return
+    end
+    if a[1] == "curl_post" is
+        write(rt_proc::http_post(a[2], a[3]))
+        return
+    end
+    let mut body: string = ""
+    if a.len() > 3 is body = a[3] end
+    let r: int = rt_http::http_request(a[1], a[2], body)
+    write(to_string(rt_ptr::ptr_read_i64(r, 0)) + "|" + rt_mem::text_at(rt_ptr::ptr_read_i64(r, 8)))
+end
