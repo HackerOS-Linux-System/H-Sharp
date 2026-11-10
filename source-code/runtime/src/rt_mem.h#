@@ -595,26 +595,6 @@ pub fn closure_create(fn_ptr: int, n_caps: int, c0: int, c1: int, c2: int, c3: i
     return c
 end
 
-;; core.c hsh_closure_call1 / hsh_closure_call2: call the function at c->fn_ptr with the arguments, then the captures (n_caps 0, 1 or 2; any
-;; other count calls it with the bare arguments); a NULL closure gives 0.  The closure block is { fn_ptr @0, n_caps @8, caps @16.. } (closure_create).
-pub fn closure_call1(c: int, a0: int) -> int is
-    if c == 0 is return 0 end
-    let f: int = rd(c, 0)
-    let n: int = rd(c, 8)
-    if n == 1 is return call_ptr2(f, a0, rd(c, 16)) end
-    if n == 2 is return call_ptr3(f, a0, rd(c, 16), rd(c, 24)) end
-    return call_ptr1(f, a0)
-end
-
-pub fn closure_call2(c: int, a0: int, a1: int) -> int is
-    if c == 0 is return 0 end
-    let f: int = rd(c, 0)
-    let n: int = rd(c, 8)
-    if n == 1 is return call_ptr3(f, a0, a1, rd(c, 16)) end
-    if n == 2 is return call_ptr4(f, a0, a1, rd(c, 16), rd(c, 24)) end
-    return call_ptr2(f, a0, a1)
-end
-
 ;; core.c hsh_val_to_str: 0 -> "0"; an int that looks like a pointer (65536 < v < 0x7fffffffffff) whose first byte is NUL or
 ;; printable ASCII is treated as a C string and returned; anything else is printed as a decimal
 pub fn val_to_str(v: int) -> string is
