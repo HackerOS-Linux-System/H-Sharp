@@ -16,6 +16,7 @@ mod rt_proc
 mod rt_net
 mod rt_state
 mod rt_mem
+mod rt_indirect
 mod rt_fmt
 mod rt_env
 mod rt_http
