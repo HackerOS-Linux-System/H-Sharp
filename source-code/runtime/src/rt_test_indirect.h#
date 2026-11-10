@@ -1,0 +1,159 @@
+use "std -> test" from "test"
+
+;; Tests of the runtime pieces that need a raw function address (fn_addr / call_ptr0..4): closures, sort_by_raw / sort_by_key, tasks.
+;; Needs the self-hosted compiler (h# 0.9.0 has neither builtin).  Run:  h# test src/rt_test_indirect.h#
+
+mod rt_ptr
+mod rt_mem
+mod rt_sort
+mod rt_indirect
+mod rt_task
+
+fn eq_s(actual: string, expected: string) is
+    if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
+end
+
+fn eq_i(actual: int, expected: int) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+;; ── tasks (rt_task): handles made by the C hsh_task_spawn_shell, waited for by the H# port ──
+extern static [c] is
+    fn strdup(p: int) -> string
+end
+
+fn hsh_task_spawn_shell(cmd: string) -> int is return rt_task::task_spawn_shell(cmd) end
+
+#[test]
+fn task_wait_and_timeout() is
+    let h: int = hsh_task_spawn_shell("printf hello")
+    eq_s(strdup(rt_task::task_wait(h)), "hello")
+    eq_i(rt_task::task_wait(0), 0)
+    eq_i(rt_task::task_wait(5), 5)
+    eq_i(rt_task::task_wait(65535), 65535)
+    let s: int = hsh_task_spawn_shell("sleep 1; printf late")
+    eq_i(rt_task::task_wait_timeout(s, 20), 0)
+    eq_i(rt_task::task_wait_timeout(s, 5000), 1)
+    eq_i(rt_task::task_wait_timeout(s, 0), 1)
+    eq_s(strdup(rt_task::task_wait(s)), "late")
+    eq_i(rt_task::task_wait_timeout(0, 10), 1)
+    eq_i(rt_task::task_wait_timeout(7, 10), 1)
+    ;; a heap block that is not a task comes back unchanged
+    let blk: int = rt_ptr::buf_new(64)
+    eq_i(rt_task::task_wait(blk), blk)
+    eq_i(rt_task::task_wait_timeout(blk, 1), 1)
+end
+
+#[test]
+fn task_join_all_in_order() is
+    let hs: int = rt_ptr::buf_new(24)
+    rt_ptr::ptr_write_i64(hs, 0, hsh_task_spawn_shell("sleep 1; printf one"))
+    rt_ptr::ptr_write_i64(hs, 8, hsh_task_spawn_shell("printf two"))
+    rt_ptr::ptr_write_i64(hs, 16, 42)
+    let r: int = rt_task::task_join_all(hs, 3)
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 0)), "one")
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 8)), "two")
+    eq_i(rt_ptr::ptr_read_i64(r, 16), 42)
+    eq_i(rt_task::task_join_all(hs, -1), 0)
+end
+
+
+;; ── closures and spawned tasks ──
+;; closure_call1/2, sort_by_raw / sort_by_key and task_spawn call an H# function through its address (`fn_addr` + `call_ptrN`);
+;; this file therefore needs a compiler that has those builtins (the self-hosted one) — rt_test.h# is the part that builds with h# 0.9.0.
+
+#[test]
+fn closure_call_null_closure_is_zero() is
+    eq_i(rt_indirect::closure_call1(0, 8), 0)
+    eq_i(rt_indirect::closure_call2(0, 8, 9), 0)
+end
+
+#[test]
+fn task_spawn_shell_runs_on_threads() is
+    let s: int = rt_task::task_spawn_shell("printf spawned")
+    eq_s(strdup(rt_task::task_wait(s)), "spawned")
+    let q: int = rt_task::task_spawn_shell("sleep 1; printf slow")
+    eq_i(rt_task::task_wait_timeout(q, 20), 0)
+    eq_s(strdup(rt_task::task_wait(q)), "slow")
+    let hs: int = rt_ptr::buf_new(24)
+    rt_ptr::ptr_write_i64(hs, 0, rt_task::task_spawn_shell("printf a"))
+    rt_ptr::ptr_write_i64(hs, 8, rt_task::task_spawn_shell("printf b"))
+    rt_ptr::ptr_write_i64(hs, 16, rt_task::task_spawn_shell("printf c"))
+    let r: int = rt_task::task_join_all(hs, 3)
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 0)), "a")
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 8)), "b")
+    eq_s(strdup(rt_ptr::ptr_read_i64(r, 16)), "c")
+end
+
+;; ── named functions handed to closure_call / task_spawn through `fn_addr` ──
+fn f_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
+fn f_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
+fn f_dbl(x: int) -> int is return x * 2 end
+
+#[test]
+fn closure_call_appends_captures() is
+    ;; fn(x) with 0 captures, fn(x, c0) with 1, fn(x, c0, c1) with 2, more than 2 is ignored
+    let c0: int = rt_mem::closure_create(fn_addr(f_dbl), 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call1(c0, 21), 42)
+    let c1: int = rt_mem::closure_create(fn_addr(f_add3), 1, 5, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call2(c1, 1, 2), 125)
+    let c2: int = rt_mem::closure_create(fn_addr(f_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call2(c2, 1, 2), 1234)
+    let c3: int = rt_mem::closure_create(fn_addr(f_add3), 1, 9, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call1(c3, 7), 790)
+    let c4: int = rt_mem::closure_create(fn_addr(f_dbl), 5, 1, 2, 3, 4, 5, 0, 0, 0)
+    eq_i(rt_indirect::closure_call1(c4, 8), 16)
+end
+
+#[test]
+fn task_spawn_runs_h_functions_on_threads() is
+    let t: int = rt_task::task_spawn(fn_addr(f_dbl), 21)
+    eq_i(rt_task::task_wait(t), 42)
+    let hs: int = rt_ptr::buf_new(40)
+    let mut i: int = 0
+    while i < 5 is
+        rt_ptr::ptr_write_i64(hs, i * 8, rt_task::task_spawn(fn_addr(f_dbl), i + 1))
+        i += 1
+    end
+    let r: int = rt_task::task_join_all(hs, 5)
+    eq_i(rt_ptr::ptr_read_i64(r, 0), 2)
+    eq_i(rt_ptr::ptr_read_i64(r, 16), 6)
+    eq_i(rt_ptr::ptr_read_i64(r, 32), 10)
+end
+
+;; ── indirect calls: closure_call, sort_by_raw / sort_by_key, task_spawn on a raw thread entry ──
+fn ic_add3(a: int, b: int, c: int) -> int is return a + b + c end
+fn ic_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
+fn ic_neg_cmp(a: int, b: int) -> int is return b - a end
+fn ic_key_mod(a: int) -> int is return a % 3 end
+fn ic_task_body(x: int) -> int is return x * 6 end
+
+#[test]
+fn closure_call_forwards_captures() is
+    let c1: int = rt_mem::closure_create(fn_addr(ic_add3), 2, 10, 20, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call1(c1, 1), 31)
+    let c2: int = rt_mem::closure_create(fn_addr(ic_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call2(c2, 1, 2), 1234)
+    eq_i(rt_indirect::closure_call1(0, 5), 0)
+end
+
+#[test]
+fn sort_by_raw_and_key() is
+    let mut a: [int] = [3, 1, 2, 5, 4]
+    rt_indirect::sort_by_raw(a, fn_addr(ic_neg_cmp))
+    eq_i(a[0], 5)
+    eq_i(a[4], 1)
+    let mut b: [int] = [5, 4, 3, 2, 1, 0]
+    rt_indirect::sort_by_key(b, fn_addr(ic_key_mod))
+    eq_i(b[0] % 3, 0)
+    eq_i(b[5] % 3, 2)
+    eq_i(b[0], 3)
+    eq_i(b[1], 0)
+end
+
+#[test]
+fn task_spawn_runs_raw_entry() is
+    let h: int = rt_task::task_spawn(fn_addr(ic_task_body), 7)
+    if h == 0 is eq_i(1, 0) end
+    eq_i(rt_task::task_wait(h), 42)
+end
