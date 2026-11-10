@@ -1,0 +1,57 @@
+name: "Przygotuj bootstrap H#"
+description: >
+  H# jest samodzielnym kompilatorem napisanym w H# (generuje C++, buduje go `bit`), więc do zbudowania
+  źródeł potrzebny jest już działający kompilator (stage0). Ta akcja instaluje: stage0 `hsharp` / `h#`
+  (gotowa binarka z wydania), menedżer `bit` oraz bibliotekę standardową z tego checkoutu
+  (/usr/lib/HackerOS/H#/std). g++ i curl muszą być już w systemie (workflow instaluje je per dystrybucja).
+
+inputs:
+  stage0_url:
+    description: "URL binarki stage0 `hsharp`. Puste = najnowsze wydanie H-Sharp."
+    required: false
+    default: ""
+  bit_url:
+    description: "URL binarki `bit`. Puste = najnowsze wydanie bit."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Pobierz stage0 (hsharp) i bit
+      shell: bash
+      env:
+        STAGE0_URL: ${{ inputs.stage0_url }}
+        BIT_URL: ${{ inputs.bit_url }}
+      run: |
+        set -euo pipefail
+        SUDO=""; if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
+        : "${STAGE0_URL:=https://github.com/HackerOS-Linux-System/H-Sharp/releases/latest/download/hsharp}"
+        : "${BIT_URL:=https://github.com/HackerOS-Linux-System/bit/releases/latest/download/bit}"
+        command -v g++ >/dev/null || { echo "::error::brak g++ (kompilator generuje C++)"; exit 1; }
+
+        fetch_elf() {  # $1=url $2=ścieżka
+          curl -fsSL --retry 3 -o "$2" "$1"
+          if [ "$(head -c 4 "$2" | od -An -c | tr -d ' ')" != '177ELF' ]; then
+            echo "::error::$1 nie zwrócił binarki ELF"; exit 1
+          fi
+        }
+
+        echo "::group::stage0 + bit"
+        fetch_elf "$STAGE0_URL" /tmp/hsharp
+        fetch_elf "$BIT_URL" /tmp/bit
+        $SUDO install -m 0755 /tmp/hsharp /usr/local/bin/hsharp
+        $SUDO ln -sf /usr/local/bin/hsharp "/usr/local/bin/h#"
+        $SUDO install -m 0755 /tmp/bit /usr/local/bin/bit
+        echo "::endgroup::"
+
+        echo "::group::std -> /usr/lib/HackerOS/H#/std"
+        # kompilator szuka modułów w /usr/lib/HackerOS/H#/std/<moduł>.h#
+        $SUDO rm -rf "/usr/lib/HackerOS/H#/std"
+        $SUDO mkdir -p "/usr/lib/HackerOS/H#/std"
+        $SUDO cp -a std/. "/usr/lib/HackerOS/H#/std/"
+        test -f "/usr/lib/HackerOS/H#/std/fmt.h#" || { echo "::error::brak std/fmt.h# po instalacji"; exit 1; }
+        echo "::endgroup::"
+
+        "h#" --version
+        bit --version || true
