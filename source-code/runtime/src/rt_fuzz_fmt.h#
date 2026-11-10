@@ -1,0 +1,40 @@
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+
+;; Differential test of rt_fmt against printf: reads a TSV made by tools/gen_fmt_vectors.py
+;;     op <TAB> x <TAB> param <TAB> expected        (op: f = fmt_f(x, param), g = fmt_g(x, param), s = float_to_string(x))
+;; and reports every line where the H# result differs from the oracle.  Exit code 1 when there is any mismatch.
+;; Run through tools/run_fmt_fuzz.sh   (h# run src/rt_fuzz_fmt.h# -- vectors.tsv).
+
+mod rt_fmt
+mod rt_num
+mod rt_conv
+
+fn main() is
+    let args: [string] = env::args()
+    let lines: [string] = fs::read_lines(args[1])
+    let mut checked: int = 0
+    let mut bad: int = 0
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = __builtin_str_split(lines[i], "\t")
+        if parts.len() >= 4 is
+            let x: f64 = rt_num::to_float(parts[1])
+            let k: int = rt_conv::to_int(parts[2])
+            let mut got: string = ""
+            if parts[0] == "f" is got = rt_fmt::fmt_f(x, k) end
+            if parts[0] == "g" is got = rt_fmt::fmt_g(x, k) end
+            if parts[0] == "s" is got = rt_fmt::float_to_string(x) end
+            checked += 1
+            if got != parts[3] is
+                bad += 1
+                if bad <= 40 is
+                    write("MISMATCH " + parts[0] + " x=" + parts[1] + " param=" + parts[2] + " want=`" + parts[3] + "` got=`" + got + "`")
+                end
+            end
+        end
+        i += 1
+    end
+    write("fmt differential: " + to_string(checked) + " checked, " + to_string(bad) + " mismatches")
+    if bad > 0 is exit(1) end
+end
