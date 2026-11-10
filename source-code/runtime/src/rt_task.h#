@@ -196,10 +196,3 @@ pub fn task_spawn_shell(cmd: string) -> int is
     memcpy(sa, cmd, n)
     return task_spawn(fn_addr(shell_task_fn), sa)
 end
-
-;; C `int` results arrive as the low 32 bits of a 64-bit register; sign-extend them
-fn cint(x: int) -> int is
-    let v: int = x & 4294967295
-    if v >= 2147483648 is return v - 4294967296 end
-    return v
-end
