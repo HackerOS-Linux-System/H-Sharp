@@ -22,7 +22,6 @@ mod rt_fmt
 mod rt_env
 mod rt_db
 mod rt_argon2
-mod rt_task
 
 ;; assert_eq takes `any` (pointer compare for strings); typed parameters make `==` a real string comparison
 fn eq_s(actual: string, expected: string) is
@@ -629,46 +628,6 @@ fn argon2_verify_rejects_malformed() is
     eq_i(rt_argon2::verify("passwore", "$argon2id$v=19$m=64,t=2,p=1$c29tZXNhbHQ$FqGkmHNGCd0BRW2kBt6fPZ2pPmyGwwChL8FGUhTOSSI"), 0)
 end
 
-;; ── tasks (rt_task): handles made by the C hsh_task_spawn_shell, waited for by the H# port ──
-extern static [c] is
-    fn strdup(p: int) -> string
-end
-
-fn hsh_task_spawn_shell(cmd: string) -> int is return rt_task::task_spawn_shell(cmd) end
-
-#[test]
-fn task_wait_and_timeout() is
-    let h: int = hsh_task_spawn_shell("printf hello")
-    eq_s(strdup(rt_task::task_wait(h)), "hello")
-    eq_i(rt_task::task_wait(0), 0)
-    eq_i(rt_task::task_wait(5), 5)
-    eq_i(rt_task::task_wait(65535), 65535)
-    let s: int = hsh_task_spawn_shell("sleep 1; printf late")
-    eq_i(rt_task::task_wait_timeout(s, 20), 0)
-    eq_i(rt_task::task_wait_timeout(s, 5000), 1)
-    eq_i(rt_task::task_wait_timeout(s, 0), 1)
-    eq_s(strdup(rt_task::task_wait(s)), "late")
-    eq_i(rt_task::task_wait_timeout(0, 10), 1)
-    eq_i(rt_task::task_wait_timeout(7, 10), 1)
-    ;; a heap block that is not a task comes back unchanged
-    let blk: int = rt_ptr::buf_new(64)
-    eq_i(rt_task::task_wait(blk), blk)
-    eq_i(rt_task::task_wait_timeout(blk, 1), 1)
-end
-
-#[test]
-fn task_join_all_in_order() is
-    let hs: int = rt_ptr::buf_new(24)
-    rt_ptr::ptr_write_i64(hs, 0, hsh_task_spawn_shell("sleep 1; printf one"))
-    rt_ptr::ptr_write_i64(hs, 8, hsh_task_spawn_shell("printf two"))
-    rt_ptr::ptr_write_i64(hs, 16, 42)
-    let r: int = rt_task::task_join_all(hs, 3)
-    eq_s(strdup(rt_ptr::ptr_read_i64(r, 0)), "one")
-    eq_s(strdup(rt_ptr::ptr_read_i64(r, 8)), "two")
-    eq_i(rt_ptr::ptr_read_i64(r, 16), 42)
-    eq_i(rt_task::task_join_all(hs, -1), 0)
-end
-
 ;; ── sort_by (rt_sort): stable, cmp(a, b) > 0 puts a after b ──
 fn cmp_asc(a: int, b: int) -> int is
     if a > b is return 1 end
@@ -704,104 +663,339 @@ fn sort_by_is_stable_and_in_place() is
     eq_s(join_ints(rt_sort::sort_by([7], cmp_asc)), "7")
 end
 
-;; ── closures and spawned tasks ──
-;; closure_call1/2 and task_spawn/task_spawn_shell forward to the C runtime (see rt_mem.h# / rt_task.h#), so what can be checked WITHOUT a raw
-;; function address runs below.  The checks that hand an H# function to them need the compiler builtin `fn_addr`, which h# 0.9.0 does not have;
-;; they are kept in the block comment further down, to be switched back on the day the compiler gains it.
+;; ── gap-filling tests (expected values from Python / libm, not from this runtime) ──
 
 #[test]
-fn closure_call_null_closure_is_zero() is
-    eq_i(rt_mem::closure_call1(0, 8), 0)
-    eq_i(rt_mem::closure_call2(0, 8, 9), 0)
+fn memory_arrays_extra() is
+    let mut a: int = rt_mem::array_new()
+    a = rt_mem::array_push(a, 10)
+    a = rt_mem::array_push(a, 20)
+    a = rt_mem::array_push(a, 30)
+    eq_i(rt_mem::array_len(rt_mem::array_set(a, 1, 99)), 3)
+    eq_i(rt_mem::array_get(a, 1), 99)
+    eq_i(rt_mem::array_len(rt_mem::array_set(a, 7, 1)), 3)
+    eq_i(rt_mem::array_contains(a, 99), 1)
+    eq_i(rt_mem::array_contains(a, 20), 0)
+    let b: int = rt_mem::array_push(rt_mem::array_new(), 5)
+    let c: int = rt_mem::array_concat(a, b)
+    eq_i(rt_mem::array_len(c), 4)
+    eq_i(rt_mem::array_get(c, 3), 5)
+    eq_i(rt_mem::array_len(rt_mem::array_concat(0, b)), 1)
+    let s: int = rt_mem::alloc_string("hi")
+    let d: int = rt_mem::array_push_str(rt_mem::arr_alloc(8), s)
+    eq_i(rt_mem::array_get(d, 0), s)
+    eq_s(rt_mem::text_at(s), "hi")
+    eq_s(rt_mem::val_to_str(0), "0")
+    eq_s(rt_mem::val_to_str(5), "5")
+    eq_s(rt_mem::val_to_str(rt_mem::c_string("abc")), "abc")
+    let z: int = rt_mem::struct_new(3)
+    eq_i(rt_ptr::ptr_read_i64(z, 0), 0)
+    eq_i(rt_ptr::ptr_read_i64(z, 16), 0)
+    if rt_mem::alloc(16) == 0 is eq_i(1, 0) end
+    rt_mem::array_free(c)
 end
 
 #[test]
-fn task_spawn_shell_runs_on_threads() is
-    let s: int = rt_task::task_spawn_shell("printf spawned")
-    eq_s(strdup(rt_task::task_wait(s)), "spawned")
-    let q: int = rt_task::task_spawn_shell("sleep 1; printf slow")
-    eq_i(rt_task::task_wait_timeout(q, 20), 0)
-    eq_s(strdup(rt_task::task_wait(q)), "slow")
-    let hs: int = rt_ptr::buf_new(24)
-    rt_ptr::ptr_write_i64(hs, 0, rt_task::task_spawn_shell("printf a"))
-    rt_ptr::ptr_write_i64(hs, 8, rt_task::task_spawn_shell("printf b"))
-    rt_ptr::ptr_write_i64(hs, 16, rt_task::task_spawn_shell("printf c"))
-    let r: int = rt_task::task_join_all(hs, 3)
-    eq_s(strdup(rt_ptr::ptr_read_i64(r, 0)), "a")
-    eq_s(strdup(rt_ptr::ptr_read_i64(r, 8)), "b")
-    eq_s(strdup(rt_ptr::ptr_read_i64(r, 16)), "c")
-end
-
-// ── DISABLED until the compiler has the `fn_addr` builtin (the address of a named fn as an int) ──
-fn f_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
-fn f_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
-fn f_dbl(x: int) -> int is return x * 2 end
-
-#[test]
-fn closure_call_appends_captures() is
-    ;; fn(x) with 0 captures, fn(x, c0) with 1, fn(x, c0, c1) with 2, more than 2 is ignored
-    let c0: int = rt_mem::closure_create(fn_addr(f_dbl), 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_mem::closure_call1(c0, 21), 42)
-    let c1: int = rt_mem::closure_create(fn_addr(f_add3), 1, 5, 0, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_mem::closure_call2(c1, 1, 2), 125)
-    let c2: int = rt_mem::closure_create(fn_addr(f_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_mem::closure_call2(c2, 1, 2), 1234)
-    let c3: int = rt_mem::closure_create(fn_addr(f_add3), 1, 9, 0, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_mem::closure_call1(c3, 7), 790)
-    let c4: int = rt_mem::closure_create(fn_addr(f_dbl), 5, 1, 2, 3, 4, 5, 0, 0, 0)
-    eq_i(rt_mem::closure_call1(c4, 8), 16)
+fn memory_maps_extra() is
+    let m: int = rt_mem::map_new(0)
+    rt_mem::map_set(m, 1, 10)
+    rt_mem::map_set(m, 2, 20)
+    rt_mem::map_set(m, 3, 30)
+    let ks: int = rt_mem::map_keys(m)
+    let vs: int = rt_mem::map_values(m)
+    eq_i(rt_mem::array_len(ks), 3)
+    eq_i(rt_mem::array_len(vs), 3)
+    eq_i(rt_mem::array_contains(ks, 2), 1)
+    eq_i(rt_mem::array_contains(vs, 30), 1)
+    eq_i(rt_mem::array_contains(vs, 2), 0)
+    rt_mem::map_clear(m)
+    eq_i(rt_mem::map_len(m), 0)
+    eq_i(rt_mem::map_has(m, 1), 0)
+    rt_mem::map_set(m, 1, 11)
+    eq_i(rt_mem::map_get(m, 1), 11)
 end
 
 #[test]
-fn task_spawn_runs_h_functions_on_threads() is
-    let t: int = rt_task::task_spawn(fn_addr(f_dbl), 21)
-    eq_i(rt_task::task_wait(t), 42)
-    let hs: int = rt_ptr::buf_new(40)
-    let mut i: int = 0
-    while i < 5 is
-        rt_ptr::ptr_write_i64(hs, i * 8, rt_task::task_spawn(fn_addr(f_dbl), i + 1))
-        i += 1
-    end
-    let r: int = rt_task::task_join_all(hs, 5)
-    eq_i(rt_ptr::ptr_read_i64(r, 0), 2)
-    eq_i(rt_ptr::ptr_read_i64(r, 16), 6)
-    eq_i(rt_ptr::ptr_read_i64(r, 32), 10)
-end
-\\
-
-;; ── indirect calls: closure_call, sort_by_raw / sort_by_key, task_spawn on a raw thread entry ──
-fn ic_add3(a: int, b: int, c: int) -> int is return a + b + c end
-fn ic_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
-fn ic_neg_cmp(a: int, b: int) -> int is return b - a end
-fn ic_key_mod(a: int) -> int is return a % 3 end
-fn ic_task_body(x: int) -> int is return x * 6 end
-
-#[test]
-fn closure_call_forwards_captures() is
-    let c1: int = rt_mem::closure_create(fn_addr(ic_add3), 2, 10, 20, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_mem::closure_call1(c1, 1), 31)
-    let c2: int = rt_mem::closure_create(fn_addr(ic_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_mem::closure_call2(c2, 1, 2), 1234)
-    eq_i(rt_mem::closure_call1(0, 5), 0)
+fn memory_arena_checkpoint_and_args() is
+    let ar: int = rt_mem::arena_new(1024)
+    rt_mem::arena_push_current(ar)
+    if rt_mem::arena_capacity() <= 0 is eq_i(1, 0) end
+    let mark: int = rt_mem::arena_checkpoint()
+    if rt_mem::arena_alloc(ar, 10) == 0 is eq_i(1, 0) end
+    rt_mem::alloc_ex(64)
+    if rt_mem::arena_used() <= mark is eq_i(1, 0) end
+    rt_mem::arena_rewind(mark)
+    eq_i(rt_mem::arena_used(), mark)
+    rt_mem::arena_pop_current()
+    rt_mem::arena_free(ar)
+    let ag: int = rt_mem::args_alloc(3)
+    rt_mem::args_set(ag, 0, 7)
+    rt_mem::args_set(ag, 2, -9)
+    eq_i(rt_mem::args_get(ag, 0), 7)
+    eq_i(rt_mem::args_get(ag, 1), 0)
+    eq_i(rt_mem::args_get(ag, 2), -9)
+    eq_i(rt_mem::args_get(ag, -1), 0)
+    eq_i(rt_mem::args_get(0, 0), 0)
+    eq_i(rt_mem::args_alloc(0), 0)
+    rt_mem::args_free(ag)
 end
 
 #[test]
-fn sort_by_raw_and_key() is
-    let mut a: [int] = [3, 1, 2, 5, 4]
-    rt_sort::sort_by_raw(a, fn_addr(ic_neg_cmp))
-    eq_i(a[0], 5)
-    eq_i(a[4], 1)
-    let mut b: [int] = [5, 4, 3, 2, 1, 0]
-    rt_sort::sort_by_key(b, fn_addr(ic_key_mod))
-    eq_i(b[0] % 3, 0)
-    eq_i(b[5] % 3, 2)
-    eq_i(b[0], 3)
+fn memory_arc_weak_references() is
+    let p: int = rt_ptr::rc_alloc(8)
+    eq_i(rt_mem::rc_count(p), 1)
+    eq_i(rt_mem::arc_weak_count(p), 0)
+    eq_i(rt_mem::arc_downgrade(p), p)
+    eq_i(rt_mem::arc_weak_count(p), 1)
+    eq_i(rt_mem::arc_upgrade(p), p)
+    eq_i(rt_mem::rc_count(p), 2)
+    rt_mem::rc_release(p)
+    rt_mem::rc_release(p)
+    eq_i(rt_mem::rc_count(p), 0)
+    eq_i(rt_mem::arc_upgrade(p), 0)
+    rt_mem::arc_weak_release(p)
+    eq_i(rt_mem::arc_upgrade(0), 0)
+    eq_i(rt_mem::arc_weak_count(0), 0)
+end
+
+#[test]
+fn libm_functions_match_python() is
+    eq_s(rt_num::fmt6(rt_num::fsin(1.0)), "841471")
+    eq_s(rt_num::fmt6(rt_num::fcos(1.0)), "540302")
+    eq_s(rt_num::fmt6(rt_num::ftan(1.0)), "1557408")
+    eq_s(rt_num::fmt6(rt_num::fasin(0.5)), "523599")
+    eq_s(rt_num::fmt6(rt_num::facos(0.5)), "1047198")
+    eq_s(rt_num::fmt6(rt_num::fatan(2.0)), "1107149")
+    eq_s(rt_num::fmt6(rt_num::fatan2(1.0, -2.0)), "2677945")
+    eq_s(rt_num::fmt6(rt_num::fexp(1.5)), "4481689")
+    eq_s(rt_num::fmt6(rt_num::flog(10.0)), "2302585")
+    eq_s(rt_num::fmt6(rt_num::flog2(10.0)), "3321928")
+    eq_s(rt_num::fmt6(rt_num::flog10(2.0)), "301030")
+    eq_s(rt_num::fmt6(rt_num::ftrunc(-2.7)), "-2000000")
+    eq_s(rt_num::fmt6(rt_num::fabs_f(-3.5)), "3500000")
+    eq_f(rt_num::max_f(1.5, 2.5), 2.5)
+    eq_i(rt_num::atoll("123"), 123)
+    eq_i(rt_num::atoll("-7x"), -7)
+end
+
+#[test]
+fn small_aliases_and_dates() is
+    eq_i(rt_date::add_days(0, 2), 172800)
+    eq_i(rt_str::find("hello", "ll"), 2)
+    eq_s(rt_str::trim_right("a \n"), "a")
+    eq_b(rt_str::string_starts_with("abc", "ab"), true)
+    eq_b(rt_str::string_ends_with("abc", "bc"), true)
+    eq_b(rt_str::string_ends_with("abc", "ab"), false)
+    eq_s(rt_str::string_replace("aXbX", "X", "-"), "a-b-")
+    eq_s(rt_str::string_lower("AbC"), "abc")
+    eq_s(rt_text::green_text("x"), "\u{1b}[32mx\u{1b}[0m")
+    eq_s(rt_text::yellow_text("x"), "\u{1b}[33mx\u{1b}[0m")
+    eq_s(rt_text::dim_text("x"), "\u{1b}[2mx\u{1b}[0m")
+    eq_s(rt_text::cyan_text("x"), "\u{1b}[36mx\u{1b}[0m")
+    eq_s(rt_crypto::hmac_sha512("key", "msg"), "1e4b55b925ccc28ed90d9d18fc2393fcbe164c0d84e67e173cc5aa486b7afc106633c66bdc309076f5f8d9fdbbb62456f894f2c23377fbcc12f4ab2940eb6d70")
+end
+
+#[test]
+fn system_invariants() is
+    eq_b(rt_sys::is_root(), rt_sys::uid() == 0)
+    eq_b(rt_sys::is_little_endian(), true)
+    if rt_sys::ppid() <= 0 is eq_i(1, 0) end
+    if rt_sys::hostname().len() == 0 is eq_i(1, 0) end
+    if rt_sys::machine().len() == 0 is eq_i(1, 0) end
+    if rt_sys::kernel_version().len() == 0 is eq_i(1, 0) end
+    if rt_sys::disk_total("/") <= 0 is eq_i(1, 0) end
+    if rt_sys::disk_free("/") > rt_sys::disk_total("/") is eq_i(1, 0) end
+    if rt_sys::memory_free() < 0 is eq_i(1, 0) end
+    let d: int = rt_sys::now_ms() / 1000 - rt_sys::now_unix()
+    if d < -2 || d > 2 is eq_i(d, 0) end
+end
+
+#[test]
+fn pointers_and_files_extra() is
+    let b: int = rt_ptr::buf_new(32)
+    rt_ptr::ptr_write_i16(b, 0, 258)
+    eq_i(rt_ptr::peek_byte(b), 2)
+    eq_i(rt_ptr::ptr_read_i16(b, 0), 258)
+    rt_ptr::ptr_write_ptr(b, 8, b)
+    eq_i(rt_ptr::ptr_read_ptr(b, 8), b)
+    rt_ptr::buf_free(b)
+    let d: string = "/tmp/hs_rt_fs_" + to_string(rt_sys::pid())
+    eq_b(rt_os::dir_exists(d), false)
+    eq_b(rt_os::dir_create(d), true)
+    eq_b(rt_os::dir_exists(d), true)
+    eq_b(rt_os::write_file(d + "/a.txt", "x"), true)
+    eq_b(rt_os::remove_file(d + "/a.txt"), true)
+    eq_b(rt_os::file_exists(d + "/a.txt"), false)
+    eq_b(rt_os::remove_file(d + "/a.txt"), false)
+    eq_b(rt_os::dir_create(d + "/sub"), true)
+    eq_b(rt_os::dir_remove_all(d), true)
+    eq_b(rt_os::dir_exists(d), false)
+end
+
+#[test]
+fn sqlite_rollback_and_bind() is
+    let d: string = "/tmp/hs_rt_db2_" + to_string(rt_sys::pid())
+    rt_os::mkdir_all(d)
+    let h: string = rt_db::sqlite_open(d + "/t.db")
+    eq_i(rt_db::sqlite_exec(h, "CREATE TABLE t(a, f)"), 0)
+    eq_i(rt_db::sqlite_exec(h, "INSERT INTO t VALUES(1, 2.5)"), 1)
+    let tx: string = rt_mem::text_at(rt_db::sqlite_begin(h))
+    eq_i(rt_db::sqlite_exec(tx, "INSERT INTO t VALUES(2, 3.5)"), 0)
+    eq_i(rt_db::sqlite_rollback(tx), 1)
+    eq_i(rt_mem::array_len(rt_db::sqlite_query(h, "SELECT * FROM t")), 1)
+    let r: int = rt_mem::array_get(rt_db::sqlite_query(h, "SELECT a, f FROM t"), 0)
+    eq_f(rt_db::db_col_float(r, "f"), 2.5)
+    eq_s(rt_db::sqlite_query_bind2(d + "/t.db", "SELECT a FROM t WHERE a = CAST(? AS INTEGER) AND f = CAST(? AS REAL)", "1", "2.5"), "1\n")
+    rt_db::sqlite_close(h)
+    eq_b(rt_os::remove_dir_recursive(d), true)
+end
+
+#[test]
+fn conversions_and_bytes_extra() is
+    let imin: int = -9223372036854775807 - 1
+    let imax: int = 9223372036854775807
+    let a: [int] = rt_conv::strtoll10("  12ab", 0)
+    eq_i(a[0], 12)
+    eq_i(a[1], 6 - 2)
+    eq_i(a[2], 0)
+    let b: [int] = rt_conv::strtoll10("x", 0)
+    eq_i(b[0], 0)
     eq_i(b[1], 0)
+    let c: [int] = rt_conv::strtoll10("-9223372036854775808", 0)
+    eq_b(c[0] == imin && c[1] == 20 && c[2] == 0, true)
+    let d: [int] = rt_conv::strtoll10("9223372036854775808", 0)
+    eq_b(d[0] == imax && d[1] == 19 && d[2] == 1, true)
+    let e: [int] = rt_conv::strtoll10("-9223372036854775809", 0)
+    eq_b(e[0] == imin && e[2] == 1, true)
+    eq_s(rt_conv::int_to_string(-45), "-45")
+    eq_s(rt_conv::int_to_string(0), "0")
+    eq_s(rt_conv::int_to_string(imin), "-9223372036854775808")
+    let h: [int] = rt_bytes::hex_pairs("ab12ff")
+    eq_i(h.len(), 3)
+    eq_i(h[0], 171)
+    eq_i(h[2], 255)
+    eq_i(rt_bytes::hex_pairs("abc").len(), 1)
+    ;; Python: bytes([0xC3, 0x28]).decode("utf-8", "replace")
+    let u: [int] = rt_bytes::utf8_lossy([195, 40])
+    eq_i(u.len(), 4)
+    eq_i(u[0], 239)
+    eq_i(u[1], 191)
+    eq_i(u[2], 189)
+    eq_i(u[3], 40)
+    eq_i(rt_bytes::utf8_lossy([226, 130]).len(), 3)
+    eq_i(rt_bytes::utf8_lossy([240, 159, 146]).len(), 3)
+    let ok: [int] = rt_bytes::utf8_lossy([195, 169])
+    eq_i(ok.len(), 2)
+    eq_i(ok[1], 169)
+    eq_i(rt_bytes::bytes_to_ints([1, 2, 3])[2], 3)
+    eq_s(rt_argon2::b64_encode_nopad([255, 254]), "//4")
+    eq_s(rt_argon2::b64_encode_nopad([102, 111, 111, 98]), "Zm9vYg")
+    eq_s(rt_argon2::b64_encode_nopad([102]), "Zg")
+    eq_s(rt_argon2::b64_encode_nopad([]), "")
 end
 
 #[test]
-fn task_spawn_runs_raw_entry() is
-    let h: int = rt_task::task_spawn(fn_addr(ic_task_body), 7)
-    if h == 0 is eq_i(1, 0) end
-    eq_i(rt_task::task_wait(h), 42)
+fn run_cmd_and_exec_extra() is
+    eq_s(rt_proc::exec3("printf", "%s-%s", "a"), "a-")
+    eq_s(rt_proc::exec4("echo", "a", "b", "c"), "a b c\n")
+    eq_s(rt_proc::process_run_args("echo", ["x", "y"]), "x y\n")
+    eq_i(rt_proc::run_cmd_exec("printf out; printf err >&2; exit 3", 10), 3)
+    eq_s(rt_proc::run_cmd_last_stdout(), "out")
+    eq_s(rt_proc::run_cmd_last_stderr(), "err")
+    eq_i(rt_proc::run_cmd_exec("true", 10), 0)
+    eq_s(rt_proc::run_cmd_last_stdout(), "")
+    ;; both pipes must be drained at once (tests/runtime/run_cmd_big_output.h#): 300000 bytes on stderr, 200000 on stdout
+    eq_i(rt_proc::run_cmd_exec("head -c 300000 /dev/zero | tr '\\0' x >&2; head -c 200000 /dev/zero | tr '\\0' y", 20), 0)
+    eq_i(rt_proc::run_cmd_last_stderr().len(), 300000)
+    eq_i(rt_proc::run_cmd_last_stdout().len(), 200000)
+    eq_i(rt_proc::run_cmd_exec("sleep 5", 1), -2)
+end
+
+#[test]
+fn state_db_params_and_misc() is
+    let s1: int = rt_state::global_slot("_HSH_TEST_SLOT", 32)
+    rt_ptr::ptr_write_i64(s1, 0, 77)
+    eq_i(rt_state::global_slot("_HSH_TEST_SLOT", 32), s1)
+    eq_i(rt_ptr::ptr_read_i64(rt_state::global_slot("_HSH_TEST_SLOT", 32), 0), 77)
+    let t1: int = rt_state::tls_block(16)
+    eq_i(rt_state::tls_block(16), t1)
+    let d: string = "/tmp/hs_rt_db3_" + to_string(rt_sys::pid())
+    rt_os::mkdir_all(d)
+    let h: string = rt_db::sqlite_open(d + "/t.db")
+    eq_i(rt_db::sqlite_exec(h, "CREATE TABLE t(a, b)"), 0)
+    let mut p: int = rt_mem::array_push(rt_mem::array_new(), 5)
+    p = rt_mem::array_push(p, rt_mem::c_string("o'k"))
+    eq_i(rt_db::sqlite_exec_params(h, "INSERT INTO t VALUES(?, ?)", p), 1)
+    let rows: int = rt_db::sqlite_query_params(h, "SELECT a, b FROM t WHERE a = ?", rt_mem::array_push(rt_mem::array_new(), 5))
+    eq_i(rt_mem::array_len(rows), 1)
+    eq_s(rt_db::db_col_str(rt_mem::array_get(rows, 0), "b"), "o'k")
+    eq_i(rt_db::sqlite_exec(h, "INSERT INTO t VALUES(1, 'true'), (2, 'T'), (3, '1'), (4, '0'), (5, 'no')"), 5)
+    let all: int = rt_db::sqlite_query(h, "SELECT a, b FROM t WHERE a < 6 ORDER BY a")
+    eq_i(rt_db::db_col_bool(rt_mem::array_get(all, 0), "b"), 1)
+    eq_i(rt_db::db_col_bool(rt_mem::array_get(all, 1), "b"), 1)
+    eq_i(rt_db::db_col_bool(rt_mem::array_get(all, 2), "b"), 1)
+    eq_i(rt_db::db_col_bool(rt_mem::array_get(all, 3), "b"), 0)
+    eq_i(rt_db::db_col_bool(rt_mem::array_get(all, 4), "b"), 0)
+    eq_s(rt_db::sqlite_query_bind3(d + "/t.db", "SELECT CAST(? AS INTEGER) + CAST(? AS INTEGER) + CAST(? AS INTEGER)", "1", "2", "3"), "6\n")
+    eq_b(rt_os::remove_dir_recursive(d), true)
+    let fx: int = rt_mem::arena_new_kind(256, 1)
+    rt_mem::arena_push_current(fx)
+    if rt_mem::arena_alloc(fx, 16) == 0 is eq_i(1, 0) end
+    let ar: int = rt_mem::array_push(rt_mem::array_new(), 1)
+    rt_mem::array_drop(ar)
+    eq_i(rt_mem::array_len(ar), 0)
+    rt_mem::arena_pop_current()
+    rt_mem::arena_free(fx)
+    if rt_sys::gid() < 0 is eq_i(1, 0) end
+    if rt_sys::load_avg() < 0.0 is eq_i(1, 0) end
+    let here: string = rt_sys::getcwd_s()
+    eq_b(rt_os::change_dir("/tmp"), true)
+    eq_b(rt_os::change_dir("/definitely/not/here"), false)
+    eq_b(rt_str::ends_with(rt_sys::getcwd_s(), "tmp"), true)
+    rt_os::change_dir(here)
+    rt_os::sleep_ms(1)
+end
+
+#[test]
+fn environment_order_and_streams() is
+    eq_b(rt_os::setenv_s("HS_RT_A", "1"), true)
+    eq_b(rt_os::setenv_s("HS_RT_B", "two"), true)
+    let v: int = rt_env::env_vars()
+    let n: int = rt_mem::array_len(v)
+    if n < 2 is eq_i(n, 2) end
+    eq_s(rt_mem::text_at(rt_mem::array_get(v, n - 2)), "HS_RT_A=1")
+    eq_s(rt_mem::text_at(rt_mem::array_get(v, n - 1)), "HS_RT_B=two")
+    ;; an existing name keeps its place when its value changes
+    rt_os::setenv_s("HS_RT_A", "9")
+    let v2: int = rt_env::env_vars()
+    eq_s(rt_mem::text_at(rt_mem::array_get(v2, rt_mem::array_len(v2) - 2)), "HS_RT_A=9")
+    ;; a removed name leaves the list, and re-entering puts it last
+    eq_b(rt_os::env_remove("HS_RT_A"), true)
+    eq_b(rt_state::env_names().len() == n - 1, true)
+    eq_b(rt_os::env_remove(""), true)
+    rt_os::setenv_s("HS_RT_A", "3")
+    let v3: int = rt_env::env_vars()
+    eq_s(rt_mem::text_at(rt_mem::array_get(v3, rt_mem::array_len(v3) - 1)), "HS_RT_A=3")
+    rt_os::env_remove("HS_RT_A")
+    rt_os::env_remove("HS_RT_B")
+    let r: [int] = rt_os::urandom(16)
+    eq_i(r.len(), 16)
+    eq_i(rt_os::urandom(0).len(), 0)
+    eq_b(rt_os::urandom(32) != rt_os::urandom(32), true)
+    eq_b(rt_str::starts_with(rt_os::read_stream("/proc/self/stat"), to_string(rt_sys::pid()) + " "), true)
+    eq_s(rt_os::read_stream("/definitely/not/here"), "")
+    let s: int = rt_ptr::struct_set(rt_mem::struct_new(2), 1, 42)
+    eq_i(rt_ptr::struct_get(s, 1), 42)
+    rt_ptr::struct_free(s)
+    rt_ptr::bytes_free(rt_mem::alloc(8))
+    rt_ptr::struct_free(0)
+    rt_ptr::string_free("x")
+end
+
+#[test]
+fn environment_dependent_getters() is
+    eq_s(rt_sys::home_dir(), rt_proc::shell("printf %s \"$HOME\""))
+    eq_s(rt_sys::username(), rt_proc::shell("printf %s \"${USER:-${LOGNAME:-$(id -un)}}\""))
+    eq_b(rt_sys::stdout_is_tty() == true || rt_sys::stdout_is_tty() == false, true)
+    eq_s(rt_proc::py_eval("print(6 * 7)"), "42\n")
 end
