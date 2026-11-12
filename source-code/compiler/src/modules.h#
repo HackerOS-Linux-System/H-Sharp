@@ -223,6 +223,16 @@ end
 
 pub fn resolve_bit_import(r: Resolver, name: string, has_version: bool, version: string, alias: string, dynamic_link: bool, start_dir: string) -> Expanded is
     if dynamic_link is return ex_err(dynamic_bit_msg(name)) end
+    ;; a bit library written in another language (HackerScript ...): bind its `.hlib` C-ABI facade, exactly as
+    ;; `use "hlib -> name"` would — `use "bit -> name"` works for every bit library, whatever language it is in
+    let foreign: string = bit_resolve::foreign_lib_dir(name, start_dir)
+    if foreign != "" is
+        let hx: Expanded = resolve_hlib_import(r, name, has_version, version, alias, start_dir)
+        if !hx.ok && starts_with(hx.err, "hlib '") is
+            return ex_err(hx.err + "\n\n`" + name + "` is a bit library written in another language (" + foreign + "): H# links its compiled C-ABI facade.\nbuild it with:  bit hlib build " + name + "   (needs cargo)")
+        end
+        return hx
+    end
     let u: bit_resolve::UseResult = bit_resolve::resolve_bit_use(name, has_version, version, dynamic_link, start_dir)
     if !u.ok is return ex_err(u.err) end
     let path: string = u.entry
@@ -271,6 +281,19 @@ fn find_hlib_file(name: string, has_version: bool, version: string, start_dir: s
         end
     end
     return "ERR:hlib '" + name + "' not found. Tried:\n" + join_strs(tried, "\n") + "\n\nbuild one with `h# lib build <file.h#> -o hlibs/" + name + ".hlib`, or place a prebuilt archive at one of the paths above."
+end
+
+fn clean_lib_name(n: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n.len() is
+        let c: int = byte_at(n, i)
+        let ok: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45 || c == 46 || c == 43
+        if !ok is break end
+        out = out + str_from_byte(c)
+        i += 1
+    end
+    return out
 end
 
 fn abi_to_type(t: string) -> ast::Node is
@@ -419,7 +442,11 @@ pub fn resolve_hlib_import(r: Resolver, name: string, has_version: bool, version
     let mut out: [ast::Node] = []
     for al in aliases is out.push(al) end
     out.push(ast::nd("Extern", "", [ast::lf("Lang", "Rust"), ast::lf("Link", link), ast::lf("S", lib_file), ast::nd("Fns", "", fns)]))
-    for sl in sys_libs is
+    for sl0 in sys_libs is
+        ;; a `link_libs` entry is a bare library name (`dl`, `unwind`, `c`); older hackerc builds let terminal colour codes
+        ;; ("c\u{1b}[0m") leak into it — keep only the legal characters so the archive still links
+        let sl: string = clean_lib_name(sl0)
+        if sl == "" is continue end
         out.push(ast::nd("Extern", "", [ast::lf("Lang", "Sys"), ast::lf("Link", "Dynamic"), ast::lf("S", sl), ast::nd("Fns", "", [])]))
     end
     return ex_ok(out)
@@ -519,7 +546,68 @@ pub fn expand_program(r: Resolver, module: ast::Node, entry_dir: string) -> Expa
     let ex: Expanded = expand_module(r, module.kids[3].kids, entry_dir)
     if !ex.ok is return ex end
     for it in ex.items is items.push(it) end
-    return ex_ok(items)
+    return ex_ok(prune_facade_externs(items))
+end
+
+;; ── facade pruning ─────────────────────────────────────────────────────────────
+;; `use "hlib -> lib"` / `use "bit -> lib"` of a library built by another language binds EVERY function of the
+;; library's `manifest.exports` (a HackerScript GUI facade: hundreds). The program only ever calls a few of them, so
+;; once all imports are expanded the synthesized facade `extern` blocks are cut down to the functions the rest of the
+;; program actually mentions. Nothing the program names is ever dropped (every node's text counts as a mention, which
+;; can only keep too much, never too little), and `extern` blocks the user wrote by hand are left untouched.
+fn is_facade_extern(it: ast::Node) -> bool is
+    if it.tag != "Extern" || it.kids.len() < 4 is return false end
+    if it.kids[0].text != "Rust" is return false end
+    return contains_sub(it.kids[2].text, "/hlib-cache/")
+end
+
+fn contains_sub(s: string, p: string) -> bool is
+    if p.len() > s.len() is return false end
+    let mut i: int = 0
+    while i + p.len() <= s.len() is
+        if s[i..i + p.len()] == p is return true end
+        i += 1
+    end
+    return false
+end
+
+fn collect_mentions(n: ast::Node, seen: map::Set<string>) is
+    if n.text != "" is seen.add(n.text) end
+    for k in n.kids is collect_mentions(k, seen) end
+end
+
+pub fn prune_facade_externs(items: [ast::Node]) -> [ast::Node] is
+    let mut has_facade: bool = false
+    for it in items is
+        if is_facade_extern(it) is has_facade = true end
+    end
+    if !has_facade is return items end
+    let seen: map::Set<string> = map::Set::new()
+    for it in items is
+        if !is_facade_extern(it) is collect_mentions(it, seen) end
+    end
+    let mut out: [ast::Node] = []
+    let mut dropped: int = 0
+    let mut kept: int = 0
+    for it in items is
+        if is_facade_extern(it) is
+            let mut keep: [ast::Node] = []
+            for f in it.kids[3].kids is
+                if seen.has(f.text) is keep.push(f) else dropped += 1 end
+            end
+            kept += keep.len()
+            if keep.len() > 0 is
+                it.kids[3].kids = keep
+                out.push(it)
+            end
+        else
+            out.push(it)
+        end
+    end
+    if dropped > 0 && env::get("HSHARP_VERBOSE_HLIB") != "" is
+        eprint_mod("  note: hlib facade pruned: " + to_string(kept) + " used function(s) kept, " + to_string(dropped) + " unused dropped\n")
+    end
+    return out
 end
 
 ;; ── `mod X` ─────────────────────────────────────────────────────────────────
