@@ -601,74 +601,57 @@ pub fn manifest_parse(raw: string) -> option::Result<Manifest, string> is
             return option::Result::Err("manifest (de)serialization failed: unknown variant `" + lang + "`, expected one of `hsharp`, `hackerlang`, `hackerscript`")
         end
     end
+    ;; Every array is cut into its elements ONCE (`lsp::json::items`, a single pass) and each element is then read
+    ;; on its own — a few hundred bytes. The previous `lsp::json::get(raw, "exports.<i>.<field>")` per field re-walked
+    ;; and re-copied the WHOLE manifest for every field of every export: a facade with ~1000 exports (a ~270 KB
+    ;; manifest) needed several GB of RAM and was killed by the OOM killer while merely opening the .hlib.
     let mut authors: [string] = []
-    let na: int = lsp::json::array_length(lsp::json::get(raw, "authors"))
-    let mut i: int = 0
-    while i < na is
-        authors.push(lsp::json::get_str(raw, "authors." + to_string(i)))
-        i += 1
+    for a in lsp::json::items(lsp::json::get(raw, "authors")) is
+        authors.push(lsp::json::to_str(a))
     end
     let mut deps: [Dependency] = []
-    let nd: int = lsp::json::array_length(lsp::json::get(raw, "dependencies"))
-    i = 0
-    while i < nd is
-        let b: string = "dependencies." + to_string(i)
-        deps.push(Dependency { name: lsp::json::get_str(raw, b + ".name"), version_req: lsp::json::get_str(raw, b + ".version_req") })
-        i += 1
+    for d in lsp::json::items(lsp::json::get(raw, "dependencies")) is
+        deps.push(Dependency { name: lsp::json::get_str(d, "name"), version_req: lsp::json::get_str(d, "version_req") })
     end
     let mut arts: [Artifact] = []
-    let nr: int = lsp::json::array_length(lsp::json::get(raw, "artifacts"))
-    i = 0
-    while i < nr is
-        let b: string = "artifacts." + to_string(i)
+    for ar in lsp::json::items(lsp::json::get(raw, "artifacts")) is
         let mut ll: [string] = []
-        let nl: int = lsp::json::array_length(lsp::json::get(raw, b + ".link_libs"))
-        let mut k: int = 0
-        while k < nl is
-            ll.push(lsp::json::get_str(raw, b + ".link_libs." + to_string(k)))
-            k += 1
+        for l in lsp::json::items(lsp::json::get(ar, "link_libs")) is
+            ll.push(lsp::json::to_str(l))
         end
         arts.push(Artifact {
             link_libs: ll,
-            path: lsp::json::get_str(raw, b + ".path"),
-            kind: lsp::json::get_str(raw, b + ".kind"),
-            target: str_or(raw, b + ".target", ""),
-            sha256: lsp::json::get_str(raw, b + ".sha256"),
-            size: lsp::json::get_int(raw, b + ".size")
+            path: lsp::json::get_str(ar, "path"),
+            kind: lsp::json::get_str(ar, "kind"),
+            target: str_or(ar, "target", ""),
+            sha256: lsp::json::get_str(ar, "sha256"),
+            size: lsp::json::get_int(ar, "size")
         })
-        i += 1
     end
     let mut exps: [Export] = []
-    let ne: int = lsp::json::array_length(lsp::json::get(raw, "exports"))
-    i = 0
-    while i < ne is
-        let b: string = "exports." + to_string(i)
+    for ex in lsp::json::items(lsp::json::get(raw, "exports")) is
         let mut ps: [string] = []
-        let np: int = lsp::json::array_length(lsp::json::get(raw, b + ".params"))
-        let mut j: int = 0
-        while j < np is
-            let pb: string = b + ".params." + to_string(j)
-            let t: string = lsp::json::get_str(raw, pb + ".type")
-            if t == "opaque" is ps.push("opaque:" + lsp::json::get_str(raw, pb + ".struct_name")) else ps.push(t) end
-            j += 1
+        for p in lsp::json::items(lsp::json::get(ex, "params")) is
+            let t: string = lsp::json::get_str(p, "type")
+            if t == "opaque" is ps.push("opaque:" + lsp::json::get_str(p, "struct_name")) else ps.push(t) end
         end
         let mut ret: string = ""
-        if lsp::json::get(raw, b + ".returns") != "" is
-            ret = lsp::json::get_str(raw, b + ".returns.type")
-            if ret == "opaque" is ret = "opaque:" + lsp::json::get_str(raw, b + ".returns.struct_name") end
+        let rv: string = lsp::json::get(ex, "returns")
+        if rv != "" is
+            ret = lsp::json::get_str(rv, "type")
+            if ret == "opaque" is ret = "opaque:" + lsp::json::get_str(rv, "struct_name") end
         end
         exps.push(Export {
-            name: lsp::json::get_str(raw, b + ".name"),
-            kind: lsp::json::get_str(raw, b + ".kind"),
-            signature: lsp::json::get_str(raw, b + ".signature"),
+            name: lsp::json::get_str(ex, "name"),
+            kind: lsp::json::get_str(ex, "kind"),
+            signature: lsp::json::get_str(ex, "signature"),
             params: ps,
             returns: ret,
-            generic: lsp::json::get_bool(raw, b + ".generic"),
-            is_macro: lsp::json::get_bool(raw, b + ".is_macro"),
-            api: str_or(raw, b + ".api", ""),
-            owner: str_or(raw, b + ".owner", "")
+            generic: lsp::json::get_bool(ex, "generic"),
+            is_macro: lsp::json::get_bool(ex, "is_macro"),
+            api: str_or(ex, "api", ""),
+            owner: str_or(ex, "owner", "")
         })
-        i += 1
     end
     let has_sig: bool = lsp::json::get(raw, "signature") != ""
     let m: Manifest = Manifest {
