@@ -1119,6 +1119,11 @@ pub fn resolve_bit_use(name: string, has_version: bool, version: string, dynamic
     if !valid_lib_name(name) is return use_err(invalid_name_message(name)) end
     let lock: LockTable = read_bit_lock()
     if dynamic_link && !lock_has(lock, name) is return use_err(not_locked_message(name)) end
+    ;; a bit library written in another language is imported through its `.hlib` C-ABI facade (see foreign_lib_dir)
+    if !dynamic_link is
+        let fg: string = foreign_lib_dir(name, start_dir)
+        if fg != "" is return UseResult { ok: true, entry: pjoin(fg, name + ".hlib"), err: "" } end
+    end
     let f: FindResult = find_bit_lib(name, start_dir)
     if !f.ok is
         if f.err_kind == "NotFound" is return use_err(missing_message(name, f.tried)) end
@@ -1140,6 +1145,30 @@ pub fn resolve_bit_use(name: string, has_version: bool, version: string, dynamic
         end
     end
     return UseResult { ok: true, entry: f.entry, err: "" }
+end
+
+fn hk_lang_text(hk: [HkEntry]) -> string is
+    let mut raw: string = hk_get(hk, "package", "lang")
+    if raw == "" is raw = hk_get(hk, "project", "lang") end
+    if raw == "" is raw = hk_get(hk, "build", "lang") end
+    return raw
+end
+
+;; `use "bit -> name"` where `name` is an installed bit library written in ANOTHER HackerOS language (its Bit.hk says
+;; `lang => HackerScript`, there is no H# entry point): returns that library's directory, "" for everything else.
+;; H# cannot read its sources — it links the C-ABI facade shipped in the library's `.hlib` instead.
+pub fn foreign_lib_dir(name: string, start_dir: string) -> string is
+    if !valid_lib_name(name) is return "" end
+    for dir in bit_lib_candidates(name, start_dir) is
+        if !fs::is_dir(dir) is continue end
+        if manifest_in(dir) == "" is continue end
+        let hk: [HkEntry] = load_hk(dir)
+        if hk_lang_text(hk) == "" is continue end
+        if hk_lang_includes_hsharp(hk) is continue end
+        if lib_dir_entry(dir, name) != "" is continue end
+        return dir
+    end
+    return ""
 end
 
 pub fn find_bit_lib_entry(name: string, start_dir: string) -> string is
