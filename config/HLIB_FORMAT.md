@@ -116,3 +116,19 @@ All three toolchains implement §§1–4 (the container/manifest/checksum/signat
 - H#'s own compiler is expected to move to a self-hosted (H#-in-H#) implementation over time; keeping its `.hlib` module (`source-code/hlib/`) small and dependency-isolated means that eventual rewrite doesn't ripple into Hacker Lang or HackerScript.
 
 If you're fixing a bug in one language's copy, check whether the same bug exists in the other two — they started from the same design but are not kept in sync automatically.
+
+## 10. Which functions a library exposes (facade selection)
+
+A library written in another language reaches H# through a C-ABI **facade** inside its `.hlib`.
+
+- **Producer (HackerScript).** `hackerc hlib build --ffi` exports every `pub fun` of the library. If the library has no
+  `pub fun` at all, *everything* is exported (the pre-0.7 behaviour). `--ffi-api a,b,c` states the list explicitly and
+  wins over `pub`. With a list, only those free functions are exported, and a struct/enum gets accessors only when it
+  occurs in the signature of an exported function — this is what keeps a GUI library from exporting ~1000 internals.
+- **Consumer (H#).** `use "hlib -> name"` and `use "bit -> name"` are equivalent for a bit library written in another
+  language (its `Bit.hk` has `lang => HackerScript`): H# binds the `.hlib` facade. After all imports are expanded, the
+  synthesized `extern` block is pruned to the functions the program actually mentions; set `HSHARP_VERBOSE_HLIB=1` to see
+  the counts.
+- **Reading the manifest** is linear in its size (each array is split once). A manifest with thousands of exports
+  used to exhaust RAM; keep it that way.
+- `link_libs` entries are bare library names (`dl`, `c`); H# ignores anything after the first illegal character.
