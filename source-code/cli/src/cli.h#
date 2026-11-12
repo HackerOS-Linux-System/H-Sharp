@@ -510,6 +510,7 @@ fn kind_debug(k: string) -> string is
     if k == "bytecode" is return "Bytecode" end
     if k == "ast" is return "Ast" end
     if k == "header" is return "Header" end
+    if k == "static_lib" is return "StaticLib" end
     return "Extra"
 end
 
