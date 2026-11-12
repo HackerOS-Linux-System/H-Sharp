@@ -1,0 +1,46 @@
+use "std -> test" from "test"
+use "std -> strbuf" from "strbuf"
+use "workspace -> hlib" from "lib -> *"
+
+;; Regression: `hlib::manifest_parse` used to re-parse (and re-copy) the WHOLE manifest for every field of every
+;; export. A HackerScript GUI facade (~1000 exports, ~270 KB of JSON) then needed several GB of RAM and the
+;; compiler was killed by the OOM killer while merely opening the .hlib. It must stay (roughly) linear.
+
+fn big_manifest(n: int) -> string is
+    let mut sb = strbuf::new()
+    sb.push("{\"hlib_spec_version\":1,\"name\":\"gui\",\"version\":\"0.1\",\"language\":\"hackerscript\",\"abi_version\":2,")
+    sb.push("\"created_at\":\"2026-11-11T20:06:57Z\",\"artifacts\":[{\"path\":\"ast/gui.hcs\",\"kind\":\"ast\",\"sha256\":\"aa\",\"size\":3},")
+    sb.push("{\"path\":\"native/x86_64-unknown-linux-musl/libgui.a\",\"kind\":\"static_lib\",\"target\":\"x86_64-unknown-linux-musl\",\"sha256\":\"bb\",\"size\":9,\"link_libs\":[\"dl\",\"unwind\",\"c\"]}],")
+    sb.push("\"exports\":[")
+    let mut i: int = 0
+    while i < n is
+        if i > 0 is sb.push(",") end
+        sb.push("{\"name\":\"f" + to_string(i) + "\",\"kind\":\"function\",\"signature\":\"fun f" + to_string(i) + "(Int, Str) -> Str\",")
+        sb.push("\"params\":[{\"type\":\"i64\"},{\"type\":\"cstr\"},{\"type\":\"opaque\",\"struct_name\":\"Box\"}],\"returns\":{\"type\":\"cstr\"},")
+        sb.push("\"generic\":false,\"is_macro\":false,\"api\":\"hksffi_gui_f" + to_string(i) + "\"}")
+        i += 1
+    end
+    sb.push("]}")
+    return sb.build()
+end
+
+#[test]
+fn test_manifest_with_many_exports_parses_fast_and_correctly() is
+    let n: int = 1500
+    match hlib::manifest_parse(big_manifest(n)) is
+        option::Result::Ok(m) => is
+            assert_eq(m.exports.len(), n)
+            assert_eq(m.exports[0].name, "f0")
+            assert_eq(m.exports[n - 1].name, "f" + to_string(n - 1))
+            assert_eq(m.exports[7].api, "hksffi_gui_f7")
+            assert_eq(m.exports[7].params.len(), 3)
+            assert_eq(m.exports[7].params[2], "opaque:Box")
+            assert_eq(m.exports[7].returns, "cstr")
+            assert_eq(m.artifacts.len(), 2)
+            assert_eq(m.artifacts[1].kind, "static_lib")
+            assert_eq(m.artifacts[1].link_libs.len(), 3)
+            assert_eq(m.artifacts[1].link_libs[2], "c")
+        end
+        option::Result::Err(e) => is assert_eq(e, "") end
+    end
+end
