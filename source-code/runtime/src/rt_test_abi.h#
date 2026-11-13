@@ -1,0 +1,176 @@
+use "std -> test" from "test"
+
+mod rt_abi
+mod rt_mem
+
+;; rt_test_abi — the exact-C-name facade (rt_abi.h#) must behave like the C symbols it stands for (core.c / async_rt.c).
+;; Expected values below are what core.c returns for the same inputs.
+
+fn eq_s(actual: string, expected: string) is
+    if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
+end
+
+fn eq_i(actual: int, expected: int) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+#[test]
+fn abi_strings() is
+    eq_s(rt_abi::hsh_trim("  a b \t"), "a b")
+    eq_s(rt_abi::hsh_trim_start("  x "), "x ")
+    eq_s(rt_abi::hsh_trim_end(" x  "), " x")
+    eq_s(rt_abi::hsh_to_upper("abC1"), "ABC1")
+    eq_s(rt_abi::hsh_to_lower("AbC1"), "abc1")
+    eq_i(rt_abi::hsh_str_contains("hello world", "o w"), 1)
+    eq_i(rt_abi::hsh_str_contains("hello", "xyz"), 0)
+    eq_i(rt_abi::hsh_str_index_of("hello", "ll"), 2)
+    eq_i(rt_abi::hsh_str_index_of("hello", "zz"), -1)
+    eq_s(rt_abi::hsh_str_replace("a-b-c", "-", "+"), "a+b+c")
+    eq_i(rt_abi::hsh_starts_with("prefix.x", "prefix"), 1)
+    eq_i(rt_abi::hsh_ends_with("a.txt", ".txt"), 1)
+    eq_i(rt_abi::hsh_ends_with("a.txt", ".md"), 0)
+    eq_s(rt_abi::hsh_substr("abcdef", 1, 4), "bcd")
+    eq_i(rt_abi::hsh_strlen("héllo"), 6)
+    eq_s(rt_abi::hsh_strcat("ab", "cd"), "abcd")
+    eq_s(rt_abi::hsh_int_to_string(-42), "-42")
+    eq_i(rt_abi::hsh_atoll("  17xyz"), 17)
+end
+
+#[test]
+fn abi_math() is
+    eq_i(rt_abi::hsh_abs_i(-5), 5)
+    eq_i(rt_abi::hsh_min_i(3, 9), 3)
+    eq_i(rt_abi::hsh_max_i(3, 9), 9)
+    eq_i(rt_abi::hsh_floor(2.7) as int, 2)
+    eq_i(rt_abi::hsh_ceil(2.1) as int, 3)
+    eq_i(rt_abi::hsh_math_round(2.5) as int, 3)
+    eq_i(rt_abi::hsh_math_round(-2.5) as int, -3)
+    eq_i(rt_abi::hsh_math_trunc(-2.9) as int, -2)
+    eq_i(rt_abi::hsh_sqrt(144.0) as int, 12)
+    eq_i(rt_abi::hsh_pow(2.0, 10.0) as int, 1024)
+    eq_i((rt_abi::hsh_math_exp(0.0) * 1000.0) as int, 1000)
+    eq_i(rt_abi::hsh_math_log2(1024.0) as int, 10)
+    eq_i(rt_abi::hsh_math_log10(1000.0) as int, 3)
+    eq_i((rt_abi::hsh_math_atan2(1.0, 1.0) * 1000000.0) as int, 785398)
+    eq_i((rt_abi::hsh_math_acos(1.0) * 1000.0) as int, 0)
+    eq_i((rt_abi::hsh_abs_f(-1.5) * 10.0) as int, 15)
+    eq_i((rt_abi::hsh_atof("2.25e1") * 10.0) as int, 225)
+end
+
+#[test]
+fn abi_crypto_and_codec() is
+    eq_s(rt_abi::hsh_crypto_sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    eq_s(rt_abi::hsh_crypto_sha1("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    eq_s(rt_abi::hsh_crypto_md5("abc"), "900150983cd24fb0d6963f7d28e17f72")
+    eq_s(rt_abi::hsh_hex_encode("AB"), "4142")
+    eq_s(rt_abi::hsh_hex_decode("4142"), "AB")
+    eq_s(rt_abi::hsh_base64_encode("Man"), "TWFu")
+    eq_s(rt_abi::hsh_base64_decode("TWFu"), "Man")
+    eq_s(rt_abi::hsh_url_encode("a b&c"), "a%20b%26c")
+    eq_s(rt_abi::hsh_url_decode("a%20b%26c"), "a b&c")
+end
+
+#[test]
+fn abi_paths_and_env() is
+    eq_s(rt_abi::hsh_path_join("a", "b.txt"), "a/b.txt")
+    eq_s(rt_abi::hsh_path_filename("/x/y/z.tar"), "z.tar")
+    eq_s(rt_abi::hsh_path_extension("/x/y/z.tar"), "tar")
+    eq_s(rt_abi::hsh_path_parent("/x/y/z.tar"), "/x/y")
+    eq_i(rt_abi::hsh_path_is_absolute("/x"), 1)
+    eq_i(rt_abi::hsh_path_is_absolute("x"), 0)
+    eq_i(rt_abi::hsh_setenv("HSH_ABI_T", "v1"), 1)
+    eq_s(rt_abi::hsh_getenv("HSH_ABI_T"), "v1")
+    eq_i(rt_abi::hsh_env_remove("HSH_ABI_T"), 1)
+    eq_s(rt_abi::hsh_getenv("HSH_ABI_T"), "")
+    eq_s(rt_abi::hsh_env_home(), rt_abi::hsh_getenv("HOME"))
+end
+
+#[test]
+fn abi_files() is
+    let dir: string = "/tmp/hsh_abi_test_dir"
+    rt_abi::hsh_remove_dir_recursive(dir)
+    eq_i(rt_abi::hsh_dir_create(dir), 1)
+    eq_i(rt_abi::hsh_is_dir(dir), 1)
+    let f: string = dir + "/a.txt"
+    eq_i(rt_abi::hsh_write_file(f, "hello"), 1)
+    eq_i(rt_abi::hsh_file_exists(f), 1)
+    eq_i(rt_abi::hsh_file_size(f), 5)
+    eq_i(rt_abi::hsh_append_file(f, "!"), 1)
+    eq_s(rt_abi::hsh_read_file(f), "hello!")
+    eq_i(rt_abi::hsh_rename(f, dir + "/b.txt"), 1)
+    eq_i(rt_abi::hsh_file_exists(f), 0)
+    eq_i(rt_abi::hsh_rename(f, dir + "/c.txt"), 0)
+    eq_i(rt_abi::hsh_chdir(dir), 1)
+    eq_s(rt_abi::hsh_getcwd(), dir)
+    eq_i(rt_abi::hsh_chdir("/definitely/not/here"), 0)
+    eq_i(rt_abi::hsh_chdir("/tmp"), 1)
+    rt_abi::hsh_remove_dir_recursive(dir)
+    eq_i(rt_abi::hsh_is_dir(dir), 0)
+end
+
+#[test]
+fn abi_system_and_dates() is
+    eq_i(rt_abi::hsh_getpid(), rt_abi::hsh_proc_id())
+    eq_i(rt_abi::hsh_sys_get_uid(), rt_abi::hsh_sys_get_uid())
+    eq_s(rt_abi::hsh_sys_sysname(), "Linux")
+    eq_i(rt_abi::hsh_sys_is_64bit(), 1)
+    eq_i(rt_abi::hsh_sys_is_little_endian(), 1)
+    eq_i(rt_abi::hsh_date_year(0), 1970)
+    eq_i(rt_abi::hsh_date_month(86400 * 31), 2)
+    eq_i(rt_abi::hsh_date_day(86400 * 31), 1)
+    eq_i(rt_abi::hsh_date_add_days(0, 2), 172800)
+    eq_i(rt_abi::hsh_date_add_hours(0, 2), 7200)
+    eq_i(rt_abi::hsh_date_diff_days(172800, 0), 2)
+    eq_s(rt_abi::hsh_date_weekday(0), "Thu")
+end
+
+#[test]
+fn abi_memory_and_maps() is
+    let a: int = rt_abi::hsh_array_new()
+    rt_abi::hsh_array_push(a, 10)
+    rt_abi::hsh_array_push(a, 20)
+    eq_i(rt_abi::hsh_array_len(a), 2)
+    eq_i(rt_abi::hsh_array_get(a, 1), 20)
+    eq_i(rt_abi::hsh_array_get(a, 9), 0)
+    rt_abi::hsh_array_set(a, 0, 7)
+    eq_i(rt_abi::hsh_array_get(a, 0), 7)
+    eq_i(rt_abi::hsh_array_contains(a, 20), 1)
+    let sa: int = rt_abi::hsh_array_new()
+    rt_abi::hsh_array_push_str(sa, "hi")
+    eq_i(rt_abi::hsh_array_len(sa), 1)
+    eq_s(rt_mem::text_at(rt_abi::hsh_array_get(sa, 0)), "hi")
+    let m: int = rt_abi::hsh_map_new(0)
+    rt_abi::hsh_map_set(m, 1, 10)
+    rt_abi::hsh_map_set(m, 2, 20)
+    rt_abi::hsh_map_set(m, 1, 11)
+    eq_i(rt_abi::hsh_map_len(m), 2)
+    eq_i(rt_abi::hsh_map_get(m, 1), 11)
+    eq_i(rt_abi::hsh_map_has(m, 3), 0)
+    eq_i(rt_abi::hsh_map_remove(m, 2), 1)
+    eq_i(rt_abi::hsh_map_len(m), 1)
+    let p: int = rt_abi::hsh_rc_alloc(16)
+    eq_i(rt_abi::hsh_rc_count(p), 1)
+    rt_abi::hsh_rc_retain(p)
+    eq_i(rt_abi::hsh_rc_count(p), 2)
+    let q: int = rt_abi::hsh_rc_alloc(32)
+    eq_i(rt_abi::hsh_ptr_alloc_size(q), 32)
+    rt_abi::hsh_ptr_write_i32(q, 4, -7)
+    eq_i(rt_abi::hsh_ptr_read_i32(q, 4), -7)
+    rt_abi::hsh_ptr_write_i16(q, 8, 513)
+    eq_i(rt_abi::hsh_ptr_read_i16(q, 8), 513)
+    rt_abi::hsh_ptr_write_i64(q, 16, 123456789012)
+    eq_i(rt_abi::hsh_ptr_read_i64(q, 16), 123456789012)
+end
+
+#[test]
+fn abi_text_and_misc() is
+    eq_s(rt_abi::hsh_bold("x"), "\u{1b}[1mx\u{1b}[0m")
+    eq_s(rt_abi::hsh_red_text("a"), "\u{1b}[31ma\u{1b}[0m")
+    eq_s(rt_abi::hsh_green_text("a"), "\u{1b}[32ma\u{1b}[0m")
+    eq_i(rt_abi::hsh_uuid_is_valid("123e4567-e89b-12d3-a456-426614174000"), 1)
+    eq_i(rt_abi::hsh_uuid_is_valid("nope"), 0)
+    eq_i(rt_abi::hsh_str_to_int("  42x"), 42)
+    eq_s(rt_abi::hsh_conv_int_to_hex(255), "ff")
+    eq_i(rt_abi::hsh_regex_match("^a.c$", "abc"), 1)
+    eq_s(rt_abi::hsh_regex_replace("[0-9]+", "#", "a1b22"), "a#b#")
+end
