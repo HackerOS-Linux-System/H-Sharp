@@ -1,0 +1,77 @@
+use "std -> test" from "test"
+
+mod rt_abi
+mod rt_abi_arrays
+mod rt_abi_indirect
+mod rt_mem
+mod rt_ptr
+
+;; rt_test_abi_indirect — the C-name wrappers that need a raw function address (rt_abi_indirect.h#): closures, threads, comparators.
+;; Self-hosted compiler only (fn_addr / call_ptr*).
+
+fn eq_s(actual: string, expected: string) is
+    if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
+end
+
+fn eq_i(actual: int, expected: int) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+fn f_dbl(x: int) -> int is return x * 2 end
+fn f_add2(a: int, b: int) -> int is return a * 10 + b end
+fn f_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
+;; cmp(a, b) > 0 means a goes after b
+fn cmp_desc(a: int, b: int) -> int is return b - a end
+fn cmp_asc(a: int, b: int) -> int is return a - b end
+fn key_neg(x: int) -> int is return 0 - x end
+
+fn ints3(a: int, b: int, c: int) -> int is
+    let r: int = rt_abi::hsh_array_new()
+    rt_abi::hsh_array_push(r, a)
+    rt_abi::hsh_array_push(r, b)
+    rt_abi::hsh_array_push(r, c)
+    return r
+end
+
+#[test]
+fn abi_closure_calls() is
+    let c0: int = rt_mem::closure_create(fn_addr(f_dbl), 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_abi_indirect::hsh_closure_call1(c0, 21), 42)
+    let c1: int = rt_mem::closure_create(fn_addr(f_add3), 1, 5, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_abi_indirect::hsh_closure_call2(c1, 1, 2), 125)
+    let c2: int = rt_mem::closure_create(fn_addr(f_add2), 1, 9, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_abi_indirect::hsh_closure_call1(c2, 7), 79)
+    eq_i(rt_abi_indirect::hsh_closure_call1(0, 7), 0)
+end
+
+#[test]
+fn abi_tasks() is
+    let t: int = rt_abi_indirect::hsh_task_spawn(fn_addr(f_dbl), 21)
+    eq_i(rt_abi_indirect::hsh_task_wait(t), 42)
+    let s: int = rt_abi_indirect::hsh_task_spawn_shell("printf spawned")
+    eq_s(strdup(rt_abi_indirect::hsh_task_wait(s)), "spawned")
+    let q: int = rt_abi_indirect::hsh_task_spawn_shell("sleep 1; printf slow")
+    eq_i(rt_abi_indirect::hsh_task_wait_timeout(q, 20), 0)
+    eq_s(strdup(rt_abi_indirect::hsh_task_wait(q)), "slow")
+    let hs: int = rt_ptr::buf_new(24)
+    rt_ptr::ptr_write_i64(hs, 0, rt_abi_indirect::hsh_task_spawn(fn_addr(f_dbl), 1))
+    rt_ptr::ptr_write_i64(hs, 8, rt_abi_indirect::hsh_task_spawn(fn_addr(f_dbl), 2))
+    rt_ptr::ptr_write_i64(hs, 16, rt_abi_indirect::hsh_task_spawn(fn_addr(f_dbl), 3))
+    let r: int = rt_abi_indirect::hsh_task_join_all(hs, 3)
+    eq_i(rt_ptr::ptr_read_i64(r, 0), 2)
+    eq_i(rt_ptr::ptr_read_i64(r, 8), 4)
+    eq_i(rt_ptr::ptr_read_i64(r, 16), 6)
+end
+
+#[test]
+fn abi_sorting_with_function_addresses() is
+    let d: int = rt_abi_indirect::hsh_sort_by(ints3(2, 9, 5), fn_addr(cmp_desc))
+    eq_i(rt_abi::hsh_array_get(d, 0), 9)
+    eq_i(rt_abi::hsh_array_get(d, 2), 2)
+    let a: int = rt_abi_indirect::hsh_sort_by(ints3(2, 9, 5), fn_addr(cmp_asc))
+    eq_i(rt_abi::hsh_array_get(a, 0), 2)
+    let k: int = rt_abi_indirect::hsh_sort_by_key(ints3(2, 9, 5), fn_addr(key_neg))
+    eq_i(rt_abi::hsh_array_get(k, 0), 9)
+    eq_i(rt_abi::hsh_array_get(k, 2), 2)
+    eq_i(rt_abi::hsh_array_len(rt_abi_indirect::hsh_sort_by(0, fn_addr(cmp_asc))), 0)
+end
