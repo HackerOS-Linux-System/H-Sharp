@@ -1,0 +1,135 @@
+mod rt_bytes
+mod rt_codec
+mod rt_crypto
+mod rt_os
+mod rt_proc
+mod rt_rand
+mod rt_sort
+mod rt_str
+mod rt_sys
+
+pub fn hsh_crypto_sha256_bytes(p0: int) -> string is
+    return rt_crypto::sha256_bytes(array_from_ptr(p0))
+end
+
+pub fn hsh_crypto_pbkdf2(p0: string, p1: int, p2: int, p3: int) -> int is
+    return array_ptr(rt_crypto::pbkdf2(p0, array_from_ptr(p1), p2, p3))
+end
+
+pub fn hsh_crypto_random_bytes(p0: int) -> int is
+    return array_ptr(rt_rand::crypto_random_bytes(p0))
+end
+
+pub fn hsh_crypto_bytes_eq(p0: int, p1: int) -> int is
+    if rt_crypto::bytes_eq(array_from_ptr(p0), array_from_ptr(p1)) is return 1 end
+    return 0
+end
+
+pub fn hsh_crypto_xor_bytes(p0: int, p1: int) -> int is
+    return array_ptr(rt_crypto::xor_bytes(array_from_ptr(p0), array_from_ptr(p1)))
+end
+
+pub fn hsh_sort_ints(p0: int) -> int is
+    return array_ptr(rt_sort::sort_ints(array_from_ptr(p0)))
+end
+
+pub fn hsh_process_run_args(p0: string, p1: int) -> string is
+    return rt_proc::process_run_args(p0, array_from_ptr(p1))
+end
+
+pub fn hsh_fs_read_bytes(p0: string) -> int is
+    return array_ptr(rt_os::fs_read_bytes(p0))
+end
+
+pub fn hsh_fs_write_bytes(p0: string, p1: int) -> int is
+    if rt_os::fs_write_bytes(p0, array_from_ptr(p1)) is return 1 end
+    return 0
+end
+
+pub fn hsh_fs_read_lines(p0: string) -> int is
+    return array_ptr(rt_os::fs_read_lines(p0))
+end
+
+pub fn hsh_fs_walk(p0: string) -> int is
+    return array_ptr(rt_os::fs_walk(p0))
+end
+
+pub fn hsh_fs_list_dir(p0: string) -> int is
+    return array_ptr(rt_os::fs_list_dir(p0))
+end
+
+pub fn hsh_env_args() -> int is
+    return array_ptr(rt_sys::env_args())
+end
+
+pub fn hsh_sort_strings(p0: int) -> int is
+    return array_ptr(rt_sort::sort_strings(array_from_ptr(p0)))
+end
+
+pub fn hsh_str_split_whitespace(p0: string) -> int is
+    return array_ptr(rt_str::split_whitespace(p0))
+end
+
+pub fn hsh_string_split(p0: string, p1: string) -> int is
+    return array_ptr(rt_str::string_split(p0, p1))
+end
+
+pub fn hsh_array_join(p0: int, p1: string) -> string is
+    return rt_str::array_join(array_from_ptr(p0), p1)
+end
+
+pub fn hsh_regex_find_all(p0: string, p1: string) -> int is
+    return array_ptr(rt_proc::regex_find_all(p0, p1))
+end
+
+pub fn hsh_regex_captures(p0: string, p1: string) -> int is
+    return array_ptr(rt_proc::regex_captures(p0, p1))
+end
+
+pub fn hsh_regex_captures_all(p0: string, p1: string) -> int is
+    return array_ptr(rt_proc::regex_captures_all(p0, p1))
+end
+
+pub fn hsh_regex_split(p0: string, p1: string) -> int is
+    return array_ptr(rt_proc::regex_split(p0, p1))
+end
+
+pub fn hsh_string_chars(p0: string) -> int is
+    return array_ptr(rt_str::string_chars(p0))
+end
+
+pub fn hsh_bytes_to_string(p0: int, p1: int) -> string is
+    return rt_bytes::bytes_to_string(array_from_ptr(p0), p1)
+end
+
+pub fn hsh_string_to_bytes(p0: string) -> int is
+    return array_ptr(rt_bytes::string_to_bytes(p0))
+end
+
+pub fn hsh_hex_encode_bytes(p0: int) -> string is
+    return rt_bytes::hex_encode_bytes(array_from_ptr(p0))
+end
+
+pub fn hsh_bytes_from_ints(p0: int) -> int is
+    return array_ptr(rt_bytes::bytes_from_ints(array_from_ptr(p0)))
+end
+
+pub fn hsh_bytes_to_ints(p0: int) -> int is
+    return array_ptr(rt_bytes::bytes_to_ints(array_from_ptr(p0)))
+end
+
+pub fn hsh_bytes_concat(p0: int, p1: int) -> int is
+    return array_ptr(rt_bytes::bytes_concat(array_from_ptr(p0), array_from_ptr(p1)))
+end
+
+pub fn hsh_bytes_len(p0: int) -> int is
+    return rt_bytes::bytes_len(array_from_ptr(p0))
+end
+
+pub fn hsh_bytes_to_str_lossy(p0: int) -> string is
+    return rt_bytes::bytes_to_str_lossy(array_from_ptr(p0))
+end
+
+pub fn hsh_base64_decode_bytes(p0: string) -> int is
+    return array_ptr(rt_codec::base64_decode_bytes(p0))
+end
