@@ -1,0 +1,1248 @@
+mod rt_argon2
+mod rt_bytes
+mod rt_codec
+mod rt_conv
+mod rt_crypto
+mod rt_date
+mod rt_db
+mod rt_env
+mod rt_fmt
+mod rt_http
+mod rt_io
+mod rt_mem
+mod rt_net
+mod rt_num
+mod rt_os
+mod rt_path
+mod rt_proc
+mod rt_ptr
+mod rt_rand
+mod rt_str
+mod rt_sys
+mod rt_text
+
+pub fn hsh_print(p0: string) is
+    rt_io::print_s(p0)
+end
+
+pub fn hsh_println(p0: string) is
+    rt_os::println_s(p0)
+end
+
+pub fn hsh_atoll(p0: string) -> int is
+    return rt_num::atoll(p0)
+end
+
+pub fn hsh_atof(p0: string) -> f64 is
+    return rt_num::to_float(p0)
+end
+
+pub fn hsh_int_to_string(p0: int) -> string is
+    return rt_conv::int_to_string(p0)
+end
+
+pub fn hsh_float_to_string(p0: f64) -> string is
+    return rt_fmt::float_to_string(p0)
+end
+
+pub fn hsh_strlen(p0: string) -> int is
+    return rt_str::strlen(p0)
+end
+
+pub fn hsh_strcat(p0: string, p1: string) -> string is
+    return rt_str::strcat(p0, p1)
+end
+
+pub fn hsh_assert(p0: int, p1: string) is
+    rt_io::assert_s(p0 != 0, p1)
+end
+
+pub fn hsh_panic(p0: string) is
+    rt_io::panic_s(p0)
+end
+
+pub fn hsh_string_free(p0: string) is
+    rt_ptr::string_free(p0)
+end
+
+pub fn hsh_bytes_free(p0: int) is
+    rt_ptr::bytes_free(p0)
+end
+
+pub fn hsh_array_free(p0: int) is
+    rt_mem::array_free(p0)
+end
+
+pub fn hsh_struct_free(p0: int) is
+    rt_ptr::struct_free(p0)
+end
+
+pub fn hsh_arena_new_kind(p0: int, p1: int) -> int is
+    return rt_mem::arena_new_kind(p0, p1)
+end
+
+pub fn hsh_arena_new(p0: int) -> int is
+    return rt_mem::arena_new(p0)
+end
+
+pub fn hsh_arena_alloc(p0: int, p1: int) -> int is
+    return rt_mem::arena_alloc(p0, p1)
+end
+
+pub fn hsh_arena_free(p0: int) is
+    rt_mem::arena_free(p0)
+end
+
+pub fn hsh_arena_push_current(p0: int) is
+    rt_mem::arena_push_current(p0)
+end
+
+pub fn hsh_arena_pop_current() -> int is
+    return rt_mem::arena_pop_current()
+end
+
+pub fn hsh_alloc_ex(p0: int) -> int is
+    return rt_mem::alloc_ex(p0)
+end
+
+pub fn hsh_array_drop(p0: int) is
+    rt_mem::array_drop(p0)
+end
+
+pub fn hsh_arena_checkpoint() -> int is
+    return rt_mem::arena_checkpoint()
+end
+
+pub fn hsh_arena_rewind(p0: int) is
+    rt_mem::arena_rewind(p0)
+end
+
+pub fn hsh_arena_used() -> int is
+    return rt_mem::arena_used()
+end
+
+pub fn hsh_arena_capacity() -> int is
+    return rt_mem::arena_capacity()
+end
+
+pub fn hsh_trim(p0: string) -> string is
+    return rt_str::trim(p0)
+end
+
+pub fn hsh_str_contains(p0: string, p1: string) -> int is
+    if rt_str::contains(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_str_index_of(p0: string, p1: string) -> int is
+    return rt_str::index_of(p0, p1)
+end
+
+pub fn hsh_to_upper(p0: string) -> string is
+    return rt_str::to_upper(p0)
+end
+
+pub fn hsh_to_lower(p0: string) -> string is
+    return rt_str::to_lower(p0)
+end
+
+pub fn hsh_str_replace(p0: string, p1: string, p2: string) -> string is
+    return rt_str::replace(p0, p1, p2)
+end
+
+pub fn hsh_starts_with(p0: string, p1: string) -> int is
+    if rt_str::starts_with(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_ends_with(p0: string, p1: string) -> int is
+    if rt_str::ends_with(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_substr(p0: string, p1: int, p2: int) -> string is
+    return rt_str::substr(p0, p1, p2)
+end
+
+pub fn hsh_now_unix() -> int is
+    return rt_sys::now_unix()
+end
+
+pub fn hsh_now_ms() -> int is
+    return rt_sys::now_ms()
+end
+
+pub fn hsh_sleep_ms(p0: int) is
+    rt_os::sleep_ms(p0)
+end
+
+pub fn hsh_sin(p0: f64) -> f64 is
+    return rt_num::fsin(p0)
+end
+
+pub fn hsh_cos(p0: f64) -> f64 is
+    return rt_num::fcos(p0)
+end
+
+pub fn hsh_tan(p0: f64) -> f64 is
+    return rt_num::ftan(p0)
+end
+
+pub fn hsh_sqrt(p0: f64) -> f64 is
+    return rt_num::fsqrt(p0)
+end
+
+pub fn hsh_pow(p0: f64, p1: f64) -> f64 is
+    return rt_num::fpow(p0, p1)
+end
+
+pub fn hsh_floor(p0: f64) -> f64 is
+    return rt_num::ffloor(p0)
+end
+
+pub fn hsh_round(p0: f64) -> f64 is
+    return rt_num::fround(p0)
+end
+
+pub fn hsh_ceil(p0: f64) -> f64 is
+    return rt_num::fceil(p0)
+end
+
+pub fn hsh_abs_f(p0: f64) -> f64 is
+    return rt_num::fabs_f(p0)
+end
+
+pub fn hsh_abs_i(p0: int) -> int is
+    return rt_num::abs_i(p0)
+end
+
+pub fn hsh_min_i(p0: int, p1: int) -> int is
+    return rt_num::min_i(p0, p1)
+end
+
+pub fn hsh_max_i(p0: int, p1: int) -> int is
+    return rt_num::max_i(p0, p1)
+end
+
+pub fn hsh_min_f(p0: f64, p1: f64) -> f64 is
+    return rt_num::min_f(p0, p1)
+end
+
+pub fn hsh_max_f(p0: f64, p1: f64) -> f64 is
+    return rt_num::max_f(p0, p1)
+end
+
+pub fn hsh_hostname() -> string is
+    return rt_sys::hostname()
+end
+
+pub fn hsh_date_format(p0: int, p1: string) -> string is
+    return rt_os::date_format(p0, p1)
+end
+
+pub fn hsh_date_parse(p0: string) -> int is
+    return rt_date::parse(p0)
+end
+
+pub fn hsh_http_request(p0: string, p1: string, p2: string) -> int is
+    return rt_http::http_request(p0, p1, p2)
+end
+
+pub fn hsh_getpid() -> int is
+    return rt_sys::pid()
+end
+
+pub fn hsh_proc_id() -> int is
+    return rt_sys::pid()
+end
+
+pub fn hsh_getenv(p0: string) -> string is
+    return rt_os::getenv_s(p0)
+end
+
+pub fn hsh_username() -> string is
+    return rt_sys::username()
+end
+
+pub fn hsh_platform() -> string is
+    return rt_os::platform()
+end
+
+pub fn hsh_sys_cpu_count() -> int is
+    return rt_sys::cpu_count()
+end
+
+pub fn hsh_sys_memory_total() -> int is
+    return rt_sys::memory_total()
+end
+
+pub fn hsh_sys_memory_free() -> int is
+    return rt_sys::memory_free()
+end
+
+pub fn hsh_sys_uptime() -> int is
+    return rt_sys::uptime()
+end
+
+pub fn hsh_sys_load_avg() -> f64 is
+    return rt_sys::load_avg()
+end
+
+pub fn hsh_sys_disk_total(p0: string) -> int is
+    return rt_sys::disk_total(p0)
+end
+
+pub fn hsh_sys_disk_free(p0: string) -> int is
+    return rt_sys::disk_free(p0)
+end
+
+pub fn hsh_sys_page_size() -> int is
+    return rt_sys::page_size()
+end
+
+pub fn hsh_sys_get_uid() -> int is
+    return rt_sys::uid()
+end
+
+pub fn hsh_sys_get_gid() -> int is
+    return rt_sys::gid()
+end
+
+pub fn hsh_sys_get_ppid() -> int is
+    return rt_sys::ppid()
+end
+
+pub fn hsh_sys_is_64bit() -> int is
+    if rt_sys::is_64bit() is return 1 end
+    return 0
+end
+
+pub fn hsh_sys_is_little_endian() -> int is
+    if rt_sys::is_little_endian() is return 1 end
+    return 0
+end
+
+pub fn hsh_sys_sysname() -> string is
+    return rt_sys::sysname()
+end
+
+pub fn hsh_sys_machine() -> string is
+    return rt_sys::machine()
+end
+
+pub fn hsh_sys_kernel_version() -> string is
+    return rt_sys::kernel_version()
+end
+
+pub fn hsh_setenv(p0: string, p1: string) -> int is
+    if rt_os::setenv_s(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_base64_encode(p0: string) -> string is
+    return rt_codec::base64_encode(p0)
+end
+
+pub fn hsh_base64_decode(p0: string) -> string is
+    return rt_codec::base64_decode(p0)
+end
+
+pub fn hsh_url_encode(p0: string) -> string is
+    return rt_codec::url_encode(p0)
+end
+
+pub fn hsh_url_decode(p0: string) -> string is
+    return rt_codec::url_decode(p0)
+end
+
+pub fn hsh_shell(p0: string) -> string is
+    return rt_proc::shell(p0)
+end
+
+pub fn hsh_shell_escape(p0: string) -> string is
+    return rt_text::shell_escape(p0)
+end
+
+pub fn hsh_sqlite_query_bind1(p0: string, p1: string, p2: string) -> string is
+    return rt_db::sqlite_query_bind1(p0, p1, p2)
+end
+
+pub fn hsh_sqlite_query_bind2(p0: string, p1: string, p2: string, p3: string) -> string is
+    return rt_db::sqlite_query_bind2(p0, p1, p2, p3)
+end
+
+pub fn hsh_sqlite_query_bind3(p0: string, p1: string, p2: string, p3: string, p4: string) -> string is
+    return rt_db::sqlite_query_bind3(p0, p1, p2, p3, p4)
+end
+
+pub fn hsh_sqlite_open(p0: string) -> string is
+    return rt_db::sqlite_open(p0)
+end
+
+pub fn hsh_sqlite_exec(p0: string, p1: string) -> int is
+    return rt_db::sqlite_exec(p0, p1)
+end
+
+pub fn hsh_sqlite_query(p0: string, p1: string) -> int is
+    return rt_db::sqlite_query(p0, p1)
+end
+
+pub fn hsh_sqlite_close(p0: string) is
+    rt_db::sqlite_close(p0)
+end
+
+pub fn hsh_sqlite_ping(p0: string) -> int is
+    return rt_db::sqlite_ping(p0)
+end
+
+pub fn hsh_sqlite_begin(p0: string) -> int is
+    return rt_db::sqlite_begin(p0)
+end
+
+pub fn hsh_sqlite_commit(p0: string) -> int is
+    return rt_db::sqlite_commit(p0)
+end
+
+pub fn hsh_sqlite_rollback(p0: string) -> int is
+    return rt_db::sqlite_rollback(p0)
+end
+
+pub fn hsh_sqlite_exec_params(p0: string, p1: string, p2: int) -> int is
+    return rt_db::sqlite_exec_params(p0, p1, p2)
+end
+
+pub fn hsh_sqlite_query_params(p0: string, p1: string, p2: int) -> int is
+    return rt_db::sqlite_query_params(p0, p1, p2)
+end
+
+pub fn hsh_db_col_str(p0: int, p1: string) -> string is
+    return rt_db::db_col_str(p0, p1)
+end
+
+pub fn hsh_db_col_int(p0: int, p1: string) -> int is
+    return rt_db::db_col_int(p0, p1)
+end
+
+pub fn hsh_db_col_float(p0: int, p1: string) -> f64 is
+    return rt_db::db_col_float(p0, p1)
+end
+
+pub fn hsh_db_col_bool(p0: int, p1: string) -> int is
+    return rt_db::db_col_bool(p0, p1)
+end
+
+pub fn hsh_db_col_is_null(p0: int, p1: string) -> int is
+    return rt_db::db_col_is_null(p0, p1)
+end
+
+pub fn hsh_crypto_sha256(p0: string) -> string is
+    return rt_crypto::sha256(p0)
+end
+
+pub fn hsh_crypto_sha512(p0: string) -> string is
+    return rt_crypto::sha512(p0)
+end
+
+pub fn hsh_crypto_sha1(p0: string) -> string is
+    return rt_crypto::sha1(p0)
+end
+
+pub fn hsh_crypto_md5(p0: string) -> string is
+    return rt_crypto::md5(p0)
+end
+
+pub fn hsh_crypto_hmac_sha256(p0: string, p1: string) -> string is
+    return rt_crypto::hmac_sha256(p0, p1)
+end
+
+pub fn hsh_crypto_hmac_sha512(p0: string, p1: string) -> string is
+    return rt_crypto::hmac_sha512(p0, p1)
+end
+
+pub fn hsh_crypto_blake3(p0: string) -> string is
+    return rt_crypto::blake3(p0)
+end
+
+pub fn hsh_crypto_argon2_hash(p0: string) -> string is
+    return rt_argon2::hash(p0)
+end
+
+pub fn hsh_crypto_argon2_verify(p0: string, p1: string) -> int is
+    return rt_argon2::verify(p0, p1)
+end
+
+pub fn hsh_path_join(p0: string, p1: string) -> string is
+    return rt_path::join(p0, p1)
+end
+
+pub fn hsh_path_filename(p0: string) -> string is
+    return rt_path::filename(p0)
+end
+
+pub fn hsh_path_stem(p0: string) -> string is
+    return rt_path::stem(p0)
+end
+
+pub fn hsh_path_extension(p0: string) -> string is
+    return rt_path::extension(p0)
+end
+
+pub fn hsh_path_parent(p0: string) -> string is
+    return rt_path::parent(p0)
+end
+
+pub fn hsh_path_is_absolute(p0: string) -> int is
+    if rt_path::is_absolute(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_path_normalize(p0: string) -> string is
+    return rt_path::normalize(p0)
+end
+
+pub fn hsh_path_with_extension(p0: string, p1: string) -> string is
+    return rt_path::with_extension(p0, p1)
+end
+
+pub fn hsh_os_home_dir() -> string is
+    return rt_sys::home_dir()
+end
+
+pub fn hsh_os_temp_dir() -> string is
+    return rt_sys::temp_dir()
+end
+
+pub fn hsh_os_is_root() -> int is
+    if rt_sys::is_root() is return 1 end
+    return 0
+end
+
+pub fn hsh_run_cmd_exec(p0: string, p1: int) -> int is
+    return rt_proc::run_cmd_exec(p0, p1)
+end
+
+pub fn hsh_run_cmd_last_stdout() -> string is
+    return rt_proc::run_cmd_last_stdout()
+end
+
+pub fn hsh_run_cmd_last_stderr() -> string is
+    return rt_proc::run_cmd_last_stderr()
+end
+
+pub fn hsh_str_split_count(p0: string, p1: string) -> int is
+    return rt_str::split_count(p0, p1)
+end
+
+pub fn hsh_str_split_part(p0: string, p1: string, p2: int) -> string is
+    return rt_str::split_part(p0, p1, p2)
+end
+
+pub fn hsh_remove_dir_recursive(p0: string) -> int is
+    if rt_os::remove_dir_recursive(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_int_to_str(p0: int) -> string is
+    return rt_conv::int_to_str(p0)
+end
+
+pub fn hsh_str_to_int(p0: string) -> int is
+    return rt_conv::to_int(p0)
+end
+
+pub fn hsh_parse_int_opt(p0: string) -> int is
+    return rt_conv::parse_int_opt(p0)
+end
+
+pub fn hsh_conv_int_to_hex(p0: int) -> string is
+    return rt_conv::int_to_hex(p0)
+end
+
+pub fn hsh_conv_float_to_int(p0: f64) -> int is
+    return rt_num::float_to_int(p0)
+end
+
+pub fn hsh_env_get(p0: string) -> string is
+    return rt_os::env_get(p0)
+end
+
+pub fn hsh_env_read_line() -> string is
+    return rt_io::env_read_line()
+end
+
+pub fn hsh_io_read_char() -> string is
+    return rt_io::io_read_char()
+end
+
+pub fn hsh_json_set_str(p0: string, p1: string, p2: string) -> string is
+    return rt_text::json_set_str(p0, p1, p2)
+end
+
+pub fn hsh_exec1(p0: string) -> string is
+    return rt_proc::exec1(p0)
+end
+
+pub fn hsh_exec2(p0: string, p1: string) -> string is
+    return rt_proc::exec2(p0, p1)
+end
+
+pub fn hsh_exec3(p0: string, p1: string, p2: string) -> string is
+    return rt_proc::exec3(p0, p1, p2)
+end
+
+pub fn hsh_exec4(p0: string, p1: string, p2: string, p3: string) -> string is
+    return rt_proc::exec4(p0, p1, p2, p3)
+end
+
+pub fn hsh_py_eval(p0: string) -> string is
+    return rt_proc::py_eval(p0)
+end
+
+pub fn hsh_py_repr(p0: string) -> string is
+    return rt_fmt::py_repr(p0)
+end
+
+pub fn hsh_process_spawn(p0: string) -> int is
+    return rt_proc::process_spawn(p0)
+end
+
+pub fn hsh_process_kill(p0: int) -> int is
+    if rt_proc::process_kill(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_process_which(p0: string) -> string is
+    return rt_proc::process_which(p0)
+end
+
+pub fn hsh_random_hex(p0: int) -> string is
+    return rt_rand::random_hex(p0)
+end
+
+pub fn hsh_random_int(p0: int, p1: int) -> int is
+    return rt_rand::random_int(p0, p1)
+end
+
+pub fn hsh_random_string(p0: int) -> string is
+    return rt_rand::random_string(p0)
+end
+
+pub fn hsh_uuid_v4() -> string is
+    return rt_rand::uuid_v4()
+end
+
+pub fn hsh_file_exists(p0: string) -> int is
+    if rt_os::file_exists(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_is_file(p0: string) -> int is
+    if rt_os::is_file(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_is_dir(p0: string) -> int is
+    if rt_os::is_dir(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_read_file(p0: string) -> string is
+    return rt_os::read_file(p0)
+end
+
+pub fn hsh_write_file(p0: string, p1: string) -> int is
+    if rt_os::write_file(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_append_file(p0: string, p1: string) -> int is
+    if rt_os::append_file(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_remove_file(p0: string) -> int is
+    if rt_os::remove_file(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_mkdir_all(p0: string) -> int is
+    if rt_os::mkdir_all(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_file_size(p0: string) -> int is
+    return rt_os::file_size(p0)
+end
+
+pub fn hsh_getcwd() -> string is
+    return rt_sys::getcwd_s()
+end
+
+pub fn hsh_chdir(p0: string) -> int is
+    if rt_os::change_dir(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_rename(p0: string, p1: string) -> int is
+    if rt_os::rename_file(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_fs_modified_time(p0: string) -> int is
+    return rt_os::fs_modified_time(p0)
+end
+
+pub fn hsh_fs_temp_file(p0: string) -> string is
+    return rt_os::fs_temp_file(p0)
+end
+
+pub fn hsh_fs_copy(p0: string, p1: string) -> int is
+    if rt_os::fs_copy(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_test_fail(p0: string) -> int is
+    return rt_io::test_fail(p0)
+end
+
+pub fn hsh_test_skip(p0: string) -> int is
+    return rt_io::test_skip(p0)
+end
+
+pub fn hsh_fs_rmdir(p0: string) -> int is
+    if rt_os::fs_rmdir(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_closure_create(p0: int, p1: int, p2: int, p3: int, p4: int, p5: int, p6: int, p7: int, p8: int, p9: int) -> int is
+    return rt_mem::closure_create(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9)
+end
+
+pub fn hsh_val_to_str(p0: int) -> string is
+    return rt_mem::val_to_str(p0)
+end
+
+pub fn hsh_http_get(p0: string) -> string is
+    return rt_proc::http_get(p0)
+end
+
+pub fn hsh_http_post(p0: string, p1: string) -> string is
+    return rt_proc::http_post(p0, p1)
+end
+
+pub fn hsh_atoll_export(p0: string) -> int is
+    return rt_num::atoll_export(p0)
+end
+
+pub fn hsh_atof_export(p0: string) -> f64 is
+    return rt_num::atof_export(p0)
+end
+
+pub fn hsh_array_new() -> int is
+    return rt_mem::array_new()
+end
+
+pub fn hsh_array_push(p0: int, p1: int) -> int is
+    return rt_mem::array_push(p0, p1)
+end
+
+pub fn hsh_array_len(p0: int) -> int is
+    return rt_mem::array_len(p0)
+end
+
+pub fn hsh_array_get(p0: int, p1: int) -> int is
+    return rt_mem::array_get(p0, p1)
+end
+
+pub fn hsh_array_set(p0: int, p1: int, p2: int) -> int is
+    return rt_mem::array_set(p0, p1, p2)
+end
+
+pub fn hsh_array_concat(p0: int, p1: int) -> int is
+    return rt_mem::array_concat(p0, p1)
+end
+
+pub fn hsh_array_slice(p0: int, p1: int, p2: int) -> int is
+    return rt_mem::array_slice(p0, p1, p2)
+end
+
+pub fn hsh_array_contains(p0: int, p1: int) -> int is
+    return rt_mem::array_contains(p0, p1)
+end
+
+pub fn hsh_struct_new(p0: int) -> int is
+    return rt_mem::struct_new(p0)
+end
+
+pub fn hsh_struct_get(p0: int, p1: int) -> int is
+    return rt_ptr::struct_get(p0, p1)
+end
+
+pub fn hsh_struct_set(p0: int, p1: int, p2: int) -> int is
+    return rt_ptr::struct_set(p0, p1, p2)
+end
+
+pub fn hsh_regex_match(p0: string, p1: string) -> int is
+    if rt_proc::regex_match(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_regex_find(p0: string, p1: string) -> string is
+    return rt_proc::regex_find(p0, p1)
+end
+
+pub fn hsh_regex_replace(p0: string, p1: string, p2: string) -> string is
+    return rt_proc::regex_replace(p0, p1, p2)
+end
+
+pub fn hsh_string_at(p0: string, p1: int) -> string is
+    return rt_str::at(p0, p1)
+end
+
+pub fn hsh_string_slice(p0: string, p1: int, p2: int) -> string is
+    return rt_str::slice(p0, p1, p2)
+end
+
+pub fn hsh_string_find(p0: string, p1: string) -> int is
+    return rt_str::find(p0, p1)
+end
+
+pub fn hsh_string_rfind(p0: string, p1: string) -> int is
+    return rt_str::rfind(p0, p1)
+end
+
+pub fn hsh_string_pad_right(p0: string, p1: int) -> string is
+    return rt_str::pad_right(p0, p1)
+end
+
+pub fn hsh_string_repeat(p0: string, p1: int) -> string is
+    return rt_str::repeat(p0, p1)
+end
+
+pub fn hsh_to_int(p0: string) -> int is
+    return rt_conv::to_int(p0)
+end
+
+pub fn hsh_to_int_from_hex(p0: string) -> int is
+    return rt_conv::to_int_from_hex(p0)
+end
+
+pub fn hsh_to_float(p0: string) -> f64 is
+    return rt_num::to_float(p0)
+end
+
+pub fn hsh_string_lower(p0: string) -> string is
+    return rt_str::string_lower(p0)
+end
+
+pub fn hsh_string_upper(p0: string) -> string is
+    return rt_str::string_upper(p0)
+end
+
+pub fn hsh_string_trim_right(p0: string) -> string is
+    return rt_str::trim_right(p0)
+end
+
+pub fn hsh_file_delete(p0: string) -> int is
+    if rt_os::file_delete(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_dir_create(p0: string) -> int is
+    if rt_os::dir_create(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_dir_exists(p0: string) -> int is
+    if rt_os::dir_exists(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_readline() -> string is
+    return rt_io::readline()
+end
+
+pub fn hsh_flush() is
+    rt_os::flush_stdout()
+end
+
+pub fn hsh_scan_port_net(p0: string, p1: int, p2: int) -> int is
+    if rt_net::scan_port_net(p0, p1, p2) is return 1 end
+    return 0
+end
+
+pub fn hsh_str_to_char_code(p0: string) -> int is
+    return rt_conv::char_code(p0)
+end
+
+pub fn hsh_char_code_to_str(p0: int) -> string is
+    return rt_conv::char_code_to_str(p0)
+end
+
+pub fn hsh_dir_remove_all(p0: string) -> int is
+    if rt_os::dir_remove_all(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_array_push_str(p0: int, p1: string) -> int is
+    return rt_mem::array_push_str(p0, rt_mem::alloc_string(p1))
+end
+
+pub fn hsh_string_contains(p0: string, p1: string) -> int is
+    if rt_str::string_contains(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_string_replace(p0: string, p1: string, p2: string) -> string is
+    return rt_str::string_replace(p0, p1, p2)
+end
+
+pub fn hsh_string_trim(p0: string) -> string is
+    return rt_str::string_trim(p0)
+end
+
+pub fn hsh_string_starts_with(p0: string, p1: string) -> int is
+    if rt_str::string_starts_with(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_string_ends_with(p0: string, p1: string) -> int is
+    if rt_str::string_ends_with(p0, p1) is return 1 end
+    return 0
+end
+
+pub fn hsh_string_len(p0: string) -> int is
+    return rt_str::string_len(p0)
+end
+
+pub fn hsh_array_remove(p0: int, p1: int) -> int is
+    return rt_mem::array_remove(p0, p1)
+end
+
+pub fn hsh_dns_resolve(p0: string) -> string is
+    return rt_net::dns_resolve(p0)
+end
+
+pub fn hsh_json_get(p0: string, p1: string) -> string is
+    return rt_text::json_get(p0, p1)
+end
+
+pub fn hsh_rc_alloc(p0: int) -> int is
+    return rt_ptr::rc_alloc(p0)
+end
+
+pub fn hsh_rc_retain(p0: int) is
+    rt_mem::rc_retain(p0)
+end
+
+pub fn hsh_rc_release(p0: int) is
+    rt_mem::rc_release(p0)
+end
+
+pub fn hsh_rc_count(p0: int) -> int is
+    return rt_mem::rc_count(p0)
+end
+
+pub fn hsh_arc_downgrade(p0: int) -> int is
+    return rt_mem::arc_downgrade(p0)
+end
+
+pub fn hsh_arc_upgrade(p0: int) -> int is
+    return rt_mem::arc_upgrade(p0)
+end
+
+pub fn hsh_arc_weak_release(p0: int) is
+    rt_mem::arc_weak_release(p0)
+end
+
+pub fn hsh_arc_weak_count(p0: int) -> int is
+    return rt_mem::arc_weak_count(p0)
+end
+
+pub fn hsh_ptr_read_i64(p0: int, p1: int) -> int is
+    return rt_ptr::ptr_read_i64(p0, p1)
+end
+
+pub fn hsh_ptr_write_i64(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_write_i64(p0, p1, p2)
+end
+
+pub fn hsh_ptr_is_null(p0: int) -> int is
+    if rt_ptr::ptr_is_null(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_ptr_add(p0: int, p1: int) -> int is
+    return rt_ptr::ptr_add(p0, p1)
+end
+
+pub fn hsh_ptr_read_i32(p0: int, p1: int) -> int is
+    return rt_ptr::ptr_read_i32(p0, p1)
+end
+
+pub fn hsh_ptr_write_i32(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_write_i32(p0, p1, p2)
+end
+
+pub fn hsh_ptr_read_i16(p0: int, p1: int) -> int is
+    return rt_ptr::ptr_read_i16(p0, p1)
+end
+
+pub fn hsh_ptr_write_i16(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_write_i16(p0, p1, p2)
+end
+
+pub fn hsh_ptr_read_i8(p0: int, p1: int) -> int is
+    return rt_ptr::ptr_read_i8(p0, p1)
+end
+
+pub fn hsh_ptr_write_i8(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_write_i8(p0, p1, p2)
+end
+
+pub fn hsh_ptr_read_f64(p0: int, p1: int) -> f64 is
+    return rt_ptr::ptr_read_f64(p0, p1)
+end
+
+pub fn hsh_ptr_write_f64(p0: int, p1: int, p2: f64) is
+    rt_ptr::ptr_write_f64(p0, p1, p2)
+end
+
+pub fn hsh_ptr_read_f32(p0: int, p1: int) -> f64 is
+    return rt_ptr::ptr_read_f32(p0, p1)
+end
+
+pub fn hsh_ptr_write_f32(p0: int, p1: int, p2: f64) is
+    rt_ptr::ptr_write_f32(p0, p1, p2)
+end
+
+pub fn hsh_ptr_read_ptr(p0: int, p1: int) -> int is
+    return rt_ptr::ptr_read_ptr(p0, p1)
+end
+
+pub fn hsh_ptr_write_ptr(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_write_ptr(p0, p1, p2)
+end
+
+pub fn hsh_ptr_alloc_size(p0: int) -> int is
+    return rt_ptr::ptr_alloc_size(p0)
+end
+
+pub fn hsh_ptr_copy(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_copy(p0, p1, p2)
+end
+
+pub fn hsh_ptr_compare(p0: int, p1: int, p2: int) -> int is
+    return rt_ptr::ptr_compare(p0, p1, p2)
+end
+
+pub fn hsh_ptr_fill(p0: int, p1: int, p2: int) is
+    rt_ptr::ptr_fill(p0, p1, p2)
+end
+
+pub fn hsh_ptr_zero(p0: int, p1: int) is
+    rt_ptr::ptr_zero(p0, p1)
+end
+
+pub fn hsh_ptr_read_checked(p0: int, p1: int, p2: int) -> int is
+    return rt_io::ptr_read_checked(p0, p1, p2)
+end
+
+pub fn hsh_ptr_write_checked(p0: int, p1: int, p2: int, p3: int) is
+    rt_io::ptr_write_checked(p0, p1, p2, p3)
+end
+
+pub fn hsh_map_new(p0: int) -> int is
+    return rt_mem::map_new(p0)
+end
+
+pub fn hsh_map_set(p0: int, p1: int, p2: int) is
+    rt_mem::map_set(p0, p1, p2)
+end
+
+pub fn hsh_map_get(p0: int, p1: int) -> int is
+    return rt_mem::map_get(p0, p1)
+end
+
+pub fn hsh_map_has(p0: int, p1: int) -> int is
+    return rt_mem::map_has(p0, p1)
+end
+
+pub fn hsh_map_remove(p0: int, p1: int) -> int is
+    return rt_mem::map_remove(p0, p1)
+end
+
+pub fn hsh_map_len(p0: int) -> int is
+    return rt_mem::map_len(p0)
+end
+
+pub fn hsh_map_keys(p0: int) -> int is
+    return rt_mem::map_keys(p0)
+end
+
+pub fn hsh_map_values(p0: int) -> int is
+    return rt_mem::map_values(p0)
+end
+
+pub fn hsh_map_clear(p0: int) is
+    rt_mem::map_clear(p0)
+end
+
+pub fn hsh_hex_encode(p0: string) -> string is
+    return rt_str::hex_encode(p0)
+end
+
+pub fn hsh_hex_decode(p0: string) -> string is
+    return rt_bytes::hex_decode(p0)
+end
+
+pub fn hsh_hex_xor(p0: string, p1: string) -> string is
+    return rt_bytes::hex_xor(p0, p1)
+end
+
+pub fn hsh_date_year(p0: int) -> int is
+    return rt_date::year(p0)
+end
+
+pub fn hsh_date_month(p0: int) -> int is
+    return rt_date::month(p0)
+end
+
+pub fn hsh_date_day(p0: int) -> int is
+    return rt_date::day(p0)
+end
+
+pub fn hsh_date_weekday(p0: int) -> string is
+    return rt_date::weekday(p0)
+end
+
+pub fn hsh_date_add_days(p0: int, p1: int) -> int is
+    return rt_date::add_days(p0, p1)
+end
+
+pub fn hsh_date_add_hours(p0: int, p1: int) -> int is
+    return rt_date::add_hours(p0, p1)
+end
+
+pub fn hsh_date_diff_days(p0: int, p1: int) -> int is
+    return rt_date::diff_days(p0, p1)
+end
+
+pub fn hsh_env_home() -> string is
+    return rt_os::getenv_s("HOME")
+end
+
+pub fn hsh_env_remove(p0: string) -> int is
+    if rt_os::env_remove(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_env_vars() -> int is
+    return rt_env::env_vars()
+end
+
+pub fn hsh_term_width() -> int is
+    return rt_sys::term_width()
+end
+
+pub fn hsh_term_height() -> int is
+    return rt_sys::term_height()
+end
+
+pub fn hsh_term_is_tty() -> int is
+    if rt_sys::stdout_is_tty() is return 1 end
+    return 0
+end
+
+pub fn hsh_uuid_is_valid(p0: string) -> int is
+    if rt_text::uuid_is_valid(p0) is return 1 end
+    return 0
+end
+
+pub fn hsh_math_asin(p0: f64) -> f64 is
+    return rt_num::fasin(p0)
+end
+
+pub fn hsh_math_acos(p0: f64) -> f64 is
+    return rt_num::facos(p0)
+end
+
+pub fn hsh_math_atan(p0: f64) -> f64 is
+    return rt_num::fatan(p0)
+end
+
+pub fn hsh_math_atan2(p0: f64, p1: f64) -> f64 is
+    return rt_num::fatan2(p0, p1)
+end
+
+pub fn hsh_math_round(p0: f64) -> f64 is
+    return rt_num::fround(p0)
+end
+
+pub fn hsh_math_trunc(p0: f64) -> f64 is
+    return rt_num::ftrunc(p0)
+end
+
+pub fn hsh_math_log(p0: f64) -> f64 is
+    return rt_num::flog(p0)
+end
+
+pub fn hsh_math_log2(p0: f64) -> f64 is
+    return rt_num::flog2(p0)
+end
+
+pub fn hsh_math_log10(p0: f64) -> f64 is
+    return rt_num::flog10(p0)
+end
+
+pub fn hsh_math_exp(p0: f64) -> f64 is
+    return rt_num::fexp(p0)
+end
+
+pub fn hsh_trim_start(p0: string) -> string is
+    return rt_str::trim_start(p0)
+end
+
+pub fn hsh_trim_end(p0: string) -> string is
+    return rt_str::trim_end(p0)
+end
+
+pub fn hsh_args_alloc(p0: int) -> int is
+    return rt_mem::args_alloc(p0)
+end
+
+pub fn hsh_args_set(p0: int, p1: int, p2: int) is
+    rt_mem::args_set(p0, p1, p2)
+end
+
+pub fn hsh_args_get(p0: int, p1: int) -> int is
+    return rt_mem::args_get(p0, p1)
+end
+
+pub fn hsh_args_free(p0: int) is
+    rt_mem::args_free(p0)
+end
+
+pub fn hsh_bold(p0: string) -> string is
+    return rt_text::bold(p0)
+end
+
+pub fn hsh_green_text(p0: string) -> string is
+    return rt_text::green_text(p0)
+end
+
+pub fn hsh_red_text(p0: string) -> string is
+    return rt_text::red_text(p0)
+end
+
+pub fn hsh_yellow_text(p0: string) -> string is
+    return rt_text::yellow_text(p0)
+end
+
+pub fn hsh_dim_text(p0: string) -> string is
+    return rt_text::dim_text(p0)
+end
+
+pub fn hsh_cyan_text(p0: string) -> string is
+    return rt_text::cyan_text(p0)
+end
