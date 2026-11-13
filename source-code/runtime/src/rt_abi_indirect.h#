@@ -1,0 +1,38 @@
+mod rt_indirect
+mod rt_task
+
+pub fn hsh_sort_by(p0: int, p1: int) -> int is
+    return array_ptr(rt_indirect::sort_by_raw(array_from_ptr(p0), p1))
+end
+
+pub fn hsh_sort_by_key(p0: int, p1: int) -> int is
+    return array_ptr(rt_indirect::sort_by_key(array_from_ptr(p0), p1))
+end
+
+pub fn hsh_closure_call1(p0: int, p1: int) -> int is
+    return rt_indirect::closure_call1(p0, p1)
+end
+
+pub fn hsh_closure_call2(p0: int, p1: int, p2: int) -> int is
+    return rt_indirect::closure_call2(p0, p1, p2)
+end
+
+pub fn hsh_task_spawn(p0: int, p1: int) -> int is
+    return rt_task::task_spawn(p0, p1)
+end
+
+pub fn hsh_task_wait(p0: int) -> int is
+    return rt_task::task_wait(p0)
+end
+
+pub fn hsh_task_join_all(p0: int, p1: int) -> int is
+    return rt_task::task_join_all(p0, p1)
+end
+
+pub fn hsh_task_wait_timeout(p0: int, p1: int) -> int is
+    return rt_task::task_wait_timeout(p0, p1)
+end
+
+pub fn hsh_task_spawn_shell(p0: string) -> int is
+    return rt_task::task_spawn_shell(p0)
+end
