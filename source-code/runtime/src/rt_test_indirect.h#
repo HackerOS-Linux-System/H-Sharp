@@ -88,6 +88,7 @@ end
 ;; ── named functions handed to closure_call / task_spawn through `fn_addr` ──
 fn f_add3(a: int, b: int, c: int) -> int is return a * 100 + b * 10 + c end
 fn f_add4(a: int, b: int, c: int, d: int) -> int is return a * 1000 + b * 100 + c * 10 + d end
+fn f_add2(a: int, b: int) -> int is return a * 10 + b end
 fn f_dbl(x: int) -> int is return x * 2 end
 
 #[test]
@@ -99,8 +100,9 @@ fn closure_call_appends_captures() is
     eq_i(rt_indirect::closure_call2(c1, 1, 2), 125)
     let c2: int = rt_mem::closure_create(fn_addr(f_add4), 2, 3, 4, 0, 0, 0, 0, 0, 0)
     eq_i(rt_indirect::closure_call2(c2, 1, 2), 1234)
-    let c3: int = rt_mem::closure_create(fn_addr(f_add3), 1, 9, 0, 0, 0, 0, 0, 0, 0)
-    eq_i(rt_indirect::closure_call1(c3, 7), 790)
+    ;; closure_call1 with one capture passes exactly (x, c0): the callee must take 2 parameters (a 3-parameter callee would read garbage)
+    let c3: int = rt_mem::closure_create(fn_addr(f_add2), 1, 9, 0, 0, 0, 0, 0, 0, 0)
+    eq_i(rt_indirect::closure_call1(c3, 7), 79)
     let c4: int = rt_mem::closure_create(fn_addr(f_dbl), 5, 1, 2, 3, 4, 5, 0, 0, 0)
     eq_i(rt_indirect::closure_call1(c4, 8), 16)
 end
