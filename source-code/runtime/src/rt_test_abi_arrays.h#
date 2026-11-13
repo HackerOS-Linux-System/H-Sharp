@@ -1,0 +1,121 @@
+use "std -> test" from "test"
+
+mod rt_abi
+mod rt_abi_arrays
+mod rt_mem
+
+;; rt_test_abi_arrays — the C-name wrappers that take or return a raw HshArray* (rt_abi_arrays.h#).  Arrays are built and read through the
+;; C API itself (hsh_array_new / push / get / len), so these tests exercise exactly what C code linked against the runtime would do.
+;; Needs the compiler that has array_ptr / array_from_ptr (source-code/compiler), not the h# 0.9.0 binary.
+
+fn eq_s(actual: string, expected: string) is
+    if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
+end
+
+fn eq_i(actual: int, expected: int) is
+    if actual != expected is test::fail("expected " + to_string(expected) + ", got " + to_string(actual)) end
+end
+
+fn ints3(a: int, b: int, c: int) -> int is
+    let r: int = rt_abi::hsh_array_new()
+    rt_abi::hsh_array_push(r, a)
+    rt_abi::hsh_array_push(r, b)
+    rt_abi::hsh_array_push(r, c)
+    return r
+end
+
+fn str_at(arr: int, i: int) -> string is return rt_mem::text_at(rt_abi::hsh_array_get(arr, i)) end
+
+#[test]
+fn abi_array_bytes() is
+    let b: int = rt_abi_arrays::hsh_string_to_bytes("AB")
+    eq_i(rt_abi_arrays::hsh_bytes_len(b), 2)
+    eq_i(rt_abi::hsh_array_get(b, 0), 65)
+    eq_s(rt_abi_arrays::hsh_bytes_to_string(b, 2), "AB")
+    eq_s(rt_abi_arrays::hsh_hex_encode_bytes(b), "4142")
+    eq_s(rt_abi_arrays::hsh_bytes_to_str_lossy(b), "AB")
+    let c: int = rt_abi_arrays::hsh_bytes_concat(b, rt_abi_arrays::hsh_string_to_bytes("C"))
+    eq_i(rt_abi_arrays::hsh_bytes_len(c), 3)
+    eq_s(rt_abi_arrays::hsh_bytes_to_string(c, 3), "ABC")
+    let d: int = rt_abi_arrays::hsh_base64_decode_bytes("TWFu")
+    eq_s(rt_abi_arrays::hsh_bytes_to_string(d, 3), "Man")
+    let i: int = rt_abi_arrays::hsh_bytes_to_ints(b)
+    eq_i(rt_abi::hsh_array_get(i, 1), 66)
+    eq_s(rt_abi_arrays::hsh_bytes_to_string(rt_abi_arrays::hsh_bytes_from_ints(i), 2), "AB")
+end
+
+#[test]
+fn abi_array_crypto() is
+    let abc: int = rt_abi_arrays::hsh_string_to_bytes("abc")
+    eq_s(rt_abi_arrays::hsh_crypto_sha256_bytes(abc), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    eq_i(rt_abi_arrays::hsh_crypto_bytes_eq(abc, rt_abi_arrays::hsh_string_to_bytes("abc")), 1)
+    eq_i(rt_abi_arrays::hsh_crypto_bytes_eq(abc, rt_abi_arrays::hsh_string_to_bytes("abd")), 0)
+    let x: int = rt_abi_arrays::hsh_crypto_xor_bytes(ints3(1, 2, 3), ints3(3, 2, 1))
+    eq_i(rt_abi::hsh_array_get(x, 0), 2)
+    eq_i(rt_abi::hsh_array_get(x, 1), 0)
+    eq_i(rt_abi::hsh_array_get(x, 2), 2)
+    eq_i(rt_abi::hsh_array_len(rt_abi_arrays::hsh_crypto_random_bytes(16)), 16)
+    let dk: int = rt_abi_arrays::hsh_crypto_pbkdf2("password", rt_abi_arrays::hsh_string_to_bytes("salt"), 1, 32)
+    eq_s(rt_abi_arrays::hsh_hex_encode_bytes(dk), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+end
+
+#[test]
+fn abi_array_sorting_and_text() is
+    let s: int = rt_abi_arrays::hsh_sort_ints(ints3(3, 1, 2))
+    eq_i(rt_abi::hsh_array_get(s, 0), 1)
+    eq_i(rt_abi::hsh_array_get(s, 2), 3)
+    let parts: int = rt_abi_arrays::hsh_string_split("b,a,c", ",")
+    eq_i(rt_abi::hsh_array_len(parts), 3)
+    eq_s(str_at(parts, 1), "a")
+    let sorted: int = rt_abi_arrays::hsh_sort_strings(parts)
+    eq_s(str_at(sorted, 0), "a")
+    eq_s(str_at(sorted, 2), "c")
+    eq_s(rt_abi_arrays::hsh_array_join(sorted, "-"), "a-b-c")
+    let w: int = rt_abi_arrays::hsh_str_split_whitespace("  x  yy ")
+    eq_i(rt_abi::hsh_array_len(w), 2)
+    eq_s(str_at(w, 1), "yy")
+    let ch: int = rt_abi_arrays::hsh_string_chars("abc")
+    eq_i(rt_abi::hsh_array_len(ch), 3)
+    eq_s(str_at(ch, 2), "c")
+end
+
+#[test]
+fn abi_array_regex() is
+    let f: int = rt_abi_arrays::hsh_regex_find_all("[0-9]+", "a1b22c333")
+    eq_i(rt_abi::hsh_array_len(f), 3)
+    eq_s(str_at(f, 2), "333")
+    ;; core.c: `\s+` / `\s*` split on whitespace, any other pattern is a literal-substring split (its documented fallback)
+    let sp: int = rt_abi_arrays::hsh_regex_split("a  b c", "\\s+")
+    eq_i(rt_abi::hsh_array_len(sp), 3)
+    eq_s(str_at(sp, 1), "b")
+    let lit: int = rt_abi_arrays::hsh_regex_split("a--b--c", "--")
+    eq_i(rt_abi::hsh_array_len(lit), 3)
+    eq_s(str_at(lit, 2), "c")
+    let cp: int = rt_abi_arrays::hsh_regex_captures("([a-z]+)-([0-9]+)", "ab-12")
+    eq_s(str_at(cp, 1), "ab")
+    eq_s(str_at(cp, 2), "12")
+    let all: int = rt_abi_arrays::hsh_regex_captures_all("([a-z])([0-9])", "a1 b2")
+    eq_i(rt_abi::hsh_array_len(all), 2)
+end
+
+#[test]
+fn abi_array_files_and_process() is
+    let dir: string = "/tmp/hsh_abi_arrays_dir"
+    rt_abi::hsh_remove_dir_recursive(dir)
+    eq_i(rt_abi::hsh_dir_create(dir), 1)
+    eq_i(rt_abi::hsh_write_file(dir + "/l.txt", "one\ntwo\nthree"), 1)
+    let lines: int = rt_abi_arrays::hsh_fs_read_lines(dir + "/l.txt")
+    eq_i(rt_abi::hsh_array_len(lines), 3)
+    eq_s(str_at(lines, 1), "two")
+    eq_i(rt_abi_arrays::hsh_fs_write_bytes(dir + "/b.bin", rt_abi_arrays::hsh_string_to_bytes("hey")), 1)
+    let rb: int = rt_abi_arrays::hsh_fs_read_bytes(dir + "/b.bin")
+    eq_s(rt_abi_arrays::hsh_bytes_to_string(rb, 3), "hey")
+    eq_i(rt_abi::hsh_array_len(rt_abi_arrays::hsh_fs_list_dir(dir)), 2)
+    eq_i(rt_abi::hsh_array_len(rt_abi_arrays::hsh_fs_walk(dir)), 2)
+    let args: int = rt_abi::hsh_array_new()
+    rt_abi::hsh_array_push_str(args, "%s")
+    rt_abi::hsh_array_push_str(args, "ok")
+    eq_s(rt_abi_arrays::hsh_process_run_args("printf", args), "ok")
+    if rt_abi::hsh_array_len(rt_abi_arrays::hsh_env_args()) < 0 is test::fail("env_args") end
+    rt_abi::hsh_remove_dir_recursive(dir)
+end
