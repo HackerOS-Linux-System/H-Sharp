@@ -1,3 +1,4 @@
+mod rt_raw
 use "std -> fs" from "fs"
 use "std -> env" from "env"
 
@@ -41,7 +42,7 @@ fn unhex(h: string) -> string is
         bs.push(nib(byte_at(h, i)) * 16 + nib(byte_at(h, i + 1)))
         i += 2
     end
-    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+    return rt_raw::string_from_ints(bs)
 end
 
 fn bool_n(b: bool) -> string is
@@ -138,7 +139,7 @@ end
 ;; ── script ops (see tests/parity_c.c): "cmd,arg,arg;cmd,arg" -> one comma separated token per command ──
 fn tok_h(s: string) -> string is
     if s.len() == 0 is return "-" end
-    return rt_str::hex_encode(s)
+    return rt_str::hex_encode_h(s)
 end
 
 fn tok_add(acc: string, t: string) -> string is
@@ -258,7 +259,7 @@ fn strs_tok(a: [string]) -> string is
     let mut i: int = 0
     while i < a.len() is
         if i > 0 is out += "." end
-        if a[i].len() == 0 is out += "_" else out += rt_str::hex_encode(a[i]) end
+        if a[i].len() == 0 is out += "_" else out += rt_str::hex_encode_h(a[i]) end
         i += 1
     end
     return out
@@ -358,7 +359,7 @@ fn run_fs(script: string) -> string is
             if ok is
                 let parts: [string] = __builtin_str_split(t, "/")
                 let base: string = parts[parts.len() - 1]
-                ok = rt_str::starts_with(base, x) && base.len() == x.len() + 6
+                ok = rt_str::starts_with_h(base, x) && base.len() == x.len() + 6
             end
             if t.len() > 0 is rt_os::file_delete(t) end
             if ok is out = tok_add(out, "ok") else out = tok_add(out, "bad") end
@@ -389,7 +390,7 @@ fn run_env(script: string) -> string is
         elsif c == "get" is
             out = tok_add(out, tok_h(rt_os::getenv_s(x)))
         elsif c == "eget" is
-            out = tok_add(out, tok_h(rt_os::env_get(x)))
+            out = tok_add(out, tok_h(rt_os::env_get_h(x)))
         elsif c == "rm" is
             out = tok_add(out, nb(rt_os::env_remove(x)))
         elsif c == "vars" is
@@ -574,7 +575,7 @@ fn dump_arr(a: int, strs: bool) -> string is
         let v: int = rt_mem::array_get(a, i)
         if strs is
             let t: string = rt_mem::text_at(v)
-            if t.len() == 0 is out += "_" else out += rt_str::hex_encode(t) end
+            if t.len() == 0 is out += "_" else out += rt_str::hex_encode_h(t) end
         else
             out += to_string(v)
         end
@@ -835,7 +836,7 @@ fn dump_rows(q: int) -> string is
         while j < m is
             if j > 0 is out += "." end
             let t: string = rt_mem::text_at(rt_mem::array_get(r, j))
-            if t.len() == 0 is out += "_" else out += rt_str::hex_encode(t) end
+            if t.len() == 0 is out += "_" else out += rt_str::hex_encode_h(t) end
             j += 1
         end
         i += 1
@@ -912,48 +913,48 @@ fn run_db(script: string) -> string is
 end
 
 fn run_op(op: string, a: string, b: string, c: string) -> string is
-    if op == "trim" is return rt_str::hex_encode(rt_str::trim(a)) end
-    if op == "trim_start" is return rt_str::hex_encode(rt_str::trim_start(a)) end
-    if op == "trim_end" is return rt_str::hex_encode(rt_str::trim_end(a)) end
-    if op == "upper" is return rt_str::hex_encode(rt_str::to_upper(a)) end
-    if op == "lower" is return rt_str::hex_encode(rt_str::to_lower(a)) end
-    if op == "hexe" is return rt_str::hex_encode(rt_str::hex_encode(a)) end
+    if op == "trim" is return rt_str::hex_encode_h(rt_str::trim(a)) end
+    if op == "trim_start" is return rt_str::hex_encode_h(rt_str::trim_start(a)) end
+    if op == "trim_end" is return rt_str::hex_encode_h(rt_str::trim_end(a)) end
+    if op == "upper" is return rt_str::hex_encode_h(rt_str::to_upper_h(a)) end
+    if op == "lower" is return rt_str::hex_encode_h(rt_str::to_lower_h(a)) end
+    if op == "hexe" is return rt_str::hex_encode_h(rt_str::hex_encode_h(a)) end
     if op == "indexof" is return "#" + to_string(rt_str::index_of(a, b)) end
-    if op == "starts" is return "#" + bool_n(rt_str::starts_with(a, b)) end
-    if op == "ends" is return "#" + bool_n(rt_str::ends_with(a, b)) end
-    if op == "replace" is return rt_str::hex_encode(rt_str::replace(a, b, c)) end
-    if op == "repeat" is return rt_str::hex_encode(rt_str::repeat(a, to_int(b))) end
-    if op == "pad" is return rt_str::hex_encode(rt_str::pad_right(a, to_int(b))) end
-    if op == "join" is return rt_str::hex_encode(rt_path::join(a, b)) end
-    if op == "filename" is return rt_str::hex_encode(rt_path::filename(a)) end
-    if op == "stem" is return rt_str::hex_encode(rt_path::stem(a)) end
-    if op == "ext" is return rt_str::hex_encode(rt_path::extension(a)) end
-    if op == "parent" is return rt_str::hex_encode(rt_path::parent(a)) end
-    if op == "norm" is return rt_str::hex_encode(rt_path::normalize(a)) end
-    if op == "withext" is return rt_str::hex_encode(rt_path::with_extension(a, b)) end
+    if op == "starts" is return "#" + bool_n(rt_str::starts_with_h(a, b)) end
+    if op == "ends" is return "#" + bool_n(rt_str::ends_with_h(a, b)) end
+    if op == "replace" is return rt_str::hex_encode_h(rt_str::replace_h(a, b, c)) end
+    if op == "repeat" is return rt_str::hex_encode_h(rt_str::repeat(a, to_int(b))) end
+    if op == "pad" is return rt_str::hex_encode_h(rt_str::pad_right(a, to_int(b))) end
+    if op == "join" is return rt_str::hex_encode_h(rt_path::join(a, b)) end
+    if op == "filename" is return rt_str::hex_encode_h(rt_path::filename(a)) end
+    if op == "stem" is return rt_str::hex_encode_h(rt_path::stem(a)) end
+    if op == "ext" is return rt_str::hex_encode_h(rt_path::extension(a)) end
+    if op == "parent" is return rt_str::hex_encode_h(rt_path::parent(a)) end
+    if op == "norm" is return rt_str::hex_encode_h(rt_path::normalize(a)) end
+    if op == "withext" is return rt_str::hex_encode_h(rt_path::with_extension(a, b)) end
     if op == "isabs" is return "#" + bool_n(rt_path::is_absolute(a)) end
-    if op == "b64e" is return rt_str::hex_encode(rt_codec::base64_encode(a)) end
-    if op == "b64d" is return rt_str::hex_encode(rt_codec::base64_decode(a)) end
-    if op == "urle" is return rt_str::hex_encode(rt_codec::url_encode(a)) end
-    if op == "urld" is return rt_str::hex_encode(rt_codec::url_decode(a)) end
-    if op == "toint" is return "#" + to_string(rt_conv::to_int(a)) end
+    if op == "b64e" is return rt_str::hex_encode_h(rt_codec::base64_encode(a)) end
+    if op == "b64d" is return rt_str::hex_encode_h(rt_codec::base64_decode(a)) end
+    if op == "urle" is return rt_str::hex_encode_h(rt_codec::url_encode(a)) end
+    if op == "urld" is return rt_str::hex_encode_h(rt_codec::url_decode(a)) end
+    if op == "toint" is return "#" + to_string(rt_conv::to_int_h(a)) end
     if op == "tointhex" is return "#" + to_string(rt_conv::to_int_from_hex(a)) end
     if op == "charcode" is return "#" + to_string(rt_conv::char_code(a)) end
     if op == "dyear" is return "#" + to_string(rt_date::year(to_int(a))) end
     if op == "dmonth" is return "#" + to_string(rt_date::month(to_int(a))) end
     if op == "dday" is return "#" + to_string(rt_date::day(to_int(a))) end
-    if op == "dweekday" is return rt_str::hex_encode(rt_date::weekday(to_int(a))) end
+    if op == "dweekday" is return rt_str::hex_encode_h(rt_date::weekday(to_int(a))) end
     if op == "daddd" is return "#" + to_string(rt_date::add_days(to_int(a), to_int(b))) end
     if op == "daddh" is return "#" + to_string(rt_date::add_hours(to_int(a), to_int(b))) end
     if op == "ddiff" is return "#" + to_string(rt_date::diff_days(to_int(a), to_int(b))) end
     if op == "dparse" is return "#" + to_string(rt_date::parse(a)) end
     if op == "find" is return "#" + to_string(rt_str::find(a, b)) end
     if op == "rfind" is return "#" + to_string(rt_str::rfind(a, b)) end
-    if op == "at" is return rt_str::hex_encode(rt_str::at(a, to_int(b))) end
-    if op == "slice" is return rt_str::hex_encode(rt_str::slice(a, to_int(b), to_int(c))) end
-    if op == "trimr" is return rt_str::hex_encode(rt_str::trim_right(a)) end
+    if op == "at" is return rt_str::hex_encode_h(rt_str::at(a, to_int(b))) end
+    if op == "slice" is return rt_str::hex_encode_h(rt_str::slice(a, to_int(b), to_int(c))) end
+    if op == "trimr" is return rt_str::hex_encode_h(rt_str::trim_right(a)) end
     if op == "splitc" is return "#" + to_string(rt_str::split_count(a, b)) end
-    if op == "splitp" is return rt_str::hex_encode(rt_str::split_part(a, b, to_int(c))) end
+    if op == "splitp" is return rt_str::hex_encode_h(rt_str::split_part(a, b, to_int(c))) end
     if op == "absi" is return "#" + to_string(rt_num::abs_i(to_int(a))) end
     if op == "mini" is return "#" + to_string(rt_num::min_i(to_int(a), to_int(b))) end
     if op == "maxi" is return "#" + to_string(rt_num::max_i(to_int(a), to_int(b))) end
@@ -961,60 +962,60 @@ fn run_op(op: string, a: string, b: string, c: string) -> string is
     if op == "f2i" is return "#" + to_string(rt_num::float_to_int(dd(a))) end
     if op == "f_tofloat" is return "!" + rt_num::fmt6(rt_num::to_float(a)) end
     if starts_f(op) is return "!" + run_float(op, dd(a), dd(b)) end
-    if op == "hexd" is return rt_str::hex_encode(rt_bytes::hex_decode(a)) end
-    if op == "hexx" is return rt_str::hex_encode(rt_bytes::hex_xor(a, b)) end
-    if op == "hexeb" is return rt_str::hex_encode(rt_bytes::hex_encode_bytes(ints(a))) end
-    if op == "bfrom" is return rt_str::hex_encode(list_s(rt_bytes::bytes_from_ints(ints(a)))) end
-    if op == "bto" is return rt_str::hex_encode(list_s(rt_bytes::bytes_to_ints(ints(a)))) end
-    if op == "bcat" is return rt_str::hex_encode(list_s(rt_bytes::bytes_concat(ints(a), ints(b)))) end
+    if op == "hexd" is return rt_str::hex_encode_h(rt_bytes::hex_decode(a)) end
+    if op == "hexx" is return rt_str::hex_encode_h(rt_bytes::hex_xor(a, b)) end
+    if op == "hexeb" is return rt_str::hex_encode_h(rt_bytes::hex_encode_bytes(ints(a))) end
+    if op == "bfrom" is return rt_str::hex_encode_h(list_s(rt_bytes::bytes_from_ints_h(ints(a)))) end
+    if op == "bto" is return rt_str::hex_encode_h(list_s(rt_bytes::bytes_to_ints(ints(a)))) end
+    if op == "bcat" is return rt_str::hex_encode_h(list_s(rt_bytes::bytes_concat(ints(a), ints(b)))) end
     if op == "blen" is return "#" + to_string(rt_bytes::bytes_len(ints(a))) end
-    if op == "bstr" is return rt_str::hex_encode(rt_bytes::bytes_to_str_lossy(ints(a))) end
-    if op == "slower" is return rt_str::hex_encode(rt_str::string_lower(a)) end
-    if op == "supper" is return rt_str::hex_encode(rt_str::string_upper(a)) end
-    if op == "strim" is return rt_str::hex_encode(rt_str::string_trim(a)) end
+    if op == "bstr" is return rt_str::hex_encode_h(rt_bytes::bytes_to_str_lossy(ints(a))) end
+    if op == "slower" is return rt_str::hex_encode_h(rt_str::string_lower(a)) end
+    if op == "supper" is return rt_str::hex_encode_h(rt_str::string_upper(a)) end
+    if op == "strim" is return rt_str::hex_encode_h(rt_str::string_trim(a)) end
     if op == "slen" is return "#" + to_string(rt_str::string_len(a)) end
     if op == "strlen" is return "#" + to_string(rt_str::strlen(a)) end
     if op == "scontains" is return "#" + bool_n(rt_str::string_contains(a, b)) end
     if op == "sstarts" is return "#" + bool_n(rt_str::string_starts_with(a, b)) end
     if op == "sends" is return "#" + bool_n(rt_str::string_ends_with(a, b)) end
-    if op == "sreplace" is return rt_str::hex_encode(rt_str::string_replace(a, b, c)) end
-    if op == "strcat" is return rt_str::hex_encode(rt_str::strcat(a, b)) end
-    if op == "substr" is return rt_str::hex_encode(rt_str::substr(a, to_int(b), to_int(c))) end
-    if op == "splitws" is return rt_str::hex_encode(words_s(rt_str::split_whitespace(a))) end
-    if op == "i2s" is return rt_str::hex_encode(rt_conv::int_to_str(to_int(a))) end
-    if op == "i2str" is return rt_str::hex_encode(rt_conv::int_to_string(to_int(a))) end
-    if op == "i2hex" is return rt_str::hex_encode(rt_conv::int_to_hex(to_int(a))) end
-    if op == "c2s" is return rt_str::hex_encode(rt_conv::char_code_to_str(to_int(a))) end
+    if op == "sreplace" is return rt_str::hex_encode_h(rt_str::string_replace(a, b, c)) end
+    if op == "strcat" is return rt_str::hex_encode_h(rt_str::strcat(a, b)) end
+    if op == "substr" is return rt_str::hex_encode_h(rt_str::substr(a, to_int(b), to_int(c))) end
+    if op == "splitws" is return rt_str::hex_encode_h(words_s(rt_str::split_whitespace(a))) end
+    if op == "i2s" is return rt_str::hex_encode_h(rt_conv::int_to_str(to_int(a))) end
+    if op == "i2str" is return rt_str::hex_encode_h(rt_conv::int_to_string(to_int(a))) end
+    if op == "i2hex" is return rt_str::hex_encode_h(rt_conv::int_to_hex(to_int(a))) end
+    if op == "c2s" is return rt_str::hex_encode_h(rt_conv::char_code_to_str(to_int(a))) end
     if op == "uuidv" is return "#" + bool_n(rt_text::uuid_is_valid(a)) end
-    if op == "shesc" is return rt_str::hex_encode(rt_text::shell_escape(a)) end
-    if op == "jget" is return rt_str::hex_encode(rt_text::json_get(a, b)) end
+    if op == "shesc" is return rt_str::hex_encode_h(rt_text::shell_escape(a)) end
+    if op == "jget" is return rt_str::hex_encode_h(rt_text::json_get(a, b)) end
     if op == "parseopt" is return "#" + to_string(rt_conv::parse_int_opt(a)) end
-    if op == "sorti" is return rt_str::hex_encode(list_s(rt_sort::sort_ints(ints(a)))) end
-    if op == "sorts" is return rt_str::hex_encode(join_c(rt_sort::sort_strings(__builtin_str_split(a, ",")))) end
-    if op == "sha256" is return rt_str::hex_encode(rt_crypto::sha256(a)) end
-    if op == "sha512" is return rt_str::hex_encode(rt_crypto::sha512(a)) end
-    if op == "sha1" is return rt_str::hex_encode(rt_crypto::sha1(a)) end
-    if op == "md5" is return rt_str::hex_encode(rt_crypto::md5(a)) end
-    if op == "blake3" is return rt_str::hex_encode(rt_crypto::blake3(a)) end
-    if op == "hmac256" is return rt_str::hex_encode(rt_crypto::hmac_sha256(a, b)) end
-    if op == "hmac512" is return rt_str::hex_encode(rt_crypto::hmac_sha512(a, b)) end
-    if op == "sha256b" is return rt_str::hex_encode(rt_crypto::sha256_bytes(ints(a))) end
+    if op == "sorti" is return rt_str::hex_encode_h(list_s(rt_sort::sort_ints(ints(a)))) end
+    if op == "sorts" is return rt_str::hex_encode_h(join_c(rt_sort::sort_strings(__builtin_str_split(a, ",")))) end
+    if op == "sha256" is return rt_str::hex_encode_h(rt_crypto::sha256(a)) end
+    if op == "sha512" is return rt_str::hex_encode_h(rt_crypto::sha512(a)) end
+    if op == "sha1" is return rt_str::hex_encode_h(rt_crypto::sha1(a)) end
+    if op == "md5" is return rt_str::hex_encode_h(rt_crypto::md5(a)) end
+    if op == "blake3" is return rt_str::hex_encode_h(rt_crypto::blake3(a)) end
+    if op == "hmac256" is return rt_str::hex_encode_h(rt_crypto::hmac_sha256(a, b)) end
+    if op == "hmac512" is return rt_str::hex_encode_h(rt_crypto::hmac_sha512(a, b)) end
+    if op == "sha256b" is return rt_str::hex_encode_h(rt_crypto::sha256_bytes(ints(a))) end
     if op == "pbkdf2" is
         let kv: [string] = __builtin_str_split(c, ",")
-        return rt_str::hex_encode(list_s(rt_crypto::pbkdf2(a, ints(b), to_int(kv[0]), to_int(kv[1]))))
+        return rt_str::hex_encode_h(list_s(rt_crypto::pbkdf2(a, ints(b), to_int(kv[0]), to_int(kv[1]))))
     end
     if op == "a2verify" is return "#" + to_string(rt_argon2::verify(a, b)) end
     if op == "a2round" is
         let hh: string = rt_argon2::hash(a)
-        return rt_str::hex_encode(to_string(rt_argon2::verify(a, hh)) + to_string(rt_argon2::verify("not-the-password", hh)))
+        return rt_str::hex_encode_h(to_string(rt_argon2::verify(a, hh)) + to_string(rt_argon2::verify("not-the-password", hh)))
     end
     if op == "taskw" is
-        return rt_str::hex_encode(c_str(rt_task::task_wait(spawn_shell(a))))
+        return rt_str::hex_encode_h(c_str(rt_task::task_wait(spawn_shell(a))))
     end
     if op == "taskwt" is
         let hh: int = spawn_shell(a)
         let rd: int = rt_task::task_wait_timeout(hh, to_int(b))
-        return rt_str::hex_encode(to_string(rd) + ":" + c_str(rt_task::task_wait(hh)))
+        return rt_str::hex_encode_h(to_string(rd) + ":" + c_str(rt_task::task_wait(hh)))
     end
     if op == "taskj" is
         let hs: int = rt_ptr::buf_new(24)
@@ -1022,120 +1023,120 @@ fn run_op(op: string, a: string, b: string, c: string) -> string is
         rt_ptr::ptr_write_i64(hs, 8, spawn_shell(b))
         rt_ptr::ptr_write_i64(hs, 16, 42)
         let res: int = rt_task::task_join_all(hs, 3)
-        return rt_str::hex_encode(c_str(rt_ptr::ptr_read_i64(res, 0)) + "|" + c_str(rt_ptr::ptr_read_i64(res, 8)) + "|" + to_string(rt_ptr::ptr_read_i64(res, 16)))
+        return rt_str::hex_encode_h(c_str(rt_ptr::ptr_read_i64(res, 0)) + "|" + c_str(rt_ptr::ptr_read_i64(res, 8)) + "|" + to_string(rt_ptr::ptr_read_i64(res, 16)))
     end
     if op == "taskp" is
         let v: int = to_int(a)
-        return rt_str::hex_encode(to_string(rt_task::task_wait(v)) + "," + to_string(rt_task::task_wait_timeout(v, 5)))
+        return rt_str::hex_encode_h(to_string(rt_task::task_wait(v)) + "," + to_string(rt_task::task_wait_timeout(v, 5)))
     end
     if op == "taskn" is
         let blk: int = rt_ptr::buf_new(64)
         let same: int = 0
         let mut s1: int = 0
         if rt_task::task_wait(blk) == blk is s1 = 1 end
-        return rt_str::hex_encode(to_string(s1) + to_string(rt_task::task_wait_timeout(blk, 1)))
+        return rt_str::hex_encode_h(to_string(s1) + to_string(rt_task::task_wait_timeout(blk, 1)))
     end
-    if op == "sortby" is return rt_str::hex_encode(list_s(rt_sort::sort_by(ints(a), pick_cmp(b)))) end
+    if op == "sortby" is return rt_str::hex_encode_h(list_s(rt_sort::sort_by(ints(a), pick_cmp(b)))) end
     if op == "closure" is
         let ps: [string] = b.split(",")
         let a0: int = to_int(ps[0])
         let a1: int = to_int(ps[1])
         if a == "null" is
-            return rt_str::hex_encode(to_string(rt_indirect::closure_call1(0, a0)) + "," + to_string(rt_indirect::closure_call2(0, a0, a1)))
+            return rt_str::hex_encode_h(to_string(rt_indirect::closure_call1(0, a0)) + "," + to_string(rt_indirect::closure_call2(0, a0, a1)))
         end
         let fs: [string] = a.split(",")
         if !have_fn_addr() is return "?needs-fn_addr" end
         let c: int = rt_mem::closure_create(fn_addr_of(fs[0]), to_int(fs[1]), to_int(ps[2]), to_int(ps[3]), 0, 0, 0, 0, 0, 0)
-        if to_int(fs[2]) == 1 is return rt_str::hex_encode(to_string(rt_indirect::closure_call1(c, a0))) end
-        return rt_str::hex_encode(to_string(rt_indirect::closure_call2(c, a0, a1)))
+        if to_int(fs[2]) == 1 is return rt_str::hex_encode_h(to_string(rt_indirect::closure_call1(c, a0))) end
+        return rt_str::hex_encode_h(to_string(rt_indirect::closure_call2(c, a0, a1)))
     end
     if op == "spawnfn" is
         if !have_fn_addr() is return "?needs-fn_addr" end
         return "#" + to_string(rt_task::task_wait(rt_task::task_spawn(fn_addr_of(a), to_int(b))))
     end
     if op == "beq" is return "#" + bool_n(rt_crypto::bytes_eq(ints(a), ints(b))) end
-    if op == "xorb" is return rt_str::hex_encode(list_s(rt_crypto::xor_bytes(ints(a), ints(b)))) end
-    if op == "ptrs" is return rt_str::hex_encode(run_ptrs(a)) end
-    if op == "fsops" is return rt_str::hex_encode(run_fs(a)) end
-    if op == "envops" is return rt_str::hex_encode(run_env(a)) end
-    if op == "chars" is return rt_str::hex_encode(hexlist(rt_str::string_chars(a))) end
-    if op == "split" is return rt_str::hex_encode(hexlist(rt_str::string_split(a, b))) end
-    if op == "s2b" is return rt_str::hex_encode(list_s(rt_bytes::string_to_bytes(a))) end
-    if op == "b2s" is return rt_str::hex_encode(rt_bytes::bytes_to_string(ints(a), to_int(b))) end
-    if op == "ajoin" is return rt_str::hex_encode(rt_str::array_join(__builtin_str_split(a, ","), b)) end
-    if op == "jset" is return rt_str::hex_encode(rt_text::json_set_str(a, b, c)) end
-    if op == "platform" is return rt_str::hex_encode(rt_os::platform()) end
+    if op == "xorb" is return rt_str::hex_encode_h(list_s(rt_crypto::xor_bytes(ints(a), ints(b)))) end
+    if op == "ptrs" is return rt_str::hex_encode_h(run_ptrs(a)) end
+    if op == "fsops" is return rt_str::hex_encode_h(run_fs(a)) end
+    if op == "envops" is return rt_str::hex_encode_h(run_env(a)) end
+    if op == "chars" is return rt_str::hex_encode_h(hexlist(rt_str::string_chars(a))) end
+    if op == "split" is return rt_str::hex_encode_h(hexlist(rt_str::string_split(a, b))) end
+    if op == "s2b" is return rt_str::hex_encode_h(list_s(rt_bytes::string_to_bytes(a))) end
+    if op == "b2s" is return rt_str::hex_encode_h(rt_bytes::bytes_to_string_h(ints(a), to_int(b))) end
+    if op == "ajoin" is return rt_str::hex_encode_h(rt_str::array_join(__builtin_str_split(a, ","), b)) end
+    if op == "jset" is return rt_str::hex_encode_h(rt_text::json_set_str(a, b, c)) end
+    if op == "platform" is return rt_str::hex_encode_h(rt_os::platform()) end
     if op == "sleep" is
         rt_os::sleep_ms(to_int(a))
-        return rt_str::hex_encode("ok")
+        return rt_str::hex_encode_h("ok")
     end
-    if op == "sysname" is return rt_str::hex_encode(rt_sys::sysname()) end
-    if op == "machine" is return rt_str::hex_encode(rt_sys::machine()) end
-    if op == "kernelv" is return rt_str::hex_encode(rt_sys::kernel_version()) end
-    if op == "hostname" is return rt_str::hex_encode(rt_sys::hostname()) end
-    if op == "username" is return rt_str::hex_encode(rt_sys::username()) end
-    if op == "getcwd" is return rt_str::hex_encode(rt_sys::getcwd_s()) end
+    if op == "sysname" is return rt_str::hex_encode_h(rt_sys::sysname()) end
+    if op == "machine" is return rt_str::hex_encode_h(rt_sys::machine()) end
+    if op == "kernelv" is return rt_str::hex_encode_h(rt_sys::kernel_version()) end
+    if op == "hostname" is return rt_str::hex_encode_h(rt_sys::hostname()) end
+    if op == "username" is return rt_str::hex_encode_h(rt_sys::username()) end
+    if op == "getcwd" is return rt_str::hex_encode_h(rt_sys::getcwd_s()) end
     if op == "termw" is return "#" + to_string(rt_sys::term_width()) end
     if op == "termh" is return "#" + to_string(rt_sys::term_height()) end
     if op == "memtotal" is return "#" + to_string(rt_sys::memory_total()) end
     if op == "cpucount" is return "#" + to_string(rt_sys::cpu_count()) end
     if op == "disktotal" is return "#" + to_string(rt_sys::disk_total(a)) end
-    if op == "sysprop" is return rt_str::hex_encode(prop_sys(a)) end
-    if op == "bold" is return rt_str::hex_encode(rt_text::bold(a)) end
-    if op == "green" is return rt_str::hex_encode(rt_text::green_text(a)) end
-    if op == "red" is return rt_str::hex_encode(rt_text::red_text(a)) end
-    if op == "yellow" is return rt_str::hex_encode(rt_text::yellow_text(a)) end
-    if op == "dim" is return rt_str::hex_encode(rt_text::dim_text(a)) end
-    if op == "cyan" is return rt_str::hex_encode(rt_text::cyan_text(a)) end
-    if op == "datefmt" is return rt_str::hex_encode(rt_os::date_format(to_int(a), b)) end
-    if op == "b64db" is return rt_str::hex_encode(list_s(rt_codec::base64_decode_bytes(a))) end
-    if op == "rhex" is return rt_str::hex_encode(prop_rhex(to_int(a))) end
-    if op == "rstr" is return rt_str::hex_encode(prop_rstr(to_int(a))) end
-    if op == "rint" is return rt_str::hex_encode(prop_rint(to_int(a), to_int(b))) end
-    if op == "uuid" is return rt_str::hex_encode(prop_uuid()) end
-    if op == "rbytes" is return rt_str::hex_encode(prop_rbytes(to_int(a))) end
+    if op == "sysprop" is return rt_str::hex_encode_h(prop_sys(a)) end
+    if op == "bold" is return rt_str::hex_encode_h(rt_text::bold(a)) end
+    if op == "green" is return rt_str::hex_encode_h(rt_text::green_text(a)) end
+    if op == "red" is return rt_str::hex_encode_h(rt_text::red_text(a)) end
+    if op == "yellow" is return rt_str::hex_encode_h(rt_text::yellow_text(a)) end
+    if op == "dim" is return rt_str::hex_encode_h(rt_text::dim_text(a)) end
+    if op == "cyan" is return rt_str::hex_encode_h(rt_text::cyan_text(a)) end
+    if op == "datefmt" is return rt_str::hex_encode_h(rt_os::date_format(to_int(a), b)) end
+    if op == "b64db" is return rt_str::hex_encode_h(list_s(rt_codec::base64_decode_bytes(a))) end
+    if op == "rhex" is return rt_str::hex_encode_h(prop_rhex(to_int(a))) end
+    if op == "rstr" is return rt_str::hex_encode_h(prop_rstr(to_int(a))) end
+    if op == "rint" is return rt_str::hex_encode_h(prop_rint(to_int(a), to_int(b))) end
+    if op == "uuid" is return rt_str::hex_encode_h(prop_uuid()) end
+    if op == "rbytes" is return rt_str::hex_encode_h(prop_rbytes(to_int(a))) end
     if op == "umod" is
-        return rt_str::hex_encode(utext(rt_rand::umod64(to_int(a), to_int(b))))
+        return rt_str::hex_encode_h(utext(rt_rand::umod64(to_int(a), to_int(b))))
     end
-    if op == "exec1" is return rt_str::hex_encode(rt_proc::exec1(a)) end
-    if op == "exec2" is return rt_str::hex_encode(rt_proc::exec2(a, b)) end
-    if op == "exec3" is return rt_str::hex_encode(rt_proc::exec3(a, b, c)) end
+    if op == "exec1" is return rt_str::hex_encode_h(rt_proc::exec1(a)) end
+    if op == "exec2" is return rt_str::hex_encode_h(rt_proc::exec2(a, b)) end
+    if op == "exec3" is return rt_str::hex_encode_h(rt_proc::exec3(a, b, c)) end
     if op == "exec4" is
         let cs: [string] = __builtin_str_split(c, "\u{1}")
         let mut a3: string = ""
         if cs.len() > 1 is a3 = cs[1] end
-        return rt_str::hex_encode(rt_proc::exec4(a, b, cs[0], a3))
+        return rt_str::hex_encode_h(rt_proc::exec4(a, b, cs[0], a3))
     end
-    if op == "runargs" is return rt_str::hex_encode(rt_proc::process_run_args(a, __builtin_str_split(b, ","))) end
-    if op == "shell" is return rt_str::hex_encode(rt_proc::shell(a)) end
-    if op == "which" is return rt_str::hex_encode(rt_proc::process_which(a)) end
-    if op == "spawnkill" is return rt_str::hex_encode(spawnkill(a)) end
+    if op == "runargs" is return rt_str::hex_encode_h(rt_proc::process_run_args(a, __builtin_str_split(b, ","))) end
+    if op == "shell" is return rt_str::hex_encode_h(rt_proc::shell(a)) end
+    if op == "which" is return rt_str::hex_encode_h(rt_proc::process_which(a)) end
+    if op == "spawnkill" is return rt_str::hex_encode_h(spawnkill(a)) end
     if op == "rematch" is return "#" + bool_n(rt_proc::regex_match(a, b)) end
-    if op == "refind" is return rt_str::hex_encode(rt_proc::regex_find(a, b)) end
-    if op == "refindall" is return rt_str::hex_encode(strs_tok(rt_proc::regex_find_all(a, b))) end
-    if op == "resplit" is return rt_str::hex_encode(strs_tok(rt_proc::regex_split(a, b))) end
-    if op == "rerepl" is return rt_str::hex_encode(rt_proc::regex_replace(a, b, c)) end
-    if op == "recap" is return rt_str::hex_encode(strs_tok(rt_proc::regex_captures(a, b))) end
-    if op == "recapall" is return rt_str::hex_encode(rows_tok(rt_proc::regex_captures_all(a, b))) end
-    if op == "pyeval" is return rt_str::hex_encode(rt_proc::py_eval(a)) end
-    if op == "httpget" is return rt_str::hex_encode(rt_proc::http_get(a)) end
-    if op == "httppost" is return rt_str::hex_encode(rt_proc::http_post(a, b)) end
-    if op == "dns" is return rt_str::hex_encode(rt_net::dns_resolve(a)) end
+    if op == "refind" is return rt_str::hex_encode_h(rt_proc::regex_find(a, b)) end
+    if op == "refindall" is return rt_str::hex_encode_h(strs_tok(rt_proc::regex_find_all(a, b))) end
+    if op == "resplit" is return rt_str::hex_encode_h(strs_tok(rt_proc::regex_split(a, b))) end
+    if op == "rerepl" is return rt_str::hex_encode_h(rt_proc::regex_replace(a, b, c)) end
+    if op == "recap" is return rt_str::hex_encode_h(strs_tok(rt_proc::regex_captures(a, b))) end
+    if op == "recapall" is return rt_str::hex_encode_h(rows_tok(rt_proc::regex_captures_all(a, b))) end
+    if op == "pyeval" is return rt_str::hex_encode_h(rt_proc::py_eval(a)) end
+    if op == "httpget" is return rt_str::hex_encode_h(rt_proc::http_get(a)) end
+    if op == "httppost" is return rt_str::hex_encode_h(rt_proc::http_post(a, b)) end
+    if op == "dns" is return rt_str::hex_encode_h(rt_net::dns_resolve(a)) end
     if op == "scan" is return "#" + bool_n(rt_net::scan_port_net(a, to_int(b), to_int(c))) end
-    if op == "mem" is return rt_str::hex_encode(run_mem(a)) end
-    if op == "f2s" is return rt_str::hex_encode(rt_fmt::float_to_string(rt_num::to_float(a))) end
-    if op == "pyrepr" is return rt_str::hex_encode(rt_fmt::py_repr(a)) end
+    if op == "mem" is return rt_str::hex_encode_h(run_mem(a)) end
+    if op == "f2s" is return rt_str::hex_encode_h(rt_fmt::float_to_string(rt_num::to_float(a))) end
+    if op == "pyrepr" is return rt_str::hex_encode_h(rt_fmt::py_repr(a)) end
     if op == "runcmd" is
-        let rc: int = rt_proc::run_cmd_exec(a, to_int(b))
-        return rt_str::hex_encode(to_string(rc) + "," + lm_tok(rt_proc::run_cmd_last_stdout()) + "," + lm_tok(rt_proc::run_cmd_last_stderr()))
+        let rc: int = rt_proc::run_cmd_exec_h(a, to_int(b))
+        return rt_str::hex_encode_h(to_string(rc) + "," + lm_tok(rt_proc::run_cmd_last_stdout_h()) + "," + lm_tok(rt_proc::run_cmd_last_stderr_h()))
     end
-    if op == "runcmd0" is return rt_str::hex_encode(lm_tok(rt_proc::run_cmd_last_stdout()) + "," + lm_tok(rt_proc::run_cmd_last_stderr())) end
+    if op == "runcmd0" is return rt_str::hex_encode_h(lm_tok(rt_proc::run_cmd_last_stdout_h()) + "," + lm_tok(rt_proc::run_cmd_last_stderr_h())) end
     if op == "http" is
         let h: int = rt_http::http_request(a, b, c)
         let body: string = rt_mem::text_at(rt_ptr::ptr_read_ptr(h, 8))
-        return rt_str::hex_encode(to_string(rt_ptr::ptr_read_i64(h, 0)) + "," + lm_tok(body))
+        return rt_str::hex_encode_h(to_string(rt_ptr::ptr_read_i64(h, 0)) + "," + lm_tok(body))
     end
-    if op == "dbops" is return rt_str::hex_encode(run_db(a)) end
+    if op == "dbops" is return rt_str::hex_encode_h(run_db(a)) end
     if op == "uid" is return "#" + to_string(rt_sys::uid()) end
     if op == "gid" is return "#" + to_string(rt_sys::gid()) end
     if op == "ppid" is return "#" + to_string(rt_sys::ppid()) end
@@ -1144,8 +1145,8 @@ fn run_op(op: string, a: string, b: string, c: string) -> string is
     if op == "is64" is return "#" + bool_n(rt_sys::is_64bit()) end
     if op == "le" is return "#" + bool_n(rt_sys::is_little_endian()) end
     if op == "tty" is return "#" + bool_n(rt_sys::stdout_is_tty()) end
-    if op == "home" is return rt_str::hex_encode(rt_sys::home_dir()) end
-    if op == "tmp" is return rt_str::hex_encode(rt_sys::temp_dir()) end
+    if op == "home" is return rt_str::hex_encode_h(rt_sys::home_dir()) end
+    if op == "tmp" is return rt_str::hex_encode_h(rt_sys::temp_dir()) end
     return "?unknown-op"
 end
 
