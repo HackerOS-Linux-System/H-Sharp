@@ -101,7 +101,7 @@ pub fn getenv_s(name: string) -> string is
     if p == 0 is return "" end
     return strdup(p)
 end
-pub fn env_get(name: string) -> string is return getenv_s(name) end
+pub fn env_get_h(name: string) -> string is return getenv_s(name) end
 ;; core.c hsh_setenv: overwrite = 1
 pub fn setenv_s(name: string, value: string) -> bool is
     if name.len() > 0 is rt_state::env_note_set(name) end
