@@ -1,5 +1,6 @@
+mod rt_raw
 fn raw_string(bs: [int]) -> string is
-    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+    return rt_raw::string_from_ints(bs)
 end
 
 ;; (uint8_t)x for any int: the low 8 bits (also right for negatives)
@@ -169,7 +170,7 @@ pub fn hex_encode_bytes(b: [int]) -> string is
 end
 
 ;; core.c hsh_bytes_from_ints / hsh_bytes_to_ints: copy with `& 0xff`
-pub fn bytes_from_ints(a: [int]) -> [int] is
+pub fn bytes_from_ints_h(a: [int]) -> [int] is
     let mut out: [int] = []
     let mut i: int = 0
     while i < a.len() is
@@ -180,12 +181,12 @@ pub fn bytes_from_ints(a: [int]) -> [int] is
 end
 
 pub fn bytes_to_ints(b: [int]) -> [int] is
-    return bytes_from_ints(b)
+    return rt_bytes::bytes_from_ints_h(b)
 end
 
 ;; core.c hsh_bytes_concat
 pub fn bytes_concat(a: [int], b: [int]) -> [int] is
-    let mut out: [int] = bytes_from_ints(a)
+    let mut out: [int] = rt_bytes::bytes_from_ints_h(a)
     let mut i: int = 0
     while i < b.len() is
         out.push(mask(b[i]))
@@ -201,7 +202,7 @@ end
 
 ;; core.c hsh_bytes_to_str_lossy
 pub fn bytes_to_str_lossy(b: [int]) -> string is
-    return raw_string(cut_nul(utf8_lossy(bytes_from_ints(b))))
+    return raw_string(cut_nul(utf8_lossy(rt_bytes::bytes_from_ints_h(b))))
 end
 
 ;; core.c hsh_string_to_bytes: the bytes of the string up to its first NUL, as 0..255
@@ -218,7 +219,7 @@ end
 ;; core.c hsh_bytes_to_string(bytes, n): the first n bytes (low 8 bits each) as a C string, "" for n <= 0 or no bytes.
 ;; (C reads only min(n, len) elements and leaves the rest of its n-byte buffer uninitialised: n > len is not a defined result,
 ;; here it simply ends at len.)  Goes through __builtin_bytes_to_string, so bytes that are not valid UTF-8 come back as U+FFFD.
-pub fn bytes_to_string(b: [int], n: int) -> string is
+pub fn bytes_to_string_h(b: [int], n: int) -> string is
     if b.len() == 0 || n <= 0 is return "" end
     let mut out: [int] = []
     let mut i: int = 0
