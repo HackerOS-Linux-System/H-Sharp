@@ -71,7 +71,7 @@ fn meminfo_kb(key: string) -> int is
     let lines: [string] = __builtin_str_split(rt_os::read_stream("/proc/meminfo"), "\n")
     let mut i: int = 0
     while i < lines.len() is
-        if rt_str::starts_with(lines[i], key) is
+        if rt_str::starts_with_h(lines[i], key) is
             let rest: string = lines[i][key.len()..lines[i].len()]
             let mut j: int = 0
             while j < rest.len() && (byte_at(rest, j) == 32 || byte_at(rest, j) == 9) is j += 1 end
@@ -97,7 +97,7 @@ pub fn cpu_count() -> int is
     let mut n: int = 0
     let mut i: int = 0
     while i < lines.len() is
-        if rt_str::starts_with(lines[i], "processor") is n += 1 end
+        if rt_str::starts_with_h(lines[i], "processor") is n += 1 end
         i += 1
     end
     if n > 0 is return n end
@@ -219,7 +219,7 @@ pub fn term_height() -> int is return term_size()[0] end
 
 ;; core.c hsh_env_args: the process arguments, program name first.  The C hands out argv; on Linux /proc/self/cmdline is the same
 ;; NUL-separated list, so it is read from there (as bytes: an empty argument is two NULs in a row).
-pub fn env_args() -> [string] is
+pub fn env_args_h() -> [string] is
     let mut out: [string] = []
     let f: int = fopen("/proc/self/cmdline", "rb")
     if f == 0 is return out end
