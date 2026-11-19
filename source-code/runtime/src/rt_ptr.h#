@@ -13,6 +13,16 @@ extern static [c] is
     fn memset(p: int, c: int, n: int) -> int
     fn memmove(dst: int, src: int, n: int) -> int
     fn memcmp(a: int, b: int, n: int) -> int
+    ;; the native load/store primitives (core.c today, intrinsics.c once core.c is gone): H# 0.9.0 has no way to dereference an address,
+    ;; and emulating it through strndup/memset costs ~100x (every array slot access went through it)
+    fn hsh_ptr_read_i8(p: int, off: int) -> int
+    fn hsh_ptr_read_i16(p: int, off: int) -> int
+    fn hsh_ptr_read_i32(p: int, off: int) -> int
+    fn hsh_ptr_read_i64(p: int, off: int) -> int
+    fn hsh_ptr_write_i8(p: int, off: int, v: int)
+    fn hsh_ptr_write_i16(p: int, off: int, v: int)
+    fn hsh_ptr_write_i32(p: int, off: int, v: int)
+    fn hsh_ptr_write_i64(p: int, off: int, v: int)
 end
 
 ;; helpers for the other modules / tests (not hsh_* symbols)
@@ -21,26 +31,32 @@ pub fn buf_free(p: int) is free(p) end
 
 ;; the byte (0..255) at address p
 pub fn peek_byte(p: int) -> int is
-    let s: string = strndup(p, 1)
-    if s.len() == 0 is return 0 end
-    return byte_at(s, 0)
+    return hsh_ptr_read_i8(p, 0) & 255
 end
 
-;; `width` bytes at p, little-endian, as an unsigned number (wraps into the sign bit for width 8)
+;; `width` bytes at p, little-endian, as an unsigned number (wraps into the sign bit for width 8); width is 1, 2, 4 or 8
 fn peek_le(p: int, width: int) -> int is
+    if width == 8 is return hsh_ptr_read_i64(p, 0) end
+    if width == 4 is return hsh_ptr_read_i32(p, 0) & 4294967295 end
+    if width == 2 is return hsh_ptr_read_i16(p, 0) & 65535 end
+    if width == 1 is return hsh_ptr_read_i8(p, 0) & 255 end
     let mut v: int = 0
     let mut k: int = width - 1
     while k >= 0 is
-        v = (v << 8) | peek_byte(p + k)
+        v = (v << 8) | (hsh_ptr_read_i8(p + k, 0) & 255)
         k -= 1
     end
     return v
 end
 
 fn poke_le(p: int, width: int, val: int) is
+    if width == 8 is hsh_ptr_write_i64(p, 0, val) return end
+    if width == 4 is hsh_ptr_write_i32(p, 0, val) return end
+    if width == 2 is hsh_ptr_write_i16(p, 0, val) return end
+    if width == 1 is hsh_ptr_write_i8(p, 0, val) return end
     let mut k: int = 0
     while k < width is
-        memset(p + k, (val >> (8 * k)) & 255, 1)
+        hsh_ptr_write_i8(p + k, 0, (val >> (8 * k)) & 255)
         k += 1
     end
 end
