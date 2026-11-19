@@ -1,0 +1,30 @@
+extern static [c] is
+    fn malloc(n: int) -> int
+    fn free(p: int) -> int
+    fn memset(p: int, c: int, n: int) -> int
+    fn strdup(p: int) -> string
+end
+
+;; the bytes of `bs` (low 8 bits each) up to the first NUL, as a fresh string — what hsh_bytes_to_str_lossy returns for already valid bytes
+pub fn string_from_ints(bs: [int]) -> string is
+    let n: int = bs.len()
+    let buf: int = malloc(n + 1)
+    if buf == 0 is return "" end
+    let mut i: int = 0
+    let mut c: int = 0
+    while i < n is
+        c = ((bs[i] % 256) + 256) % 256
+        if c == 0 is
+            memset(buf + i, 0, 1)
+            let s0: string = strdup(buf)
+            free(buf)
+            return s0
+        end
+        memset(buf + i, c, 1)
+        i += 1
+    end
+    memset(buf + n, 0, 1)
+    let s: string = strdup(buf)
+    free(buf)
+    return s
+end
