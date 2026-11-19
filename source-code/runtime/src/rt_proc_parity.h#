@@ -58,14 +58,14 @@ fn main() is
         end
         rt_io::print_s("\n")
         elsif sc == "env_args" is
-        let a: [string] = rt_sys::env_args()
+        let a: [string] = rt_sys::env_args_h()
         rt_io::print_s("n=" + to_string(a.len()) + "\n")
         let mut i: int = 1
         while i < a.len() is
             rt_io::print_s("[" + a[i] + "]\n")
             i += 1
         end
-    elsif rt_str::starts_with(sc, "chk_") is
+    elsif rt_str::starts_with_h(sc, "chk_") is
         let p: int = rt_ptr::rc_alloc(16)
         rt_io::ptr_write_checked(p, 0, 8, -2)
         rt_io::ptr_write_checked(p, 8, 4, 16909060)
