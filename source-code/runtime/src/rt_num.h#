@@ -84,7 +84,7 @@ end
 
 ;; hsh_atoll == strtoll base 10 (saturating)
 pub fn atoll(s: string) -> int is
-    return rt_conv::to_int(s)
+    return rt_conv::to_int_h(s)
 end
 
 ;; core.c hsh_atoll_export / hsh_atof_export: the same conversions as hsh_atoll / hsh_atof, kept as separate exported symbols
