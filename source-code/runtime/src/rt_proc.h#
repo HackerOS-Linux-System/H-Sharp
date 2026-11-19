@@ -394,7 +394,7 @@ fn drain_nonblock(fd: int, buf: int) -> [string] is
 end
 
 ;; core.c hsh_run_cmd_exec: the exit code (-1: could not start or not a normal exit, -2: killed on timeout)
-pub fn run_cmd_exec(cmd: string, timeout_secs: int) -> int is
+pub fn run_cmd_exec_h(cmd: string, timeout_secs: int) -> int is
     runcmd_store("", "")
     let a: int = rt_ptr::buf_new(8)
     let b: int = rt_ptr::buf_new(8)
@@ -525,13 +525,13 @@ pub fn run_cmd_exec(cmd: string, timeout_secs: int) -> int is
 end
 
 ;; core.c hsh_run_cmd_last_stdout / last_stderr: what the previous run_cmd_exec captured ("" before the first one)
-pub fn run_cmd_last_stdout() -> string is
+pub fn run_cmd_last_stdout_h() -> string is
     let slot: int = rt_state::global_slot("_HSH_RT_RUNCMD", 16)
     let p: int = rt_ptr::ptr_read_ptr(slot, 0)
     if p == 0 is return "" end
     return strdup(p)
 end
-pub fn run_cmd_last_stderr() -> string is
+pub fn run_cmd_last_stderr_h() -> string is
     let slot: int = rt_state::global_slot("_HSH_RT_RUNCMD", 16)
     let p: int = rt_ptr::ptr_read_ptr(slot, 8)
     if p == 0 is return "" end
