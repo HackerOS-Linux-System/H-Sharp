@@ -130,7 +130,7 @@ pub fn hsh_trim(p0: string) -> string is
 end
 
 pub fn hsh_str_contains(p0: string, p1: string) -> int is
-    if rt_str::contains(p0, p1) is return 1 end
+    if rt_str::contains_h(p0, p1) is return 1 end
     return 0
 end
 
@@ -139,24 +139,24 @@ pub fn hsh_str_index_of(p0: string, p1: string) -> int is
 end
 
 pub fn hsh_to_upper(p0: string) -> string is
-    return rt_str::to_upper(p0)
+    return rt_str::to_upper_h(p0)
 end
 
 pub fn hsh_to_lower(p0: string) -> string is
-    return rt_str::to_lower(p0)
+    return rt_str::to_lower_h(p0)
 end
 
 pub fn hsh_str_replace(p0: string, p1: string, p2: string) -> string is
-    return rt_str::replace(p0, p1, p2)
+    return rt_str::replace_h(p0, p1, p2)
 end
 
 pub fn hsh_starts_with(p0: string, p1: string) -> int is
-    if rt_str::starts_with(p0, p1) is return 1 end
+    if rt_str::starts_with_h(p0, p1) is return 1 end
     return 0
 end
 
 pub fn hsh_ends_with(p0: string, p1: string) -> int is
-    if rt_str::ends_with(p0, p1) is return 1 end
+    if rt_str::ends_with_h(p0, p1) is return 1 end
     return 0
 end
 
@@ -518,15 +518,15 @@ pub fn hsh_os_is_root() -> int is
 end
 
 pub fn hsh_run_cmd_exec(p0: string, p1: int) -> int is
-    return rt_proc::run_cmd_exec(p0, p1)
+    return rt_proc::run_cmd_exec_h(p0, p1)
 end
 
 pub fn hsh_run_cmd_last_stdout() -> string is
-    return rt_proc::run_cmd_last_stdout()
+    return rt_proc::run_cmd_last_stdout_h()
 end
 
 pub fn hsh_run_cmd_last_stderr() -> string is
-    return rt_proc::run_cmd_last_stderr()
+    return rt_proc::run_cmd_last_stderr_h()
 end
 
 pub fn hsh_str_split_count(p0: string, p1: string) -> int is
@@ -547,7 +547,7 @@ pub fn hsh_int_to_str(p0: int) -> string is
 end
 
 pub fn hsh_str_to_int(p0: string) -> int is
-    return rt_conv::to_int(p0)
+    return rt_conv::to_int_h(p0)
 end
 
 pub fn hsh_parse_int_opt(p0: string) -> int is
@@ -563,7 +563,7 @@ pub fn hsh_conv_float_to_int(p0: f64) -> int is
 end
 
 pub fn hsh_env_get(p0: string) -> string is
-    return rt_os::env_get(p0)
+    return rt_os::env_get_h(p0)
 end
 
 pub fn hsh_env_read_line() -> string is
@@ -820,7 +820,7 @@ pub fn hsh_string_repeat(p0: string, p1: int) -> string is
 end
 
 pub fn hsh_to_int(p0: string) -> int is
-    return rt_conv::to_int(p0)
+    return rt_conv::to_int_h(p0)
 end
 
 pub fn hsh_to_int_from_hex(p0: string) -> int is
@@ -1089,7 +1089,7 @@ pub fn hsh_map_clear(p0: int) is
 end
 
 pub fn hsh_hex_encode(p0: string) -> string is
-    return rt_str::hex_encode(p0)
+    return rt_str::hex_encode_h(p0)
 end
 
 pub fn hsh_hex_decode(p0: string) -> string is
