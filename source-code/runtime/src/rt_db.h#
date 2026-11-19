@@ -1,3 +1,4 @@
+mod rt_raw
 mod rt_ptr
 mod rt_mem
 mod rt_state
@@ -72,7 +73,7 @@ fn error_context(zsql: string, off: int) -> string is
         if c == 32 || (c >= 9 && c <= 13) is code.push(32) else code.push(c) end
         i += 1
     end
-    let ctext2: string = __builtin_bytes_to_string(__builtin_bytes_from_ints(code))
+    let ctext2: string = rt_raw::string_from_ints(code)
     if o < 25 is return "\n  " + ctext2 + "\n  " + spaces(o) + "^--- error here" end
     return "\n  " + ctext2 + "\n  " + spaces(o - 14) + "error here ---^"
 end
@@ -238,7 +239,7 @@ fn strtoll_sat(s: string) -> int is
     return -v
 end
 
-fn is_tx(h: string) -> bool is return rt_str::starts_with(h, "sqlite-tx://") end
+fn is_tx(h: string) -> bool is return rt_str::starts_with_h(h, "sqlite-tx://") end
 
 ;; index of the open transaction named by the handle, -1 when it is not one
 fn tx_get(h: string) -> int is
@@ -252,7 +253,7 @@ end
 fn path_of(h: string) -> string is
     let t: int = tx_get(h)
     if t >= 0 is return rt_mem::text_at(rt_ptr::ptr_read_ptr(txbase() + t * 40, 8)) end
-    if rt_str::starts_with(h, "sqlite://") is return h[9..h.len()] end
+    if rt_str::starts_with_h(h, "sqlite://") is return h[9..h.len()] end
     return h
 end
 
@@ -448,7 +449,7 @@ end
 ;; core.c hsh_sqlite_open: "sqlite://<path>" (a leading "sqlite://" is not doubled)
 pub fn sqlite_open(uri: string) -> string is
     let mut p: string = uri
-    if rt_str::starts_with(p, "sqlite://") is p = p[9..p.len()] end
+    if rt_str::starts_with_h(p, "sqlite://") is p = p[9..p.len()] end
     return "sqlite://" + p
 end
 
@@ -601,7 +602,7 @@ pub fn db_col_float(row: int, col: string) -> f64 is return rt_num::to_float(cel
 pub fn db_col_bool(row: int, col: string) -> int is
     let v: string = cell(row, col)
     if v == "1" is return 1 end
-    let lower: string = rt_str::to_lower(v)
+    let lower: string = rt_str::to_lower_h(v)
     if lower == "true" || lower == "t" is return 1 end
     return 0
 end
