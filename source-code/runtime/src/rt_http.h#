@@ -96,9 +96,9 @@ pub fn http_request(method0: string, url: string, body0: string) -> int is
     if method.len() == 0 is method = "GET" end
     let body: string = body0
     let mut rest: string = url
-    if rt_str::starts_with(url, "http://") is
+    if rt_str::starts_with_h(url, "http://") is
         rest = url[7..url.len()]
-    elsif rt_str::starts_with(url, "https://") is
+    elsif rt_str::starts_with_h(url, "https://") is
         return http_fail("https:// is not supported — this runtime has no TLS backend, use http:// or a reverse proxy")
     end
     let slash: int = rt_str::index_of(rest, "/")
