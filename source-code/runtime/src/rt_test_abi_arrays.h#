@@ -3,10 +3,11 @@ use "std -> test" from "test"
 mod rt_abi
 mod rt_abi_arrays
 mod rt_mem
+mod rt_marshal
 
 ;; rt_test_abi_arrays — the C-name wrappers that take or return a raw HshArray* (rt_abi_arrays.h#).  Arrays are built and read through the
 ;; C API itself (hsh_array_new / push / get / len), so these tests exercise exactly what C code linked against the runtime would do.
-;; Needs the compiler that has array_ptr / array_from_ptr (source-code/compiler), not the h# 0.9.0 binary.
+;; Raw <-> typed array conversion is rt_marshal (pure H#), so this runs on any toolchain, h# 0.9.0 included.
 
 fn eq_s(actual: string, expected: string) is
     if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
@@ -118,4 +119,24 @@ fn abi_array_files_and_process() is
     eq_s(rt_abi_arrays::hsh_process_run_args("printf", args), "ok")
     if rt_abi::hsh_array_len(rt_abi_arrays::hsh_env_args()) < 0 is test::fail("env_args") end
     rt_abi::hsh_remove_dir_recursive(dir)
+end
+
+#[test]
+fn marshal_roundtrip() is
+    let raw: int = ints3(7, -2, 40)
+    let a: [int] = rt_marshal::ints_from_raw(raw)
+    eq_i(a.len(), 3)
+    eq_i(a[1], -2)
+    let back: int = rt_marshal::ints_to_raw(a)
+    eq_i(rt_abi::hsh_array_len(back), 3)
+    eq_i(rt_abi::hsh_array_get(back, 2), 40)
+    eq_i(rt_marshal::ints_from_raw(0).len(), 0)
+    let s: [string] = ["alpha", "", "gamma"]
+    let sr: int = rt_marshal::strs_to_raw(s)
+    let s2: [string] = rt_marshal::strs_from_raw(sr)
+    eq_i(s2.len(), 3)
+    eq_s(s2[0], "alpha")
+    eq_s(s2[1], "")
+    eq_s(s2[2], "gamma")
+    eq_s(rt_abi_arrays::hsh_array_join(sr, "-"), "alpha--gamma")
 end
