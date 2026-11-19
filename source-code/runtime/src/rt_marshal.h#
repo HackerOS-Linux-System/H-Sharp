@@ -1,0 +1,47 @@
+mod rt_mem
+
+;; raw HshArray* of integers -> [int] (NULL -> empty)
+pub fn ints_from_raw(p: int) -> [int] is
+    let mut out: [int] = []
+    let n: int = rt_mem::array_len(p)
+    let mut i: int = 0
+    while i < n is
+        out.push(rt_mem::array_get(p, i))
+        i += 1
+    end
+    return out
+end
+
+;; [int] -> fresh raw HshArray*
+pub fn ints_to_raw(a: [int]) -> int is
+    let mut r: int = rt_mem::array_new()
+    let mut i: int = 0
+    while i < a.len() is
+        r = rt_mem::array_push(r, a[i])
+        i += 1
+    end
+    return r
+end
+
+;; raw HshArray* of `char*` -> [string] (each element copied; NULL element -> "")
+pub fn strs_from_raw(p: int) -> [string] is
+    let mut out: [string] = []
+    let n: int = rt_mem::array_len(p)
+    let mut i: int = 0
+    while i < n is
+        out.push(rt_mem::text_at(rt_mem::array_get(p, i)))
+        i += 1
+    end
+    return out
+end
+
+;; [string] -> fresh raw HshArray* whose slots are malloc'd NUL-terminated copies
+pub fn strs_to_raw(a: [string]) -> int is
+    let mut r: int = rt_mem::array_new()
+    let mut i: int = 0
+    while i < a.len() is
+        r = rt_mem::array_push(r, rt_mem::c_string(a[i]))
+        i += 1
+    end
+    return r
+end
