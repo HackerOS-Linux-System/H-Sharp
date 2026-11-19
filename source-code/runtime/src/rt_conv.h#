@@ -1,3 +1,4 @@
+mod rt_raw
 fn is_space(c: int) -> bool is
     return c == 32 || (c >= 9 && c <= 13)
 end
@@ -37,7 +38,7 @@ pub fn strtoll10(s: string, from: int) -> [int] is
 end
 
 ;; hsh_to_int / hsh_str_to_int
-pub fn to_int(s: string) -> int is
+pub fn to_int_h(s: string) -> int is
     return strtoll10(s, 0)[0]
 end
 
@@ -186,7 +187,7 @@ pub fn char_code_to_str(code0: int) -> string is
         bs.push(128 + (code / 64) % 64)
         bs.push(128 + code % 64)
     end
-    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+    return rt_raw::string_from_ints(bs)
 end
 
 ;; core.c hsh_parse_int_opt: the WHOLE string must be [+-]digits (no whitespace, no empty digits) and fit an i64, else 0
