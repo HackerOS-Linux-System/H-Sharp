@@ -52,16 +52,16 @@ fn search() is
     eq_i(rt_str::index_of("hello", "z"), -1)
     eq_i(rt_str::index_of("hello", ""), 0)
     eq_i(rt_str::index_of("aab", "ab"), 1)
-    eq_b(rt_str::contains("abc", "bc"), true)
-    eq_b(rt_str::contains("abc", "cb"), false)
+    eq_b(rt_str::contains_h("abc", "bc"), true)
+    eq_b(rt_str::contains_h("abc", "cb"), false)
 end
 
 #[test]
 fn case_and_hex() is
-    eq_s(rt_str::to_upper("aBc-1ż"), "ABC-1ż")
-    eq_s(rt_str::to_lower("AbC-1Ż"), "abc-1Ż")
-    eq_s(rt_str::hex_encode("A\nz"), "410a7a")
-    eq_s(rt_str::hex_encode(""), "")
+    eq_s(rt_str::to_upper_h("aBc-1ż"), "ABC-1ż")
+    eq_s(rt_str::to_lower_h("AbC-1Ż"), "abc-1Ż")
+    eq_s(rt_str::hex_encode_h("A\nz"), "410a7a")
+    eq_s(rt_str::hex_encode_h(""), "")
 end
 
 #[test]
@@ -103,21 +103,21 @@ end
 
 #[test]
 fn more_strings() is
-    eq_s(rt_str::replace("a-b-c", "-", "+"), "a+b+c")
-    eq_s(rt_str::replace("aaa", "aa", "b"), "ba")
-    eq_s(rt_str::replace("abc", "", "x"), "abc")
-    eq_b(rt_str::starts_with("hello", "he"), true)
-    eq_b(rt_str::ends_with("hello", "llo"), true)
-    eq_b(rt_str::ends_with("lo", "llo"), false)
+    eq_s(rt_str::replace_h("a-b-c", "-", "+"), "a+b+c")
+    eq_s(rt_str::replace_h("aaa", "aa", "b"), "ba")
+    eq_s(rt_str::replace_h("abc", "", "x"), "abc")
+    eq_b(rt_str::starts_with_h("hello", "he"), true)
+    eq_b(rt_str::ends_with_h("hello", "llo"), true)
+    eq_b(rt_str::ends_with_h("lo", "llo"), false)
     eq_s(rt_str::repeat("ab", 3), "ababab")
     eq_s(rt_str::pad_right("ab", 5), "ab   ")
 end
 
 #[test]
 fn conversions() is
-    eq_i(rt_conv::to_int("  -17abc"), -17)
-    eq_i(rt_conv::to_int("abc"), 0)
-    eq_i(rt_conv::to_int("9223372036854775808"), 9223372036854775807)
+    eq_i(rt_conv::to_int_h("  -17abc"), -17)
+    eq_i(rt_conv::to_int_h("abc"), 0)
+    eq_i(rt_conv::to_int_h("9223372036854775808"), 9223372036854775807)
     eq_i(rt_conv::to_int_from_hex("f"), 15)
     eq_i(rt_conv::to_int_from_hex("ff"), 15)
     eq_i(rt_conv::char_code("ż"), 380)
@@ -208,8 +208,8 @@ end
 fn bytes_helpers() is
     eq_s(rt_bytes::hex_encode_bytes([0, 1, 255, 256, -1]), "0001ff00ff")
     eq_i(rt_bytes::bytes_len([1, 2, 3]), 3)
-    eq_i(rt_bytes::bytes_from_ints([300, -1])[0], 44)
-    eq_i(rt_bytes::bytes_from_ints([300, -1])[1], 255)
+    eq_i(rt_bytes::bytes_from_ints_h([300, -1])[0], 44)
+    eq_i(rt_bytes::bytes_from_ints_h([300, -1])[1], 255)
     eq_i(rt_bytes::bytes_concat([1, 2], [257])[2], 1)
     eq_i(rt_bytes::bytes_concat([1, 2], [257]).len(), 3)
     eq_s(rt_bytes::bytes_to_str_lossy([72, 105]), "Hi")
@@ -359,7 +359,7 @@ fn files_and_env() is
     eq_b(rt_os::fs_rmdir(d), true)
     eq_b(rt_os::setenv_s("HSH_RT_TEST_VAR", "abc"), true)
     eq_s(rt_os::getenv_s("HSH_RT_TEST_VAR"), "abc")
-    eq_s(rt_os::env_get("HSH_RT_TEST_VAR"), "abc")
+    eq_s(rt_os::env_get_h("HSH_RT_TEST_VAR"), "abc")
     eq_b(rt_os::env_remove("HSH_RT_TEST_VAR"), true)
     eq_s(rt_os::getenv_s("HSH_RT_TEST_VAR"), "")
     eq_s(rt_os::platform(), "linux")
@@ -377,7 +377,7 @@ fn chars_split_join_json_set() is
     eq_i(rt_str::string_split("abc", "").len(), 1)
     eq_s(rt_str::array_join(["x", "y", "z"], "-"), "x-y-z")
     eq_i(rt_bytes::string_to_bytes("Hi")[1], 105)
-    eq_s(rt_bytes::bytes_to_string([72, 105, 33], 2), "Hi")
+    eq_s(rt_bytes::bytes_to_string_h([72, 105, 33], 2), "Hi")
     eq_s(rt_text::json_set_str("", "a", "b"), "{\"a\":\"b\"}")
     eq_s(rt_text::json_set_str("{\"a\":\"1\"}", "b", "2"), "{\"a\":\"1\",\"b\":\"2\"}")
     eq_s(rt_text::json_set_str("{\"a\":\"1\",\"b\":\"2\"}", "a", "X"), "{\"a\":\"X\",\"b\":\"2\"}")
@@ -391,7 +391,7 @@ fn system_information_and_misc() is
     eq_b(rt_sys::uptime() > 0, true)
     eq_b(rt_sys::getcwd_s().len() > 0, true)
     eq_b(rt_sys::term_width() > 0 && rt_sys::term_height() > 0, true)
-    eq_b(rt_sys::env_args().len() >= 1, true)
+    eq_b(rt_sys::env_args_h().len() >= 1, true)
     eq_s(rt_text::bold("x"), "\u{1b}[1mx\u{1b}[0m")
     eq_s(rt_text::red_text("a"), "\u{1b}[31ma\u{1b}[0m")
     eq_s(rt_os::date_format(1700000000, "%Y"), "2023")
@@ -566,7 +566,7 @@ fn sqlite_linked_statically() is
     eq_i(rt_db::sqlite_commit(tx), 1)
     eq_i(rt_mem::array_len(rt_db::sqlite_query(h, "SELECT * FROM t")), 3)
     eq_s(rt_db::sqlite_query_bind1(d + "/t.db", "SELECT b FROM t WHERE a = CAST(? AS INTEGER)", "2"), "y\n")
-    eq_b(rt_str::starts_with(rt_db::sqlite_query_bind1(d + "/t.db", "SELEC 1", ""), "Error: in prepare, near \"SELEC\": syntax error"), true)
+    eq_b(rt_str::starts_with_h(rt_db::sqlite_query_bind1(d + "/t.db", "SELEC 1", ""), "Error: in prepare, near \"SELEC\": syntax error"), true)
     eq_b(rt_os::remove_dir_recursive(d), true)
 end
 
@@ -609,7 +609,7 @@ end
 #[test]
 fn argon2_hash_verify_roundtrip() is
     let h: string = rt_argon2::hash("correct horse")
-    eq_b(rt_str::starts_with(h, "$argon2id$v=19$m=19456,t=2,p=1$"), true)
+    eq_b(rt_str::starts_with_h(h, "$argon2id$v=19$m=19456,t=2,p=1$"), true)
     eq_i(rt_argon2::verify("correct horse", h), 1)
     eq_i(rt_argon2::verify("wrong horse", h), 0)
     eq_b(rt_argon2::hash("a") != rt_argon2::hash("a"), true)
@@ -899,16 +899,16 @@ fn run_cmd_and_exec_extra() is
     eq_s(rt_proc::exec3("printf", "%s-%s", "a"), "a-")
     eq_s(rt_proc::exec4("echo", "a", "b", "c"), "a b c\n")
     eq_s(rt_proc::process_run_args("echo", ["x", "y"]), "x y\n")
-    eq_i(rt_proc::run_cmd_exec("printf out; printf err >&2; exit 3", 10), 3)
-    eq_s(rt_proc::run_cmd_last_stdout(), "out")
-    eq_s(rt_proc::run_cmd_last_stderr(), "err")
-    eq_i(rt_proc::run_cmd_exec("true", 10), 0)
-    eq_s(rt_proc::run_cmd_last_stdout(), "")
+    eq_i(rt_proc::run_cmd_exec_h("printf out; printf err >&2; exit 3", 10), 3)
+    eq_s(rt_proc::run_cmd_last_stdout_h(), "out")
+    eq_s(rt_proc::run_cmd_last_stderr_h(), "err")
+    eq_i(rt_proc::run_cmd_exec_h("true", 10), 0)
+    eq_s(rt_proc::run_cmd_last_stdout_h(), "")
     ;; both pipes must be drained at once (tests/runtime/run_cmd_big_output.h#): 300000 bytes on stderr, 200000 on stdout
-    eq_i(rt_proc::run_cmd_exec("head -c 300000 /dev/zero | tr '\\0' x >&2; head -c 200000 /dev/zero | tr '\\0' y", 20), 0)
-    eq_i(rt_proc::run_cmd_last_stderr().len(), 300000)
-    eq_i(rt_proc::run_cmd_last_stdout().len(), 200000)
-    eq_i(rt_proc::run_cmd_exec("sleep 5", 1), -2)
+    eq_i(rt_proc::run_cmd_exec_h("head -c 300000 /dev/zero | tr '\\0' x >&2; head -c 200000 /dev/zero | tr '\\0' y", 20), 0)
+    eq_i(rt_proc::run_cmd_last_stderr_h().len(), 300000)
+    eq_i(rt_proc::run_cmd_last_stdout_h().len(), 200000)
+    eq_i(rt_proc::run_cmd_exec_h("sleep 5", 1), -2)
 end
 
 #[test]
@@ -951,7 +951,7 @@ fn state_db_params_and_misc() is
     let here: string = rt_sys::getcwd_s()
     eq_b(rt_os::change_dir("/tmp"), true)
     eq_b(rt_os::change_dir("/definitely/not/here"), false)
-    eq_b(rt_str::ends_with(rt_sys::getcwd_s(), "tmp"), true)
+    eq_b(rt_str::ends_with_h(rt_sys::getcwd_s(), "tmp"), true)
     rt_os::change_dir(here)
     rt_os::sleep_ms(1)
 end
@@ -982,7 +982,7 @@ fn environment_order_and_streams() is
     eq_i(r.len(), 16)
     eq_i(rt_os::urandom(0).len(), 0)
     eq_b(rt_os::urandom(32) != rt_os::urandom(32), true)
-    eq_b(rt_str::starts_with(rt_os::read_stream("/proc/self/stat"), to_string(rt_sys::pid()) + " "), true)
+    eq_b(rt_str::starts_with_h(rt_os::read_stream("/proc/self/stat"), to_string(rt_sys::pid()) + " "), true)
     eq_s(rt_os::read_stream("/definitely/not/here"), "")
     let s: int = rt_ptr::struct_set(rt_mem::struct_new(2), 1, 42)
     eq_i(rt_ptr::struct_get(s, 1), 42)
