@@ -20,7 +20,7 @@ fn main() is
         let parts: [string] = __builtin_str_split(lines[i], "\t")
         if parts.len() >= 4 is
             let x: f64 = rt_num::to_float(parts[1])
-            let k: int = rt_conv::to_int(parts[2])
+            let k: int = rt_conv::to_int_h(parts[2])
             let mut got: string = ""
             if parts[0] == "f" is got = rt_fmt::fmt_f(x, k) end
             if parts[0] == "g" is got = rt_fmt::fmt_g(x, k) end
