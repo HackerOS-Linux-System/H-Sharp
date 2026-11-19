@@ -475,7 +475,7 @@ pub fn b64_encode_nopad(d: [int]) -> string is
         o.push(b64_char((v2 >> 12) & 63))
         o.push(b64_char((v2 >> 6) & 63))
     end
-    return rt_bytes::bytes_to_string(o, o.len())
+    return rt_bytes::bytes_to_string_h(o, o.len())
 end
 
 ;; [] + ok=false through the second element is awkward in H#; returns (bytes, valid) as: bytes with a trailing 1 / just [0]
