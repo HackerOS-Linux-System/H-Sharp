@@ -1,5 +1,6 @@
+mod rt_raw
 fn raw_string(bs: [int]) -> string is
-    return __builtin_bytes_to_string(__builtin_bytes_from_ints(bs))
+    return rt_raw::string_from_ints(bs)
 end
 
 ;; hsh_b64_val: -1 for padding / anything that is not in the alphabet
