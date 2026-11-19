@@ -1,3 +1,4 @@
+mod rt_raw
 fn is_ws4(c: int) -> bool is
     return c == 32 || c == 9 || c == 10 || c == 13
 end
@@ -45,12 +46,12 @@ pub fn index_of(s: string, sub: string) -> int is
 end
 
 ;; core.c hsh_str_contains
-pub fn contains(s: string, sub: string) -> bool is
+pub fn contains_h(s: string, sub: string) -> bool is
     return index_of(s, sub) >= 0
 end
 
 ;; core.c hsh_to_upper / hsh_to_lower
-pub fn to_upper(s: string) -> string is
+pub fn to_upper_h(s: string) -> string is
     let mut out: string = ""
     let mut i: int = 0
     while i < s.len() is
@@ -58,8 +59,10 @@ pub fn to_upper(s: string) -> string is
         if c >= 97 && c <= 122 is out += str_from_byte(c - 32) else out += s[i..i + 1] end
         i += 1
     end
+    return out
+end
 
-pub fn to_lower(s: string) -> string is
+pub fn to_lower_h(s: string) -> string is
     let mut out: string = ""
     let mut i: int = 0
     while i < s.len() is
@@ -71,7 +74,7 @@ pub fn to_lower(s: string) -> string is
 end
 
 ;; core.c hsh_hex_encode: lowercase hex of every byte
-pub fn hex_encode(s: string) -> string is
+pub fn hex_encode_h(s: string) -> string is
     ;; one allocation: the digits go into an int array and become the string at the end (appending to a string per byte allocates
     ;; a new string each time, quadratic for large inputs)
     let mut out: [int] = []
@@ -84,22 +87,20 @@ pub fn hex_encode(s: string) -> string is
         if lo < 10 is out.push(48 + lo) else out.push(87 + lo) end
         i += 1
     end
-    return __builtin_bytes_to_string(__builtin_bytes_from_ints(out))
-end
-    return out
+    return rt_raw::string_from_ints(out)
 end
 
 ;; core.c hsh_starts_with / hsh_ends_with
-pub fn starts_with(s: string, p: string) -> bool is
+pub fn starts_with_h(s: string, p: string) -> bool is
     return s.len() >= p.len() && s[0..p.len()] == p
 end
 
-pub fn ends_with(s: string, p: string) -> bool is
+pub fn ends_with_h(s: string, p: string) -> bool is
     return s.len() >= p.len() && s[s.len() - p.len()..s.len()] == p
 end
 
 ;; core.c hsh_str_replace: every non-overlapping occurrence, left to right; an empty `from` changes nothing
-pub fn replace(s: string, from: string, to: string) -> string is
+pub fn replace_h(s: string, from: string, to: string) -> string is
     if from.len() == 0 is return s end
     let mut out: string = ""
     let mut at: int = 0
@@ -118,13 +119,20 @@ end
 
 ;; core.c hsh_string_repeat: "" for n <= 0
 pub fn repeat(s: string, n: int) -> string is
-    let mut out: string = ""
+    let l: int = s.len()
+    if n <= 0 || l == 0 is return "" end
+    ;; one allocation (the old `out += s` loop copied the whole result n times: quadratic, and it exhausted memory for large n)
+    let buf: int = malloc(l * n + 1)
+    if buf == 0 is return "" end
     let mut i: int = 0
     while i < n is
-        out += s
+        memcpy(buf + i * l, s, l)
         i += 1
     end
-    return out
+    memset(buf + l * n, 0, 1)
+    let r: string = strdup(buf)
+    free(buf)
+    return r
 end
 
 ;; core.c hsh_string_pad_right: pads with spaces up to `width` BYTES; longer strings are returned unchanged
@@ -213,20 +221,40 @@ end
 ;; ── thin aliases in core.c (hsh_string_* / hsh_strlen / hsh_strcat): the C bodies just call the function ported above ──
 ;; core.c hsh_string_contains -> hsh_str_contains; hsh_string_starts_with/ends_with -> hsh_starts_with/ends_with;
 ;; hsh_string_trim -> hsh_trim; hsh_string_replace -> hsh_str_replace; hsh_string_lower/upper = ASCII tolower/toupper
-pub fn string_contains(s: string, sub: string) -> bool is return contains(s, sub) end
-pub fn string_starts_with(s: string, p: string) -> bool is return starts_with(s, p) end
-pub fn string_ends_with(s: string, p: string) -> bool is return ends_with(s, p) end
+pub fn string_contains(s: string, sub: string) -> bool is return rt_str::contains_h(s, sub) end
+pub fn string_starts_with(s: string, p: string) -> bool is return rt_str::starts_with_h(s, p) end
+pub fn string_ends_with(s: string, p: string) -> bool is return rt_str::ends_with_h(s, p) end
 pub fn string_trim(s: string) -> string is return trim(s) end
-pub fn string_replace(s: string, from: string, to: string) -> string is return replace(s, from, to) end
-pub fn string_lower(s: string) -> string is return to_lower(s) end
-pub fn string_upper(s: string) -> string is return to_upper(s) end
+pub fn string_replace(s: string, from: string, to: string) -> string is return rt_str::replace_h(s, from, to) end
+pub fn string_lower(s: string) -> string is return rt_str::to_lower_h(s) end
+pub fn string_upper(s: string) -> string is return rt_str::to_upper_h(s) end
 
 ;; core.c hsh_string_len / hsh_strlen: length in BYTES (NULL -> 0)
 pub fn string_len(s: string) -> int is return s.len() end
 pub fn strlen(s: string) -> int is return s.len() end
 
-;; core.c hsh_strcat
-pub fn strcat(a: string, b: string) -> string is return a + b end
+;; core.c hsh_strcat. The compiler lowers every string `+` to a call of hsh_strcat, so this function must not use `+` itself (it would
+;; recurse forever once hsh_strcat is exported under its C name): bytes are glued in a malloc'd scratch buffer and copied out with strdup.
+extern static [c] is
+    fn malloc(n: int) -> int
+    fn free(p: int) -> int
+    fn memcpy(dst: int, src: string, n: int) -> int
+    fn memset(p: int, c: int, n: int) -> int
+    fn strdup(p: int) -> string
+end
+
+pub fn strcat(a: string, b: string) -> string is
+    let la: int = a.len()
+    let lb: int = b.len()
+    let buf: int = malloc(la + lb + 1)
+    if buf == 0 is return "" end
+    memcpy(buf, a, la)
+    memcpy(buf + la, b, lb)
+    memset(buf + la + lb, 0, 1)
+    let r: string = strdup(buf)
+    free(buf)
+    return r
+end
 
 ;; core.c hsh_substr: byte range [start, end); start < 0 -> 0, end < 0 or end > len -> len (NOT clamped to 0 like string_slice);
 ;; "" when start >= end
