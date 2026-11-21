@@ -28,6 +28,12 @@ extern static [c] is
     fn poll(fds: int, nfds: int, timeout: int) -> int
     fn fcntl(fd: int, cmd: int, arg: int) -> int
     fn usleep(us: int) -> int
+    fn tmpfile() -> int
+    fn fileno(f: int) -> int
+    fn fwrite(buf: int, size: int, n: int, f: int) -> int
+    fn fflush(f: int) -> int
+    fn fseek(f: int, off: int, whence: int) -> int
+    fn fclose(f: int) -> int
     fn time(t: int) -> int
     fn __errno_location() -> int
 end
@@ -60,15 +66,16 @@ end
 ;; everything readable from fd until EOF (a NUL ends a 4 KiB chunk, like the C's strlen-based copies)
 fn read_all(fd: int) -> string is
     let buf: int = rt_ptr::buf_new(4097)
-    let mut out: string = ""
+    let mut parts: [string] = []
     let mut n: int = read(fd, buf, 4096)
     while n > 0 is
         rt_ptr::ptr_write_i8(buf, n, 0)
-        out += strdup(buf)
+        parts.push(strdup(buf))
         n = read(fd, buf, 4096)
     end
     rt_ptr::buf_free(buf)
-    return out
+    ;; chunks joined once (appending to a string per chunk was quadratic and never freed: OOM for tens of MB of output)
+    return rt_str::array_join(parts, "")
 end
 
 ;; core.c hsh_exec_argv: run argv[0] with stdout and stderr on one pipe, return what it printed ("" if pipe/fork fail)
@@ -144,7 +151,7 @@ pub fn process_which(cmd: string) -> string is
     end
     let p: int = getenv("PATH")
     if p == 0 is return "" end
-    let dirs: [string] = __builtin_str_split(strdup(p), ":")
+    let dirs: [string] = rt_str::string_split(strdup(p), ":")
     let mut i: int = 0
     while i < dirs.len() is
         if dirs[i].len() > 0 is
@@ -161,56 +168,62 @@ pub fn shell(cmd: string) -> string is
     let fp: int = popen(cmd, "r")
     if fp == 0 is return "" end
     let buf: int = rt_ptr::buf_new(4097)
-    let mut out: string = ""
+    let mut parts: [string] = []
     let mut n: int = fread(buf, 1, 4096, fp)
     while n > 0 is
         rt_ptr::ptr_write_i8(buf, n, 0)
-        out += strdup(buf)
+        parts.push(strdup(buf))
         n = fread(buf, 1, 4096, fp)
     end
     pclose(fp)
     rt_ptr::buf_free(buf)
-    return out
+    return rt_str::array_join(parts, "")
 end
 
 ;; core.c hsh_run_piped: run argv with `input` on its stdin; [stdout, exit code] (exit code -1 when it did not exit normally,
-;; or when pipes/fork fail -> ["", "-1"]).  Like the C, the whole input is written before any output is read.
+;; or when pipes/fork fail -> ["", "-1"]).
+;; DIFFERENCE FROM core.c, on purpose: the C writes the whole input into a pipe before it reads any output, which hangs for good when the
+;; input (> 64 KiB) makes the child produce more than a pipe buffer of output before it has read everything (multi-line text through
+;; `grep -oP`), and kills the whole process with SIGPIPE when the child exits early (an invalid pattern such as "(").  Here the input goes
+;; to the child through an anonymous temporary file instead; stdout is still a pipe that is read to the end.  Same results otherwise.
 fn run_piped(args: [string], input: string) -> [string] is
-    let a: int = rt_ptr::buf_new(8)
     let b: int = rt_ptr::buf_new(8)
-    if cint(pipe(a)) != 0 is return ["", "-1"] end
-    if cint(pipe(b)) != 0 is
-        close(rt_ptr::ptr_read_i32(a, 0))
-        close(rt_ptr::ptr_read_i32(a, 4))
+    if cint(pipe(b)) != 0 is return ["", "-1"] end
+    let tf: int = tmpfile()
+    if tf == 0 is
+        close(rt_ptr::ptr_read_i32(b, 0))
+        close(rt_ptr::ptr_read_i32(b, 4))
         return ["", "-1"]
     end
-    let in_r: int = rt_ptr::ptr_read_i32(a, 0)
-    let in_w: int = rt_ptr::ptr_read_i32(a, 4)
+    if input.len() > 0 is
+        let ib: int = rt_ptr::buf_new(input.len() + 1)
+        memcpy(ib, input, input.len())
+        fwrite(ib, 1, input.len(), tf)
+        rt_ptr::buf_free(ib)
+    end
+    fflush(tf)
+    fseek(tf, 0, 0)
+    let in_fd: int = cint(fileno(tf))
     let out_r: int = rt_ptr::ptr_read_i32(b, 0)
     let out_w: int = rt_ptr::ptr_read_i32(b, 4)
     let argv: int = make_argv(args)
     let pid: int = cint(fork())
     if pid < 0 is
-        close(in_r)
-        close(in_w)
+        fclose(tf)
         close(out_r)
         close(out_w)
         return ["", "-1"]
     end
     if pid == 0 is
-        dup2(in_r, 0)
+        dup2(in_fd, 0)
         dup2(out_w, 1)
-        close(in_r)
-        close(in_w)
         close(out_r)
         close(out_w)
         execvp(rt_ptr::ptr_read_ptr(argv, 0), argv)
         _exit(127)
     end
-    close(in_r)
+    fclose(tf)
     close(out_w)
-    if input.len() > 0 is dprintf(in_w, "%s", input) end
-    close(in_w)
     let out: string = read_all(out_r)
     close(out_r)
     let st: int = rt_ptr::buf_new(8)
@@ -242,7 +255,7 @@ pub fn regex_find_all(pattern: string, text: string) -> [string] is
     let mut out: [string] = []
     let r: [string] = run_piped(["grep", "-oP", pattern], text)
     if to_int(r[1]) < 0 is return out end
-    let lines: [string] = __builtin_str_split(r[0], "\n")
+    let lines: [string] = rt_str::string_split(r[0], "\n")
     let mut i: int = 0
     while i < lines.len() is
         if lines[i].len() > 0 is out.push(lines[i]) end
@@ -372,14 +385,14 @@ end
 
 ;; drain what is readable from a non-blocking fd; [text, closed]  (closed = "1" once EOF / a real error was seen)
 fn drain_nonblock(fd: int, buf: int) -> [string] is
-    let mut text: string = ""
+    let mut tparts: [string] = []
     let mut closed: string = "0"
     let mut go: bool = true
     while go is
         let n: int = read(fd, buf, 8192)
         if n > 0 is
             rt_ptr::ptr_write_i8(buf, n, 0)
-            text += strdup(buf)
+            tparts.push(strdup(buf))
         else
             go = false
             if n < 0 is
@@ -390,7 +403,7 @@ fn drain_nonblock(fd: int, buf: int) -> [string] is
             end
         end
     end
-    return [text, closed]
+    return [rt_str::array_join(tparts, ""), closed]
 end
 
 ;; core.c hsh_run_cmd_exec: the exit code (-1: could not start or not a normal exit, -2: killed on timeout)
@@ -437,8 +450,9 @@ pub fn run_cmd_exec_h(cmd: string, timeout_secs: int) -> int is
     let mut deadline: int = 0
     if timeout_secs > 0 is deadline = time(0) + timeout_secs end
     let mut killed: bool = false
-    let mut ob: string = ""
-    let mut eb: string = ""
+    ;; captured output kept as chunk lists and joined once at the end (appending per read was quadratic: OOM for tens of MB)
+    let mut ob: [string] = []
+    let mut eb: [string] = []
     let pf: int = rt_ptr::buf_new(16)
     let chunk: int = rt_ptr::buf_new(8193)
     let mut running: bool = true
@@ -467,14 +481,14 @@ pub fn run_cmd_exec_h(cmd: string, timeout_secs: int) -> int is
             if (rev & 25) != 0 is
                 if i == which0 is
                     let r: [string] = drain_nonblock(ofd, chunk)
-                    ob += r[0]
+                    ob.push(r[0])
                     if r[1] == "1" is
                         close(ofd)
                         ofd = -1
                     end
                 else
                     let r2: [string] = drain_nonblock(efd, chunk)
-                    eb += r2[0]
+                    eb.push(r2[0])
                     if r2[1] == "1" is
                         close(efd)
                         efd = -1
@@ -520,7 +534,7 @@ pub fn run_cmd_exec_h(cmd: string, timeout_secs: int) -> int is
     rt_ptr::buf_free(pf)
     rt_ptr::buf_free(chunk)
     rt_ptr::buf_free(st)
-    runcmd_store(ob, eb)
+    runcmd_store(rt_str::array_join(ob, ""), rt_str::array_join(eb, ""))
     return code
 end
 
