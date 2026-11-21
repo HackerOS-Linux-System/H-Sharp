@@ -640,6 +640,8 @@ end
 
 fn banner(info: EditionInfo) is
     out_line(cyan_b("  H# v" + version() + "  LLVM backend  (default edition " + info.edition + ")"))
+    let bf: [string] = conditional::active()
+    if bf.len() > 0 is out_line(dim("  features: " + cli_join(bf, ", "))) end
     out_line("")
 end
 
@@ -1671,6 +1673,8 @@ fn report(opts: options::CompileOptions, t0: int, out_path: string, kind: string
     if link_desc != "" is out_line("  " + bold(pad_right("Linked:", 10)) + " " + yellow(link_desc)) end
     out_line("  " + bold(pad_right("Time:", 10)) + " " + fmt_elapsed(elapsed))
     if ed_summary != "" is out_line("  " + bold(pad_right("Edition:", 10)) + " " + cyan(ed_summary)) end
+    let on_feats: [string] = conditional::active()
+    if on_feats.len() > 0 is out_line("  " + bold(pad_right("Features:", 10)) + " " + cyan(cli_join(on_feats, ", "))) end
     out_line("  " + bold(pad_right("Toolchain:", 10)) + " h# " + version())
     out_line(dim(bar))
     out_line("\n  " + green_b("✓") + " Build complete!")
@@ -1794,6 +1798,9 @@ pub fn run(argv: [string]) -> int is
     ;; the global --edition flag may appear anywhere (e.g. `h# lib build x.h# --edition 2026`); for `run` only before the file,
     ;; because everything after it belongs to the program
     let mut edition_flag: string = ""
+    ;; the global --features / -F flag (repeatable, comma or space separated) — same placement rules as --edition
+    let mut features_flag: string = ""
+    let mut features_given: bool = false
     let mut args: [string] = []
     let mut i: int = 0
     while i < argv.len() is
@@ -1804,6 +1811,14 @@ pub fn run(argv: [string]) -> int is
                 i += 1
             end
             break
+        end
+        if is_opt(a, "--features", "-F") && (args.len() < 2 || (args.len() >= 1 && args[0] != "run")) is
+            let fv: string = opt_value(argv, i, "--features", "-F")
+            if features_given is features_flag = features_flag + "," + fv else features_flag = fv end
+            features_given = true
+            if a == "--features" || a == "-F" is i += 1 end
+            i += 1
+            continue
         end
         if is_opt(a, "--edition", "") && (args.len() < 2 || (args.len() >= 1 && args[0] != "run")) is
             edition_flag = opt_value(argv, i, "--edition", "")
@@ -1822,6 +1837,18 @@ pub fn run(argv: [string]) -> int is
         out_line(usage())
         return 0
     end
+    ;; the enabled features travel to every compiler stage (front-end children, lib build, lsp) through the environment:
+    ;; flag > HSHARP_FEATURES; the final list is normalised (split, de-duplicated) and validated once, here
+    let feat_src: string = if features_given then features_flag else env::get("HSHARP_FEATURES")
+    let feat_list: [string] = conditional::split_list(feat_src)
+    for fname in feat_list is
+        if !conditional::valid_name(fname) is
+            let origin: string = if features_given then "--features" else "HSHARP_FEATURES"
+            eprint(red_b("Error:") + " " + origin + ": invalid feature name `" + fname + "` (letters, digits, `-` and `_` only)\n")
+            return 2
+        end
+    end
+    if features_given || feat_list.len() > 0 is env::set("HSHARP_FEATURES", cli_join(feat_list, ",")) end
     if cmd == "-V" || cmd == "--version" is
         out_line("h# " + version())
         return 0
