@@ -164,3 +164,53 @@ pub fn sort_by(a: [int], cmp: fn(int, int) -> int) -> [int] is
     msort(a, tmp, 0, n, cmp)
     return a
 end
+
+;; stable merge sort of the slot values `ptrs` by the strings `texts[i]` they point to (same byte-wise order as sort_strings / strcmp);
+;; the pointers themselves are kept, only their order changes — core.c's hsh_sort_strings permutes the `char*` slots in place.
+pub fn sort_ptrs_by_text(ptrs: [int], texts: [string]) -> [int] is
+    let n: int = ptrs.len()
+    let mut src: [int] = []
+    let mut c0: int = 0
+    while c0 < n is
+        src.push(c0)
+        c0 += 1
+    end
+    let mut width: int = 1
+    while width < n is
+        let mut dst: [int] = []
+        let mut lo: int = 0
+        while lo < n is
+            let mid: int = lo + width
+            let hi: int = lo + 2 * width
+            let mut i: int = lo
+            let mut j: int = mid
+            while i < mid && i < n && j < hi && j < n is
+                if cmp_s(texts[src[j]], texts[src[i]]) < 0 is
+                    dst.push(src[j])
+                    j += 1
+                else
+                    dst.push(src[i])
+                    i += 1
+                end
+            end
+            while i < mid && i < n is
+                dst.push(src[i])
+                i += 1
+            end
+            while j < hi && j < n is
+                dst.push(src[j])
+                j += 1
+            end
+            lo += 2 * width
+        end
+        src = dst
+        width *= 2
+    end
+    let mut out: [int] = []
+    let mut k: int = 0
+    while k < n is
+        out.push(ptrs[src[k]])
+        k += 1
+    end
+    return out
+end
