@@ -286,6 +286,53 @@ Przykłady: [`examples/editions/`](examples/editions/README.md).
 
 ---
 
+## Featury i kompilacja warunkowa
+
+Featury wybiera się **przy starcie kompilatora** — nic nie przepisuje źródeł (żadnego `sed`, żadnego generowanego pliku).
+Kod wyłączonego featura jest parsowany, ale nie jest sprawdzany typami, nie jest generowany i nie trafia do binarki.
+
+```bash
+h# compile src/main.h# --features fast,simd     # flaga globalna, działa przy compile/check/run/test/lib build…
+h# compile src/main.h# -F fast -F simd          # -F, powtarzalna; przecinki i spacje są równoważne
+HSHARP_FEATURES=fast h# check src/main.h#       # to samo przez środowisko (flaga ma pierwszeństwo)
+h# run --features fast main.h#                  # UWAGA: przy `run` flaga musi stać PRZED plikiem (po nim to argumenty programu)
+```
+
+W kodzie:
+
+```
+#[cfg(feature = "fast")]
+fn fast_path() is ... end
+
+#[cfg(not(feature = "fast"))]
+fn fast_path() is ... end
+
+#[cfg(all(feature = "a", feature = "b"))]    ;; all(..) / any(..) / not(..) / true / false
+
+struct Conn is
+    host: string
+    #[cfg(feature = "tls")]
+    cert: string                              ;; pole struktury
+end
+
+fn main() is
+    #[cfg(feature = "tls")]
+    write("tls")                              ;; instrukcja
+    if feature_enabled("fast") is ... end     ;; literał bool, ustalany podczas parsowania
+    let all: [string] = enabled_features()    ;; literał tablicy z włączonymi featurami
+end
+```
+
+`#[cfg(...)]` działa na: itemach (`fn`, `struct`, `enum`, `trait`, `impl`, `type`, `const`, `extern`, `mod`), członkach
+`impl`/`trait`, polach struktur, wariantach `enum`, importach `use` i instrukcjach. Kilka `#[cfg]` na jednym elemencie
+muszą zachodzić wszystkie. Literówka w predykacie (`#[cfg(banan)]`) to błąd z podpowiedzią. Nazwy featurów: litery, cyfry, `-`, `_`.
+Własna `fn feature_enabled` / `fn enabled_features` w pliku ma pierwszeństwo przed wbudowaną.
+
+Menedżer `bit` robi to za Ciebie: `bit build --features fast` rozwija sekcję `[features]` z `Bit.hk` i uruchamia `h#`
+z gotową listą (patrz README bita). Testy: `tests/parser/conditional_test.h#`.
+
+---
+
 ## Standard Library (84 modułów)
 
 ```hsharp
