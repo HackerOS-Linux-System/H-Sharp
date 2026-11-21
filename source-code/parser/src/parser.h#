@@ -5,6 +5,7 @@ mod ast
 mod error
 mod lexer
 mod edition
+mod conditional
 
 pub struct Parser is
     pub toks: [lexer::Token]
@@ -609,6 +610,46 @@ fn parse_import(p: Parser) -> option::Result<ast::Node, error::ParseError> is
 end
 
 ;; ── attributes / memory modes ─────────────────────────────────────────────────
+;; a name inside `#[...]`: an identifier, or a keyword spelled like one (`any(...)`)
+fn attr_name(p: Parser) -> string is
+    let c: lexer::Token = p_cur(p)
+    if c.kind == "ident" || c.kind == "kw" is
+        p_adv(p)
+        return c.text
+    end
+    return ""
+end
+
+;; the arguments of `#[name( ... )]`, after the `(` (consumes the closing `)`):
+;;   key = "value"   -> AKV  "key=value"        ident -> AIdent        ident(...) -> ACall (nested, for cfg predicates)
+fn parse_attr_args(p: Parser) -> [ast::Node] is
+    let mut args: [ast::Node] = []
+    while !at_op(p, ")") && !at_eof(p) is
+        skip_nl(p)
+        if at_op(p, ")") is break end
+        let k: string = attr_name(p)
+        if k == "" is
+            p_adv(p)                      ;; not a name: skip the token so a malformed attribute cannot loop forever
+        elsif at_op(p, "=") is
+            p_adv(p)
+            let mut v: string = ""
+            if at_kind(p, "str") is
+                v = p_cur(p).text
+                p_adv(p)
+            end
+            args.push(lf("AKV", "{k}={v}"))
+        elsif at_op(p, "(") is
+            p_adv(p)
+            args.push(nd("ACall", k, parse_attr_args(p)))
+        else
+            args.push(lf("AIdent", k))
+        end
+        if at_op(p, ",") is p_adv(p) end
+    end
+    if at_op(p, ")") is p_adv(p) end
+    return args
+end
+
 fn parse_attributes(p: Parser) -> ast::Node is
     let mut attrs: [ast::Node] = []
     while at_op(p, "#") is
@@ -616,34 +657,11 @@ fn parse_attributes(p: Parser) -> ast::Node is
         p_adv(p)
         if !at_op(p, "[") is break end
         p_adv(p)
-        let mut name: string = ""
-        match expect_ident(p) is
-            option::Result::Ok(s) => is name = s end
-            option::Result::Err(_) => is name = "" end
-        end
+        let name: string = attr_name(p)
         let mut args: [ast::Node] = []
         if at_op(p, "(") is
             p_adv(p)
-            while !at_op(p, ")") && !at_eof(p) is
-                let mut k: string = ""
-                match expect_ident(p) is
-                    option::Result::Ok(s) => is k = s end
-                    option::Result::Err(_) => is k = "" end
-                end
-                if at_op(p, "=") is
-                    p_adv(p)
-                    let mut v: string = ""
-                    if at_kind(p, "str") is
-                        v = p_cur(p).text
-                        p_adv(p)
-                    end
-                    args.push(lf("AKV", "{k}={v}"))
-                else
-                    args.push(lf("AIdent", k))
-                end
-                if at_op(p, ",") is p_adv(p) end
-            end
-            if at_op(p, ")") is p_adv(p) end
+            args = parse_attr_args(p)
         end
         if at_op(p, "]") is p_adv(p) end
         let end_sp: ast::Sp = cur_sp(p)
@@ -651,6 +669,21 @@ fn parse_attributes(p: Parser) -> ast::Node is
         skip_nl(p)
     end
     return nd("Attrs", "", attrs)
+end
+
+;; `#[cfg(...)]`: true when the thing the attributes belong to is compiled in. A malformed predicate is reported
+;; and the item is kept (so one typo does not turn into a pile of "undefined" errors).
+fn cfg_on(p: Parser, attrs: ast::Node) -> bool is
+    let r: conditional::Eval = conditional::eval_attrs(attrs)
+    if !r.ok is
+        report(p, err_at(p, "Custom", r.sp, r.err, [r.hint]))
+        return true
+    end
+    return r.on
+end
+
+fn at_attr(p: Parser) -> bool is
+    return at_op(p, "#") && is_op_at(p, 1, "[")
 end
 
 fn mem_mode_name(n: string) -> string is
@@ -921,7 +954,9 @@ fn parse_mod_decl(p: Parser, pub_: bool) -> option::Result<ast::Node, error::Par
             skip_nl(p)
             if at_kw(p, "end") || at_eof(p) is break end
             match parse_item(p) is
-                option::Result::Ok(i) => is inner.push(i) end
+                option::Result::Ok(i) => is
+                    if i.tag != "CfgOff" is inner.push(i) end
+                end
                 option::Result::Err(em) => is
                     report(p, em)
                     recover(p)
@@ -943,6 +978,8 @@ fn parse_struct_fields(p: Parser) -> option::Result<ast::Node, error::ParseError
     while !at_kw(p, "end") && !at_eof(p) is
         skip_nl(p)
         if at_kw(p, "end") is break end
+        let fattrs: ast::Node = parse_attributes(p)
+        let fon: bool = cfg_on(p, fattrs)
         let mut fpub: bool = false
         if at_kw(p, "pub") is
             p_adv(p)
@@ -952,7 +989,7 @@ fn parse_struct_fields(p: Parser) -> option::Result<ast::Node, error::ParseError
         let fname: string = expect_ident(p)?
         p_expect_op(p, ":")?
         let fty: ast::Node = parse_type(p)?
-        fields.push(spn(nd("Field", fname, [bn(fpub), fty]), fspan))
+        if fon is fields.push(spn(nd("Field", fname, [bn(fpub), fty]), fspan)) end
         skip_nl(p)
     end
     return ok(nd("Fields", "", fields))
@@ -988,6 +1025,8 @@ fn parse_enum(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseEr
         while !at_kw(p, "end") && !at_eof(p) is
             skip_nl(p)
             if at_kw(p, "end") is break end
+            let vattrs: ast::Node = parse_attributes(p)
+            let von: bool = cfg_on(p, vattrs)
             let vspan: ast::Sp = cur_sp(p)
             let vname: string = expect_ident(p)?
             let mut fields: ast::Node = lf("Unit", "")
@@ -1007,7 +1046,7 @@ fn parse_enum(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseEr
                 p_expect_kw(p, "end")?
                 fields = nd("StructV", "", [fs])
             end
-            variants.push(spn(nd("Variant", vname, [fields]), vspan))
+            if von is variants.push(spn(nd("Variant", vname, [fields]), vspan)) end
             if at_op(p, ",") is p_adv(p) end
             skip_nl(p)
         end
@@ -1030,6 +1069,8 @@ fn parse_trait(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseE
         while !at_kw(p, "end") && !at_eof(p) is
             skip_nl(p)
             if at_kw(p, "end") is break end
+            let tattrs: ast::Node = parse_attributes(p)
+            let ton: bool = cfg_on(p, tattrs)
             if at_kw(p, "fn") is
                 p_adv(p)
                 let mspan: ast::Sp = cur_sp(p)
@@ -1045,7 +1086,7 @@ fn parse_trait(p: Parser, pub_: bool) -> option::Result<ast::Node, error::ParseE
                 skip_nl(p)
                 let mut db: ast::Node = nn()
                 if at_kw(p, "is") is db = parse_block(p)? end
-                methods.push(spn(nd("Method", mname, [params, ret, db]), mspan))
+                if ton is methods.push(spn(nd("Method", mname, [params, ret, db]), mspan)) end
             else
                 report(p, perr(p, "expected `fn` in trait", []))
                 recover(p)
@@ -1076,6 +1117,8 @@ fn parse_impl(p: Parser) -> option::Result<ast::Node, error::ParseError> is
         while !at_kw(p, "end") && !at_eof(p) is
             skip_nl(p)
             if at_kw(p, "end") is break end
+            let mattrs: ast::Node = parse_attributes(p)
+            let mon: bool = cfg_on(p, mattrs)
             let mm: [string] = parse_mem_mode(p)?
             let mut fpub: bool = false
             if at_kw(p, "pub") is
@@ -1083,8 +1126,10 @@ fn parse_impl(p: Parser) -> option::Result<ast::Node, error::ParseError> is
                 fpub = true
             end
             if at_kw(p, "fn") is
-                match parse_fn_with_attrs(p, fpub, nd("Attrs", "", []), false, mm[0]) is
-                    option::Result::Ok(f) => is methods.push(f) end
+                match parse_fn_with_attrs(p, fpub, mattrs, false, mm[0]) is
+                    option::Result::Ok(f) => is
+                        if mon is methods.push(f) end
+                    end
                     option::Result::Err(em) => is
                         report(p, em)
                         recover(p)
@@ -1214,9 +1259,18 @@ fn parse_extern_block_inline(p: Parser) -> option::Result<ast::Node, error::Pars
     return ok(spn(nd("Extern", "", [lf("Lang", lang), lf("Link", link), opt_s(has_lib, lib), nd("Fns", "", fns)]), span))
 end
 
+;; An item switched off by `#[cfg(...)]` is still parsed (it has to be well-formed) and then dropped: it comes back as a
+;; `CfgOff` node that every caller skips.
 fn parse_item(p: Parser) -> option::Result<ast::Node, error::ParseError> is
     skip_nl(p)
     let attrs: ast::Node = parse_attributes(p)
+    let on: bool = cfg_on(p, attrs)
+    let it: ast::Node = parse_item_with(p, attrs)?
+    if !on is return ok(lf("CfgOff", "")) end
+    return ok(it)
+end
+
+fn parse_item_with(p: Parser, attrs: ast::Node) -> option::Result<ast::Node, error::ParseError> is
     let mm: [string] = parse_mem_mode(p)?
     let mem: string = mm[0]
     let mut pub_: bool = false
@@ -1270,6 +1324,23 @@ end
 
 fn parse_stmt(p: Parser) -> option::Result<ast::Node, error::ParseError> is
     skip_nl(p)
+    if at_attr(p) is
+        ;; `#[cfg(feature = "x")]` in front of a statement: parsed, then dropped when the feature is off
+        let save: int = p.pos
+        let sattrs: ast::Node = parse_attributes(p)
+        let c0: lexer::Token = p_cur(p)
+        let starts_item: bool = c0.kind == "kw" && (c0.text == "fn" || c0.text == "struct" || c0.text == "enum" || c0.text == "trait" || c0.text == "impl" || c0.text == "type" || c0.text == "pub" || c0.text == "const" || c0.text == "async" || c0.text == "mod" || c0.text == "extern")
+        if starts_item is
+            p.pos = save                  ;; parse_item reads the attributes itself
+            let sit: ast::Node = parse_item(p)?
+            if sit.tag == "CfgOff" is return ok(nd("Stmts", "", [])) end
+            return one(sit)
+        end
+        let son: bool = cfg_on(p, sattrs)
+        let inner: ast::Node = parse_stmt(p)?
+        if !son is return ok(nd("Stmts", "", [])) end
+        return ok(inner)
+    end
     if at_ident_text(p, "dynamic") && is_kw_at(p, 1, "use") is
         let im: ast::Node = parse_import(p)?
         return one(im)
@@ -1306,6 +1377,7 @@ fn parse_stmt(p: Parser) -> option::Result<ast::Node, error::ParseError> is
         end
         if c.text == "fn" || c.text == "struct" || c.text == "enum" || c.text == "trait" || c.text == "impl" || c.text == "type" || c.text == "pub" || c.text == "const" is
             let it: ast::Node = parse_item(p)?
+            if it.tag == "CfgOff" is return ok(nd("Stmts", "", [])) end
             return one(it)
         end
     end
@@ -2344,6 +2416,25 @@ pub fn parse_module(p: Parser) -> ast::Node is
             skip_nl(p)
             continue
         end
+        if at_attr(p) is
+            ;; `#[cfg(feature = "x")] use "std -> foo"` — attributes in front of an import
+            let save: int = p.pos
+            let iattrs: ast::Node = parse_attributes(p)
+            if at_use_import(p) is
+                let ion: bool = cfg_on(p, iattrs)
+                match parse_import(p) is
+                    option::Result::Ok(im) => is
+                        if ion is imports.push(im) end
+                    end
+                    option::Result::Err(em) => is
+                        report(p, em)
+                        recover(p)
+                    end
+                end
+                continue
+            end
+            p.pos = save
+        end
         if at_use_import(p) is
             match parse_import(p) is
                 option::Result::Ok(im) => is imports.push(im) end
@@ -2356,7 +2447,9 @@ pub fn parse_module(p: Parser) -> ast::Node is
         end
         item_seen = true
         match parse_item(p) is
-            option::Result::Ok(it) => is items.push(it) end
+            option::Result::Ok(it) => is
+                if it.tag != "CfgOff" is items.push(it) end
+            end
             option::Result::Err(em) => is
                 report(p, em)
                 recover(p)
