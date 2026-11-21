@@ -45,3 +45,39 @@ pub fn strs_to_raw(a: [string]) -> int is
     end
     return r
 end
+
+;; [[string]] -> fresh raw HshArray* whose slots are raw HshArray* rows of malloc'd C strings (core.c hsh_regex_captures_all layout)
+pub fn rows_to_raw(a: [[string]]) -> int is
+    let mut r: int = rt_mem::array_new()
+    let mut i: int = 0
+    while i < a.len() is
+        r = rt_mem::array_push(r, strs_to_raw(a[i]))
+        i += 1
+    end
+    return r
+end
+
+;; raw HshArray* of raw HshArray* rows of `char*` -> [[string]] (NULL -> empty)
+pub fn rows_from_raw(p: int) -> [[string]] is
+    let mut out: [[string]] = []
+    let n: int = rt_mem::array_len(p)
+    let mut i: int = 0
+    while i < n is
+        out.push(strs_from_raw(rt_mem::array_get(p, i)))
+        i += 1
+    end
+    return out
+end
+
+;; write `a` back into the EXISTING raw HshArray* `p` and return `p` — the in-place contract of core.c's hsh_sort_ints / hsh_sort_strings /
+;; hsh_sort_by / hsh_sort_by_key (callers use them as bare statements, and `p` stays aliased).  NULL gives a fresh empty array like core.c.
+pub fn ints_store(p: int, a: [int]) -> int is
+    if p == 0 is return rt_mem::array_new() end
+    let n: int = rt_mem::array_len(p)
+    let mut i: int = 0
+    while i < n && i < a.len() is
+        rt_mem::array_set(p, i, a[i])
+        i += 1
+    end
+    return p
+end
