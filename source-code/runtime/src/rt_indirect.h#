@@ -1,9 +1,8 @@
 mod rt_ptr
 
 ;; rt_indirect — the part of the H# runtime that needs a raw *function address*: closure_call1/2, sort_by_raw, sort_by_key.
-;; It is built on the compiler builtins `call_ptr0..call_ptr4` (call an int as a function), which exist in the self-hosted
-;; compiler (source-code/compiler, typecheck/src/tc_builtins.h#) but NOT in the h# 0.9.0 binary.  Everything else in
-;; source-code/runtime builds with 0.9.0 — see RUNTIME_STATUS.md.  Tests: src/rt_test_indirect.h#.
+;; It is built on the compiler builtins `call_ptr0..call_ptr4` (call an int as a function) and `fn_addr` (address of a named fn), both
+;; available in h# 0.9.0.  Tests: src/rt_test_indirect.h# (values checked against core.c).
 
 fn rd(p: int, off: int) -> int is return rt_ptr::ptr_read_i64(p, off) end
 
