@@ -17,30 +17,31 @@ end
 pub fn base64_encode(s: string) -> string is
     let tab: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     let n: int = s.len()
-    let mut out: string = ""
+    let mut out: [int] = []
     let mut i: int = 0
     while i + 2 < n is
         let v: int = byte_at(s, i) * 65536 + byte_at(s, i + 1) * 256 + byte_at(s, i + 2)
-        out += tab[v / 262144 % 64..v / 262144 % 64 + 1]
-        out += tab[v / 4096 % 64..v / 4096 % 64 + 1]
-        out += tab[v / 64 % 64..v / 64 % 64 + 1]
-        out += tab[v % 64..v % 64 + 1]
+        out.push(byte_at(tab, v / 262144 % 64))
+        out.push(byte_at(tab, v / 4096 % 64))
+        out.push(byte_at(tab, v / 64 % 64))
+        out.push(byte_at(tab, v % 64))
         i += 3
     end
     let rem: int = n - i
     if rem == 1 is
         let v: int = byte_at(s, i) * 65536
-        out += tab[v / 262144 % 64..v / 262144 % 64 + 1]
-        out += tab[v / 4096 % 64..v / 4096 % 64 + 1]
-        out += "=="
+        out.push(byte_at(tab, v / 262144 % 64))
+        out.push(byte_at(tab, v / 4096 % 64))
+        out.push(61)
+        out.push(61)
     elsif rem == 2 is
         let v: int = byte_at(s, i) * 65536 + byte_at(s, i + 1) * 256
-        out += tab[v / 262144 % 64..v / 262144 % 64 + 1]
-        out += tab[v / 4096 % 64..v / 4096 % 64 + 1]
-        out += tab[v / 64 % 64..v / 64 % 64 + 1]
-        out += "="
+        out.push(byte_at(tab, v / 262144 % 64))
+        out.push(byte_at(tab, v / 4096 % 64))
+        out.push(byte_at(tab, v / 64 % 64))
+        out.push(61)
     end
-    return out
+    return raw_string(out)
 end
 
 ;; hsh_base64_decode: skips every character that is not in the alphabet (padding, whitespace, garbage)
@@ -86,22 +87,25 @@ end
 ;; hsh_url_encode: every byte that is not unreserved becomes %XX (uppercase hex); a space is %20, not '+'
 pub fn url_encode(s: string) -> string is
     let hexd: string = "0123456789ABCDEF"
-    let mut out: string = ""
+    let n: int = s.len()
+    let mut out: [int] = []
     let mut i: int = 0
-    while i < s.len() is
+    while i < n is
         let c: int = byte_at(s, i)
         if url_safe(c) is
-            out += s[i..i + 1]
+            out.push(c)
         else
-            out += "%" + hexd[c / 16..c / 16 + 1] + hexd[c % 16..c % 16 + 1]
+            out.push(37)
+            out.push(byte_at(hexd, c / 16))
+            out.push(byte_at(hexd, c % 16))
         end
         i += 1
     end
-    return out
+    return raw_string(out)
 end
 
 ;; hsh_url_decode: '+' -> ' ', %XX -> byte; a '%' not followed by two hex digits is kept as it is.
-;; Known limitation: output that is not valid UTF-8 (e.g. "%e5%bc") comes out lossy (U+FFFD) — the C version returns the raw bytes.
+;; Output that is not valid UTF-8 (e.g. "%e5%bc") is returned as the raw bytes, exactly like core.c; a decoded %00 ends the string there.
 pub fn url_decode(s: string) -> string is
     let n: int = s.len()
     let mut out: [int] = []
