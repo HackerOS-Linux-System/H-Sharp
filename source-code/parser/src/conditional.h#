@@ -1,0 +1,236 @@
+mod ast
+mod error
+
+;; ── Conditional compilation ──────────────────────────────────────────────────
+;;
+;; The set of enabled *features* is chosen when the compiler is started and never touches the sources:
+;;
+;;     h# compile src/main.h# --features fast,simd          (or  -F fast,simd ; repeatable)
+;;     HSHARP_FEATURES=fast,simd h# compile src/main.h#     (the flag overrides the variable)
+;;
+;; `bit` does this for you: `bit build --features fast` resolves `[features]` of Bit.hk and starts h# with
+;; the final, flattened list.
+;;
+;; What the code can say about them (everything below is decided while the file is parsed, so code that is
+;; switched off is never type-checked, never lowered and never ends up in the binary):
+;;
+;;   #[cfg(feature = "fast")]                    an item (fn, struct, enum, trait, impl, type, const/let, extern,
+;;   fn fast_path() is ... end                   mod), an `impl` / `trait` member, a struct field, an enum variant,
+;;                                               a `use` import or a statement that exists only with that feature
+;;
+;;   #[cfg(not(feature = "fast"))]               negation
+;;   #[cfg(all(feature = "a", feature = "b"))]   every predicate holds        (all() is true)
+;;   #[cfg(any(feature = "a", feature = "b"))]   at least one holds           (any() is false)
+;;   #[cfg(true)] / #[cfg(false)]                constants (handy while bisecting)
+;;
+;;   feature_enabled("fast")                     bool literal: `if feature_enabled("fast") is ... end`
+;;   enabled_features()                          [string] literal with every enabled feature, in order
+;;                                               (annotate the receiver: `let f: [string] = enabled_features()`)
+;;
+;; Several `#[cfg]` on one item all have to hold. A `fn` of the same name defined in the file wins over the
+;; two built-in helpers (so an old `fn feature_enabled` of yours keeps working).
+
+pub fn env_name() -> string is return "HSHARP_FEATURES" end
+
+fn is_sep(b: int) -> bool is
+    return b == 44 || b == 32 || b == 9 || b == 10 || b == 13
+end
+
+;; "a, b  c" -> ["a", "b", "c"]   (commas and/or white space; duplicates dropped, order kept)
+pub fn split_list(s: string) -> [string] is
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i <= s.len() is
+        if i == s.len() || is_sep(byte_at(s, i)) is
+            if cur.len() > 0 is
+                let mut seen: bool = false
+                for o in out is
+                    if o == cur is seen = true end
+                end
+                if !seen is out.push(cur) end
+            end
+            cur = ""
+        else
+            cur = cur + str_from_byte(byte_at(s, i))
+        end
+        i += 1
+    end
+    return out
+end
+
+;; a feature name is ASCII letters, digits, `-` and `_` (what Bit.hk `[features]` keys look like)
+pub fn valid_name(n: string) -> bool is
+    if n.len() == 0 is return false end
+    let mut i: int = 0
+    while i < n.len() is
+        let b: int = byte_at(n, i)
+        let alpha: bool = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+        if !alpha && b != 45 && b != 95 is return false end
+        i += 1
+    end
+    return true
+end
+
+;; the features this compiler run was started with
+pub fn active() -> [string] is
+    return split_list(env_get(env_name()))
+end
+
+pub fn is_active(name: string) -> bool is
+    for f in active() is
+        if f == name is return true end
+    end
+    return false
+end
+
+;; ── predicates ───────────────────────────────────────────────────────────────
+
+pub struct Eval is
+    pub ok:   bool         ;; false: the attribute is malformed (err / hint / sp say how)
+    pub on:   bool         ;; the item is kept
+    pub err:  string
+    pub hint: string
+    pub sp:   ast::Sp
+end
+
+fn zero_sp() -> ast::Sp is
+    return ast::Sp { sl: 0, sc: 0, so: 0, el: 0, ec: 0, eo: 0 }
+end
+
+fn good(on: bool) -> Eval is
+    return Eval { ok: true, on: on, err: "", hint: "", sp: zero_sp() }
+end
+
+fn bad(msg: string, hint: string) -> Eval is
+    return Eval { ok: false, on: true, err: msg, hint: hint, sp: zero_sp() }
+end
+
+fn find_eq(s: string) -> int is
+    let mut i: int = 0
+    while i < s.len() is
+        if byte_at(s, i) == 61 is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn pred(n: ast::Node) -> Eval is
+    if n.tag == "AKV" is
+        let eq: int = find_eq(n.text)
+        let key: string = n.text[0..eq]
+        let val: string = n.text[eq + 1..n.text.len()]
+        if key != "feature" is
+            return bad("unknown `cfg` key `" + key + "`", "the only key is `feature = \"name\"`")
+        end
+        if val.len() == 0 is
+            return bad("`feature = \"\"` names no feature", "write the feature name between the quotes: `feature = \"fast\"`")
+        end
+        return good(is_active(val))
+    end
+    if n.tag == "ACall" is
+        if n.text == "not" is
+            if n.kids.len() != 1 is
+                return bad("`not(...)` takes exactly one predicate", "write `not(feature = \"x\")`")
+            end
+            let r: Eval = pred(n.kids[0])
+            if !r.ok is return r end
+            return good(!r.on)
+        end
+        if n.text == "all" || n.text == "any" is
+            let is_all: bool = n.text == "all"
+            let mut acc: bool = is_all
+            for k in n.kids is
+                let r2: Eval = pred(k)
+                if !r2.ok is return r2 end
+                if is_all is acc = acc && r2.on else acc = acc || r2.on end
+            end
+            return good(acc)
+        end
+        if n.text == "feature" is
+            return bad("`feature(...)` is not a predicate", "write `feature = \"name\"`")
+        end
+        return bad("unknown `cfg` predicate `" + n.text + "(...)`", "supported: `feature = \"name\"`, `not(..)`, `all(..)`, `any(..)`, `true`, `false`")
+    end
+    if n.text == "true" is return good(true) end
+    if n.text == "false" is return good(false) end
+    if n.text == "feature" is
+        return bad("`feature` needs a name", "write `feature = \"name\"`")
+    end
+    return bad("unknown `cfg` predicate `" + n.text + "`", "supported: `feature = \"name\"`, `not(..)`, `all(..)`, `any(..)`, `true`, `false`")
+end
+
+;; Evaluates every `#[cfg(...)]` of an `Attrs` node (they all have to hold). Attributes of other names are ignored.
+pub fn eval_attrs(attrs: ast::Node) -> Eval is
+    let mut on: bool = true
+    for a in attrs.kids is
+        if a.tag == "Attr" && a.text == "cfg" is
+            if a.kids.len() != 1 is
+                let mut e: Eval = bad("`#[cfg(...)]` takes exactly one predicate", "combine several with `all(...)` / `any(...)`")
+                e.sp = ast::sp_of(a)
+                return e
+            end
+            let r: Eval = pred(a.kids[0])
+            if !r.ok is
+                let mut e2: Eval = r
+                e2.sp = ast::sp_of(a)
+                return e2
+            end
+            on = on && r.on
+        end
+    end
+    return good(on)
+end
+
+;; ── feature_enabled("x") / enabled_features() ────────────────────────────────
+
+fn has_fn(module: ast::Node, name: string) -> bool is
+    for it in module.kids[3].kids is
+        if it.tag == "Fn" && it.text == name is return true end
+    end
+    return false
+end
+
+fn lower_node(n: ast::Node, file: string, shadow_fe: bool, shadow_ef: bool, errs: [error::ParseError]) is
+    if n.tag == "Call" && n.kids.len() == 2 && n.kids[0].tag == "Ident" is
+        let callee: string = n.kids[0].text
+        let args: [ast::Node] = n.kids[1].kids
+        if callee == "feature_enabled" && !shadow_fe is
+            if args.len() == 1 && args[0].tag == "Str" is
+                let none: [ast::Node] = []
+                n.text = if is_active(args[0].text) then "true" else "false"
+                n.tag = "Bool"
+                n.kids = none
+            else
+                errs.push(error::new_error("Custom", file, n.sl, n.sc, n.so, n.el, n.ec, n.eo,
+                    "`feature_enabled` takes one string literal",
+                    ["write `feature_enabled(\"name\")` — the name has to be known while compiling, so it cannot be a variable"]))
+            end
+        elsif callee == "enabled_features" && !shadow_ef is
+            if args.len() == 0 is
+                let mut elems: [ast::Node] = []
+                let at: ast::Sp = ast::sp_of(n)
+                for f in active() is
+                    elems.push(ast::with_sp(ast::lf("Str", f), at))
+                end
+                n.tag = "ArrayLit"
+                n.text = ""
+                n.kids = elems
+            else
+                errs.push(error::new_error("Custom", file, n.sl, n.sc, n.so, n.el, n.ec, n.eo,
+                    "`enabled_features` takes no arguments",
+                    ["write `enabled_features()`"]))
+            end
+        end
+    end
+    for k in n.kids is
+        lower_node(k, file, shadow_fe, shadow_ef, errs)
+    end
+end
+
+;; Rewrites the two built-in helpers into literals. Returns the problems found (wrong arguments).
+pub fn lower_module(module: ast::Node, file: string) -> [error::ParseError] is
+    let mut errs: [error::ParseError] = []
+    lower_node(module, file, has_fn(module, "feature_enabled"), has_fn(module, "enabled_features"), errs)
+    return errs
+end
