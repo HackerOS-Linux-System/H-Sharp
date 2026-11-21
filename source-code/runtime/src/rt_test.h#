@@ -999,3 +999,157 @@ fn environment_dependent_getters() is
     eq_b(rt_sys::stdout_is_tty() == true || rt_sys::stdout_is_tty() == false, true)
     eq_s(rt_proc::py_eval("print(6 * 7)"), "42\n")
 end
+
+;; ── large inputs: these used to build their result with `out += ..` per byte (quadratic, never freed) and ran out of memory near 100 KB ──
+fn big_text(reps: int) -> string is return rt_str::repeat("Hello, W\u00f6rld! a-b_c d=e&f 123 ", reps) end
+
+#[test]
+fn large_case_replace_split_join() is
+    let t: string = big_text(20000)
+    let up: string = rt_str::to_upper_h(t)
+    eq_i(up.len(), t.len())
+    eq_s(up[0..14], "HELLO, W\u00f6RLD!")
+    eq_i(rt_str::to_lower_h(up).len(), t.len())
+    eq_s(rt_str::to_lower_h(up)[0..14], "hello, w\u00f6rld!")
+    ;; 20000 copies of "a-b_c": every "-" becomes "++"
+    let r: string = rt_str::replace_h(t, "-", "++")
+    eq_i(r.len(), t.len() + 20000)
+    eq_s(r[0..13], "Hello, W\u00f6rld")
+    let parts: [string] = rt_str::string_split(t, " ")
+    eq_i(parts.len(), 5 * 20000 + 1)
+    eq_s(parts[0], "Hello,")
+    eq_s(parts[5], "Hello,")
+    eq_s(parts[parts.len() - 1], "")
+    eq_s(rt_str::array_join(parts, " "), t)
+end
+
+#[test]
+fn large_encodings_roundtrip() is
+    let t: string = big_text(20000)
+    let b: string = rt_codec::base64_encode(t)
+    eq_i(b.len(), (t.len() + 2) / 3 * 4)
+    eq_s(rt_codec::base64_decode(b), t)
+    let u: string = rt_codec::url_encode(t)
+    eq_s(rt_codec::url_decode(u), t)
+    eq_s(rt_text::shell_escape(t)[0..8], "'Hello, ")
+    eq_i(rt_text::shell_escape(t).len(), t.len() + 2)
+    eq_i(rt_fmt::py_repr(t).len(), t.len() + 2)
+    eq_i(rt_fmt::py_repr(rt_str::replace_h(t, "a", "'")).len(), t.len() + 2 + 20000)
+end
+
+;; the edge cases of the byte-array rewrites (values checked against core.c)
+#[test]
+fn string_rewrites_edge_cases() is
+    eq_s(rt_str::replace_h("aaa", "aa", "b"), "ba")
+    eq_s(rt_str::replace_h("abcabc", "abc", ""), "")
+    eq_s(rt_str::replace_h("abab", "ab", "abab"), "abababab")
+    eq_s(rt_str::replace_h("xay", "a", "\u00e9"), "x\u00e9y")
+    eq_s(rt_str::replace_h("abc", "abcd", "x"), "abc")
+    eq_s(rt_str::replace_h("", "a", "b"), "")
+    eq_s(rt_str::replace_h("abc", "", "x"), "abc")
+    eq_i(rt_str::string_split("", ",").len(), 1)
+    eq_i(rt_str::string_split(",", ",").len(), 2)
+    eq_i(rt_str::string_split("a,,b,", ",").len(), 4)
+    eq_i(rt_str::string_split("aaa", "aa").len(), 2)
+    eq_s(rt_str::string_split("aaa", "aa")[1], "a")
+    eq_i(rt_str::string_split("abc", "").len(), 1)
+    eq_s(rt_str::array_join([], ","), "")
+    eq_s(rt_str::array_join(["a"], ","), "a")
+    eq_s(rt_str::array_join(["", "", ""], "-"), "--")
+    eq_s(rt_text::shell_escape("it's"), "'it'\\''s'")
+    eq_s(rt_text::shell_escape(""), "''")
+    eq_s(rt_fmt::py_repr("a'b\\c\nd\re"), "'a\\'b\\\\c\\nd\\re'")
+    eq_s(rt_fmt::py_repr(""), "''")
+    eq_s(rt_codec::base64_encode(""), "")
+    eq_s(rt_codec::base64_encode("f"), "Zg==")
+    eq_s(rt_codec::base64_encode("fo"), "Zm8=")
+    eq_s(rt_codec::base64_encode("foo"), "Zm9v")
+    eq_s(rt_codec::url_encode("a b&c/\u00e9~"), "a%20b%26c%2F%C3%A9~")
+    eq_s(rt_codec::url_decode("%e5%bc"), rt_proc::shell("printf '\\345\\274'"))
+end
+
+#[test]
+fn large_process_output() is
+    ;; 5 MB through popen: the 4 KiB chunks are joined once, not re-copied per chunk
+    let o: string = rt_proc::shell("head -c 5000000 /dev/zero | tr '\\000' 'a'")
+    eq_i(o.len(), 5000000)
+    eq_i(rt_os::read_stream("/dev/null").len(), 0)
+end
+
+;; a result set of 50000 rows: the text used to be appended row by row (quadratic, OOM for a few hundred thousand rows)
+#[test]
+fn sqlite_large_result_set() is
+    let d: string = "/tmp/hs_rt_dbbig_" + to_string(rt_sys::pid())
+    rt_os::mkdir_all(d)
+    ;; like core.c, the *_bind queries take the database PATH (an open() handle "sqlite://..." is not accepted there)
+    let h: string = rt_db::sqlite_open(d + "/big.db")
+    eq_i(rt_db::sqlite_exec(h, "CREATE TABLE t(id INTEGER, name TEXT)"), 0)
+    rt_db::sqlite_exec(h, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<50000) INSERT INTO t SELECT x,'name'||x FROM c")
+    let out: string = rt_db::sqlite_query_bind1(d + "/big.db", "SELECT id,name FROM t WHERE id>?", "0")
+    let lines: [string] = rt_str::string_split(out, "\n")
+    ;; 50000 rows + the empty piece after the last newline
+    eq_i(lines.len(), 50001)
+    eq_s(lines[0], "1\tname1")
+    eq_s(lines[49999], "50000\tname50000")
+    eq_s(rt_db::sqlite_query_bind1(d + "/big.db", "SELECT name FROM t WHERE id=?", "777"), "name777\n")
+    rt_db::sqlite_close(h)
+    rt_proc::shell("rm -rf '" + d + "'")
+end
+
+;; regex_find_all on a 1.2 MB single line with 40000 matches.  The 160 KB of grep output used to be cut into lines by the compiler's
+;; quadratic `__builtin_str_split` (5.8 s here, core.c needs 0.28 s); now it is linear.  The limit is generous so that only a regression trips it.
+#[test]
+fn regex_find_all_large_input_is_linear() is
+    let text: string = rt_str::repeat("Hello, W\u00f6rld! a-b_c d=e&f 123 ", 40000)
+    let t0: int = rt_sys::now_ms()
+    let m: [string] = rt_proc::regex_find_all("[0-9]+", text)
+    let ms: int = rt_sys::now_ms() - t0
+    eq_i(m.len(), 40000)
+    eq_s(m[0], "123")
+    eq_s(m[39999], "123")
+    if ms > 3000 is test::fail("regex_find_all took " + to_string(ms) + " ms") end
+end
+
+;; 100000 result rows through sqlite_query_params / db_col_str (the output is cut into lines and cells with rt_str::string_split)
+#[test]
+fn sqlite_query_params_large_result() is
+    let d: string = "/tmp/hs_rt_dbq_" + to_string(rt_sys::pid())
+    rt_os::mkdir_all(d)
+    let db: string = d + "/q.db"
+    rt_db::sqlite_exec(db, "CREATE TABLE t(id INTEGER, name TEXT)")
+    rt_db::sqlite_exec(db, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<100000) INSERT INTO t SELECT x,'name'||x FROM c")
+    let mut p: int = rt_mem::array_new()
+    p = rt_mem::array_push(p, rt_mem::c_string("0"))
+    let t0: int = rt_sys::now_ms()
+    let rows: int = rt_db::sqlite_query_params(db, "SELECT id,name FROM t WHERE id>?", p)
+    let ms: int = rt_sys::now_ms() - t0
+    eq_i(rt_mem::array_len(rows), 100000)
+    let last: int = rt_mem::array_get(rows, 99999)
+    eq_s(rt_db::db_col_str(last, "id"), "100000")
+    eq_s(rt_db::db_col_str(last, "name"), "name100000")
+    if ms > 5000 is test::fail("sqlite_query_params took " + to_string(ms) + " ms") end
+    rt_proc::shell("rm -rf '" + d + "'")
+end
+
+;; run_piped gives the child its stdin through a temporary file, not a pipe.  With core.c's pipe, multi-line text whose `grep -oP` output
+;; exceeds a pipe buffer (64 KiB) hangs forever (both sides blocked), and an invalid pattern kills the whole process with SIGPIPE.
+#[test]
+fn regex_survives_big_multiline_input_and_bad_patterns() is
+    let text: string = rt_str::repeat("Hello, W\u00f6rld! a-b_c d=e&f 123\n", 40000)
+    let t0: int = rt_sys::now_ms()
+    let m: [string] = rt_proc::regex_find_all("[0-9]+", text)
+    eq_i(m.len(), 40000)
+    eq_s(m[39999], "123")
+    if rt_sys::now_ms() - t0 > 5000 is test::fail("regex_find_all on multi-line input is too slow") end
+    ;; invalid patterns: grep fails at once; the caller gets "no match" and keeps running
+    eq_s(rt_proc::regex_find("(", rt_str::repeat("abc ", 20000)), "")
+    eq_s(rt_proc::regex_find("[", "abc"), "")
+    eq_i(rt_proc::regex_find_all("(", "abc").len(), 0)
+    eq_i(bool_to_int(rt_proc::regex_match("(", rt_str::repeat("abc ", 20000))), 0)
+    eq_i(bool_to_int(rt_proc::regex_match("b+", rt_str::repeat("abc ", 20000))), 1)
+end
+
+fn bool_to_int(b: bool) -> int is
+    if b is return 1 end
+    return 0
+end
