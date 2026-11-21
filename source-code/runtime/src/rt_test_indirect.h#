@@ -1,13 +1,17 @@
 use "std -> test" from "test"
 
 ;; Tests of the runtime pieces that need a raw function address (fn_addr / call_ptr0..4): closures, sort_by_raw / sort_by_key, tasks.
-;; Needs the self-hosted compiler (h# 0.9.0 has neither builtin).  Run:  h# test src/rt_test_indirect.h#
+;; `fn_addr` and `call_ptr0..4` are available in h# 0.9.0 (checked).  Run:  h# test src/rt_test_indirect.h#
 
 mod rt_ptr
 mod rt_mem
 mod rt_sort
 mod rt_indirect
 mod rt_task
+mod rt_state
+mod rt_abi
+mod rt_abi_arrays
+mod rt_abi_indirect
 
 fn eq_s(actual: string, expected: string) is
     if actual != expected is test::fail("expected `" + expected + "`, got `" + actual + "`") end
@@ -158,4 +162,252 @@ fn task_spawn_runs_raw_entry() is
     let h: int = rt_task::task_spawn(fn_addr(ic_task_body), 7)
     if h == 0 is eq_i(1, 0) end
     eq_i(rt_task::task_wait(h), 42)
+end
+
+;; ── values below were produced by core.c on the same inputs (hsh_sort_by / hsh_sort_by_key / closures / tasks) ──
+fn fp_slot() -> int is return rt_state::global_slot("_RT_TEST_FPLOG", 16) end
+fn fp_reset() is
+    rt_ptr::ptr_write_i64(fp_slot(), 0, 0)
+    rt_ptr::ptr_write_i64(fp_slot(), 8, 0)
+end
+;; every comparator call is folded into a (count, checksum) pair: the same pair means the same sequence of comparisons
+fn fp_log(a: int, b: int) is
+    let s: int = fp_slot()
+    rt_ptr::ptr_write_i64(s, 0, rt_ptr::ptr_read_i64(s, 0) + 1)
+    let h: int = rt_ptr::ptr_read_i64(s, 8)
+    rt_ptr::ptr_write_i64(s, 8, (h * 31 + (a + 100) * 7 + (b + 100) + 13) % 1000000007)
+end
+fn fp_calls() -> int is return rt_ptr::ptr_read_i64(fp_slot(), 0) end
+fn fp_hash() -> int is return rt_ptr::ptr_read_i64(fp_slot(), 8) end
+
+fn cmp_asc(a: int, b: int) -> int is
+    fp_log(a, b)
+    if a > b is return 1 end
+    if a < b is return -1 end
+    return 0
+end
+fn cmp_desc(a: int, b: int) -> int is
+    fp_log(a, b)
+    if b > a is return 1 end
+    if b < a is return -1 end
+    return 0
+end
+fn cmp_mod7(a: int, b: int) -> int is
+    fp_log(a, b)
+    return (a % 7) - (b % 7)
+end
+fn cmp_zero(a: int, b: int) -> int is
+    fp_log(a, b)
+    return 0
+end
+fn cmp_one(a: int, b: int) -> int is
+    fp_log(a, b)
+    return 1
+end
+fn k_mod5(x: int) -> int is return (x + 100) % 5 end
+fn k_neg(x: int) -> int is return 0 - x end
+fn k_str(x: int) -> int is return rt_mem::alloc_string("k" + to_string((x + 100) % 7)) end
+fn k_mixed(x: int) -> int is
+    if x % 2 == 0 is return x end
+    return rt_mem::alloc_string("s" + to_string((x + 100) % 9))
+end
+
+fn fp_arr() -> int is
+    let v: [int] = [5, 3, 9, 1, 7, 9, 2, 0, 4, 4, 8, 6, 3]
+    let mut a: int = rt_abi::hsh_array_new()
+    let mut i: int = 0
+    while i < v.len() is
+        a = rt_abi::hsh_array_push(a, v[i])
+        i += 1
+    end
+    return a
+end
+fn fp_text(a: int) -> string is
+    let mut s: string = ""
+    let n: int = rt_abi::hsh_array_len(a)
+    let mut i: int = 0
+    while i < n is
+        if i > 0 is s += "," end
+        s += to_string(rt_abi::hsh_array_get(a, i))
+        i += 1
+    end
+    return s
+end
+fn fp_sort(cmp: int) -> int is
+    fp_reset()
+    let a: int = fp_arr()
+    let r: int = rt_abi_indirect::hsh_sort_by(a, cmp)
+    eq_i(r, a)
+    return a
+end
+
+#[test]
+fn sort_by_is_in_place_and_calls_comparator_like_c() is
+    let a: int = fp_sort(fn_addr(cmp_asc))
+    eq_s(fp_text(a), "0,1,2,3,3,4,4,5,6,7,8,9,9")
+    eq_i(fp_calls(), 33)
+    eq_i(fp_hash(), 326135832)
+    let d: int = fp_sort(fn_addr(cmp_desc))
+    eq_s(fp_text(d), "9,9,8,7,6,5,4,4,3,3,2,1,0")
+    eq_i(fp_calls(), 36)
+    eq_i(fp_hash(), 191851091)
+    ;; stable: equal keys (x % 7) keep their input order
+    let m: int = fp_sort(fn_addr(cmp_mod7))
+    eq_s(fp_text(m), "7,0,1,8,9,9,2,3,3,4,4,5,6")
+    eq_i(fp_calls(), 35)
+    eq_i(fp_hash(), 304398357)
+    let z: int = fp_sort(fn_addr(cmp_zero))
+    eq_s(fp_text(z), "5,3,9,1,7,9,2,0,4,4,8,6,3")
+    eq_i(fp_calls(), 22)
+    eq_i(fp_hash(), 917871522)
+    let o: int = fp_sort(fn_addr(cmp_one))
+    eq_s(fp_text(o), "3,6,8,4,4,0,2,9,7,1,9,3,5")
+    eq_i(fp_calls(), 27)
+    eq_i(fp_hash(), 247227966)
+    ;; NULL array -> a fresh empty one; NULL comparator or < 2 elements -> untouched
+    eq_i(rt_abi::hsh_array_len(rt_abi_indirect::hsh_sort_by(0, fn_addr(cmp_asc))), 0)
+    let u: int = fp_arr()
+    eq_i(rt_abi_indirect::hsh_sort_by(u, 0), u)
+    eq_s(fp_text(u), "5,3,9,1,7,9,2,0,4,4,8,6,3")
+    fp_reset()
+    let one: int = rt_abi::hsh_array_push(rt_abi::hsh_array_new(), 4)
+    rt_abi_indirect::hsh_sort_by(one, fn_addr(cmp_asc))
+    eq_i(fp_calls(), 0)
+end
+
+#[test]
+fn sort_by_key_is_in_place_like_c() is
+    let a: int = fp_arr()
+    eq_i(rt_abi_indirect::hsh_sort_by_key(a, fn_addr(k_mod5)), a)
+    eq_s(fp_text(a), "5,0,1,6,7,2,3,8,3,9,9,4,4")
+    let b: int = fp_arr()
+    rt_abi_indirect::hsh_sort_by_key(b, fn_addr(k_neg))
+    eq_s(fp_text(b), "9,9,8,7,6,5,4,4,3,3,2,1,0")
+    ;; string keys are compared with strcmp, int keys numerically, a string key sorts after a small int key
+    let c: int = fp_arr()
+    rt_abi_indirect::hsh_sort_by_key(c, fn_addr(k_str))
+    eq_s(fp_text(c), "5,6,7,0,1,8,9,9,2,3,3,4,4")
+    let d: int = fp_arr()
+    rt_abi_indirect::hsh_sort_by_key(d, fn_addr(k_mixed))
+    eq_s(fp_text(d), "0,2,4,4,6,8,9,9,1,3,3,5,7")
+    eq_i(rt_abi::hsh_array_len(rt_abi_indirect::hsh_sort_by_key(0, fn_addr(k_neg))), 0)
+    let e: int = fp_arr()
+    eq_i(rt_abi_indirect::hsh_sort_by_key(e, 0), e)
+    eq_s(fp_text(e), "5,3,9,1,7,9,2,0,4,4,8,6,3")
+end
+
+#[test]
+fn sort_ints_and_strings_are_in_place() is
+    let a: int = fp_arr()
+    eq_i(rt_abi_arrays::hsh_sort_ints(a), a)
+    eq_s(fp_text(a), "0,1,2,3,3,4,4,5,6,7,8,9,9")
+    let s: int = rt_abi::hsh_array_new()
+    let names: [string] = ["pear", "apple", "fig", "apple", ""]
+    let mut i: int = 0
+    while i < names.len() is
+        rt_abi::hsh_array_push_str(s, names[i])
+        i += 1
+    end
+    ;; the original slot pointers are only reordered
+    let first: int = rt_abi::hsh_array_get(s, 0)
+    eq_i(rt_abi_arrays::hsh_sort_strings(s), s)
+    eq_s(rt_mem::text_at(rt_abi::hsh_array_get(s, 0)), "")
+    eq_s(rt_mem::text_at(rt_abi::hsh_array_get(s, 1)), "apple")
+    eq_s(rt_mem::text_at(rt_abi::hsh_array_get(s, 2)), "apple")
+    eq_s(rt_mem::text_at(rt_abi::hsh_array_get(s, 3)), "fig")
+    eq_s(rt_mem::text_at(rt_abi::hsh_array_get(s, 4)), "pear")
+    eq_i(rt_abi::hsh_array_get(s, 4), first)
+    eq_i(rt_abi::hsh_array_len(rt_abi_arrays::hsh_sort_ints(0)), 0)
+    eq_i(rt_abi::hsh_array_len(rt_abi_arrays::hsh_sort_strings(0)), 0)
+end
+
+fn cl1_0(a0: int) -> int is return a0 * 2 + 1 end
+fn cl1_1(a0: int, c0: int) -> int is return a0 * 10 + c0 end
+fn cl1_2(a0: int, c0: int, c1: int) -> int is return a0 * 100 + c0 * 10 + c1 end
+fn cl2_0(a0: int, a1: int) -> int is return a0 * 10 + a1 end
+fn cl2_1(a0: int, a1: int, c0: int) -> int is return a0 * 100 + a1 * 10 + c0 end
+fn cl2_2(a0: int, a1: int, c0: int, c1: int) -> int is return a0 * 1000 + a1 * 100 + c0 * 10 + c1 end
+
+#[test]
+fn closure_calls_match_c_for_every_capture_count() is
+    eq_i(rt_abi_indirect::hsh_closure_call1(rt_abi::hsh_closure_create(fn_addr(cl1_0), 0, 0, 0, 0, 0, 0, 0, 0, 0), 7), 15)
+    eq_i(rt_abi_indirect::hsh_closure_call1(rt_abi::hsh_closure_create(fn_addr(cl1_1), 1, 5, 0, 0, 0, 0, 0, 0, 0), 7), 75)
+    eq_i(rt_abi_indirect::hsh_closure_call1(rt_abi::hsh_closure_create(fn_addr(cl1_2), 2, 3, 4, 0, 0, 0, 0, 0, 0), 7), 734)
+    ;; more than two captures: the function is called with the bare arguments
+    eq_i(rt_abi_indirect::hsh_closure_call1(rt_abi::hsh_closure_create(fn_addr(cl1_0), 3, 3, 4, 5, 0, 0, 0, 0, 0), 7), 15)
+    eq_i(rt_abi_indirect::hsh_closure_call1(rt_abi::hsh_closure_create(fn_addr(cl1_0), 9, 1, 2, 3, 4, 5, 6, 7, 8), 7), 15)
+    eq_i(rt_abi_indirect::hsh_closure_call2(rt_abi::hsh_closure_create(fn_addr(cl2_0), 0, 0, 0, 0, 0, 0, 0, 0, 0), 7, 8), 78)
+    eq_i(rt_abi_indirect::hsh_closure_call2(rt_abi::hsh_closure_create(fn_addr(cl2_1), 1, 5, 0, 0, 0, 0, 0, 0, 0), 7, 8), 785)
+    eq_i(rt_abi_indirect::hsh_closure_call2(rt_abi::hsh_closure_create(fn_addr(cl2_2), 2, 3, 4, 0, 0, 0, 0, 0, 0), 7, 8), 7834)
+    eq_i(rt_abi_indirect::hsh_closure_call2(rt_abi::hsh_closure_create(fn_addr(cl2_0), 4, 1, 2, 3, 4, 0, 0, 0, 0), 7, 8), 78)
+    eq_i(rt_abi_indirect::hsh_closure_call1(0, 1), 0)
+    eq_i(rt_abi_indirect::hsh_closure_call2(0, 1, 2), 0)
+    let raw: int = rt_abi::hsh_closure_create(fn_addr(cl1_2), 2, 11, 22, 33, 44, 55, 66, 77, 88)
+    eq_i(rt_ptr::ptr_read_i64(raw, 8), 2)
+    eq_i(rt_ptr::ptr_read_i64(raw, 16), 11)
+    eq_i(rt_ptr::ptr_read_i64(raw, 24), 22)
+end
+
+fn tk_triple(a: int) -> int is return a * 3 end
+fn tk_slow(a: int) -> int is
+    rt_abi::hsh_sleep_ms(300)
+    return a + 1
+end
+fn tk_args(a: int) -> int is
+    return rt_abi::hsh_args_get(a, 0) * 100 + rt_abi::hsh_args_get(a, 1) * 10 + rt_abi::hsh_args_get(a, 2)
+end
+
+#[test]
+fn task_api_matches_c() is
+    let mut hs: [int] = []
+    let mut i: int = 0
+    while i < 6 is
+        hs.push(rt_abi_indirect::hsh_task_spawn(fn_addr(tk_triple), i + 1))
+        i += 1
+    end
+    i = 0
+    while i < 6 is
+        eq_i(rt_abi_indirect::hsh_task_wait(hs[i]), (i + 1) * 3)
+        i += 1
+    end
+    let hb: int = rt_ptr::buf_new(32)
+    i = 0
+    while i < 4 is
+        rt_ptr::ptr_write_i64(hb, i * 8, rt_abi_indirect::hsh_task_spawn(fn_addr(tk_triple), 10 + i))
+        i += 1
+    end
+    let jr: int = rt_abi_indirect::hsh_task_join_all(hb, 4)
+    eq_i(rt_ptr::ptr_read_i64(jr, 0), 30)
+    eq_i(rt_ptr::ptr_read_i64(jr, 8), 33)
+    eq_i(rt_ptr::ptr_read_i64(jr, 16), 36)
+    eq_i(rt_ptr::ptr_read_i64(jr, 24), 39)
+    let ar: int = rt_abi::hsh_args_alloc(3)
+    rt_abi::hsh_args_set(ar, 0, 4)
+    rt_abi::hsh_args_set(ar, 1, 5)
+    rt_abi::hsh_args_set(ar, 2, 6)
+    eq_i(rt_abi::hsh_args_get(ar, 1), 5)
+    eq_i(rt_abi::hsh_args_get(ar, -1), 0)
+    eq_i(rt_abi_indirect::hsh_task_wait(rt_abi_indirect::hsh_task_spawn(fn_addr(tk_args), ar)), 456)
+    eq_i(rt_abi_indirect::hsh_task_wait(0), 0)
+    eq_i(rt_abi_indirect::hsh_task_wait_timeout(0, 10), 1)
+    ;; bounded wait only peeks: 0 while the 300 ms task still runs, 1 once it is done; wait then fetches the result
+    let slow: int = rt_abi_indirect::hsh_task_spawn(fn_addr(tk_slow), 7)
+    eq_i(rt_abi_indirect::hsh_task_wait_timeout(slow, 50), 0)
+    eq_i(rt_abi_indirect::hsh_task_wait_timeout(slow, 3000), 1)
+    eq_i(rt_abi_indirect::hsh_task_wait_timeout(slow, 0), 1)
+    eq_i(rt_abi_indirect::hsh_task_wait(slow), 8)
+    let neg: int = rt_abi_indirect::hsh_task_spawn(fn_addr(tk_slow), 1)
+    eq_i(rt_abi_indirect::hsh_task_wait_timeout(neg, -5), 0)
+    eq_i(rt_abi_indirect::hsh_task_wait(neg), 2)
+end
+
+#[test]
+fn shell_task_output_matches_c() is
+    eq_s(rt_mem::text_at(rt_abi_indirect::hsh_task_wait(rt_abi_indirect::hsh_task_spawn_shell("echo hello; echo world"))), "hello\nworld\n")
+    eq_s(rt_mem::text_at(rt_abi_indirect::hsh_task_wait(rt_abi_indirect::hsh_task_spawn_shell("printf nonl"))), "nonl")
+    eq_s(rt_mem::text_at(rt_abi_indirect::hsh_task_wait(rt_abi_indirect::hsh_task_spawn_shell("exit 3"))), "")
+    ;; stderr is not captured
+    eq_s(rt_mem::text_at(rt_abi_indirect::hsh_task_wait(rt_abi_indirect::hsh_task_spawn_shell("echo err 1>&2; echo out"))), "out\n")
+    ;; the output buffer is 64 KiB - 1
+    eq_i(rt_mem::text_at(rt_abi_indirect::hsh_task_wait(rt_abi_indirect::hsh_task_spawn_shell("head -c 70000 /dev/zero | tr '\\000' 'x'"))).len(), 65535)
 end
