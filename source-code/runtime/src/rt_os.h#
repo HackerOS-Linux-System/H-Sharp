@@ -1,3 +1,4 @@
+mod rt_str
 mod rt_ptr
 mod rt_text
 mod rt_state
@@ -183,16 +184,16 @@ pub fn read_stream(path: string) -> string is
     let f: int = fopen(path, "rb")
     if f == 0 is return "" end
     let buf: int = rt_ptr::buf_new(4097)
-    let mut out: string = ""
+    let mut parts: [string] = []
     let mut n: int = fread(buf, 1, 4096, f)
     while n > 0 is
         rt_ptr::ptr_write_i8(buf, n, 0)
-        out += strdup(buf)
+        parts.push(strdup(buf))
         n = fread(buf, 1, 4096, f)
     end
     fclose(f)
     rt_ptr::buf_free(buf)
-    return out
+    return rt_str::array_join(parts, "")
 end
 
 ;; n bytes from /dev/urandom as 0..255 ([] when it cannot be opened; the C leaves such a buffer zeroed, see the callers)
