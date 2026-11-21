@@ -7,6 +7,7 @@ mod error
 mod lexer
 mod parser
 mod edition
+mod conditional
 
 pub struct ParseResult is
     pub module: ast::Node
@@ -90,6 +91,7 @@ pub fn parse_with_default(source: string, file: string, file_default_year: int, 
         errors.push(error::new_error("Custom", file, v.sp.sl, v.sp.sc, v.sp.so, v.sp.el, v.sp.ec, v.sp.eo, msg, ["use `using \"{since}\"` (or newer) at the top of the file"]))
     end
     edition::lower_module(module, y)
+    for ce in conditional::lower_module(module, file) is errors.push(ce) end
     edition::record(rec, file, y, declared)
     return ParseResult { module: module, errors: errors, source: source }
 end
