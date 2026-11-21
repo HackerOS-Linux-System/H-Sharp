@@ -1,3 +1,4 @@
+mod rt_raw
 mod rt_ptr
 mod rt_num
 mod rt_conv
@@ -273,22 +274,28 @@ end
 
 ;; core.c hsh_py_repr: a Python-style single-quoted literal: ' \ newline and return are escaped, everything else is kept
 pub fn py_repr(s: string) -> string is
-    let mut out: string = "'"
+    let n: int = s.len()
+    let mut out: [int] = [39]
     let mut i: int = 0
-    while i < s.len() is
+    while i < n is
         let c: int = byte_at(s, i)
         if c == 39 is
-            out += "\\'"
+            out.push(92)
+            out.push(39)
         elsif c == 92 is
-            out += "\\\\"
+            out.push(92)
+            out.push(92)
         elsif c == 10 is
-            out += "\\n"
+            out.push(92)
+            out.push(110)
         elsif c == 13 is
-            out += "\\r"
+            out.push(92)
+            out.push(114)
         else
-            out += s[i..i + 1]
+            out.push(c)
         end
         i += 1
     end
-    return out + "'"
+    out.push(39)
+    return rt_raw::string_from_ints(out)
 end
