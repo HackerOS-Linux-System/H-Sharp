@@ -1,6 +1,9 @@
 use "std -> test" from "test"
 
 mod rt_abi
+mod rt_abi_indirect
+mod rt_abi_arrays
+mod rt_ptr
 mod rt_mem
 
 ;; rt_test_abi — the exact-C-name facade (rt_abi.h#) must behave like the C symbols it stands for (core.c / async_rt.c).
@@ -173,4 +176,323 @@ fn abi_text_and_misc() is
     eq_s(rt_abi::hsh_conv_int_to_hex(255), "ff")
     eq_i(rt_abi::hsh_regex_match("^a.c$", "abc"), 1)
     eq_s(rt_abi::hsh_regex_replace("[0-9]+", "#", "a1b22"), "a#b#")
+end
+
+;; ── containers: every expected value below was produced by core.c for the same call sequence ──
+fn cs_c(s: string) -> int is return rt_mem::alloc_string(s) end
+
+fn join_ints(a: int) -> string is
+    let mut s: string = ""
+    let n: int = rt_abi::hsh_array_len(a)
+    let mut i: int = 0
+    while i < n is
+        if i > 0 is s += "," end
+        s += to_string(rt_abi::hsh_array_get(a, i))
+        i += 1
+    end
+    return s
+end
+
+fn join_strs(a: int) -> string is
+    let mut s: string = ""
+    let n: int = rt_abi::hsh_array_len(a)
+    let mut i: int = 0
+    while i < n is
+        if i > 0 is s += "," end
+        s += rt_mem::text_at(rt_abi::hsh_array_get(a, i))
+        i += 1
+    end
+    return s
+end
+
+#[test]
+fn abi_map_matches_c_iteration_order() is
+    let m: int = rt_abi::hsh_map_new(0)
+    let mut i: int = 1
+    while i <= 40 is
+        rt_abi::hsh_map_set(m, i * 7, i * 100)
+        i += 1
+    end
+    eq_i(rt_abi::hsh_map_len(m), 40)
+    eq_i(rt_abi::hsh_map_get(m, 21), 300)
+    eq_i(rt_abi::hsh_map_get(m, 22), 0)
+    eq_i(rt_abi::hsh_map_remove(m, 21), 1)
+    eq_i(rt_abi::hsh_map_remove(m, 21), 0)
+    rt_abi::hsh_map_set(m, 7, -5)
+    eq_s(join_ints(rt_abi::hsh_map_keys(m)), "70,112,161,252,231,203,42,133,49,140,224,154,28,84,266,280,98,210,91,273,217,35,56,126,147,238,77,14,168,196,105,259,63,245,119,7,189,175,182")
+    rt_abi::hsh_map_clear(m)
+    eq_i(rt_abi::hsh_map_len(m), 0)
+    i = 0
+    while i < 5 is
+        rt_abi::hsh_map_set(m, 0 - i, i)
+        i += 1
+    end
+    eq_s(join_ints(rt_abi::hsh_map_keys(m)), "0,-3,-1,-2,-4")
+
+    let s: int = rt_abi::hsh_map_new(1)
+    let ks: [string] = ["alpha", "beta", "gamma", "", "delta", "alpha"]
+    i = 0
+    while i < 6 is
+        rt_abi::hsh_map_set(s, cs_c(ks[i]), i + 1)
+        i += 1
+    end
+    eq_i(rt_abi::hsh_map_len(s), 5)
+    eq_i(rt_abi::hsh_map_get(s, cs_c("alpha")), 6)
+    eq_i(rt_abi::hsh_map_has(s, cs_c("")), 1)
+    eq_s(join_strs(rt_abi::hsh_map_keys(s)), ",delta,alpha,gamma,beta")
+    eq_s(join_ints(rt_abi::hsh_map_values(s)), "4,5,6,3,2")
+    eq_i(rt_abi::hsh_map_remove(s, cs_c("beta")), 1)
+    eq_i(rt_abi::hsh_map_remove(s, cs_c("beta")), 0)
+    eq_s(join_strs(rt_abi::hsh_map_keys(s)), ",delta,alpha,gamma")
+    i = 0
+    while i < 300 is
+        rt_abi::hsh_map_set(s, cs_c("k" + to_string(i)), i)
+        i += 1
+    end
+    eq_i(rt_abi::hsh_map_len(s), 304)
+    eq_i(rt_abi::hsh_map_get(s, cs_c("k299")), 299)
+end
+
+#[test]
+fn abi_array_edges_match_c() is
+    let mut a: int = rt_abi::hsh_array_new()
+    let mut i: int = 0
+    while i < 100 is
+        a = rt_abi::hsh_array_push(a, i * 3)
+        i += 1
+    end
+    eq_i(rt_abi::hsh_array_get(a, 500), 0)
+    eq_i(rt_abi::hsh_array_get(a, -1), 0)
+    eq_s(join_ints(rt_abi::hsh_array_slice(a, 95, 200)), "285,288,291,294,297")
+    eq_s(join_ints(rt_abi::hsh_array_slice(a, -3, 2)), "0,3")
+    eq_s(join_ints(rt_abi::hsh_array_slice(a, 10, 5)), "")
+    eq_s(join_ints(rt_abi::hsh_array_concat(rt_abi::hsh_array_slice(a, 95, 200), 0)), "285,288,291,294,297")
+    eq_s(join_ints(rt_abi::hsh_array_concat(0, rt_abi::hsh_array_slice(a, 95, 200))), "285,288,291,294,297")
+    eq_i(rt_abi::hsh_array_remove(a, 0), 1)
+    eq_i(rt_abi::hsh_array_len(a), 99)
+    eq_i(rt_abi::hsh_array_remove(a, 999), 0)
+    eq_i(rt_abi::hsh_array_len(0), 0)
+end
+
+#[test]
+fn abi_rc_arc_and_arena_match_c() is
+    let r: int = rt_abi::hsh_rc_alloc(16)
+    eq_i(rt_abi::hsh_rc_count(r), 1)
+    rt_abi::hsh_rc_retain(r)
+    rt_abi::hsh_rc_retain(r)
+    eq_i(rt_abi::hsh_rc_count(r), 3)
+    let w: int = rt_abi::hsh_arc_downgrade(r)
+    eq_i(rt_abi::hsh_arc_weak_count(r), 1)
+    let u: int = rt_abi::hsh_arc_upgrade(w)
+    eq_i(rt_abi::hsh_rc_count(r), 4)
+    eq_b_nonzero(u)
+    rt_abi::hsh_rc_release(r)
+    rt_abi::hsh_rc_release(r)
+    rt_abi::hsh_rc_release(r)
+    eq_i(rt_abi::hsh_rc_count(r), 1)
+
+    let ar: int = rt_abi::hsh_arena_new(1024)
+    rt_abi::hsh_arena_push_current(ar)
+    let x1: int = rt_abi::hsh_arena_alloc(ar, 100)
+    eq_i(rt_abi::hsh_arena_used(), 104)
+    eq_i(rt_abi::hsh_arena_capacity(), 1024)
+    let ck: int = rt_abi::hsh_arena_checkpoint()
+    let x2: int = rt_abi::hsh_arena_alloc(ar, 50)
+    eq_i(rt_abi::hsh_arena_used(), 160)
+    rt_abi::hsh_arena_rewind(ck)
+    eq_i(rt_abi::hsh_arena_used(), 104)
+    let popped: int = rt_abi::hsh_arena_pop_current()
+    rt_abi::hsh_arena_free(ar)
+end
+
+fn eq_b_nonzero(v: int) is
+    if v == 0 is test::fail("expected a non-null pointer") end
+end
+
+;; ── raw pointer primitives, allocation / free, arena kinds, sqlite params + columns, paths, processes ──
+;; (every expected value was produced by core.c for the same call sequence)
+#[test]
+fn abi_pointer_primitives_match_c() is
+    let b: int = rt_abi::hsh_rc_alloc(64)
+    rt_abi::hsh_ptr_zero(b, 64)
+    rt_abi::hsh_ptr_write_i8(b, 0, -5)
+    rt_abi::hsh_ptr_write_i16(b, 2, -300)
+    rt_abi::hsh_ptr_write_i32(b, 4, -70000)
+    rt_abi::hsh_ptr_write_i64(b, 8, -1234567890123)
+    rt_abi::hsh_ptr_write_f64(b, 16, 3.5)
+    rt_abi::hsh_ptr_write_f32(b, 24, 2.25)
+    rt_abi::hsh_ptr_write_ptr(b, 32, b)
+    eq_i(rt_abi::hsh_ptr_read_i8(b, 0), -5)
+    eq_i(rt_abi::hsh_ptr_read_i16(b, 2), -300)
+    eq_i(rt_abi::hsh_ptr_read_i32(b, 4), -70000)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 8), -1234567890123)
+    eq_i(rt_ptr::f64_bits(rt_abi::hsh_ptr_read_f64(b, 16)), 4615063718147915776)
+    eq_i(rt_ptr::f64_bits(rt_abi::hsh_ptr_read_f32(b, 24)), 4612248968380809216)
+    eq_i(rt_abi::hsh_ptr_read_ptr(b, 32), b)
+    eq_i(rt_abi::hsh_ptr_add(b, 10) - b, 10)
+    eq_i(rt_abi::hsh_ptr_is_null(0), 1)
+    eq_i(rt_abi::hsh_ptr_is_null(b), 0)
+    eq_i(rt_abi::hsh_ptr_add(0, 5), 0)
+    ;; fill uses only the low byte of the value
+    rt_abi::hsh_ptr_fill(b + 40, 171, 8)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 40), -6076574518398440533)
+    rt_abi::hsh_ptr_fill(b + 40, 511, 2)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 40), -6076574518398418945)
+    rt_abi::hsh_ptr_copy(b + 48, b, 8)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 48), -300643435413253)
+    eq_i(sgn_of(rt_abi::hsh_ptr_compare(b, b + 48, 8)), 0)
+    rt_abi::hsh_ptr_write_i8(b, 48, 100)
+    eq_i(sgn_of(rt_abi::hsh_ptr_compare(b, b + 48, 8)), 1)
+    eq_i(sgn_of(rt_abi::hsh_ptr_compare(b + 48, b, 8)), -1)
+    ;; n = 0 still reports 1 for two non-null pointers (core.c)
+    eq_i(sgn_of(rt_abi::hsh_ptr_compare(b, b + 48, 0)), 1)
+    ;; overlapping copy has memmove semantics
+    rt_abi::hsh_ptr_write_i64(b, 56, 578437695752307201)
+    rt_abi::hsh_ptr_copy(b + 57, b + 56, 6)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 56), 578155116952158465)
+    rt_abi::hsh_ptr_zero(b + 8, 8)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 8), 0)
+    rt_abi::hsh_ptr_write_checked(b, 0, 8, 1234605616436508552)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 0), 1234605616436508552)
+    rt_abi::hsh_ptr_write_checked(b, 0, 4, 2864434397)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 0), 1234605617868164317)
+    rt_abi::hsh_ptr_write_checked(b, 0, 2, 4660)
+    rt_abi::hsh_ptr_write_checked(b, 6, 1, 127)
+    eq_i(rt_abi::hsh_ptr_read_i64(b, 0), 1260782790702207540)
+    ;; NULL is tolerated everywhere
+    eq_i(rt_abi::hsh_ptr_read_i64(0, 0), 0)
+    eq_i(rt_abi::hsh_ptr_compare(0, 0, 4), 0)
+    eq_i(sgn_of(rt_abi::hsh_ptr_compare(b, 0, 4)), 1)
+    eq_i(sgn_of(rt_abi::hsh_ptr_compare(0, b, 4)), -1)
+    rt_abi::hsh_ptr_copy(0, b, 4)
+    rt_abi::hsh_ptr_copy(b, 0, 4)
+    rt_abi::hsh_ptr_fill(0, 1, 4)
+    rt_abi::hsh_ptr_zero(0, 4)
+    rt_abi::hsh_ptr_write_i64(0, 0, 1)
+end
+
+fn sgn_of(v: int) -> int is
+    if v < 0 is return -1 end
+    if v > 0 is return 1 end
+    return 0
+end
+
+#[test]
+fn abi_free_functions_and_arena_kinds_match_c() is
+    let ax: int = rt_abi::hsh_alloc_ex(32)
+    rt_abi::hsh_ptr_write_i64(ax, 24, 77)
+    eq_i(rt_abi::hsh_ptr_read_i64(ax, 24), 77)
+    rt_abi::hsh_bytes_free(ax)
+    rt_abi::hsh_array_free(rt_abi::hsh_array_push(rt_abi::hsh_array_new(), 1))
+    rt_abi::hsh_array_drop(rt_abi::hsh_array_push(rt_abi::hsh_array_new(), 1))
+    rt_abi::hsh_array_free(0)
+    rt_abi::hsh_array_drop(0)
+    let st: int = rt_abi::hsh_struct_new(3)
+    let st2: int = rt_abi::hsh_struct_set(st, 1, 5)
+    rt_abi::hsh_struct_free(st)
+    rt_abi::hsh_struct_free(0)
+    let args: int = rt_abi::hsh_args_alloc(2)
+    rt_abi::hsh_args_set(args, 0, 9)
+    rt_abi::hsh_args_free(args)
+    rt_abi::hsh_args_free(0)
+    let rc: int = rt_abi::hsh_rc_alloc(8)
+    let w: int = rt_abi::hsh_arc_downgrade(rc)
+    eq_i(rt_abi::hsh_arc_weak_count(rc), 1)
+    rt_abi::hsh_arc_weak_release(w)
+    eq_i(rt_abi::hsh_arc_weak_count(rc), 0)
+    eq_i(rt_abi::hsh_rc_count(rc), 1)
+    rt_abi::hsh_arc_weak_release(0)
+    ;; arena kinds 0 and 1 hand out exactly the requested bytes, kind 2 rounds the 40 bytes up to 64
+    let mut kind: int = 0
+    while kind < 3 is
+        let a: int = rt_abi::hsh_arena_new_kind(256, kind)
+        rt_abi::hsh_arena_push_current(a)
+        let x: int = rt_abi::hsh_arena_alloc(a, 40)
+        if kind < 2 is eq_i(rt_abi::hsh_arena_used(), 40) else eq_i(rt_abi::hsh_arena_used(), 64) end
+        eq_i(rt_abi::hsh_arena_capacity(), 256)
+        let popped: int = rt_abi::hsh_arena_pop_current()
+        rt_abi::hsh_arena_free(a)
+        kind += 1
+    end
+end
+
+#[test]
+fn abi_sqlite_params_and_columns_match_c() is
+    let d: string = "/tmp/hs_rt_abi6_" + to_string(rt_sys::pid())
+    rt_os::mkdir_all(d)
+    let db: string = d + "/p.db"
+    rt_abi::hsh_sqlite_exec(db, "CREATE TABLE t(id INTEGER, name TEXT, score REAL, flag INTEGER)")
+    let mut p: int = rt_abi::hsh_array_new()
+    p = rt_abi::hsh_array_push_str(p, "7")
+    p = rt_abi::hsh_array_push_str(p, "x y'z")
+    p = rt_abi::hsh_array_push_str(p, "2.5")
+    p = rt_abi::hsh_array_push_str(p, "1")
+    eq_i(rt_abi::hsh_sqlite_exec_params(db, "INSERT INTO t VALUES(?,?,?,?)", p), 1)
+    eq_i(rt_abi::hsh_sqlite_exec_params(db, "INSERT INTO nope VALUES(?)", p), -1)
+    eq_i(rt_abi::hsh_sqlite_exec_params(db, "INSERT INTO t VALUES(8,'',0,0)", rt_abi::hsh_array_new()), 1)
+    rt_abi::hsh_sqlite_exec(db, "INSERT INTO t VALUES (9,NULL,NULL,NULL)")
+    let rows: int = rt_abi::hsh_sqlite_query(db, "SELECT id,name,score,flag FROM t ORDER BY id")
+    eq_i(rt_abi::hsh_array_len(rows), 3)
+    let r0: int = rt_abi::hsh_array_get(rows, 0)
+    eq_i(rt_abi::hsh_db_col_int(r0, "id"), 7)
+    eq_s(rt_abi::hsh_db_col_str(r0, "name"), "x y'z")
+    eq_i(rt_ptr::f64_bits(rt_abi::hsh_db_col_float(r0, "score")), 4612811918334230528)
+    eq_i(rt_abi::hsh_db_col_bool(r0, "flag"), 1)
+    eq_i(rt_abi::hsh_db_col_is_null(r0, "name"), 0)
+    ;; core.c reads cells through the sqlite3 shell: an empty string and an SQL NULL are both "null" and read back as ""/0
+    let r1: int = rt_abi::hsh_array_get(rows, 1)
+    eq_i(rt_abi::hsh_db_col_is_null(r1, "name"), 1)
+    eq_s(rt_abi::hsh_db_col_str(r1, "name"), "")
+    eq_i(rt_abi::hsh_db_col_bool(r1, "flag"), 0)
+    let r2: int = rt_abi::hsh_array_get(rows, 2)
+    eq_i(rt_abi::hsh_db_col_is_null(r2, "name"), 1)
+    eq_i(rt_abi::hsh_db_col_is_null(r2, "id"), 0)
+    eq_i(rt_abi::hsh_db_col_int(r2, "id"), 9)
+    eq_i(rt_abi::hsh_db_col_int(r2, "zzz"), 0)
+    eq_s(rt_abi::hsh_db_col_str(r2, "zzz"), "")
+    eq_i(rt_abi::hsh_array_len(rt_abi::hsh_sqlite_query(db, "SELECT * FROM t WHERE id=12345")), 0)
+    eq_i(rt_abi::hsh_array_len(rt_abi::hsh_sqlite_query(db, "SELEC bad")), 0)
+    rt_proc::shell("rm -rf '" + d + "'")
+end
+
+#[test]
+fn abi_paths_processes_and_system_match_c() is
+    eq_s(rt_abi::hsh_path_filename("/a/b/c.txt"), "c.txt")
+    eq_s(rt_abi::hsh_path_filename("c.txt"), "c.txt")
+    eq_s(rt_abi::hsh_path_filename("/a/b/"), "b")
+    eq_s(rt_abi::hsh_path_filename(""), "")
+    eq_s(rt_abi::hsh_path_filename("/"), "")
+    eq_s(rt_abi::hsh_path_filename("a/b/.hidden"), ".hidden")
+    let tf: string = rt_abi::hsh_fs_temp_file("pfx")
+    eq_i(rt_abi::hsh_file_exists(tf), 1)
+    let mt: int = rt_abi::hsh_fs_modified_time(tf)
+    let now: int = rt_abi::hsh_now_unix()
+    if mt < now - 60 || mt > now + 5 is test::fail("modified_time of a fresh file is not 'now'") end
+    eq_i(rt_abi::hsh_fs_modified_time("/nonexistent_zz"), -1)
+    rt_abi::hsh_remove_file(tf)
+    let mut ra: int = rt_abi::hsh_array_new()
+    ra = rt_abi::hsh_array_push_str(ra, "a b")
+    ra = rt_abi::hsh_array_push_str(ra, "c")
+    eq_s(rt_abi_arrays::hsh_process_run_args("echo", ra), "a b c\n")
+    eq_s(rt_abi_arrays::hsh_process_run_args("nonexistent_cmd_zz", ra), "")
+    let pid: int = rt_abi::hsh_process_spawn("sleep 30")
+    if pid <= 0 is test::fail("process_spawn returned no pid") end
+    eq_i(rt_abi::hsh_process_kill(pid), 1)
+    eq_i(rt_abi::hsh_process_kill(99999999), 0)
+    if rt_abi::hsh_getpid() <= 0 || rt_abi::hsh_getpid() != rt_abi::hsh_proc_id() is test::fail("getpid / proc_id") end
+    if rt_abi::hsh_sys_get_ppid() <= 0 is test::fail("ppid") end
+    let ms: int = rt_abi::hsh_now_ms()
+    if ms / 1000 - rt_abi::hsh_now_unix() < 0 || ms / 1000 - rt_abi::hsh_now_unix() > 1 is test::fail("now_ms vs now_unix") end
+    if rt_abi::hsh_sys_memory_free() <= 0 || rt_abi::hsh_sys_memory_free() > rt_abi::hsh_sys_memory_total() is test::fail("memory_free") end
+    if rt_abi::hsh_sys_uptime() <= 0 || rt_abi::hsh_sys_load_avg() < 0.0 is test::fail("uptime / load_avg") end
+end
+
+;; An empty search string leaves the text alone.  core.c loops forever here (strstr hits at once and nothing advances), but the project's own
+;; std/strings.h# documents the same for replace_all (`if from.len() == 0 is return s end`), so this is the specified behaviour.
+#[test]
+fn abi_replace_with_empty_pattern_is_a_no_op() is
+    eq_s(rt_abi::hsh_str_replace("abc", "", "-"), "abc")
+    eq_s(rt_abi::hsh_string_replace("abc", "", "-"), "abc")
+    eq_s(rt_abi::hsh_str_replace("", "", "-"), "")
+    eq_s(rt_abi::hsh_str_replace("abc", "b", ""), "ac")
 end
