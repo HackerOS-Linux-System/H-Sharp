@@ -102,7 +102,8 @@ fn engine(path: string, sql: string, header: bool, arg_mode: bool) -> [string] i
     let stmtp: int = rt_ptr::buf_new(8)
     let tailp: int = rt_ptr::buf_new(8)
     let mut cur: int = buf
-    let mut out: string = ""
+    ;; result text kept as chunks and joined once at the end (appending per row was quadratic: OOM for a few hundred thousand rows)
+    let mut chunks: [string] = []
     let mut err: string = ""
     let mut rcode: int = 0
     let mut go: bool = true
@@ -143,7 +144,7 @@ fn engine(path: string, sql: string, header: bool, arg_mode: bool) -> [string] i
                                 names += ctext(sqlite3_column_name(stmt, i))
                                 i += 1
                             end
-                            out += names + "\n"
+                            chunks.push(names + "\n")
                             printed = true
                         end
                         let mut row: string = ""
@@ -153,7 +154,7 @@ fn engine(path: string, sql: string, header: bool, arg_mode: bool) -> [string] i
                             row += ctext(sqlite3_column_text(stmt, j))
                             j += 1
                         end
-                        out += row + "\n"
+                        chunks.push(row + "\n")
                     elsif sr == 101 is
                         stepping = false
                     else
@@ -181,7 +182,7 @@ fn engine(path: string, sql: string, header: bool, arg_mode: bool) -> [string] i
     sqlite3_close(db)
     rt_ptr::buf_free(stmtp)
     rt_ptr::buf_free(tailp)
-    return [out, err, rt_conv::int_to_str(rcode)]
+    return [rt_str::array_join(chunks, ""), err, rt_conv::int_to_str(rcode)]
 end
 
 ;; core.c hsh_db_report: "db error: <err or 'sqlite3 failed'>" on stderr when rc != 0
@@ -306,7 +307,7 @@ fn set_header(line: string) is
         end
         free(old)
     end
-    let parts: [string] = __builtin_str_split(line, "\t")
+    let parts: [string] = rt_str::string_split(line, "\t")
     let arr: int = rt_ptr::buf_new(parts.len() * 8)
     let mut k: int = 0
     while k < parts.len() is
@@ -320,7 +321,7 @@ end
 ;; core.c hsh_db_parse_rows: line 1 is the header, every later non-empty line one row (cells split on TAB); an empty text changes nothing
 fn parse_rows(out: string) -> int is
     let mut rows: int = rt_mem::array_new()
-    let lines: [string] = __builtin_str_split(out, "\n")
+    let lines: [string] = rt_str::string_split(out, "\n")
     let mut first: bool = true
     let mut i: int = 0
     while i < lines.len() is
@@ -333,7 +334,7 @@ fn parse_rows(out: string) -> int is
                 first = false
             elsif line.len() > 0 is
                 let mut row: int = rt_mem::array_new()
-                let cells: [string] = __builtin_str_split(line, "\t")
+                let cells: [string] = rt_str::string_split(line, "\t")
                 let mut c: int = 0
                 while c < cells.len() is
                     row = rt_mem::array_push(row, rt_mem::alloc_string(cells[c]))
@@ -381,13 +382,17 @@ end
 ;; ───────────────────────── SQL text helpers ─────────────────────────
 ;; core.c hsh_sql_escape: 'text' with every ' doubled
 fn sql_escape(s: string) -> string is
-    let mut out: string = "'"
+    let n: int = s.len()
+    let mut out: [int] = [39]
     let mut i: int = 0
-    while i < s.len() is
-        if byte_at(s, i) == 39 is out += "''" else out += s[i..i + 1] end
+    while i < n is
+        let c: int = byte_at(s, i)
+        out.push(c)
+        if c == 39 is out.push(39) end
         i += 1
     end
-    return out + "'"
+    out.push(39)
+    return rt_raw::string_from_ints(out)
 end
 
 ;; core.c hsh_sql_bind: the n-th '?' becomes the n-th escaped value (no quote awareness)
