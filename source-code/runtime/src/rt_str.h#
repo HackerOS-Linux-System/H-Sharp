@@ -52,25 +52,28 @@ end
 
 ;; core.c hsh_to_upper / hsh_to_lower
 pub fn to_upper_h(s: string) -> string is
-    let mut out: string = ""
+    ;; bytes collected in an int array and turned into a string once (an `out += ..` per byte was quadratic and never freed: OOM near 100 KB)
+    let n: int = s.len()
+    let mut out: [int] = []
     let mut i: int = 0
-    while i < s.len() is
+    while i < n is
         let c: int = byte_at(s, i)
-        if c >= 97 && c <= 122 is out += str_from_byte(c - 32) else out += s[i..i + 1] end
+        if c >= 97 && c <= 122 is out.push(c - 32) else out.push(c) end
         i += 1
     end
-    return out
+    return rt_raw::string_from_ints(out)
 end
 
 pub fn to_lower_h(s: string) -> string is
-    let mut out: string = ""
+    let n: int = s.len()
+    let mut out: [int] = []
     let mut i: int = 0
-    while i < s.len() is
+    while i < n is
         let c: int = byte_at(s, i)
-        if c >= 65 && c <= 90 is out += str_from_byte(c + 32) else out += s[i..i + 1] end
+        if c >= 65 && c <= 90 is out.push(c + 32) else out.push(c) end
         i += 1
     end
-    return out
+    return rt_raw::string_from_ints(out)
 end
 
 ;; core.c hsh_hex_encode: lowercase hex of every byte
@@ -101,20 +104,46 @@ end
 
 ;; core.c hsh_str_replace: every non-overlapping occurrence, left to right; an empty `from` changes nothing
 pub fn replace_h(s: string, from: string, to: string) -> string is
-    if from.len() == 0 is return s end
-    let mut out: string = ""
-    let mut at: int = 0
-    while true is
-        let rest: string = s[at..s.len()]
-        let k: int = index_of(rest, from)
-        if k < 0 is
-            out += rest
-            return out
-        end
-        out += rest[0..k] + to
-        at += k + from.len()
+    let m: int = from.len()
+    if m == 0 is return s end
+    let n: int = s.len()
+    let f0: int = byte_at(from, 0)
+    let mut tb: [int] = []
+    let mut q: int = 0
+    while q < to.len() is
+        tb.push(byte_at(to, q))
+        q += 1
     end
-    return out
+    ;; one pass, bytes appended to an int array: linear time and memory (the old version re-sliced the whole remainder per hit)
+    let mut out: [int] = []
+    let mut hit: bool = false
+    let mut i: int = 0
+    while i < n is
+        let c: int = byte_at(s, i)
+        let mut ok: bool = false
+        if c == f0 && i + m <= n is
+            ok = true
+            let mut k: int = 1
+            while k < m && ok is
+                if byte_at(s, i + k) != byte_at(from, k) is ok = false end
+                k += 1
+            end
+        end
+        if ok is
+            hit = true
+            let mut j: int = 0
+            while j < tb.len() is
+                out.push(tb[j])
+                j += 1
+            end
+            i += m
+        else
+            out.push(c)
+            i += 1
+        end
+    end
+    if !hit is return s end
+    return rt_raw::string_from_ints(out)
 end
 
 ;; core.c hsh_string_repeat: "" for n <= 0
@@ -325,25 +354,66 @@ pub fn string_split(str: string, sep: string) -> [string] is
         out.push(str)
         return out
     end
-    let mut rest: string = str
-    let mut at_: int = index_of(rest, sep)
-    while at_ >= 0 is
-        out.push(rest[0..at_])
-        rest = rest[at_ + sep.len()..rest.len()]
-        at_ = index_of(rest, sep)
+    ;; scan with an offset: the old version re-sliced the whole remainder per separator (quadratic, OOM at ~200k parts)
+    let n: int = str.len()
+    let m: int = sep.len()
+    let f0: int = byte_at(sep, 0)
+    let mut start: int = 0
+    let mut i: int = 0
+    while i + m <= n is
+        let mut ok: bool = false
+        if byte_at(str, i) == f0 is
+            ok = true
+            let mut k: int = 1
+            while k < m && ok is
+                if byte_at(str, i + k) != byte_at(sep, k) is ok = false end
+                k += 1
+            end
+        end
+        if ok is
+            out.push(str[start..i])
+            i += m
+            start = i
+        else
+            i += 1
+        end
     end
-    out.push(rest)
+    out.push(str[start..n])
     return out
 end
 
 ;; core.c hsh_array_join (array of strings): parts glued with `sep`; "" for an empty array
 pub fn array_join(a: [string], sep: string) -> string is
-    let mut out: string = ""
+    let cnt: int = a.len()
+    if cnt == 0 is return "" end
+    if cnt == 1 is return a[0] end
+    let sl: int = sep.len()
+    let mut total: int = sl * (cnt - 1)
     let mut i: int = 0
-    while i < a.len() is
-        if i > 0 is out += sep end
-        out += a[i]
+    while i < cnt is
+        total += a[i].len()
         i += 1
     end
-    return out
+    ;; one buffer, every part copied once (appending to a string per part was quadratic and never freed)
+    let buf: int = malloc(total + 1)
+    if buf == 0 is return "" end
+    let mut w: int = 0
+    i = 0
+    while i < cnt is
+        if i > 0 && sl > 0 is
+            memcpy(buf + w, sep, sl)
+            w += sl
+        end
+        let el: string = a[i]
+        let el_len: int = el.len()
+        if el_len > 0 is
+            memcpy(buf + w, el, el_len)
+            w += el_len
+        end
+        i += 1
+    end
+    memset(buf + w, 0, 1)
+    let r: string = strdup(buf)
+    free(buf)
+    return r
 end
