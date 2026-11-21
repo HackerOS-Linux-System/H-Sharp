@@ -1,0 +1,277 @@
+use "std -> test" from "test"
+use "workspace -> parser" from "lib -> *"
+
+;; `#[cfg(...)]`, `feature_enabled("x")`, `enabled_features()` — decided while parsing, from HSHARP_FEATURES
+;; (what `h# --features a,b` and `bit build --features a,b` set).
+
+fn lines(parts: [string]) -> string is
+    let mut out: string = ""
+    for p in parts is out = out + p + "\n" end
+    return out
+end
+
+fn features(list: string) is
+    env_set("HSHARP_FEATURES", list)
+end
+
+fn parse_ok(src: string) -> parser::ParseResult is
+    let r: parser::ParseResult = parser::parse(src, "t.h#")
+    if parser::has_errors(r) is
+        test::fail("unexpected parse errors: " + parser::render_errors(r))
+    end
+    return r
+end
+
+fn items_of(r: parser::ParseResult, tag: string) -> [ast::Node] is
+    let mut out: [ast::Node] = []
+    for it in r.module.kids[3].kids is
+        if it.tag == tag is out.push(it) end
+    end
+    return out
+end
+
+fn eq_i(got: int, want: int, what: string) is
+    if got != want is test::fail(what + ": expected " + to_string(want) + ", got " + to_string(got)) end
+end
+
+fn eq_s(got: string, want: string, what: string) is
+    if got != want is test::fail(what + ": expected `" + want + "`, got `" + got + "`") end
+end
+
+fn fn_names(r: parser::ParseResult) -> string is
+    let mut out: string = ""
+    for it in items_of(r, "Fn") is out = out + it.text + "," end
+    return out
+end
+
+;; ── the feature list itself ───────────────────────────────────────────────────
+#[test]
+fn test_split_list_accepts_commas_and_spaces_and_drops_duplicates() is
+    let l: [string] = conditional::split_list(" a,b  c,,a\td ")
+    eq_i(l.len(), 4, "length")
+    eq_s(l[0], "a", "first")
+    eq_s(l[3], "d", "last")
+end
+
+#[test]
+fn test_valid_name() is
+    test::assert(conditional::valid_name("normal-mode"), "dash")
+    test::assert(conditional::valid_name("simd_2"), "underscore + digit")
+    test::assert(!conditional::valid_name(""), "empty")
+    test::assert(!conditional::valid_name("a b"), "space")
+    test::assert(!conditional::valid_name("dep:x"), "colon")
+end
+
+;; ── items ─────────────────────────────────────────────────────────────────────
+#[test]
+fn test_cfg_feature_keeps_item_only_when_enabled() is
+    let src: string = lines(["#[cfg(feature = \"fast\")]", "fn fast() is end", "fn always() is end"])
+    features("fast")
+    eq_s(fn_names(parse_ok(src)), "fast,always,", "on")
+    features("")
+    eq_s(fn_names(parse_ok(src)), "always,", "off")
+    features("other")
+    eq_s(fn_names(parse_ok(src)), "always,", "other feature")
+end
+
+#[test]
+fn test_cfg_not() is
+    let src: string = lines(["#[cfg(not(feature = \"fast\"))]", "fn slow() is end", "fn always() is end"])
+    features("")
+    eq_s(fn_names(parse_ok(src)), "slow,always,", "not off")
+    features("fast")
+    eq_s(fn_names(parse_ok(src)), "always,", "not on")
+end
+
+#[test]
+fn test_cfg_all_any_nested() is
+    let src: string = lines([
+        "#[cfg(all(feature = \"a\", feature = \"b\"))]", "fn both() is end",
+        "#[cfg(any(feature = \"a\", feature = \"b\"))]", "fn either() is end",
+        "#[cfg(all(feature = \"a\", not(feature = \"b\")))]", "fn only_a() is end"])
+    features("a")
+    eq_s(fn_names(parse_ok(src)), "either,only_a,", "a")
+    features("a,b")
+    eq_s(fn_names(parse_ok(src)), "both,either,", "a,b")
+    features("")
+    eq_s(fn_names(parse_ok(src)), "", "none")
+end
+
+#[test]
+fn test_cfg_true_false_and_stacked_attributes() is
+    features("x")
+    let r: parser::ParseResult = parse_ok(lines(["#[cfg(true)]", "fn t() is end", "#[cfg(false)]", "fn f() is end",
+        "#[cfg(feature = \"x\")]", "#[cfg(feature = \"y\")]", "fn both() is end"]))
+    eq_s(fn_names(r), "t,", "stacked attributes all have to hold")
+end
+
+#[test]
+fn test_cfg_on_every_kind_of_item() is
+    features("")
+    let r: parser::ParseResult = parse_ok(lines([
+        "#[cfg(feature = \"x\")]", "struct S is a: int end",
+        "#[cfg(feature = \"x\")]", "enum E is A end",
+        "#[cfg(feature = \"x\")]", "trait T is fn m(self) end",
+        "#[cfg(feature = \"x\")]", "impl S is fn m(self) is end end",
+        "#[cfg(feature = \"x\")]", "type Alias = int",
+        "#[cfg(feature = \"x\")]", "const K = 1",
+        "#[cfg(feature = \"x\")]", "mod inner",
+        "struct Kept is a: int end"]))
+    eq_i(r.module.kids[3].kids.len(), 1, "only the unconditional struct survives")
+    features("x")
+    let r2: parser::ParseResult = parse_ok(lines([
+        "#[cfg(feature = \"x\")]", "struct S is a: int end",
+        "#[cfg(feature = \"x\")]", "const K = 1"]))
+    eq_i(r2.module.kids[3].kids.len(), 2, "both survive with the feature")
+end
+
+#[test]
+fn test_cfg_inside_inline_mod() is
+    features("")
+    let r: parser::ParseResult = parse_ok(lines(["mod m is", "    #[cfg(feature = \"x\")]", "    fn a() is end", "    fn b() is end", "end"]))
+    let m: ast::Node = items_of(r, "ModDecl")[0]
+    eq_i(m.kids[1].kids.len(), 1, "inline mod items")
+end
+
+;; ── members ───────────────────────────────────────────────────────────────────
+#[test]
+fn test_cfg_struct_fields_and_enum_variants() is
+    let src: string = lines([
+        "struct S is", "    a: int", "    #[cfg(feature = \"x\")]", "    b: int", "end",
+        "enum E is", "    One", "    #[cfg(feature = \"x\")]", "    Two", "    Three", "end"])
+    features("")
+    let off: parser::ParseResult = parse_ok(src)
+    eq_i(items_of(off, "Struct")[0].kids[1].kids.len(), 1, "fields off")
+    eq_i(items_of(off, "Enum")[0].kids[1].kids.len(), 2, "variants off")
+    features("x")
+    let on: parser::ParseResult = parse_ok(src)
+    eq_i(items_of(on, "Struct")[0].kids[1].kids.len(), 2, "fields on")
+    eq_i(items_of(on, "Enum")[0].kids[1].kids.len(), 3, "variants on")
+end
+
+#[test]
+fn test_cfg_impl_and_trait_members() is
+    let src: string = lines([
+        "impl S is", "    fn a(self) is end", "    #[cfg(feature = \"x\")]", "    fn b(self) is end", "end",
+        "trait T is", "    fn a(self)", "    #[cfg(feature = \"x\")]", "    fn b(self)", "end"])
+    features("")
+    let off: parser::ParseResult = parse_ok(src)
+    eq_i(items_of(off, "Impl")[0].kids[1].kids.len(), 1, "impl off")
+    eq_i(items_of(off, "Trait")[0].kids[1].kids.len(), 1, "trait off")
+    features("x")
+    let on: parser::ParseResult = parse_ok(src)
+    eq_i(items_of(on, "Impl")[0].kids[1].kids.len(), 2, "impl on")
+    eq_i(items_of(on, "Trait")[0].kids[1].kids.len(), 2, "trait on")
+end
+
+;; ── imports and statements ────────────────────────────────────────────────────
+#[test]
+fn test_cfg_import() is
+    let src: string = lines(["#[cfg(feature = \"x\")]", "use \"std -> fs\" from \"fs\"", "use \"std -> env\" from \"env\"", "fn main() is end"])
+    features("")
+    eq_i(parse_ok(src).module.kids[2].kids.len(), 1, "import off")
+    features("x")
+    eq_i(parse_ok(src).module.kids[2].kids.len(), 2, "import on")
+end
+
+#[test]
+fn test_cfg_statements() is
+    let src: string = lines([
+        "fn main() is",
+        "    let a: int = 1",
+        "    #[cfg(feature = \"x\")]",
+        "    let b: int = 2",
+        "    #[cfg(feature = \"x\")]",
+        "    write(\"x on\")",
+        "    #[cfg(not(feature = \"x\"))]",
+        "    write(\"x off\")",
+        "end"])
+    features("")
+    eq_i(items_of(parse_ok(src), "Fn")[0].kids[4].kids.len(), 2, "statements off")
+    features("x")
+    eq_i(items_of(parse_ok(src), "Fn")[0].kids[4].kids.len(), 3, "statements on")
+end
+
+#[test]
+fn test_cfg_local_item_in_body() is
+    let src: string = lines(["fn main() is", "    #[cfg(feature = \"x\")]", "    fn helper() is end", "    write(\"hi\")", "end"])
+    features("")
+    eq_i(items_of(parse_ok(src), "Fn")[0].kids[4].kids.len(), 1, "local fn off")
+    features("x")
+    eq_i(items_of(parse_ok(src), "Fn")[0].kids[4].kids.len(), 2, "local fn on")
+end
+
+;; ── feature_enabled / enabled_features ────────────────────────────────────────
+fn first_let_value(r: parser::ParseResult) -> ast::Node is
+    let f: ast::Node = items_of(r, "Fn")[0]
+    return f.kids[4].kids[0]
+end
+
+#[test]
+fn test_feature_enabled_becomes_a_bool_literal() is
+    let src: string = lines(["fn main() is", "    let v: bool = feature_enabled(\"x\")", "end"])
+    features("x")
+    let on: ast::Node = first_let_value(parse_ok(src))
+    eq_s(on.kids[on.kids.len() - 1].tag, "Bool", "tag")
+    eq_s(on.kids[on.kids.len() - 1].text, "true", "value on")
+    features("")
+    let off: ast::Node = first_let_value(parse_ok(src))
+    eq_s(off.kids[off.kids.len() - 1].text, "false", "value off")
+end
+
+#[test]
+fn test_enabled_features_becomes_an_array_literal() is
+    let src: string = lines(["fn main() is", "    let v: [string] = enabled_features()", "end"])
+    features("b,a")
+    let n: ast::Node = first_let_value(parse_ok(src))
+    let arr: ast::Node = n.kids[n.kids.len() - 1]
+    eq_s(arr.tag, "ArrayLit", "tag")
+    eq_i(arr.kids.len(), 2, "count")
+    eq_s(arr.kids[0].text, "b", "order is the order given")
+end
+
+#[test]
+fn test_user_defined_helper_is_not_rewritten() is
+    let src: string = lines(["fn feature_enabled(n: string) -> bool is return true end", "fn main() is", "    let v: bool = feature_enabled(\"x\")", "end"])
+    features("")
+    let r: parser::ParseResult = parse_ok(src)
+    let n: ast::Node = items_of(r, "Fn")[1].kids[4].kids[0]
+    eq_s(n.kids[n.kids.len() - 1].tag, "Call", "left alone")
+end
+
+;; ── mistakes are reported, not silently ignored ───────────────────────────────
+fn has_error_containing(src: string, needle: string) -> bool is
+    let r: parser::ParseResult = parser::parse(src, "t.h#")
+    let text: string = parser::render_errors(r)
+    let mut i: int = 0
+    while i + needle.len() <= text.len() is
+        if text[i..i + needle.len()] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+#[test]
+fn test_malformed_cfg_is_an_error() is
+    features("")
+    test::assert(has_error_containing("#[cfg(banana)]\nfn f() is end\n", "unknown `cfg` predicate"), "bare ident")
+    test::assert(has_error_containing("#[cfg(feature)]\nfn f() is end\n", "needs a name"), "feature without value")
+    test::assert(has_error_containing("#[cfg(color = \"x\")]\nfn f() is end\n", "unknown `cfg` key"), "other key")
+    test::assert(has_error_containing("#[cfg(not(feature = \"a\", feature = \"b\"))]\nfn f() is end\n", "exactly one"), "not with two")
+    test::assert(has_error_containing("#[cfg(maybe(feature = \"a\"))]\nfn f() is end\n", "unknown `cfg` predicate"), "unknown call")
+    test::assert(has_error_containing("#[cfg]\nfn f() is end\n", "exactly one predicate"), "no predicate")
+end
+
+#[test]
+fn test_feature_enabled_needs_a_literal() is
+    features("")
+    test::assert(has_error_containing("fn main() is\n    let n: string = \"x\"\n    let v: bool = feature_enabled(n)\nend\n", "takes one string literal"), "variable")
+    test::assert(has_error_containing("fn main() is\n    let v: bool = feature_enabled()\nend\n", "takes one string literal"), "no argument")
+end
+
+#[test]
+fn test_other_attributes_are_untouched() is
+    features("")
+    let r: parser::ParseResult = parse_ok(lines(["#[test]", "fn t() is end", "#[deprecated(since = \"1\")]", "fn d() is end"]))
+    eq_s(fn_names(r), "t,d,", "non-cfg attributes keep their item")
+end
