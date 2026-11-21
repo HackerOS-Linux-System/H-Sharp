@@ -1,3 +1,4 @@
+mod rt_raw
 mod rt_str
 
 fn hexval(c: int) -> int is
@@ -25,13 +26,23 @@ end
 
 ;; core.c hsh_shell_escape: single-quote the string, every ' becomes '\''
 pub fn shell_escape(s: string) -> string is
-    let mut out: string = "'"
+    let n: int = s.len()
+    let mut out: [int] = [39]
     let mut i: int = 0
-    while i < s.len() is
-        if byte_at(s, i) == 39 is out += "'\\''" else out += s[i..i + 1] end
+    while i < n is
+        let c: int = byte_at(s, i)
+        if c == 39 is
+            out.push(39)
+            out.push(92)
+            out.push(39)
+            out.push(39)
+        else
+            out.push(c)
+        end
         i += 1
     end
-    return out + "'"
+    out.push(39)
+    return rt_raw::string_from_ints(out)
 end
 
 ;; core.c hsh_json_get: NOT a JSON parser.  Finds the first `"key":` (no space before the colon), skips spaces/tabs, then
