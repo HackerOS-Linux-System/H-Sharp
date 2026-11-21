@@ -1,3 +1,4 @@
+mod rt_str
 use "std -> env" from "env"
 
 mod rt_os
@@ -68,7 +69,7 @@ pub fn now_unix() -> int is return time(0) end
 ;; ── /proc and uname based information (core.c hsh_sys_*) ──
 ;; value of the first line starting with `key`, parsed like strtoll (leading blanks, digits); 0 when absent
 fn meminfo_kb(key: string) -> int is
-    let lines: [string] = __builtin_str_split(rt_os::read_stream("/proc/meminfo"), "\n")
+    let lines: [string] = rt_str::string_split(rt_os::read_stream("/proc/meminfo"), "\n")
     let mut i: int = 0
     while i < lines.len() is
         if rt_str::starts_with_h(lines[i], key) is
@@ -93,7 +94,7 @@ pub fn memory_free() -> int is return meminfo_kb("MemAvailable:") * 1024 end
 
 ;; core.c hsh_sys_cpu_count: lines of /proc/cpuinfo starting with "processor" (at least 1)
 pub fn cpu_count() -> int is
-    let lines: [string] = __builtin_str_split(rt_os::read_stream("/proc/cpuinfo"), "\n")
+    let lines: [string] = rt_str::string_split(rt_os::read_stream("/proc/cpuinfo"), "\n")
     let mut n: int = 0
     let mut i: int = 0
     while i < lines.len() is
