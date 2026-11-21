@@ -3,11 +3,12 @@ mod rt_indirect
 mod rt_task
 
 pub fn hsh_sort_by(p0: int, p1: int) -> int is
-    return rt_marshal::ints_to_raw(rt_indirect::sort_by_raw(rt_marshal::ints_from_raw(p0), p1))
+    ;; in place, returns the same array (core.c)
+    return rt_marshal::ints_store(p0, rt_indirect::sort_by_raw(rt_marshal::ints_from_raw(p0), p1))
 end
 
 pub fn hsh_sort_by_key(p0: int, p1: int) -> int is
-    return rt_marshal::ints_to_raw(rt_indirect::sort_by_key(rt_marshal::ints_from_raw(p0), p1))
+    return rt_marshal::ints_store(p0, rt_indirect::sort_by_key(rt_marshal::ints_from_raw(p0), p1))
 end
 
 pub fn hsh_closure_call1(p0: int, p1: int) -> int is
