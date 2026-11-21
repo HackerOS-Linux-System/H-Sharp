@@ -140,3 +140,53 @@ fn marshal_roundtrip() is
     eq_s(s2[2], "gamma")
     eq_s(rt_abi_arrays::hsh_array_join(sr, "-"), "alpha--gamma")
 end
+
+;; hsh_regex_captures_all is an array of ROWS (one raw HshArray* of C strings per match: whole match, then each group) —
+;; values checked against core.c.  (rt_marshal used to flatten the rows as if they were strings.)
+fn row_at(all: int, i: int) -> int is return rt_abi::hsh_array_get(all, i) end
+
+#[test]
+fn abi_regex_captures_all_rows() is
+    let all: int = rt_abi_arrays::hsh_regex_captures_all("([a-z])([0-9])", "a1 b2")
+    eq_i(rt_abi::hsh_array_len(all), 2)
+    let r0: int = row_at(all, 0)
+    eq_i(rt_abi::hsh_array_len(r0), 3)
+    eq_s(str_at(r0, 0), "a1")
+    eq_s(str_at(r0, 1), "a")
+    eq_s(str_at(r0, 2), "1")
+    let r1: int = row_at(all, 1)
+    eq_s(str_at(r1, 0), "b2")
+    eq_s(str_at(r1, 1), "b")
+    eq_s(str_at(r1, 2), "2")
+
+    let nums: int = rt_abi_arrays::hsh_regex_captures_all("([0-9]+)-([0-9]+)", "1-2 33-44")
+    eq_i(rt_abi::hsh_array_len(nums), 2)
+    eq_s(str_at(row_at(nums, 1), 0), "33-44")
+    eq_s(str_at(row_at(nums, 1), 2), "44")
+
+    ;; an optional group that did not take part is the empty string
+    let opt: int = rt_abi_arrays::hsh_regex_captures_all("(a)(b)?", "a b  c")
+    eq_i(rt_abi::hsh_array_len(opt), 1)
+    eq_i(rt_abi::hsh_array_len(row_at(opt, 0)), 3)
+    eq_s(str_at(row_at(opt, 0), 0), "a")
+    eq_s(str_at(row_at(opt, 0), 2), "")
+
+    ;; no group: the row is just the whole match
+    let plain: int = rt_abi_arrays::hsh_regex_captures_all("[0-9]+", "a1b22")
+    eq_i(rt_abi::hsh_array_len(plain), 2)
+    eq_i(rt_abi::hsh_array_len(row_at(plain, 0)), 1)
+    eq_s(str_at(row_at(plain, 1), 0), "22")
+end
+
+#[test]
+fn marshal_rows_roundtrip() is
+    let rows: [[string]] = [["a", "b"], [], ["c"]]
+    let raw: int = rt_marshal::rows_to_raw(rows)
+    eq_i(rt_abi::hsh_array_len(raw), 3)
+    eq_i(rt_abi::hsh_array_len(row_at(raw, 1)), 0)
+    let back: [[string]] = rt_marshal::rows_from_raw(raw)
+    eq_i(back.len(), 3)
+    eq_s(back[0][1], "b")
+    eq_i(back[1].len(), 0)
+    eq_s(back[2][0], "c")
+end
