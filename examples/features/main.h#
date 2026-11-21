@@ -1,0 +1,22 @@
+#[cfg(feature = "fast")]
+fn mode() -> string is return "fast" end
+
+#[cfg(not(feature = "fast"))]
+fn mode() -> string is return "portable" end
+
+struct Config is
+    name: string
+    #[cfg(feature = "extra")]
+    verbose: bool
+end
+
+fn main() is
+    write("mode: " + mode())
+    let enabled: [string] = enabled_features()
+    write("enabled features: {enabled.len()}")
+    #[cfg(feature = "extra")]
+    write("the `extra` feature is on")
+    if feature_enabled("fast") is
+        write("fast path")
+    end
+end
